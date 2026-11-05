@@ -428,14 +428,20 @@ pub fn wait(dirs: &Dirs, id: &JobId, deadline: Option<Instant>) -> WaitEnd {
                 continue;
             }
         };
-        if meta.state.is_terminal() {
-            return match JobReport::read(dirs, id) {
-                Ok(Some(r)) => WaitEnd::Done(Box::new(r)),
-                Ok(None) => WaitEnd::Lost(format!("job {id} ended without a report")),
-                Err(e) => WaitEnd::Lost(e.to_string()),
-            };
-        }
         let owner = sched::running_job(dirs, &meta.key).ok().flatten();
+        if meta.state.is_terminal() {
+            match JobReport::read(dirs, id) {
+                Ok(Some(r)) => return WaitEnd::Done(Box::new(r)),
+                // A queued job cancelled or superseded by another process:
+                // its runner writes the report on its way out.
+                Ok(None) if owner.as_ref() == Some(id) => {}
+                Ok(None) if !dead_once => dead_once = true,
+                Ok(None) => return WaitEnd::Lost(format!("job {id} ended without a report")),
+                Err(e) => return WaitEnd::Lost(e.to_string()),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
         if owner.as_ref() != Some(id) {
             // Seen twice in a row: the runner died without a final state.
             if dead_once {

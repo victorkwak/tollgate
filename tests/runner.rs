@@ -53,6 +53,15 @@ fn inline_budget_denies_then_wait_and_cache_hit_t19_r32_l17() {
     );
     assert!(r.out.contains("tollgate wait"), "{}", r.out);
     let job = job_id(&r.out);
+    // A second request for the same tree attaches to the running job, or
+    // hits its record when it already finished (R88, T39).
+    let d = sb.tollgate(&repo, &["check", "--detach"]);
+    assert_eq!(d.code, Some(0), "{}", d.out);
+    assert!(
+        d.out.contains(&format!("attached to running job {job}")) || d.out.contains("PASS"),
+        "{}",
+        d.out
+    );
     let w = sb.tollgate(&repo, &["wait", &job, "--timeout", "30s"]);
     assert_eq!(w.code, Some(0), "{}", w.out);
     assert!(w.out.contains("PASS"), "{}", w.out);
@@ -338,4 +347,66 @@ run = "true"
     let third = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD", "--rerun"]);
     assert_eq!(third.code, Some(0), "{}", third.out);
     assert!(!third.out.contains("REUSED"), "{}", third.out);
+    // A docs-only change passes with zero steps (R61).
+    sb.commit_file(&repo, "README.md", "docs\n", "docs");
+    let docs = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(docs.code, Some(0), "{}", docs.out);
+    let rep = sb.report(&job_id(&docs.out));
+    assert!(
+        rep["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["status"] == "skipped" && s["message"] == "docs-only change (R61)"),
+        "{rep}"
+    );
+}
+
+#[test]
+fn a_queued_job_without_waiters_is_superseded_r89_t39() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"long\"\nkind = \"command\"\nrun = \"touch $TMPDIR/../started; exec sleep 60\"\n",
+    );
+    let started = |job: &str| sb.state().join("jobs").join(job).join("started").exists();
+    let first = job_id(&sb.tollgate(&repo, &["check", "--detach"]).out);
+    assert!(eventually(20, || started(&first)));
+    // Two newer trees from the same worktree queue behind the sticky
+    // checkout; the older queued one has no waiter and is superseded.
+    std::fs::write(repo.join("a.sh"), "1").unwrap();
+    sb.git(&repo, &["add", "a.sh"]);
+    let second = job_id(&sb.tollgate(&repo, &["check", "--detach"]).out);
+    std::fs::write(repo.join("a.sh"), "2").unwrap();
+    sb.git(&repo, &["add", "a.sh"]);
+    let third = job_id(&sb.tollgate(&repo, &["check", "--detach"]).out);
+    assert!(second != third && first != second);
+    // Not `tollgate wait`: a waiter keeps a queued job alive (R89).
+    let state = |job: &str| {
+        let text = std::fs::read_to_string(sb.state().join("jobs").join(job).join("job.json"))
+            .unwrap_or_default();
+        serde_json::from_str::<serde_json::Value>(&text).map_or(String::new(), |v| {
+            v["state"].as_str().unwrap_or_default().to_owned()
+        })
+    };
+    assert!(
+        eventually(20, || state(&second) == "superseded"),
+        "second: {}",
+        state(&second)
+    );
+    assert_eq!(state(&third), "queued");
+    let report = sb.state().join("jobs").join(&second).join("report.json");
+    assert!(eventually(10, || report.is_file()));
+    assert_eq!(sb.report(&second)["outcome"], "superseded");
+    for job in [&first, &third] {
+        let _ = sb.tollgate(&repo, &["cancel", job]);
+    }
+    for job in [&first, &third] {
+        let w = sb.tollgate(&repo, &["wait", job, "--timeout", "30s"]);
+        assert_eq!(w.code, Some(1), "{}", w.out);
+        assert!(w.out.contains("CANCELLED"), "{}", w.out);
+    }
+    assert_eq!(sb.record_count(), 0);
 }
