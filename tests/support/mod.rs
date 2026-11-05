@@ -569,9 +569,7 @@ impl Armed {
             cmd.env(k, v);
         }
         let root = self.sb.root();
-        cmd.env("PATH", &self.path)
-            .env("TMPDIR", &root)
-            .env("TOLLGATE_TEST_INSTALL", "1");
+        cmd.env("PATH", &self.path).env("TMPDIR", &root);
         let hooks = self.data().join("hooks");
         cmd.env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", "core.hooksPath")

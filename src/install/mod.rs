@@ -9,9 +9,10 @@
 //! R24, R96).
 //!
 //! L10: the settings file is never edited without an interactive
-//! confirmation. `--yes` needs a TTY on stdin too, unless
-//! `TOLLGATE_TEST_INSTALL=1` and the settings file is under `$TMPDIR`
-//! (and `$TMPDIR` does not hold the account's real home dir).
+//! confirmation. Without a TTY on stdin, `--yes` is refused for the
+//! account's real settings (any file under `<passwd home>/.claude/`,
+//! symlinks resolved); tests use a sandbox settings file. No variable
+//! changes that.
 
 pub mod diff;
 pub mod doctor;
@@ -299,29 +300,51 @@ fn inside(path: &Path, dir: &Path) -> bool {
     path.starts_with(dir)
 }
 
-/// L10: may this run edit `settings` without asking?
-fn yes_allowed(env: &EnvSnapshot, settings: &Path) -> Result<(), String> {
+/// L10: may this run edit `settings` without asking? With a terminal on
+/// stdin the user is there: `--yes` is their choice. Without one, see
+/// [`yes_without_tty`].
+fn yes_allowed(settings: &Path) -> Result<(), String> {
     if std::io::stdin().is_terminal() {
         return Ok(());
     }
-    let test = env.get_str("TOLLGATE_TEST_INSTALL") == Some("1");
-    let tmp = env
-        .get_nonempty("TMPDIR")
-        .map(PathBuf::from)
-        .and_then(|p| std::fs::canonicalize(p).ok());
-    let real_home = passwd_home().and_then(|h| std::fs::canonicalize(h).ok());
-    let settings = canonical_file(settings);
-    match (test, tmp) {
-        (true, Some(tmp))
-            if inside(&settings, &tmp) && real_home.as_ref().is_none_or(|h| !inside(h, &tmp)) =>
-        {
-            Ok(())
+    yes_without_tty(settings, passwd_home().as_deref())
+}
+
+/// Where `path` leads: the file a chain of symlinks names (a dangling link
+/// too), with its parent dir made canonical.
+fn resolve_file(path: &Path) -> PathBuf {
+    let mut p = path.to_owned();
+    for _ in 0..40 {
+        match std::fs::read_link(&p) {
+            Ok(t) if t.is_absolute() => p = t,
+            Ok(t) => p = p.parent().map_or_else(|| t.clone(), |d| d.join(&t)),
+            Err(_) => break,
         }
-        _ => Err(
-            "--yes needs a terminal on stdin (L10); run tollgate install in your own terminal"
-                .into(),
-        ),
     }
+    canonical_file(&p)
+}
+
+/// L10, item 9: without a terminal, `--yes` is refused for the account's
+/// real settings: any file under `<home>/.claude/` (`home` from the
+/// password database, which no variable changes), after symlinks of the
+/// file and its dirs are resolved. Tests use a settings file elsewhere (a
+/// sandbox `HOME`); no variable or `TMPDIR` rule opens the real one.
+fn yes_without_tty(settings: &Path, home: Option<&Path>) -> Result<(), String> {
+    let refuse = |why: &str| {
+        Err(format!(
+            "--yes needs a terminal on stdin for {} (L10: {why}); run tollgate install in your own terminal",
+            settings.display()
+        ))
+    };
+    let Some(home) = home else {
+        return refuse("the account's home dir is unknown");
+    };
+    let real = home.join(".claude");
+    let real = std::fs::canonicalize(&real).unwrap_or_else(|_| canonical_file(&real));
+    if inside(&resolve_file(settings), &real) {
+        return refuse("these are the account's real settings");
+    }
+    Ok(())
 }
 
 /// Asks on the terminal; false without one.
@@ -381,7 +404,6 @@ enum Edit {
 /// Shows the diff of a settings edit and applies it after a yes (L10),
 /// writing `backup` (path, original text) first when it does not exist.
 fn edit_settings(
-    env: &EnvSnapshot,
     path: &Path,
     old: &str,
     new: &str,
@@ -400,7 +422,7 @@ fn edit_settings(
     }
     eprint!("{d}");
     if yes {
-        if let Err(e) = yes_allowed(env, path) {
+        if let Err(e) = yes_allowed(path) {
             return Ok(Edit::Declined(e));
         }
     } else if !confirm(&format!("apply this change to {}?", path.display())) {
@@ -514,14 +536,7 @@ pub fn install(ctx: &Ctx, yes: bool) -> u8 {
                     } else {
                         new_text
                     };
-                    match edit_settings(
-                        &ctx.env,
-                        &path,
-                        &old_text,
-                        &shown_new,
-                        yes,
-                        backup.as_ref(),
-                    ) {
+                    match edit_settings(&path, &old_text, &shown_new, yes, backup.as_ref()) {
                         Ok(Edit::Unchanged) => {
                             println!(
                                 "settings: {} already has the injection and the guard",
@@ -605,7 +620,7 @@ pub fn uninstall(ctx: &Ctx, yes: bool) -> u8 {
                     println!("settings: {n}");
                 }
                 if changed {
-                    match edit_settings(&ctx.env, path, &old_text, &new_text, yes, None) {
+                    match edit_settings(path, &old_text, &new_text, yes, None) {
                         Ok(Edit::Applied | Edit::Unchanged) => println!(
                             "settings: removed tollgate's entries from {}",
                             path.display()
@@ -635,7 +650,7 @@ pub fn uninstall(ctx: &Ctx, yes: bool) -> u8 {
                     "tollgate uninstall: {e}; the backup {} would replace it:",
                     backup.display()
                 );
-                match edit_settings(&ctx.env, path, &old_text, &backup_text, yes, None) {
+                match edit_settings(path, &old_text, &backup_text, yes, None) {
                     Ok(Edit::Applied | Edit::Unchanged) => {
                         println!("settings: restored {}", backup.display())
                     }
@@ -687,6 +702,49 @@ mod tests {
         assert_eq!(parse_version("claude v2.1.295"), Some((2, 1, 295)));
         assert_eq!(parse_version("none"), None);
         assert!((2, 1, 317) >= MIN_CLAUDE && (2, 0, 999) < MIN_CLAUDE);
+    }
+
+    /// L10, item 9: without a terminal, `--yes` never edits the account's
+    /// real settings: anything under `<passwd home>/.claude/`, symlinks
+    /// resolved, whatever `TMPDIR` or any variable says. `home` here is a
+    /// temp dir standing in for the passwd home.
+    #[test]
+    fn yes_without_a_tty_never_reaches_the_real_settings_l10() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap().join("home");
+        let real = home.join(".claude");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("settings.json"), "{}").unwrap();
+        let sandbox = tmp.path().canonicalize().unwrap().join("sandbox/.claude");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let refused = |p: &Path| {
+            let r = yes_without_tty(p, Some(&home));
+            assert!(r.is_err(), "{} allowed", p.display());
+            assert!(r.unwrap_err().contains("L10"));
+        };
+        // The real paths; the TMPDIR trick of item 9 has no input left:
+        // the decision reads no variable.
+        refused(&real.join("settings.json"));
+        refused(&real.join("settings.local.json"));
+        // A symlink to the real file, a dangling one into the real dir,
+        // and a config dir that is a symlink to it.
+        std::os::unix::fs::symlink(real.join("settings.json"), sandbox.join("a.json")).unwrap();
+        refused(&sandbox.join("a.json"));
+        std::os::unix::fs::symlink(real.join("new.json"), sandbox.join("b.json")).unwrap();
+        refused(&sandbox.join("b.json"));
+        let linked = tmp.path().join("cfg");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        refused(&linked.join("settings.json"));
+        // A relative link chain into the real dir.
+        std::os::unix::fs::symlink("a.json", sandbox.join("c.json")).unwrap();
+        refused(&sandbox.join("c.json"));
+        // A sandbox settings file is fine.
+        assert_eq!(
+            yes_without_tty(&sandbox.join("settings.json"), Some(&home)),
+            Ok(())
+        );
+        // No passwd home: refused.
+        assert!(yes_without_tty(&sandbox.join("settings.json"), None).is_err());
     }
 
     #[test]

@@ -29,7 +29,8 @@ L8. **Guard when unarmed.** R24 stays (deny every Bash call when the injection, 
 
 L9. Python: `pytest-baseline` runs in `fast` too (Q10). Flaky policy as R93 with `retries = 2` (Q4). Tags not gated (Q7).
 
-L10. `tollgate install` never edits `~/.claude/settings.json` without an interactive confirmation; `--yes` is for tests and is refused when stdin is not a TTY unless `TOLLGATE_TEST_INSTALL=1` and the settings path is under `$TMPDIR`. Agents never run `install --yes` on the real settings.
+L10. `tollgate install` never edits `~/.claude/settings.json` without an interactive confirmation; `--yes` is for tests: when stdin is not a TTY it is refused for the account's real settings, any file under `<passwd home>/.claude/` after symlinks of the file and its dirs are resolved (the passwd home, which no variable changes). Tests use a sandbox settings file. Agents never run `install --yes` on the real settings.
+Note (item 9): the first version allowed a TTY-less `--yes` with `TOLLGATE_TEST_INSTALL=1` and the settings under `$TMPDIR`; `TMPDIR=~/.claude` passed that check. No variable takes part now. A pty (`script -c ...`) still gives stdin a TTY: that is a guard matter.
 
 L11. `~/.claude/settings.json` is per machine (not synced): Q11 resolved, no machine-neutral path needed.
 
