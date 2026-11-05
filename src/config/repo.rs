@@ -277,10 +277,38 @@ pub struct Step {
     /// Dirs kept by `git clean` in the verify checkout (R42).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cache_dirs: Vec<String>,
+    /// Repo-relative globs of the tree entries the step's result depends on
+    /// (L16; default everything). Matching is broad: `*` also crosses `/`.
+    #[serde(default = "all_inputs")]
+    pub inputs: Vec<String>,
+    /// Globs removed from `inputs` (L16). Matching is narrow: `*` stops at
+    /// `/`, only `**` crosses dirs, so an exclusion never reaches further
+    /// than written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_inputs: Vec<String>,
 }
 
 fn both_tiers() -> Vec<Tier> {
     vec![Tier::Fast, Tier::Full]
+}
+
+fn all_inputs() -> Vec<String> {
+    vec!["**".into()]
+}
+
+/// Which tree paths are a step's inputs (L16).
+#[derive(Debug, Clone)]
+pub struct InputMatcher {
+    include: GlobSet,
+    exclude: GlobSet,
+}
+
+impl InputMatcher {
+    /// True when `path` (repo-relative) is an input.
+    #[must_use]
+    pub fn matches(&self, path: &Path) -> bool {
+        self.include.is_match(path) && !self.exclude.is_match(path)
+    }
 }
 
 impl Step {
@@ -294,6 +322,26 @@ impl Step {
     #[must_use]
     pub fn runs_on(&self, platform: Platform) -> bool {
         self.only_on.is_empty() || self.only_on.contains(&platform)
+    }
+
+    /// The step's input matcher (L16).
+    pub fn input_matcher(&self) -> Result<InputMatcher, String> {
+        Ok(InputMatcher {
+            include: glob::compile(
+                &self.inputs,
+                GlobOpts {
+                    case_insensitive: false,
+                    literal_separator: false,
+                },
+            )?,
+            exclude: glob::compile(
+                &self.exclude_inputs,
+                GlobOpts {
+                    case_insensitive: false,
+                    literal_separator: true,
+                },
+            )?,
+        })
     }
 
     /// R35: 60 s for `nextest` (it forwards SIGTERM to its tests), else 10 s.
@@ -508,11 +556,11 @@ impl RepoConfig {
             }
         }
         if let Some(b) = &self.budget.inline
-            && b.get() > Duration::from_secs(540)
+            && b.get() > super::host::DEFAULT_INLINE_CAP
         {
             v.warn(
                 "budget.inline",
-                "above 540 s: hooks cap the wait at TOLLGATE_INLINE_CAP or 100 s (R28)",
+                "above 100 s: without TOLLGATE_INLINE_CAP a hook waits at most 100 s (R28, L17)",
             );
         }
 
@@ -563,6 +611,14 @@ impl RepoConfig {
                 rel_path(&mut v, &at, "cache_dirs", Some(d));
             }
             globs(&mut v, &format!("{at}.when"), &s.when);
+            globs(&mut v, &format!("{at}.inputs"), &s.inputs);
+            globs(&mut v, &format!("{at}.exclude_inputs"), &s.exclude_inputs);
+            if s.inputs.is_empty() {
+                v.error(
+                    &at,
+                    "inputs is empty: use [\"**\"] for the whole tree (L16)",
+                );
+            }
             env_map(&mut v, &at, &s.env);
             if let Some(f) = &s.env_file
                 && !(f.starts_with('/') || f.starts_with("~/"))
@@ -811,6 +867,31 @@ issue = "Issues/open/myapp-cancel-flake"
                 ..RepoConfig::default()
             }
         );
+    }
+
+    #[test]
+    fn step_inputs_l16() {
+        let c = parse(
+            "version = 1\n[[step]]\nname = \"all\"\nkind = \"cargo-fmt\"\n[[step]]\nname = \"ios\"\nkind = \"command\"\nrun = \"x\"\ninputs = [\"ios/**\", \"*.yml\"]\nexclude_inputs = [\"ios/docs/**\", \"*.md\"]\n",
+        );
+        assert!(c.validate().is_ok(), "{:?}", c.validate());
+        let all = c.steps[0].input_matcher().unwrap();
+        assert_eq!(c.steps[0].inputs, ["**"]);
+        assert!(all.matches(Path::new("crates/a/src/lib.rs")));
+        assert!(all.matches(Path::new("README.md")));
+        let ios = c.steps[1].input_matcher().unwrap();
+        assert!(ios.matches(Path::new("ios/App/main.swift")));
+        assert!(
+            ios.matches(Path::new(".github/ci.yml")),
+            "inputs: * crosses /"
+        );
+        assert!(!ios.matches(Path::new("crates/a/src/lib.rs")));
+        assert!(!ios.matches(Path::new("ios/docs/x.swift")));
+        // exclude `*.md` is root-level only: it does not reach into ios/.
+        assert!(ios.matches(Path::new("ios/README.md")));
+        let empty =
+            parse("version = 1\n[[step]]\nname = \"x\"\nkind = \"cargo-fmt\"\ninputs = []\n");
+        assert!(errors(&empty).join("\n").contains("inputs is empty"));
     }
 
     #[test]

@@ -442,3 +442,90 @@ fn corrupt_records_are_misses_and_list_skips_them() {
     let listed = s.store.list().unwrap();
     assert_eq!(listed, vec![good]);
 }
+
+#[test]
+fn step_key_tracks_only_the_step_inputs_l16() {
+    use tollgate::cache::step::{step_inputs, step_key};
+    use tollgate::config::RepoConfig;
+    use tollgate::gitx::Git;
+
+    let sb = Sandbox::new();
+    let repo = sb.repo("r");
+    sb.commit_file(&repo, "crates/a/src/lib.rs", "pub fn a() {}\n", "a");
+    sb.commit_file(&repo, "ios/App/main.swift", "print(1)\n", "ios");
+    sb.commit_file(&repo, "docs/x y é.md", "x\n", "docs");
+    let git = Git::scrubbed(&sb.env(), &repo);
+    let entries = || {
+        let tree = git.tree_of("HEAD").unwrap().unwrap();
+        git.ls_tree(&tree).unwrap()
+    };
+    let e0 = entries();
+    assert_eq!(e0.len(), 4, "{e0:?}");
+    assert!(
+        e0.iter().any(|e| e.path == Path::new("docs/x y é.md")
+            && e.mode == "100644"
+            && e.kind == "blob")
+    );
+
+    let cfg = RepoConfig::from_toml(
+        r#"version = 1
+[[step]]
+name = "tests"
+kind = "nextest"
+inputs = ["crates/**", "Cargo.*"]
+[[step]]
+name = "ios"
+kind = "command"
+run = "swiftlint"
+inputs = ["ios/**"]
+[[step]]
+name = "fmt"
+kind = "cargo-fmt"
+exclude_inputs = ["docs/**"]
+"#,
+    )
+    .unwrap();
+    let mut fp = Fingerprint::new();
+    fp.insert("rustc", "rustc 1.96.1");
+    let keys = |entries: &[tollgate::gitx::TreeEntry], fp: &Fingerprint| {
+        cfg.steps
+            .iter()
+            .map(|s| step_key(s, fp, entries).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let k0 = keys(&e0, &fp);
+    assert_eq!(
+        step_inputs(&cfg.steps[0], &e0).unwrap().len(),
+        1,
+        "only crates/a/src/lib.rs"
+    );
+
+    // An iOS-only change keeps the Rust step key (no rerun of the suite).
+    sb.commit_file(&repo, "ios/App/main.swift", "print(2)\n", "ios2");
+    let k1 = keys(&entries(), &fp);
+    assert_eq!(k0[0], k1[0]);
+    assert_ne!(k0[1], k1[1]);
+    assert_ne!(k0[2], k1[2]);
+
+    // An excluded docs change changes no key.
+    sb.commit_file(&repo, "docs/x y é.md", "y\n", "docs2");
+    assert_eq!(keys(&entries(), &fp), k1);
+
+    // A mode change of an input changes its step key.
+    sb.git(
+        &repo,
+        &["update-index", "--chmod=+x", "crates/a/src/lib.rs"],
+    );
+    sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "chmod"]);
+    let k3 = keys(&entries(), &fp);
+    assert_ne!(k1[0], k3[0]);
+    assert_eq!(k1[1], k3[1]);
+
+    // The step definition and the fingerprint are part of the key.
+    let mut changed = cfg.steps[0].clone();
+    changed.env.insert("RUST_LOG".into(), "debug".into());
+    assert_ne!(step_key(&changed, &fp, &entries()).unwrap(), k3[0]);
+    let mut fp2 = fp.clone();
+    fp2.insert("rustc", "rustc 1.97.0");
+    assert_ne!(keys(&entries(), &fp2)[0], k3[0]);
+}

@@ -19,14 +19,17 @@
 //! - `flaky.jsonl` (R93)
 //! - `verify/` (default `verify.root`, R41)
 //!
-//! A verify root holds `<repo key>/<tier>/wt`, `wt2`, ... with the lock files
-//! `wt.lock`, `wt2.lock`, ... and the slot queue `queue/` (R41, R87).
+//! A verify root holds `<repo key>/<tier>/<worktree key>`: one sticky
+//! checkout per agent worktree and tier (L15), with `<worktree key>.lock`
+//! (R87) and `<worktree key>.json` (LRU metadata) beside it.
+//!
+//! `repairs.log` in the state dir records guard self-repairs (L18).
 
 use std::path::{Path, PathBuf};
 
 use crate::config::Tier;
 use crate::env::EnvSnapshot;
-use crate::ids::{JobId, RecordKey, RepoKey, ResourceName};
+use crate::ids::{JobId, RecordKey, RepoKey, ResourceName, WorktreeKey};
 
 const APP: &str = "tollgate";
 
@@ -203,28 +206,55 @@ impl Dirs {
     pub fn default_verify_root(&self) -> PathBuf {
         self.state_dir().join("verify")
     }
+
+    /// One line per guard self-repair (L18).
+    #[must_use]
+    pub fn repairs_log(&self) -> PathBuf {
+        self.state_dir().join("repairs.log")
+    }
 }
 
-/// `<verify root>/<repo key>/<tier>/`: checkouts, their locks and the slot queue.
+/// `<verify root>/<repo key>/<tier>/`: the checkouts of one tier.
 #[must_use]
 pub fn verify_tier_dir(verify_root: &Path, repo: &RepoKey, tier: Tier) -> PathBuf {
     verify_root.join(repo.as_str()).join(tier.as_str())
 }
 
-/// File name of verify checkout `slot` (0-based): `wt`, `wt2`, `wt3`, ... (R41).
+/// The sticky verify checkout of one agent worktree (L15):
+/// `<verify root>/<repo key>/<tier>/<worktree key>`.
 #[must_use]
-pub fn verify_checkout_name(slot: u32) -> String {
-    if slot == 0 {
-        "wt".to_owned()
-    } else {
-        format!("wt{}", slot + 1)
-    }
+pub fn verify_checkout(
+    verify_root: &Path,
+    repo: &RepoKey,
+    tier: Tier,
+    worktree: &WorktreeKey,
+) -> PathBuf {
+    verify_tier_dir(verify_root, repo, tier).join(worktree.as_str())
 }
 
-/// The verify checkout of `slot` (R41).
+/// The lock held for the whole job by the job using a checkout (R87):
+/// `<checkout>.lock`, next to the checkout so removing the checkout (LRU,
+/// L15) never removes a held lock file.
 #[must_use]
-pub fn verify_checkout(verify_root: &Path, repo: &RepoKey, tier: Tier, slot: u32) -> PathBuf {
-    verify_tier_dir(verify_root, repo, tier).join(verify_checkout_name(slot))
+pub fn verify_checkout_lock(
+    verify_root: &Path,
+    repo: &RepoKey,
+    tier: Tier,
+    worktree: &WorktreeKey,
+) -> PathBuf {
+    verify_tier_dir(verify_root, repo, tier).join(format!("{worktree}.lock"))
+}
+
+/// Metadata of a checkout (origin path, last use) for LRU eviction (L15):
+/// `<checkout>.json`.
+#[must_use]
+pub fn verify_checkout_meta(
+    verify_root: &Path,
+    repo: &RepoKey,
+    tier: Tier,
+    worktree: &WorktreeKey,
+) -> PathBuf {
+    verify_tier_dir(verify_root, repo, tier).join(format!("{worktree}.json"))
 }
 
 #[cfg(test)]
@@ -302,16 +332,31 @@ mod tests {
     }
 
     #[test]
-    fn verify_checkout_names_r41() {
+    fn sticky_verify_checkouts_l15_r87() {
         let repo = RepoKey::parse("0123456789abcdef").unwrap();
+        let wt = WorktreeKey::of_realpath(Path::new("/home/u/Repos/myapp-fix-8"));
         let root = Path::new("/v");
+        let base = format!("/v/0123456789abcdef/fast/{wt}");
         assert_eq!(
-            verify_checkout(root, &repo, Tier::Fast, 0),
-            PathBuf::from("/v/0123456789abcdef/fast/wt")
+            verify_checkout(root, &repo, Tier::Fast, &wt),
+            PathBuf::from(&base)
         );
         assert_eq!(
-            verify_checkout(root, &repo, Tier::Full, 2),
-            PathBuf::from("/v/0123456789abcdef/full/wt3")
+            verify_checkout_lock(root, &repo, Tier::Fast, &wt),
+            PathBuf::from(format!("{base}.lock"))
+        );
+        assert_eq!(
+            verify_checkout_meta(root, &repo, Tier::Fast, &wt),
+            PathBuf::from(format!("{base}.json"))
+        );
+        let other = WorktreeKey::of_realpath(Path::new("/home/u/Repos/myapp-fix-9"));
+        assert_ne!(
+            verify_checkout(root, &repo, Tier::Fast, &wt),
+            verify_checkout(root, &repo, Tier::Fast, &other)
+        );
+        assert_ne!(
+            verify_checkout(root, &repo, Tier::Fast, &wt),
+            verify_checkout(root, &repo, Tier::Full, &wt)
         );
     }
 

@@ -24,61 +24,79 @@ fn is_lower_hex(s: &str) -> bool {
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// The cache key of a record: 64 lowercase hex characters of a blake3 hash (R74).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct RecordKey(String);
+/// Defines a 64-hex-character key of a blake3 hash.
+macro_rules! hash_key {
+    ($(#[$doc:meta])* $name:ident, $kind:literal) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name(String);
 
-impl RecordKey {
-    /// Parses a key.
-    pub fn parse(value: &str) -> Result<Self, IdError> {
-        if value.len() != 64 || !is_lower_hex(value) {
-            return Err(IdError {
-                kind: "record key",
-                value: value.to_owned(),
-                reason: "expected 64 lowercase hex characters",
-            });
+        impl $name {
+            /// Parses a key.
+            pub fn parse(value: &str) -> Result<Self, IdError> {
+                if value.len() != 64 || !is_lower_hex(value) {
+                    return Err(IdError {
+                        kind: $kind,
+                        value: value.to_owned(),
+                        reason: "expected 64 lowercase hex characters",
+                    });
+                }
+                Ok(Self(value.to_owned()))
+            }
+
+            /// The key for a blake3 hash.
+            #[must_use]
+            pub fn from_hash(hash: &blake3::Hash) -> Self {
+                Self(hash.to_hex().to_string())
+            }
+
+            /// The key text.
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            /// The first two characters: the shard directory.
+            #[must_use]
+            pub fn shard(&self) -> &str {
+                &self.0[..2]
+            }
         }
-        Ok(Self(value.to_owned()))
-    }
 
-    /// The key for a blake3 hash.
-    #[must_use]
-    pub fn from_hash(hash: &blake3::Hash) -> Self {
-        Self(hash.to_hex().to_string())
-    }
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
 
-    /// The key text.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+        impl TryFrom<String> for $name {
+            type Error = IdError;
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::parse(&value)
+            }
+        }
 
-    /// The first two characters: the shard directory of R76.
-    #[must_use]
-    pub fn shard(&self) -> &str {
-        &self.0[..2]
-    }
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+    };
 }
 
-impl fmt::Display for RecordKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+hash_key!(
+    /// The cache key of a record (R74); its shard dir is `results/<key[..2]>`
+    /// (R76).
+    RecordKey,
+    "record key"
+);
 
-impl TryFrom<String> for RecordKey {
-    type Error = IdError;
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::parse(&value)
-    }
-}
-
-impl From<RecordKey> for String {
-    fn from(value: RecordKey) -> Self {
-        value.0
-    }
-}
+hash_key!(
+    /// The reuse key of one step's result (L16).
+    StepKey,
+    "step key"
+);
 
 /// A job id: `YYYYMMDD-HHMMSS-xxxxxxxx` (UTC start time, 8 hex characters).
 ///
@@ -156,56 +174,76 @@ impl From<JobId> for String {
     }
 }
 
-/// Identity of a repository clone: `blake3(realpath(common dir))[..16]` (R29, R41).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct RepoKey(String);
+/// Defines a 16-hex-character key of a canonical path:
+/// `blake3(realpath)[..16]`.
+macro_rules! path_key {
+    ($(#[$doc:meta])* $name:ident, $kind:literal) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name(String);
 
-impl RepoKey {
-    /// The key of a common dir. `realpath` must already be canonical.
-    #[must_use]
-    pub fn of_realpath(realpath: &Path) -> Self {
-        let hex = blake3::hash(realpath.as_os_str().as_bytes()).to_hex();
-        Self(hex[..16].to_owned())
-    }
+        impl $name {
+            /// The key of a path. `realpath` must already be canonical.
+            #[must_use]
+            pub fn of_realpath(realpath: &Path) -> Self {
+                let hex = blake3::hash(realpath.as_os_str().as_bytes()).to_hex();
+                Self(hex[..16].to_owned())
+            }
 
-    /// Parses a key.
-    pub fn parse(value: &str) -> Result<Self, IdError> {
-        if value.len() != 16 || !is_lower_hex(value) {
-            return Err(IdError {
-                kind: "repo key",
-                value: value.to_owned(),
-                reason: "expected 16 lowercase hex characters",
-            });
+            /// Parses a key.
+            pub fn parse(value: &str) -> Result<Self, IdError> {
+                if value.len() != 16 || !is_lower_hex(value) {
+                    return Err(IdError {
+                        kind: $kind,
+                        value: value.to_owned(),
+                        reason: "expected 16 lowercase hex characters",
+                    });
+                }
+                Ok(Self(value.to_owned()))
+            }
+
+            /// The key text.
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
         }
-        Ok(Self(value.to_owned()))
-    }
 
-    /// The key text.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = IdError;
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::parse(&value)
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+    };
 }
 
-impl fmt::Display for RepoKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+path_key!(
+    /// Identity of a repository clone: `blake3(realpath(common dir))[..16]`
+    /// (R29, R41).
+    RepoKey,
+    "repo key"
+);
 
-impl TryFrom<String> for RepoKey {
-    type Error = IdError;
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::parse(&value)
-    }
-}
-
-impl From<RepoKey> for String {
-    fn from(value: RepoKey) -> Self {
-        value.0
-    }
-}
+path_key!(
+    /// Identity of an agent worktree, `blake3(realpath(worktree root))[..16]`:
+    /// its sticky verify checkouts are keyed by it (L15).
+    WorktreeKey,
+    "worktree key"
+);
 
 /// A host resource name (`cpu`, `pg`, ...): the lock dir `locks/<name>` (R85).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

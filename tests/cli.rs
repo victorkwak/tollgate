@@ -152,10 +152,13 @@ fn config_check_validates_repo_and_host_config_r64() {
     std::fs::remove_file(repo.join("tollgate.toml")).unwrap();
     let host = sb.root().join("config/tollgate/config.toml");
     std::fs::create_dir_all(host.parent().unwrap()).unwrap();
-    std::fs::write(&host, "[verify]\nslots = { fast = 0 }\n").unwrap();
+    std::fs::write(&host, "[verify]\nmax_checkouts = 0\n").unwrap();
     let (code, text) = run_in(&sb, &repo, &["config", "--check"]);
     assert_eq!(code, Some(1), "{text}");
-    assert!(text.contains("error: host config: verify.slots"), "{text}");
+    assert!(
+        text.contains("error: host config: verify.max_checkouts"),
+        "{text}"
+    );
 
     let (code, text) = run_in(&sb, &sb.root(), &["config", "--check"]);
     assert_eq!(code, Some(1), "{text}");

@@ -27,6 +27,7 @@ pub mod layout;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -177,6 +178,19 @@ impl ObjectFormat {
             }
         })
     }
+}
+
+/// One entry of `git ls-tree -r` (L16 step inputs, R45 setup `when`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntry {
+    /// Mode, e.g. `100644`, `100755`, `120000`, `160000`.
+    pub mode: String,
+    /// Object type: `blob` or `commit` (submodule).
+    pub kind: String,
+    /// Object id.
+    pub oid: Oid,
+    /// Repo-relative path, bytes as stored.
+    pub path: PathBuf,
 }
 
 /// A prepared git invocation context.
@@ -335,6 +349,37 @@ impl Git {
         let args = ["write-tree"];
         let out = self.run(args)?;
         parse_oid_output(&args, &out)
+    }
+
+    /// Every entry of `tree`, recursively (`git ls-tree -r -z --full-tree`).
+    pub fn ls_tree(&self, tree: &Oid) -> Result<Vec<TreeEntry>, GitError> {
+        let args = ["ls-tree", "-r", "-z", "--full-tree", tree.as_str()];
+        let out = self.run(args)?;
+        let bad = |detail: String| GitError::Output {
+            args: join_args(args),
+            detail,
+        };
+        let mut entries = Vec::new();
+        for rec in out.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            let tab = rec
+                .iter()
+                .position(|b| *b == b'\t')
+                .ok_or_else(|| bad("entry without a tab".into()))?;
+            let head = std::str::from_utf8(&rec[..tab]).map_err(|e| bad(e.to_string()))?;
+            let mut parts = head.split(' ');
+            let (Some(mode), Some(kind), Some(oid), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return Err(bad(format!("bad entry {head:?}")));
+            };
+            entries.push(TreeEntry {
+                mode: mode.to_owned(),
+                kind: kind.to_owned(),
+                oid: Oid::parse(oid).map_err(bad)?,
+                path: PathBuf::from(std::ffi::OsStr::from_bytes(&rec[tab + 1..])),
+            });
+        }
+        Ok(entries)
     }
 
     /// `rev-parse --show-object-format` (R10).

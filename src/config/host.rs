@@ -179,7 +179,11 @@ impl Default for NextestHost {
     }
 }
 
-/// `[verify]` (R41, R44, L5).
+/// `[verify]` (R41, R44, L5, L15).
+///
+/// L15: verify checkouts are sticky, one per agent worktree and tier, with
+/// LRU eviction above the limits below. `verify.slots` (R41) is CUT:
+/// resource slots (R85) limit concurrency.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifyConfig {
@@ -187,9 +191,12 @@ pub struct VerifyConfig {
     /// Arch box sets `/mnt/devdisk/tollgate/verify` in its file (L5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
-    /// Checkouts per tier per repo clone (L5: fast 3, full 2).
-    #[serde(default)]
-    pub slots: VerifySlots,
+    /// `fast` checkouts kept per repo clone (L15: 12).
+    #[serde(default = "default_max_checkouts")]
+    pub max_checkouts: u32,
+    /// `full` checkouts kept per repo clone (L15: 4).
+    #[serde(default = "default_max_full_checkouts")]
+    pub max_full_checkouts: u32,
     /// Below this free space a job is deferred (R44).
     #[serde(default = "default_min_free")]
     pub min_free: SizeSpec,
@@ -198,6 +205,12 @@ pub struct VerifyConfig {
     pub max_target: SizeSpec,
 }
 
+fn default_max_checkouts() -> u32 {
+    12
+}
+fn default_max_full_checkouts() -> u32 {
+    4
+}
 fn default_min_free() -> SizeSpec {
     SizeSpec::parse("30G").expect("built-in size")
 }
@@ -209,7 +222,8 @@ impl Default for VerifyConfig {
     fn default() -> Self {
         Self {
             root: None,
-            slots: VerifySlots::default(),
+            max_checkouts: default_max_checkouts(),
+            max_full_checkouts: default_max_full_checkouts(),
             min_free: default_min_free(),
             max_target: default_max_target(),
         }
@@ -224,43 +238,13 @@ impl VerifyConfig {
             .as_deref()
             .map_or_else(|| dirs.default_verify_root(), |r| dirs.expand_tilde(r))
     }
-}
 
-/// `verify.slots`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VerifySlots {
-    /// `fast` checkouts.
-    #[serde(default = "default_fast_slots")]
-    pub fast: u32,
-    /// `full` checkouts.
-    #[serde(default = "default_full_slots")]
-    pub full: u32,
-}
-
-fn default_fast_slots() -> u32 {
-    3
-}
-fn default_full_slots() -> u32 {
-    2
-}
-
-impl Default for VerifySlots {
-    fn default() -> Self {
-        Self {
-            fast: default_fast_slots(),
-            full: default_full_slots(),
-        }
-    }
-}
-
-impl VerifySlots {
-    /// Slots for `tier`.
+    /// Checkouts kept per repo clone for `tier` before LRU eviction (L15).
     #[must_use]
-    pub fn get(&self, tier: Tier) -> u32 {
+    pub fn max_checkouts(&self, tier: Tier) -> u32 {
         match tier {
-            Tier::Fast => self.fast,
-            Tier::Full => self.full,
+            Tier::Fast => self.max_checkouts,
+            Tier::Full => self.max_full_checkouts,
         }
     }
 }
@@ -311,6 +295,10 @@ impl Default for Budgets {
 /// `git commit` returns under the 120 s Bash default timeout.
 pub const DEFAULT_INLINE_CAP: Duration = Duration::from_secs(100);
 
+/// L17: the cap the guard sets for a foreground Bash call (its timeout is
+/// raised to 600 s).
+pub const FOREGROUND_INLINE_CAP: Duration = Duration::from_secs(540);
+
 impl Budgets {
     /// The host budgets with the repo's overrides applied (R33).
     #[must_use]
@@ -332,16 +320,21 @@ impl Budgets {
         }
     }
 
-    /// R28: inline budget = min(`budget.inline`, `TOLLGATE_INLINE_CAP`
-    /// seconds when present, else 100 s). The env value can only shorten the
-    /// wait or lengthen it up to the config value; a value that does not
-    /// parse counts as absent.
+    /// The inline budget of a hook for a job of `tier` (R28 as changed by
+    /// L17).
+    ///
+    /// - `TOLLGATE_INLINE_CAP` set (the guard sets 540 s for a foreground
+    ///   Bash call, the `fast` budget for `run_in_background`): that many
+    ///   seconds, at most the tier's job budget. The env value can lengthen
+    ///   the wait only up to a config value, and shorten it at will.
+    /// - Not set, or not a number: `budget.inline`, at most 100 s, so the hook
+    ///   returns before the 120 s Bash default timeout.
     #[must_use]
-    pub fn inline_for_hook(&self, inline_cap_env: Option<&str>) -> Duration {
-        let cap = inline_cap_env
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(DEFAULT_INLINE_CAP, Duration::from_secs);
-        self.inline.get().min(cap)
+    pub fn inline_for_hook(&self, inline_cap_env: Option<&str>, tier: Tier) -> Duration {
+        match inline_cap_env.and_then(|v| v.trim().parse::<u64>().ok()) {
+            Some(secs) => Duration::from_secs(secs).min(self.job_limit(tier)),
+            None => self.inline.get().min(DEFAULT_INLINE_CAP),
+        }
     }
 }
 
@@ -490,8 +483,11 @@ impl HostConfig {
         if self.nextest.terminate_after == 0 {
             v.error("nextest.terminate_after", "must be at least 1");
         }
-        if self.verify.slots.fast == 0 || self.verify.slots.full == 0 {
-            v.error("verify.slots", "each tier needs at least 1 slot");
+        if self.verify.max_checkouts == 0 || self.verify.max_full_checkouts == 0 {
+            v.error(
+                "verify.max_checkouts",
+                "max_checkouts and max_full_checkouts must be at least 1",
+            );
         }
         if let Some(r) = &self.verify.root
             && !(r.starts_with('/') || r.starts_with("~/"))
@@ -562,7 +558,8 @@ global_timeout_fast = "15m"
 global_timeout_full = "100m"
 
 [verify]
-{verify_root}slots = {{ fast = 3, full = 2 }}
+{verify_root}max_checkouts = 12        # L15: sticky fast checkouts per repo clone, LRU
+max_full_checkouts = 4
 min_free = "30G"
 max_target = "40G"
 
@@ -655,7 +652,8 @@ mod tests {
     fn empty_file_gives_l5_defaults() {
         let c = HostConfig::from_toml("").unwrap();
         assert_eq!(c, HostConfig::default());
-        assert_eq!(c.verify.slots, VerifySlots { fast: 3, full: 2 });
+        assert_eq!(c.verify.max_checkouts(Tier::Fast), 12);
+        assert_eq!(c.verify.max_checkouts(Tier::Full), 4);
         assert_eq!(c.resource_slots(&rn("cpu")), 3);
         assert_eq!(c.resource_slots(&rn("pg")), 2);
         assert_eq!(c.resource_slots(&rn("minio")), 1);
@@ -695,7 +693,8 @@ global_timeout_full = "100m"
 
 [verify]
 root = "/mnt/data1/tollgate/verify"
-slots = { fast = 1, full = 1 }
+max_checkouts = 6
+max_full_checkouts = 2
 min_free = "30G"
 max_target = "40G"
 
@@ -718,7 +717,7 @@ SQLX_OFFLINE = "true"
         assert_eq!(c.resource_slots(&rn("pg")), 1);
         assert_eq!(c.resource_image(&rn("pg")), Some("postgres:16"));
         assert_eq!(c.resource_image(&rn("cpu")), None);
-        assert_eq!(c.verify.slots.get(Tier::Full), 1);
+        assert_eq!(c.verify.max_checkouts(Tier::Full), 2);
         assert_eq!(c.job.env["SQLX_OFFLINE"], "true");
     }
 
@@ -728,7 +727,8 @@ SQLX_OFFLINE = "true"
             let text = HostConfig::template(p);
             let c = HostConfig::from_toml(&text).unwrap_or_else(|e| panic!("{p:?}: {e}\n{text}"));
             assert!(c.validate().is_ok(), "{p:?}: {:?}", c.validate());
-            assert_eq!(c.verify.slots, VerifySlots { fast: 3, full: 2 });
+            assert_eq!(c.verify.max_checkouts(Tier::Fast), 12);
+            assert_eq!(c.verify.max_checkouts(Tier::Full), 4);
             assert_eq!(c.resource_slots(&rn("cpu")), 3);
             assert_eq!(c.resource_slots(&rn("pg")), 2);
             assert_eq!(c.nextest.pg_max_threads, 12);
@@ -747,10 +747,12 @@ SQLX_OFFLINE = "true"
     #[test]
     fn unknown_keys_and_bad_values_fail() {
         assert!(HostConfig::from_toml("[verify]\nslotz = 2\n").is_err());
+        // L15: verify.slots is CUT.
+        assert!(HostConfig::from_toml("[verify]\nslots = { fast = 3, full = 2 }\n").is_err());
         assert!(HostConfig::from_toml("[budget]\ninline = \"0s\"\n").is_err());
         assert!(HostConfig::from_toml("[resources]\n\"../x\" = 1\n").is_err());
         let c = HostConfig::from_toml(
-            "[resources]\ncpu = 0\n[verify]\nroot = \"rel\"\nslots = { fast = 0 }\n[job]\npath_prepend = [\"bin\"]\nenv = { GIT_DIR = \"x\" }\n[scope]\nroots = [\"Repos\"]\n",
+            "[resources]\ncpu = 0\n[verify]\nroot = \"rel\"\nmax_checkouts = 0\n[job]\npath_prepend = [\"bin\"]\nenv = { GIT_DIR = \"x\" }\n[scope]\nroots = [\"Repos\"]\n",
         )
         .unwrap();
         let errs: Vec<String> = c
@@ -775,16 +777,26 @@ SQLX_OFFLINE = "true"
     }
 
     #[test]
-    fn inline_budget_r28() {
+    fn inline_budget_r28_l17() {
         let mut b = Budgets::default();
-        assert_eq!(b.inline_for_hook(None).as_secs(), 100);
-        assert_eq!(b.inline_for_hook(Some("2")).as_secs(), 2);
-        // The env value cannot lengthen the wait beyond the config value.
-        assert_eq!(b.inline_for_hook(Some("540")).as_secs(), 100);
+        assert_eq!(b.inline_for_hook(None, Tier::Fast).as_secs(), 100);
+        assert_eq!(b.inline_for_hook(Some("junk"), Tier::Fast).as_secs(), 100);
+        assert_eq!(b.inline_for_hook(Some("2"), Tier::Fast).as_secs(), 2);
+        // Foreground Bash call: the guard's 540 s.
+        assert_eq!(
+            b.inline_for_hook(Some("540"), Tier::Fast),
+            FOREGROUND_INLINE_CAP
+        );
+        // Background Bash call: up to the fast budget, never beyond the
+        // tier's job budget.
+        assert_eq!(b.inline_for_hook(Some("1200"), Tier::Fast).as_secs(), 1200);
+        assert_eq!(b.inline_for_hook(Some("99999"), Tier::Fast).as_secs(), 1200);
+        assert_eq!(b.inline_for_hook(Some("99999"), Tier::Full).as_secs(), 7200);
+        // Without the cap, budget.inline above 100 s still waits 100 s.
         b.inline = DurationSpec::parse("600s").unwrap();
-        assert_eq!(b.inline_for_hook(Some("540")).as_secs(), 540);
-        assert_eq!(b.inline_for_hook(None).as_secs(), 100);
-        assert_eq!(b.inline_for_hook(Some("junk")).as_secs(), 100);
+        assert_eq!(b.inline_for_hook(None, Tier::Fast).as_secs(), 100);
+        b.inline = DurationSpec::parse("30s").unwrap();
+        assert_eq!(b.inline_for_hook(None, Tier::Fast).as_secs(), 30);
     }
 
     #[test]

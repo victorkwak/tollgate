@@ -16,8 +16,10 @@
 //! - Tickets are locked before they become visible (create a dot-file, lock,
 //!   rename), so a visible unlocked ticket is always a dead one.
 //! - Priority (R89): hook jobs rank before `--detach` pre-warms.
-//! - Verify checkouts (R41, R87): one lock file per checkout, held for the
-//!   whole job; the checkouts of a tier form one semaphore.
+//! - Verify checkouts (R87, L15): each sticky checkout has one lock file
+//!   ([`crate::dirs::verify_checkout_lock`]), taken with [`LockFile`] and held
+//!   for the whole job. Concurrency comes from resource slots, not from a
+//!   checkout pool (`verify.slots` is CUT).
 
 use std::cmp::Ordering;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -26,10 +28,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
-use crate::config::Tier;
-use crate::dirs::{self, Dirs};
+use crate::dirs::Dirs;
 use crate::fsx;
-use crate::ids::{RepoKey, ResourceName};
+use crate::ids::ResourceName;
 
 /// R86: poll interval of a waiter (with jitter).
 pub const DEFAULT_POLL: Duration = Duration::from_millis(200);
@@ -193,20 +194,6 @@ impl Semaphore {
     #[must_use]
     pub fn resource(dirs: &Dirs, name: &ResourceName, slots: u32) -> Self {
         Self::new(name.as_str(), &dirs.resource_lock_dir(name), slots)
-    }
-
-    /// The verify checkouts of one tier of one repo clone (R41, R87): slot
-    /// `i` is the lock `wt<i>.lock` of checkout `wt<i>`.
-    #[must_use]
-    pub fn verify(verify_root: &Path, repo: &RepoKey, tier: Tier, slots: u32) -> Self {
-        let dir = dirs::verify_tier_dir(verify_root, repo, tier);
-        Self {
-            label: format!("verify/{repo}/{tier}"),
-            queue_dir: dir.join("queue"),
-            slots: (0..slots.max(1))
-                .map(|i| dir.join(format!("{}.lock", dirs::verify_checkout_name(i))))
-                .collect(),
-        }
     }
 
     /// The name used for canonical order.
@@ -517,21 +504,6 @@ mod tests {
         assert!(!is_held(&p).unwrap());
         assert!(LockFile::try_acquire(&p).unwrap().is_some());
         assert!(!is_held(&tmp.path().join("missing")).unwrap());
-    }
-
-    #[test]
-    fn verify_semaphore_maps_slots_to_checkouts_r41_r87() {
-        let repo = RepoKey::parse("0123456789abcdef").unwrap();
-        let s = Semaphore::verify(Path::new("/v"), &repo, Tier::Fast, 3);
-        assert_eq!(
-            s.slot_paths(),
-            [
-                PathBuf::from("/v/0123456789abcdef/fast/wt.lock"),
-                PathBuf::from("/v/0123456789abcdef/fast/wt2.lock"),
-                PathBuf::from("/v/0123456789abcdef/fast/wt3.lock"),
-            ]
-        );
-        assert_eq!(s.queue_dir(), Path::new("/v/0123456789abcdef/fast/queue"));
     }
 
     #[test]

@@ -323,7 +323,14 @@ fn opposite_resource_orders_do_not_deadlock_r85_t38() {
 #[test]
 fn verify_lock_is_released_when_its_holder_dies_r87() {
     let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("v/0123456789abcdef/full/wt.lock");
+    let repo = tollgate::ids::RepoKey::parse("0123456789abcdef").unwrap();
+    let wt = tollgate::ids::WorktreeKey::of_realpath(tmp.path());
+    let path = tollgate::dirs::verify_checkout_lock(
+        &tmp.path().join("v"),
+        &repo,
+        tollgate::config::Tier::Full,
+        &wt,
+    );
     let mut kids = Kids(Vec::new());
     let holder = kids.spawn("lockfile", &[("PATH", path.display().to_string())]);
     wait_until(Duration::from_secs(10), || locks::is_held(&path).unwrap());

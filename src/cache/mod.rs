@@ -8,6 +8,7 @@
 
 pub mod fingerprint;
 pub mod record;
+pub mod step;
 pub mod store;
 pub mod toolcache;
 
