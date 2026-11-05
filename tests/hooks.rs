@@ -536,6 +536,168 @@ fn url_rewrites_do_not_move_remote_trust_r14_r5_r20() {
     );
 }
 
+/// R14, R5, L2: remote URLs are read NUL-separated, never from
+/// `git remote -v` lines. A URL with a newline and a tab could add a fake
+/// `origin <trusted URL> (fetch)` line, so the remote would count as
+/// trusted while git fetches it from the first line's path. Such a URL,
+/// and a trusted remote with more than one fetch URL, deny.
+#[test]
+fn remote_urls_with_control_characters_or_two_fetch_urls_deny_r14_l2() {
+    let sb = Sandbox::new();
+    let (repo, bare) = trusted_repo(&sb, PASS);
+    let fake = sb.root().join("fake.git");
+    let injected = format!("{}\norigin\t{}", fake.display(), bare.display());
+    sb.git(&repo, &["config", "remote.origin.url", &injected]);
+    let git = tollgate::gitx::Git::scrubbed(&sb.env(), &repo);
+    let scope = tollgate::config::CompiledScope::new(
+        &tollgate::config::HostConfig::from_toml("[scope]\nremotes = [\"*/remotes/trusted*\"]\n")
+            .unwrap()
+            .scope,
+        &tollgate::dirs::Dirs::from_env(&sb.env()).unwrap(),
+    )
+    .unwrap();
+    let err = tollgate::plan::remote_trust(&git, &scope).expect_err("a newline in a URL");
+    assert!(
+        err.to_string().contains("remote origin") && err.to_string().contains("control"),
+        "{err}"
+    );
+    stage(&sb, &repo, "a.txt", "1\n");
+    let before = head(&sb, &repo);
+    let r = sb.hooked(&repo, &["commit", "-m", "a"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(r.out.contains("control character"), "{}", r.out);
+    assert_eq!(head(&sb, &repo), before);
+
+    // Two fetch URLs: git fetches the first only, ls-remote too; which
+    // one counts is not worth guessing.
+    sb.git(
+        &repo,
+        &["config", "remote.origin.url", bare.to_str().unwrap()],
+    );
+    sb.git(
+        &repo,
+        &[
+            "config",
+            "--add",
+            "remote.origin.url",
+            fake.to_str().unwrap(),
+        ],
+    );
+    let err = tollgate::plan::remote_trust(&git, &scope).expect_err("two fetch URLs");
+    assert!(err.to_string().contains("more than one fetch URL"), "{err}");
+    let r = sb.hooked(&repo, &["commit", "-m", "a"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert_eq!(head(&sb, &repo), before);
+    // One URL again: the commit passes.
+    sb.git(
+        &repo,
+        &[
+            "config",
+            "--unset",
+            "remote.origin.url",
+            fake.to_str().unwrap(),
+        ],
+    );
+    let r = sb.hooked(&repo, &["commit", "-m", "a"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+}
+
+/// L2, X1: a remote-tracking ref is a local file. `git fetch .` and
+/// `git update-ref --stdin` move `origin/main` to the branch's own tip
+/// (with a fetch-like reflog line), which would make the branch its own
+/// policy commit. Only a value the trusted server reported counts.
+#[test]
+fn a_forged_remote_tracking_anchor_does_not_choose_the_policy_l2() {
+    let sb = Sandbox::new();
+    let (repo, _bare) = trusted_repo(
+        &sb,
+        "version = 1\n[[step]]\nname = \"lint\"\nkind = \"command\"\nrun = \"test ! -f bad\"\n",
+    );
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(&repo, "tollgate.toml", PASS, "weaken");
+    let feat = head(&sb, &repo);
+    stage(&sb, &repo, "bad", "x\n");
+    let forge_fetch: &[&[&str]] = &[&["fetch", "-q", ".", "+feat:refs/remotes/origin/main"]];
+    for forge in forge_fetch {
+        sb.git(&repo, forge);
+        assert_eq!(sb.git(&repo, &["rev-parse", "origin/main"]), feat);
+        let r = sb.hooked(&repo, &["commit", "-m", "bad"]);
+        assert_eq!(r.code, Some(1), "{forge:?}: {}", r.out);
+        assert!(r.out.contains("verdict fail"), "{}", r.out);
+        assert_eq!(head(&sb, &repo), feat);
+    }
+    // update-ref --stdin with a fetch-like reflog message.
+    sb.git(&repo, &["fetch", "-q", "origin"]);
+    let mut child = std::process::Command::new("git")
+        .env_clear()
+        .envs(sb.env().iter())
+        .current_dir(&repo)
+        .args(["update-ref", "-m", "fetch: fast-forward", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("update refs/remotes/origin/main {feat}\n").as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(sb.git(&repo, &["rev-parse", "origin/main"]), feat);
+    let r = sb.hooked(&repo, &["commit", "-m", "bad"]);
+    assert_eq!(r.code, Some(1), "update-ref --stdin: {}", r.out);
+    assert_eq!(head(&sb, &repo), feat);
+    // Without the bad file the branch passes main's policy.
+    sb.git(&repo, &["rm", "-q", "--cached", "bad"]);
+    stage(&sb, &repo, "ok.txt", "1\n");
+    let r = sb.hooked(&repo, &["commit", "-m", "ok"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+}
+
+/// R14(2), item 11: `ls-remote <name>` reads the repo's own config, so
+/// `remote.<name>.uploadpack` (or `core.sshCommand`) could make another
+/// repo answer for the trusted server. tollgate asks the trusted URL from
+/// outside the repo.
+#[test]
+fn remote_verification_ignores_the_repos_own_transport_config_r14() {
+    let sb = Sandbox::new();
+    let (repo, _bare) = trusted_repo(
+        &sb,
+        "version = 1\n[[step]]\nname = \"lint\"\nkind = \"command\"\nrun = \"test ! -f bad\"\n",
+    );
+    // A failing main made without hooks, and a fake repo that says the
+    // trusted main is that commit.
+    sb.commit_file(&repo, "bad", "x\n", "bad");
+    let bad = head(&sb, &repo);
+    let fake = sb.root().join("fake.git");
+    sb.git(
+        &sb.root(),
+        &["init", "-q", "--bare", fake.to_str().unwrap()],
+    );
+    sb.git(&fake, &["fetch", "-q", repo.to_str().unwrap(), "main:main"]);
+    let script = sb.root().join("fake-upload-pack");
+    write_exe(
+        &script,
+        &format!("#!/bin/sh\nexec git-upload-pack '{}'\n", fake.display()),
+    );
+    sb.git(
+        &repo,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            script.to_str().unwrap(),
+        ],
+    );
+    sb.git(&repo, &["update-ref", "refs/remotes/origin/main", &bad]);
+    let mac = sb.root().join("mac.git");
+    sb.git(&sb.root(), &["init", "-q", "--bare", mac.to_str().unwrap()]);
+    sb.git(&repo, &["remote", "add", "mac", mac.to_str().unwrap()]);
+    let r = sb.hooked(&repo, &["push", "-q", "mac", "main"]);
+    assert_ne!(r.code, Some(0), "{}", r.out);
+    assert!(!r.out.contains("remote-verified"), "{}", r.out);
+}
+
 #[test]
 fn partial_commit_in_a_linked_worktree_checks_the_commit_tree_t14_r17_r52() {
     let sb = Sandbox::new();
@@ -734,6 +896,102 @@ fn a_killed_hook_leaves_no_commit_and_no_record_t18_r31_r37() {
     }
 }
 
+/// Item 17 (detection only): `--no-verify` skips `pre-commit` and
+/// `pre-merge-commit`, but `post-commit` and `post-merge` still run. A
+/// commit no gate hook of the same git process allowed, whose tree has no
+/// pass and that no trusted remote has, is recorded as unverified with a
+/// loud warning; `tollgate status` and later denies show it. Cherry-picks
+/// and reverts are the known L1 gap, not flagged. Nothing is undone.
+#[test]
+fn commits_made_without_the_gate_are_recorded_as_unverified_item17() {
+    let sb = Sandbox::new();
+    sb.scoped_host("");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"lint\"\nkind = \"command\"\nrun = \"test ! -f bad\"\n",
+    );
+    // A gated commit: no warning, nothing unverified.
+    stage(&sb, &repo, "a.txt", "1\n");
+    let r = sb.hooked(&repo, &["commit", "-m", "a"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(!r.out.contains("unverified"), "{}", r.out);
+    let st = sb.tollgate(&repo, &["status"]);
+    assert!(st.out.contains("unverified: none"), "{}", st.out);
+    // --no-verify: the commit stays (no undo), with a warning.
+    stage(&sb, &repo, "b.txt", "1\n");
+    let r = sb.hooked(&repo, &["commit", "--no-verify", "-m", "b"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let skipped = head(&sb, &repo);
+    assert!(
+        r.out.contains("WARNING") && r.out.contains(&skipped[..12]) && r.out.contains("unverified"),
+        "{}",
+        r.out
+    );
+    let st = sb.tollgate(&repo, &["status"]);
+    assert!(
+        st.out
+            .contains("unverified: 1 commit(s) made without the gate")
+            && st.out.contains(&skipped[..12]),
+        "{}",
+        st.out
+    );
+    // A later deny names it too.
+    stage(&sb, &repo, "bad", "x\n");
+    let r = sb.hooked(&repo, &["commit", "-m", "bad"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("made without the gate") && r.out.contains(&skipped[..12]),
+        "{}",
+        r.out
+    );
+    sb.git(&repo, &["rm", "-q", "--cached", "bad"]);
+    std::fs::remove_file(repo.join("bad")).unwrap();
+    // A merge with --no-verify: post-merge records it.
+    sb.git(&repo, &["checkout", "-q", "-b", "side", "HEAD~1"]);
+    sb.commit_file(&repo, "s.txt", "1\n", "side");
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    let r = sb.hooked(
+        &repo,
+        &["merge", "--no-ff", "--no-verify", "--no-edit", "side"],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let merge = head(&sb, &repo);
+    assert!(r.out.contains(&merge[..12]), "{}", r.out);
+    // A cherry-pick and a revert (L1 gap): no warning.
+    sb.git(&repo, &["checkout", "-q", "-b", "pick", "HEAD~1"]);
+    sb.commit_file(&repo, "p.txt", "1\n", "pick me");
+    let pick = head(&sb, &repo);
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    let r = sb.hooked(&repo, &["cherry-pick", &pick]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(!r.out.contains("WARNING"), "{}", r.out);
+    let r = sb.hooked(&repo, &["revert", "--no-edit", "HEAD"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(!r.out.contains("WARNING"), "{}", r.out);
+    let st = sb.tollgate(&repo, &["status"]);
+    assert!(
+        st.out
+            .contains("unverified: 2 commit(s) made without the gate"),
+        "{}",
+        st.out
+    );
+    // Once the tree passes a check, the commit no longer counts.
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", &skipped]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let st = sb.tollgate(&repo, &["status"]);
+    assert!(
+        st.out.contains("unverified: 1 commit(s)")
+            && st.out.contains(&format!("  {} ", &merge[..12]))
+            && !st.out.contains(&format!("  {} ", &skipped[..12])),
+        "{}",
+        st.out
+    );
+    let json = sb.tollgate(&repo, &["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json.out).unwrap();
+    assert_eq!(v["unverified"][0]["commit"], merge, "{v}");
+}
+
 #[test]
 fn merges_into_a_full_ref_need_full_r17_r99() {
     let sb = Sandbox::new();
@@ -866,8 +1124,8 @@ fn a_chained_hook_runs_no_git_subprocess_on_a_warm_cache_t2_r7_r75() {
     // path is needed once (`git var`), then comes from the tool cache.
     let trace = sb.root().join("trace");
     let trace_s = trace.to_str().unwrap().to_owned();
-    let run = |traced: bool| {
-        let mut cmd = std::process::Command::new(test_hooks_dir().join("post-commit"));
+    let run_hook = |name: &str, traced: bool| {
+        let mut cmd = std::process::Command::new(test_hooks_dir().join(name));
         cmd.env_clear().current_dir(&repo);
         for (k, v) in sb.env().iter() {
             if k != "GIT_CONFIG_NOSYSTEM" {
@@ -879,8 +1137,17 @@ fn a_chained_hook_runs_no_git_subprocess_on_a_warm_cache_t2_r7_r75() {
         }
         assert!(cmd.status().unwrap().success());
     };
+    let run = |traced: bool| run_hook("post-checkout", traced);
     run(false);
     run(true);
+    let text = std::fs::read_to_string(&trace).unwrap_or_default();
+    assert!(text.is_empty(), "a git subprocess ran:\n{text}");
+    // post-commit after a gate hook of the same git process allowed the
+    // commit (item 17; the test process stands in for that git): none
+    // either.
+    let dirs = tollgate::dirs::Dirs::from_env(&sb.env()).unwrap();
+    tollgate::hook::unverified::mark_gate_run_of(&dirs, i32::try_from(std::process::id()).unwrap());
+    run_hook("post-commit", true);
     let text = std::fs::read_to_string(&trace).unwrap_or_default();
     assert!(text.is_empty(), "a git subprocess ran:\n{text}");
     // A cold cache asks git once (the trace sees it).

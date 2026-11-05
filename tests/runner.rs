@@ -236,6 +236,162 @@ mkdir -p target && touch target/marker junk.txt
     );
 }
 
+/// R71, item 3: after the checkout, a tool config reached through a
+/// symlink is refused (even one the policy commit has: its target can
+/// change on any branch), and so is a symlink to a dir outside the
+/// checkout (its files are not in the tree).
+#[test]
+fn tool_configs_reached_through_symlinks_are_refused_r71() {
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(outside.path().join("deep/er")).unwrap();
+    std::fs::write(outside.path().join("deep/er/rustfmt.toml"), "\n").unwrap();
+    for (name, link, target, extra) in [
+        (
+            ".cargo dir",
+            ".cargo",
+            "cfg",
+            Some(("cfg/config.toml", "[alias]\nx = \"y\"\n")),
+        ),
+        (
+            "clippy.toml file",
+            "clippy.toml",
+            "shared.toml",
+            Some(("shared.toml", "\n")),
+        ),
+        (
+            "dir outside with a tool config",
+            "ext",
+            outside.path().to_str().unwrap(),
+            None,
+        ),
+    ] {
+        let sb = Sandbox::new();
+        host(&sb, "");
+        let repo = repo_with(&sb, "r", PASS_POLICY);
+        if let Some((p, text)) = extra {
+            sb.commit_file(&repo, p, text, "target");
+        }
+        std::os::unix::fs::symlink(target, repo.join(link)).unwrap();
+        sb.git(&repo, &["add", link]);
+        sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "link"]);
+        let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+        assert_eq!(r.code, Some(1), "{name}: {}", r.out);
+        assert!(
+            r.out.contains("cause checkout") && r.out.contains(&format!("{link} ")),
+            "{name}: {}",
+            r.out
+        );
+    }
+    // A link into a kept dir (`target/` survives `git clean`): an earlier
+    // job's step wrote a tool config there.
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"w\"\nkind = \"command\"\nrun = \"mkdir -p target/x && touch target/x/clippy.toml\"\n",
+    );
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    std::os::unix::fs::symlink("target/x", repo.join("lint")).unwrap();
+    sb.git(&repo, &["add", "lint"]);
+    sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "link"]);
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("cause checkout") && r.out.contains("lint links to"),
+        "{}",
+        r.out
+    );
+    // A symlink to a file or dir inside the checkout is fine, and so is
+    // one to an outside dir without tool configs (a local wheel index).
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(&sb, "r", PASS_POLICY);
+    sb.commit_file(&repo, "docs/a.md", "a\n", "docs");
+    sb.commit_file(&repo, "docs/clippy.toml", "\n", "tree config");
+    let wheels = tempfile::tempdir().unwrap();
+    std::fs::write(wheels.path().join("x.whl"), "w").unwrap();
+    std::os::unix::fs::symlink("docs", repo.join("doc")).unwrap();
+    std::os::unix::fs::symlink("docs/a.md", repo.join("a.md")).unwrap();
+    std::os::unix::fs::symlink(wheels.path(), repo.join("wheels")).unwrap();
+    sb.git(&repo, &["add", "doc", "a.md", "wheels"]);
+    sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "links"]);
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+}
+
+/// R71, R42, item 5: the overlaid tool configs are exempt from the
+/// tracked-change check (the job wrote them), so after each step each one
+/// must still hold the policy commit's version, or still be absent.
+#[test]
+fn a_step_that_rewrites_an_overlaid_tool_config_is_an_error_r71_r42() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"rewrite\"\nkind = \"command\"\nrun = \"echo y > rustfmt.toml; touch clippy.toml\"\n[[step]]\nname = \"after\"\nkind = \"command\"\nrun = \"true\"\n",
+    );
+    sb.commit_file(&repo, "rustfmt.toml", "max_width = 100\n", "fmt");
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(&repo, "rustfmt.toml", "max_width = 80\n", "weaken");
+    sb.commit_file(&repo, "clippy.toml", "\n", "lint");
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("cause checkout")
+            && r.out.contains("\"rewrite\" changed")
+            && r.out.contains("clippy.toml")
+            && r.out.contains("rustfmt.toml"),
+        "{}",
+        r.out
+    );
+}
+
+/// R42, R71, item 6: a branch's `.gitignore` must not hide a tool config
+/// that a step writes (a `build.rs` writing `.cargo/config.toml`). Other
+/// ignored files a step leaves (caches) still do not count.
+#[test]
+fn an_ignored_tool_config_written_by_a_step_is_an_error_r42_r71() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"build\"\nkind = \"command\"\nrun = \"mkdir -p .cargo dist/sub __pycache__ && echo x > .cargo/config.toml && touch dist/sub/out.js __pycache__/m.pyc\"\n[[step]]\nname = \"after\"\nkind = \"command\"\nrun = \"true\"\n",
+    );
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(
+        &repo,
+        ".gitignore",
+        ".cargo/\ndist/\n__pycache__/\n",
+        "hide",
+    );
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("cause checkout")
+            && r.out
+                .contains("\"build\" changed the checkout: .cargo/config.toml")
+            && !r.out.contains("out.js")
+            && !r.out.contains("m.pyc"),
+        "{}",
+        r.out
+    );
+    // The same caches without the config pass.
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    sb.commit_file(
+        &repo,
+        "tollgate.toml",
+        "version = 1\n[[step]]\nname = \"build\"\nkind = \"command\"\nrun = \"mkdir -p dist/sub __pycache__ && touch dist/sub/out.js __pycache__/m.pyc\"\n",
+        "no config",
+    );
+    sb.commit_file(&repo, ".gitignore", "dist/\n__pycache__/\n", "ignore");
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+}
+
 #[test]
 fn unborn_repo_and_lru_eviction_r41_l15() {
     let sb = Sandbox::new();
@@ -653,7 +809,7 @@ fn an_attached_check_with_another_selection_runs_its_own_job_r79_r88() {
     host(
         &sb,
         &format!(
-            "[scope]\nremotes = [\"*example.invalid*\"]\n[job.env]\nGO = \"{}\"\n",
+            "[scope]\nremotes = [\"*/remotes/trusted*\"]\n[job.env]\nGO = \"{}\"\n",
             go.display()
         ),
     );
@@ -680,18 +836,32 @@ when = ["b/**"]
     sb.commit_file(&repo, "a/x", "a1\n", "a");
     sb.commit_file(&repo, "b/y", "b1\n", "R0");
     let r0 = sb.git(&repo, &["rev-parse", "HEAD"]);
-    sb.git(
-        &repo,
-        &["remote", "add", "origin", "https://example.invalid/r.git"],
-    );
-    sb.git(&repo, &["update-ref", "refs/remotes/origin/main", &r0]);
-    // X: b broken; W: a changed. Both are reachable from a trusted remote
-    // ref, so each is a trusted base (R56).
+    let bare = trusted_bare(&sb, &repo);
+    // X: b broken; W: a changed. Both are on the trusted remote, so each
+    // is a trusted base (R56).
     let x = sb.commit_file(&repo, "b/y", "bad\n", "X");
     sb.git(&repo, &["checkout", "-q", &r0]);
     let w = sb.commit_file(&repo, "a/x", "a2\n", "W");
-    sb.git(&repo, &["update-ref", "refs/remotes/origin/x", &x]);
-    sb.git(&repo, &["update-ref", "refs/remotes/origin/w", &w]);
+    for (oid, branch) in [(&r0, "main"), (&x, "x"), (&w, "w")] {
+        sb.git(
+            &repo,
+            &[
+                "push",
+                "-q",
+                "origin",
+                &format!("{oid}:refs/heads/{branch}"),
+            ],
+        );
+    }
+    sb.git(
+        &repo,
+        &[
+            "fetch",
+            "-q",
+            bare.to_str().unwrap(),
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
     // wt1: HEAD X, index T (only a/ changed: stepA). wt2: HEAD W, index T
     // (only b/ changed: stepB, which fails on T).
     sb.git(&repo, &["checkout", "-q", &x]);
@@ -746,19 +916,88 @@ when = ["b/**"]
     assert_eq!(w1.code, Some(0), "wt1 needs only stepA: {}", w1.out);
 }
 
+/// A bare repo at `<root>/remotes/trusted.git` (it matches the
+/// `*/remotes/trusted*` scope glob) as `origin` of `repo`.
+fn trusted_bare(sb: &Sandbox, repo: &Path) -> std::path::PathBuf {
+    let bare = sb.root().join("remotes/trusted.git");
+    sb.git(
+        &sb.root(),
+        &["init", "-q", "--bare", bare.to_str().unwrap()],
+    );
+    sb.git(repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    bare
+}
+
 /// A repo whose `main` is also `origin/main` of a trusted remote, so every
 /// commit on it is a trusted base (R56) without a record.
 fn trusted_repo(sb: &Sandbox, policy: &str) -> std::path::PathBuf {
-    host(sb, "[scope]\nremotes = [\"*example.invalid*\"]\n");
+    host(sb, "[scope]\nremotes = [\"*/remotes/trusted*\"]\n");
     let repo = repo_with(sb, "r", policy);
-    sb.git(
-        &repo,
-        &["remote", "add", "origin", "https://example.invalid/r.git"],
-    );
-    let head = sb.git(&repo, &["rev-parse", "HEAD"]);
-    sb.git(&repo, &["update-ref", "refs/remotes/origin/main", &head]);
+    trusted_bare(sb, &repo);
+    sb.git(&repo, &["push", "-q", "origin", "main"]);
+    sb.git(&repo, &["fetch", "-q", "origin"]);
     repo
 }
+
+/// R56, X1: a base counts as trusted through a remote-tracking ref only
+/// when the trusted server reported that ref's value; `update-ref` or
+/// `fetch .` into `refs/remotes/origin/*` does not turn selection on.
+#[test]
+fn a_forged_tracking_ref_does_not_trust_a_base_r56() {
+    use tollgate::plan::{Base, PlanRequest};
+
+    let sb = Sandbox::new();
+    let repo = trusted_repo(&sb, PASS_POLICY);
+    let main = sb.git(&repo, &["rev-parse", "HEAD"]);
+    sb.commit_file(&repo, "x.txt", "1\n", "X, never pushed");
+    let x = sb.git(&repo, &["rev-parse", "HEAD"]);
+    sb.git(&repo, &["update-ref", "refs/remotes/origin/x", &x]);
+    sb.git(&repo, &["fetch", "-q", ".", "+HEAD:refs/remotes/origin/y"]);
+    sb.commit_file(&repo, "y.txt", "1\n", "Y");
+    let env = sb.env();
+    let dirs = tollgate::dirs::Dirs::from_env(&env).unwrap();
+    let host = tollgate::config::HostConfig::load(&dirs).unwrap();
+    let git = tollgate::gitx::Git::scrubbed(&env, &repo);
+    let layout = tollgate::gitx::RepoLayout::discover(&git).unwrap();
+    let oid = |r: &str| tollgate::gitx::Oid::parse(&sb.git(&repo, &["rev-parse", r])).unwrap();
+    let plan_on = |base: &str| {
+        tollgate::plan::plan(&PlanRequest {
+            env: &env,
+            dirs: &dirs,
+            host: &host,
+            layout: &layout,
+            git: &git,
+            tree: oid("HEAD^{tree}"),
+            tier: tollgate::config::Tier::Fast,
+            tip: Some(oid("HEAD")),
+            base: Some(Base {
+                tree: oid(&format!("{base}^{{tree}}")),
+                commit: Some(oid(base)),
+            }),
+            refname: "refs/heads/main".into(),
+            allow_reuse: true,
+            priority: tollgate::locks::Priority::Hook,
+            rerun: false,
+        })
+        .unwrap()
+    };
+    let forged = plan_on(&x);
+    assert!(!forged.spec.select, "{:?}", forged.spec.select_note);
+    assert!(
+        forged
+            .spec
+            .select_note
+            .as_deref()
+            .is_some_and(|n| n.contains("R56")),
+        "{:?}",
+        forged.spec.select_note
+    );
+    // The fetched main is on the server: selection on.
+    assert!(plan_on(&main).spec.select);
+}
+
+const PASS_POLICY: &str =
+    "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n";
 
 #[test]
 fn a_docs_only_change_still_needs_a_valid_policy_r64_r61() {
@@ -970,6 +1209,118 @@ echo "$(basename "$0") $ch"
             .any(|l| std::path::Path::new(l).starts_with(&repo)),
         "{cwds}"
     );
+}
+
+/// R51, item 7: the version probe of the plan (hook context) never runs a
+/// tool that the tree chooses. A toolchain file with `path = ...` makes
+/// rustup run `<path>/bin/rustc`: refused. A symlinked toolchain file is
+/// written as the regular file it names in the same tree; one that leaves
+/// the tree is refused. The probe dir never holds a symlink.
+#[test]
+fn the_toolchain_probe_runs_no_tool_the_tree_chooses_r51_r74() {
+    let sb = Sandbox::new();
+    let bin = sb.root().join("fakebin");
+    // A rustup stand-in that honors `path` and `channel` as rustup does.
+    support::write_exe(
+        &bin.join("rustup"),
+        r#"#!/bin/sh
+d=$PWD; ch=default
+while :; do
+  f="$d/rust-toolchain.toml"
+  if [ -f "$f" ]; then
+    p=$(sed -n 's/^path *= *"\(.*\)"/\1/p' "$f")
+    [ -n "$p" ] && exec "$p/bin/$(basename "$0")" "$@"
+    ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$f"); break
+  fi
+  [ "$d" = / ] && break
+  d=$(dirname "$d")
+done
+echo "$(basename "$0") $ch"
+"#,
+    );
+    for name in ["rustc", "cargo", "cargo-nextest"] {
+        std::os::unix::fs::symlink("rustup", bin.join(name)).unwrap();
+    }
+    host(
+        &sb,
+        &format!("[job]\npath_prepend = [\"{}\"]\n", bin.display()),
+    );
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n",
+    );
+    sb.commit_file(&repo, "Cargo.toml", "[workspace]\n", "cargo");
+    // A "toolchain" whose rustc only leaves a mark.
+    let evil = sb.root().join("evil");
+    let mark = sb.root().join("evil-ran");
+    for name in ["rustc", "cargo", "cargo-nextest"] {
+        support::write_exe(
+            &evil.join("bin").join(name),
+            &format!("#!/bin/sh\ntouch '{}'\necho {name} evil\n", mark.display()),
+        );
+    }
+    let fp = |r: &support::Run| -> String {
+        let spec = std::fs::read(
+            sb.state()
+                .join("jobs")
+                .join(job_id(&r.out))
+                .join("spec.json"),
+        )
+        .unwrap();
+        let spec: serde_json::Value = serde_json::from_slice(&spec).unwrap();
+        spec["fingerprint"]["rustc"]
+            .as_str()
+            .unwrap_or("none")
+            .to_owned()
+    };
+    sb.commit_file(
+        &repo,
+        "rust-toolchain.toml",
+        &format!("[toolchain]\npath = \"{}\"\n", evil.display()),
+        "path toolchain",
+    );
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_ne!(r.code, Some(0), "{}", r.out);
+    assert!(r.out.contains("path"), "{}", r.out);
+    assert!(!mark.exists(), "the plan ran the tree's toolchain");
+    // A link out of the tree is refused.
+    let outside = sb.root().join("outside.toml");
+    std::fs::write(&outside, "[toolchain]\nchannel = \"outside\"\n").unwrap();
+    std::fs::remove_file(repo.join("rust-toolchain.toml")).unwrap();
+    std::os::unix::fs::symlink(&outside, repo.join("rust-toolchain.toml")).unwrap();
+    sb.git(&repo, &["add", "rust-toolchain.toml"]);
+    sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "link out"]);
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_ne!(r.code, Some(0), "{}", r.out);
+    assert!(r.out.contains("rust-toolchain.toml"), "{}", r.out);
+    // A link to a file of the same tree reads as that file.
+    sb.commit_file(
+        &repo,
+        "tools/tc.toml",
+        "[toolchain]\nchannel = \"1.91\"\n",
+        "tc",
+    );
+    std::fs::remove_file(repo.join("rust-toolchain.toml")).unwrap();
+    std::os::unix::fs::symlink("tools/tc.toml", repo.join("rust-toolchain.toml")).unwrap();
+    sb.git(&repo, &["add", "rust-toolchain.toml"]);
+    sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "link in"]);
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(fp(&r), "rustc 1.91");
+    assert!(!mark.exists());
+    for e in std::fs::read_dir(sb.state().join("probe"))
+        .unwrap()
+        .flatten()
+    {
+        for f in std::fs::read_dir(e.path()).into_iter().flatten().flatten() {
+            assert!(
+                !f.file_type().unwrap().is_symlink(),
+                "{}",
+                f.path().display()
+            );
+        }
+    }
 }
 
 #[test]

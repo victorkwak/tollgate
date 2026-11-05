@@ -11,6 +11,7 @@ pub mod chain;
 pub mod commit;
 pub mod gate;
 pub mod push;
+pub mod unverified;
 
 use std::ffi::{OsStr, OsString};
 use std::io::Read as _;
@@ -163,6 +164,19 @@ pub fn run(name: &'static str, args: &[OsString], ctx: &HookCtx) -> u8 {
         }
     }
     if !gate_hook {
+        // Item 17: a commit no gate hook of this git command allowed.
+        if let (true, Ok(d)) = (matches!(name, "post-commit" | "post-merge"), &dirs) {
+            unverified::detect(
+                &unverified::PostHook {
+                    name,
+                    args,
+                    layout: &layout,
+                    env: &ctx.env,
+                    exe: &ctx.exe,
+                },
+                d,
+            );
+        }
         return exit::OK;
     }
     // R31: from here every path is an explicit allow or deny.
@@ -182,7 +196,7 @@ pub fn run(name: &'static str, args: &[OsString], ctx: &HookCtx) -> u8 {
             return exit::FAIL;
         }
     };
-    match name {
+    let code = match name {
         "pre-commit" => commit::run(&gate, commit::Kind::Commit, &ctx.cwd),
         "pre-merge-commit" => commit::run(&gate, commit::Kind::MergeCommit, &ctx.cwd),
         "pre-push" => push::run(&gate, args, stdin.as_deref().unwrap_or_default()),
@@ -190,7 +204,13 @@ pub fn run(name: &'static str, args: &[OsString], ctx: &HookCtx) -> u8 {
             eprintln!("tollgate: DENIED {other}: no gate for this hook");
             exit::FAIL
         }
+    };
+    // Item 17: the post hook of this git command sees that a gate hook
+    // allowed its commit.
+    if code == exit::OK && matches!(name, "pre-commit" | "pre-merge-commit") {
+        unverified::mark_gate_run(&gate.dirs);
     }
+    code
 }
 
 #[cfg(test)]

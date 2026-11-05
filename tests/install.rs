@@ -73,16 +73,13 @@ impl Env {
         )
     }
 
-    /// Runs `program` with the sandbox env, the fake claude first on PATH,
-    /// TMPDIR in the sandbox and the L10 test switch.
+    /// Runs `program` with the sandbox env and the fake claude first on
+    /// PATH. The sandbox settings are not the account's real ones, so
+    /// `--yes` needs no terminal for them (L10); nothing else opens it.
     fn run(&self, program: &Path, args: &[&str], extra: &[(&str, &str)]) -> Run {
         let root = self.sb.root();
         let path = self.path_var();
-        let mut all: Vec<(&str, &str)> = vec![
-            ("PATH", path.as_str()),
-            ("TMPDIR", root.to_str().unwrap()),
-            ("TOLLGATE_TEST_INSTALL", "1"),
-        ];
+        let mut all: Vec<(&str, &str)> = vec![("PATH", path.as_str())];
         all.extend_from_slice(extra);
         let mut cmd = std::process::Command::new(program);
         cmd.env_clear()
@@ -158,6 +155,11 @@ fn install_adds_tagged_entries_and_uninstall_removes_exactly_them_t43_r95_r96() 
         .collect();
     assert_eq!(backups.len(), 1);
     assert_eq!(std::fs::read_to_string(backups[0].path()).unwrap(), FIXTURE);
+    // Item 10: the settings env may hold secrets.
+    assert_eq!(
+        std::fs::metadata(backups[0].path()).unwrap().mode() & 0o777,
+        0o600
+    );
     let rec: serde_json::Value =
         serde_json::from_slice(&std::fs::read(e.data().join("install.json")).unwrap()).unwrap();
     assert_eq!(rec["hooks"].as_array().unwrap().len(), 14);
@@ -216,25 +218,19 @@ fn reinstall_after_a_new_build_refreshes_the_copy_and_links_t43_r1() {
 #[test]
 fn settings_are_never_edited_without_confirmation_l10_r95b() {
     let e = Env::new("2.1.317");
-    // No TTY and no test switch: --yes is refused; the links are made.
-    let r = e.run(
-        Path::new(BIN),
-        &["install", "--yes"],
-        &[("TOLLGATE_TEST_INSTALL", "0")],
-    );
+    // Without --yes and without a TTY: refused; the links are made. (The
+    // real settings refuse --yes without a TTY too: a unit test in
+    // src/install covers that, since no test may touch ~/.claude.)
+    let r = e.run(Path::new(BIN), &["install"], &[]);
     assert_eq!(r.code, Some(1), "{}", r.out);
     assert!(r.out.contains("L10"), "{}", r.out);
     assert_eq!(std::fs::read_to_string(e.settings()).unwrap(), FIXTURE);
     assert!(e.data().join("hooks/pre-commit").exists());
-    // Without --yes and without a TTY: refused too.
-    let r = e.run(Path::new(BIN), &["install"], &[]);
-    assert_eq!(r.code, Some(1), "{}", r.out);
-    assert_eq!(std::fs::read_to_string(e.settings()).unwrap(), FIXTURE);
-    // A settings file outside TMPDIR is refused even with the switch.
+    // The old test switch opens nothing and is not needed for a sandbox.
     let r = e.run(
         Path::new(BIN),
-        &["install", "--yes"],
-        &[("TMPDIR", "/nonexistent")],
+        &["install"],
+        &[("TOLLGATE_TEST_INSTALL", "1"), ("TMPDIR", "/")],
     );
     assert_eq!(r.code, Some(1), "{}", r.out);
     assert_eq!(std::fs::read_to_string(e.settings()).unwrap(), FIXTURE);
@@ -347,11 +343,7 @@ fn uninstall_keeps_the_binary_while_the_settings_name_it_r96() {
     // Install without the settings edit (no confirmation), then a hand
     // edit registers the guard: uninstall must not remove the binary the
     // settings still run.
-    let r = e.run(
-        Path::new(BIN),
-        &["install", "--yes"],
-        &[("TOLLGATE_TEST_INSTALL", "0")],
-    );
+    let r = e.run(Path::new(BIN), &["install"], &[]);
     assert_eq!(r.code, Some(1), "{}", r.out);
     let bin = e.data().join("bin/tollgate");
     let mut v = e.json();

@@ -28,6 +28,7 @@ use crate::gitx::{Git, GitError, Oid, RepoLayout};
 use crate::ids::{JobId, ResourceName};
 use crate::locks::Priority;
 use crate::policy::{self, PolicyError};
+use crate::remote_refs::{RemoteRefs, TrustedRemote};
 use crate::report::JobReport;
 use crate::runner::env::{BaseInputs, EnvFile, JobEnv};
 use crate::runner::job::{JobSpec, PolicySpec, SPEC_SCHEMA};
@@ -140,24 +141,115 @@ fn toolchain_files<'a>(
     Vec::new()
 }
 
+/// How many symlinks a toolchain file may go through inside the tree.
+const MAX_TOOLCHAIN_LINKS: usize = 8;
+
+/// The content of toolchain file `e` as a regular file (R51): a symlink is
+/// followed only to a file of the same tree. Returns the blob id and its
+/// bytes.
+fn toolchain_blob(
+    git: &Git,
+    entries: &[crate::gitx::TreeEntry],
+    e: &crate::gitx::TreeEntry,
+) -> Result<(Oid, Vec<u8>), PlanError> {
+    let refuse = |why: String| {
+        PlanError::Config(format!(
+            "{}: {why}; the hook runs no tool the tree chooses (R51)",
+            e.path.display()
+        ))
+    };
+    let mut cur = e.clone();
+    for _ in 0..=MAX_TOOLCHAIN_LINKS {
+        match cur.mode.as_str() {
+            "100644" | "100755" => {
+                let bytes = git.run(["cat-file", "blob", cur.oid.as_str()])?;
+                return Ok((cur.oid.clone(), bytes));
+            }
+            "120000" => {
+                let target = git.run(["cat-file", "blob", cur.oid.as_str()])?;
+                let target = PathBuf::from(std::ffi::OsString::from(
+                    String::from_utf8_lossy(&target).into_owned(),
+                ));
+                let mut path = cur.path.parent().map(Path::to_owned).unwrap_or_default();
+                for c in target.components() {
+                    match c {
+                        std::path::Component::Normal(n) => path.push(n),
+                        std::path::Component::CurDir => {}
+                        std::path::Component::ParentDir if path.pop() => {}
+                        _ => {
+                            return Err(refuse(format!(
+                                "a symlink to {}, which is not a file of the same tree",
+                                target.display()
+                            )));
+                        }
+                    }
+                }
+                cur = entries
+                    .iter()
+                    .find(|x| x.path == path && x.kind == "blob")
+                    .cloned()
+                    .ok_or_else(|| {
+                        refuse(format!(
+                            "a symlink to {}, which is not a file of the same tree",
+                            target.display()
+                        ))
+                    })?;
+            }
+            mode => return Err(refuse(format!("mode {mode} is not a file"))),
+        }
+    }
+    Err(refuse("too many symlinks".into()))
+}
+
+/// R51: a toolchain file that names a toolchain dir (`[toolchain] path`,
+/// or a legacy `rust-toolchain` line with a path) would make the version
+/// probe run `<path>/bin/rustc`, a binary the tree chooses, in the hook.
+fn toolchain_path(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    if let Ok(v) = text.parse::<toml::Table>()
+        && let Some(t) = v.get("toolchain").and_then(toml::Value::as_table)
+    {
+        return t.get("path").map(|p| p.as_str().unwrap_or("?").to_owned());
+    }
+    let line = text.trim();
+    (!line.contains('\n') && (line.contains('/') || line.contains('\\'))).then(|| line.to_owned())
+}
+
 /// A dir under the state dir holding `files` under their file names,
 /// content-addressed and made once (R51, R74): version probes run there,
 /// so rustup picks the toolchain the tree names, not one from the agent's
 /// working tree (dirty, untracked or another branch's), and no tool runs in
-/// the agent's checkout.
+/// the agent's checkout. The dir holds regular files only: a symlinked
+/// toolchain file is written as the file it names in `entries` (the same
+/// tree), and one that names a toolchain dir is refused, so the probe never
+/// runs a tool the tree chooses (R51).
 fn probe_dir(
     dirs: &Dirs,
     git: &Git,
     files: &[&crate::gitx::TreeEntry],
+    entries: &[crate::gitx::TreeEntry],
 ) -> Result<PathBuf, PlanError> {
-    let mut h = blake3::Hasher::new();
-    h.update(b"tollgate probe dir 1\0");
+    let mut blobs = Vec::new();
     for e in files {
-        h.update(e.path.file_name().unwrap_or_default().as_encoded_bytes());
+        let (oid, bytes) = toolchain_blob(git, entries, e)?;
+        if let Some(p) = toolchain_path(&bytes) {
+            return Err(PlanError::Config(format!(
+                "{}: names the toolchain path {p}; the hook runs no tool the tree chooses (R51), so use a channel",
+                e.path.display()
+            )));
+        }
+        blobs.push((
+            e.path.file_name().unwrap_or_default().to_owned(),
+            oid,
+            bytes,
+        ));
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"tollgate probe dir 2\0");
+    for (name, oid, _) in &blobs {
+        h.update(name.as_encoded_bytes());
         h.update(b"\0");
-        h.update(e.mode.as_bytes());
-        h.update(b"\0");
-        h.update(e.oid.as_str().as_bytes());
+        h.update(oid.as_str().as_bytes());
         h.update(b"\0");
     }
     let root = dirs.probe_root();
@@ -168,16 +260,8 @@ fn probe_dir(
     let io = |e: std::io::Error| PlanError::Io(format!("{}: {e}", root.display()));
     let tmp = root.join(format!(".tmp-{}", crate::fsx::unique_suffix()));
     std::fs::create_dir_all(&tmp).map_err(io)?;
-    for e in files {
-        let name = e.path.file_name().unwrap_or_default();
-        let bytes = git.run(["cat-file", "blob", e.oid.as_str()])?;
-        if e.mode == "120000" {
-            use std::os::unix::ffi::OsStrExt as _;
-            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&bytes), tmp.join(name))
-                .map_err(io)?;
-        } else {
-            std::fs::write(tmp.join(name), bytes).map_err(io)?;
-        }
+    for (name, _, bytes) in &blobs {
+        std::fs::write(tmp.join(name), bytes).map_err(io)?;
     }
     match std::fs::rename(&tmp, &dir) {
         Ok(()) => Ok(dir),
@@ -203,7 +287,7 @@ fn rust_probe_dirs(
 ) -> Result<Vec<(String, PathBuf)>, PlanError> {
     let mut out: Vec<(String, PathBuf)> = Vec::new();
     for root in roots {
-        let dir = probe_dir(dirs, git, &toolchain_files(entries, root))?;
+        let dir = probe_dir(dirs, git, &toolchain_files(entries, root), entries)?;
         if out.iter().any(|(_, d)| *d == dir) {
             continue;
         }
@@ -258,15 +342,49 @@ pub struct RemoteUrls {
     pub name: String,
     /// `remote.<name>.url` and `remote.<name>.pushurl` values.
     pub configured: Vec<String>,
-    /// The URL `fetch` and `ls-remote` use.
-    pub fetch: Option<String>,
+    /// The URLs `fetch` and `ls-remote` use, in order (git uses the
+    /// first).
+    pub fetch: Vec<String>,
     /// The URLs `push` uses.
     pub push: Vec<String>,
 }
 
-/// Every remote's URLs: the config values (`git config`) and the URLs git
-/// uses for them (`git remote -v`, which applies the rewrites).
-pub fn remote_urls(git: &Git) -> Result<Vec<RemoteUrls>, GitError> {
+impl RemoteUrls {
+    /// Every URL of the remote: configured and as git uses them.
+    pub fn all(&self) -> impl Iterator<Item = &String> {
+        self.configured.iter().chain(&self.fetch).chain(&self.push)
+    }
+}
+
+/// True when `url` holds a control character (a newline or tab can fake
+/// lines in git's text output).
+fn has_control(url: &str) -> bool {
+    url.chars().any(char::is_control)
+}
+
+/// `git remote get-url [--push] --all <name>`: the URLs after rewrites, one
+/// per line. Configured URLs hold no newline (checked first), and a
+/// rewrite base is a config subsection name, which holds none either.
+fn get_urls(git: &Git, name: &str, push: bool) -> Result<Vec<String>, GitError> {
+    let mut args = vec!["remote", "get-url"];
+    if push {
+        args.push("--push");
+    }
+    args.extend(["--all", "--", name]);
+    let out = git.run(&args)?;
+    Ok(String::from_utf8_lossy(&out)
+        .split('\n')
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Every remote's URLs: the config values (`git config -z`, NUL-separated)
+/// and the URLs git uses for them (`git remote get-url --all`, which
+/// applies the rewrites). Never the text of `git remote -v`, whose lines a
+/// URL with a newline can fake (R14, L2). A URL with a control character
+/// is an error.
+pub fn remote_urls(git: &Git) -> Result<Vec<RemoteUrls>, PlanError> {
     let mut remotes: Vec<RemoteUrls> = Vec::new();
     fn entry<'r>(remotes: &'r mut Vec<RemoteUrls>, name: &str) -> &'r mut RemoteUrls {
         if let Some(i) = remotes.iter().position(|r| r.name == name) {
@@ -278,9 +396,16 @@ pub fn remote_urls(git: &Git) -> Result<Vec<RemoteUrls>, GitError> {
         });
         remotes.last_mut().expect("just pushed")
     }
-    let out = git.output(["config", "--get-regexp", r"^remote\..*\.(url|pushurl)$"])?;
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let Some((key, url)) = line.split_once(' ') else {
+    // Records are `<key>\n<value>\0`; keys hold no newline.
+    let out = git.output([
+        "config",
+        "-z",
+        "--get-regexp",
+        r"^remote\..*\.(url|pushurl)$",
+    ])?;
+    for rec in out.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let text = String::from_utf8_lossy(rec);
+        let Some((key, url)) = text.split_once('\n') else {
             continue;
         };
         let Some(name) = key.strip_prefix("remote.").and_then(|k| {
@@ -291,15 +416,28 @@ pub fn remote_urls(git: &Git) -> Result<Vec<RemoteUrls>, GitError> {
         };
         entry(&mut remotes, name).configured.push(url.to_owned());
     }
-    let out = git.run(["remote", "-v"])?;
-    for line in String::from_utf8_lossy(&out).lines() {
-        let Some((name, rest)) = line.split_once('\t') else {
-            continue;
-        };
-        if let Some(url) = rest.strip_suffix(" (fetch)") {
-            entry(&mut remotes, name).fetch = Some(url.to_owned());
-        } else if let Some(url) = rest.strip_suffix(" (push)") {
-            entry(&mut remotes, name).push.push(url.to_owned());
+    // Remote names are config subsection names: no newline.
+    let out = git.run(["remote"])?;
+    for name in String::from_utf8_lossy(&out)
+        .split('\n')
+        .filter(|n| !n.is_empty())
+    {
+        entry(&mut remotes, name);
+    }
+    for r in &mut remotes {
+        if let Some(u) = r.configured.iter().find(|u| has_control(u)) {
+            return Err(PlanError::Config(format!(
+                "remote {}: its URL {u:?} holds a control character; fix it with: git remote set-url {} <url>",
+                r.name, r.name
+            )));
+        }
+        r.fetch = get_urls(git, &r.name, false)?;
+        r.push = get_urls(git, &r.name, true)?;
+        if let Some(u) = r.fetch.iter().chain(&r.push).find(|u| has_control(u)) {
+            return Err(PlanError::Config(format!(
+                "remote {}: git uses the URL {u:?}, which holds a control character (a url.<base>.insteadOf rewrite); remove the rewrite",
+                r.name
+            )));
         }
     }
     Ok(remotes)
@@ -310,8 +448,11 @@ pub fn remote_urls(git: &Git) -> Result<Vec<RemoteUrls>, GitError> {
 pub struct RemoteTrust {
     /// Remotes whose fetch URL, as git uses it, is trusted: their
     /// remote-tracking refs (L2 anchors, R56) and `ls-remote` answers
-    /// (R14(2)) come from the trusted server.
+    /// (R14(2)) come from the trusted server, once it confirms them
+    /// ([`RemoteRefs`]).
     pub trusted: Vec<String>,
+    /// The same remotes with that fetch URL.
+    pub trusted_urls: Vec<TrustedRemote>,
     /// Remotes with any trusted URL, configured or as git uses it: a push
     /// to one is a push to a trusted remote (R5, R20), wherever a
     /// `pushInsteadOf` sends it.
@@ -328,17 +469,29 @@ pub struct RemoteTrust {
 pub fn remote_trust(git: &Git, scope: &CompiledScope) -> Result<RemoteTrust, PlanError> {
     let mut t = RemoteTrust::default();
     for r in remote_urls(git)? {
+        if r.fetch.len() > 1 && r.all().any(|u| scope.remote_trusted(u)) {
+            return Err(PlanError::Config(format!(
+                "remote {}: it has more than one fetch URL ({}) and one matches scope.remotes; git fetches only the first, so keep one: git config --get-all remote.{}.url",
+                r.name,
+                r.fetch.join(", "),
+                r.name
+            )));
+        }
         let configured = r.configured.iter().find(|u| scope.remote_trusted(u));
-        let fetch = r.fetch.as_deref().is_some_and(|u| scope.remote_trusted(u));
+        let fetch = r.fetch.first().is_some_and(|u| scope.remote_trusted(u));
         if let (Some(c), false) = (configured, fetch) {
             return Err(PlanError::Config(format!(
                 "remote {}: its URL {c} matches scope.remotes, but git fetches it from {} (a url.<base>.insteadOf rewrite); its refs cannot be trusted. Remove the rewrite (git config --get-regexp '^url\\.'), or add that URL to scope.remotes in the host config",
                 r.name,
-                r.fetch.as_deref().unwrap_or("nowhere")
+                r.fetch.first().map_or("nowhere", String::as_str)
             )));
         }
-        if fetch {
+        if let (true, Some(url)) = (fetch, r.fetch.first()) {
             t.trusted.push(r.name.clone());
+            t.trusted_urls.push(TrustedRemote {
+                name: r.name.clone(),
+                url: url.clone(),
+            });
         }
         if fetch || configured.is_some() || r.push.iter().any(|u| scope.remote_trusted(u)) {
             t.push_trusted.push(r.name.clone());
@@ -358,14 +511,22 @@ pub fn trusted_remotes(git: &Git, scope: &CompiledScope) -> Result<Vec<String>, 
     remote_trust(git, scope).map(|t| t.trusted)
 }
 
+/// The trusted remotes of `trust` with the record of what their server
+/// reported (L2, R56).
+#[must_use]
+pub fn remote_refs(dirs: &Dirs, env: &EnvSnapshot, trust: &RemoteTrust) -> RemoteRefs {
+    RemoteRefs::new(dirs, env, trust.trusted_urls.clone())
+}
+
 /// R56: a base is trusted when its tree has a pass at `fast` or above, or
-/// its commit is reachable from a trusted remote-tracking ref.
+/// its commit is reachable from a trusted remote-tracking ref whose value
+/// the trusted server reported (a forged tracking ref does not count).
 fn base_trusted(
     git: &Git,
     store: &RecordStore,
     base: &Base,
     fp: &Fingerprint,
-    trusted: &[String],
+    remotes: &RemoteRefs,
 ) -> Result<bool, PlanError> {
     for tier in [Tier::Full, Tier::Fast] {
         let key = record_key(&base.tree, tier, fp);
@@ -379,18 +540,32 @@ fn base_trusted(
         }
     }
     if let Some(c) = &base.commit
-        && !trusted.is_empty()
+        && !remotes.is_empty()
     {
         let mut args = vec![
             "for-each-ref".to_owned(),
-            "--count=1".to_owned(),
             format!("--contains={c}"),
-            "--format=%(refname)".to_owned(),
+            "--format=%(objectname) %(refname)".to_owned(),
         ];
-        args.extend(trusted.iter().map(|r| format!("refs/remotes/{r}/")));
+        args.extend(
+            remotes
+                .remotes()
+                .iter()
+                .map(|r| format!("refs/remotes/{}/", r.name)),
+        );
         let out = git.run(&args)?;
-        if !out.trim_ascii().is_empty() {
-            return Ok(true);
+        for line in String::from_utf8_lossy(&out).lines() {
+            let Some((oid, refname)) = line.split_once(' ') else {
+                continue;
+            };
+            let (Ok(oid), Some((remote, branch))) =
+                (Oid::parse(oid), remotes.split_tracking(refname))
+            else {
+                continue;
+            };
+            if remotes.is_reported(remote, branch, &oid) {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -430,13 +605,13 @@ fn exact_selection(
 pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
     let host = &req.host.config;
     let scope = CompiledScope::new(&host.scope, req.dirs).map_err(PlanError::Config)?;
-    let trusted = trusted_remotes(req.git, &scope)?;
+    let remotes = remote_refs(req.dirs, req.env, &remote_trust(req.git, &scope)?);
     let entries = req.git.ls_tree(&req.tree)?;
     let policy = policy::resolve(
         req.git,
         &entries,
         req.tip.as_ref(),
-        &trusted,
+        &remotes,
         Some(&req.refname),
     )?;
     let config = &policy.config;
@@ -479,7 +654,7 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
     let detected = select::detect::roots_from_tree(&entries);
     let mut rust_roots = steps::rust_roots(config, req.tier, Platform::current());
     rust_roots.extend(detected.rust.iter().cloned());
-    let neutral = probe_dir(req.dirs, req.git, &[])?;
+    let neutral = probe_dir(req.dirs, req.git, &[], &[])?;
     let rust_dirs = rust_probe_dirs(req.dirs, req.git, &entries, &rust_roots)?;
     let mut tools = ToolCache::load(&req.dirs.toolcache_file());
     let mut fp = fingerprint::compute(
@@ -519,7 +694,7 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
                     Some("the base is the empty tree (R56)".to_owned()),
                     Needed::Exact(Selection::All),
                 )
-            } else if base_trusted(req.git, &store, b, &fp, &trusted)? {
+            } else if base_trusted(req.git, &store, b, &fp, &remotes)? {
                 let needed = exact_selection(req, config, &entries, &b.tree, &fp)
                     .map_or_else(|| Needed::SameBase(b.tree.clone()), Needed::Exact);
                 (true, None, needed)
@@ -817,5 +992,23 @@ pub fn wait(dirs: &Dirs, id: &JobId, deadline: Option<Instant>) -> WaitEnd {
             return WaitEnd::Running;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toolchain_files_that_name_a_dir_are_found_r51() {
+        let path = |t: &str| toolchain_path(t.as_bytes());
+        assert_eq!(
+            path("[toolchain]\npath = \"/opt/tc\"\n").as_deref(),
+            Some("/opt/tc")
+        );
+        assert_eq!(path("[toolchain]\nchannel = \"1.89\"\n"), None);
+        assert_eq!(path("nightly-2026-01-01\n"), None);
+        assert_eq!(path("../tc\n").as_deref(), Some("../tc"));
+        assert_eq!(path("[toolchain]\npath = 3\n").as_deref(), Some("?"));
     }
 }

@@ -87,6 +87,14 @@ impl ProcTable {
     }
 }
 
+/// When process `pid` started, in a platform unit (clock ticks since boot
+/// on Linux, microseconds since the epoch on macOS): with the pid, it
+/// names one process, since a reused pid gets another start time.
+#[must_use]
+pub fn start_time(pid: i32) -> Option<u64> {
+    platform::start_time(pid)
+}
+
 static SUBREAPER: AtomicBool = AtomicBool::new(false);
 
 /// Makes the calling process a child subreaper (Linux), so orphans of its
@@ -249,6 +257,16 @@ mod platform {
             .is_ok_and(|env| env.split(|b| *b == 0).any(|e| e == marker))
     }
 
+    /// Field 22 of `/proc/<pid>/stat` (`starttime`, 20th after the comm).
+    pub(super) fn start_time(pid: i32) -> Option<u64> {
+        let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        text[text.rfind(')')? + 1..]
+            .split_whitespace()
+            .nth(19)?
+            .parse()
+            .ok()
+    }
+
     pub(super) fn set_subreaper() -> io::Result<bool> {
         // SAFETY: prctl(PR_SET_CHILD_SUBREAPER, 1) changes only how orphans
         // of this process's descendants are reparented.
@@ -316,6 +334,22 @@ mod platform {
     /// No portable way to read another process's environment here.
     pub(super) fn environ_has(_pid: i32, _marker: &[u8]) -> bool {
         false
+    }
+
+    /// `pbi_start_tvsec` and `pbi_start_tvusec` of `PROC_PIDTBSDINFO`.
+    pub(super) fn start_time(pid: i32) -> Option<u64> {
+        // SAFETY: proc_bsdinfo is plain old data; zeroed is valid.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+        // SAFETY: `info` is a writable proc_bsdinfo of `size` bytes.
+        let r = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+        };
+        (r == size).then(|| {
+            info.pbi_start_tvsec
+                .saturating_mul(1_000_000)
+                .saturating_add(info.pbi_start_tvusec)
+        })
     }
 }
 

@@ -11,7 +11,10 @@
 //! `target`, `node_modules`, `.venv` and the steps' `cache_dirs`, then no
 //! untracked file and no index/worktree difference may be left, and
 //! `write-tree` must equal `T`. After each step, no tracked file, index
-//! entry or untracked file may have changed ([`Checkout::changes`]).
+//! entry or untracked file may have changed, the overlaid tool configs
+//! must hold what the overlay wrote, and no untracked or ignored file
+//! outside the kept dirs may carry a tool-config name ([`Checkout::changes`],
+//! R71).
 
 use std::fs;
 use std::io;
@@ -29,6 +32,10 @@ use crate::runner::env::JobEnv;
 
 /// Dirs `git clean` keeps in every checkout (R42, R43).
 pub const KEEP_DIRS: &[&str] = &["target", "node_modules", ".venv"];
+
+/// Entries [`Checkout::check_links`] reads under link targets that are not
+/// tree content before it gives up (and refuses).
+const LINK_WALK_BUDGET: usize = 20_000;
 
 /// Metadata next to a checkout (L15 LRU, R45 setup state).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,16 +431,22 @@ impl Checkout {
 
     /// R42 after a step: tracked files whose content differs from the
     /// index, index entries that differ from `tree` (a step ran `git add`),
-    /// and untracked files that were not in `before`. Paths in `allowed`
-    /// (the R71 tool configs the job itself replaced) do not count.
+    /// and untracked files that were not in `before`. The R71 tool configs
+    /// the job itself replaced (`overlay`) differ from the index on
+    /// purpose: each counts when it no longer holds what the overlay wrote
+    /// (content, mode, link target, or absence).
     pub fn changes(
         &self,
         env: &JobEnv,
         tree: &Oid,
         cache_dirs: &[String],
         before: &std::collections::BTreeSet<String>,
-        allowed: &std::collections::BTreeSet<String>,
+        overlay: &std::collections::BTreeMap<PathBuf, crate::policy::OverlayFile>,
     ) -> Result<Vec<String>, CheckoutError> {
+        let allowed: std::collections::BTreeSet<String> = overlay
+            .keys()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         let git = self.git(env);
         let mut changed: std::collections::BTreeSet<String> =
             self.tracked_changes(env)?.into_iter().collect();
@@ -444,12 +457,9 @@ impl Checkout {
             "-z",
             tree.as_str(),
         ])?));
-        changed.extend(
-            self.untracked(env, cache_dirs)?
-                .into_iter()
-                .filter(|p| !before.contains(p)),
-        );
-        Ok(changed
+        let untracked = self.untracked(env, cache_dirs)?;
+        changed.extend(untracked.iter().filter(|p| !before.contains(*p)).cloned());
+        let mut out: Vec<String> = changed
             .into_iter()
             .filter(|p| {
                 !allowed.contains(p)
@@ -457,7 +467,125 @@ impl Checkout {
                         .iter()
                         .any(|a| p.ends_with('/') && a.starts_with(p.as_str()))
             })
-            .collect())
+            .collect();
+        out.extend(self.overlay_changes(overlay));
+        out.extend(self.foreign_tool_configs(env, cache_dirs, &untracked, overlay)?);
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// R71, R42: untracked or ignored files with a tool-config name that
+    /// the overlay did not write, outside the kept dirs. A branch's
+    /// `.gitignore` decides what [`Checkout::untracked`] sees, so it could
+    /// hide a `.cargo/config.toml` that a step (a `build.rs`) writes for
+    /// the next step; other ignored files (caches) do not count. Ignored
+    /// dirs are listed as dirs (git does not list a whole `target/`) and
+    /// walked here, skipping kept dirs; a walk over the budget counts.
+    /// `untracked` is [`Checkout::untracked`] as it is now.
+    pub fn foreign_tool_configs(
+        &self,
+        env: &JobEnv,
+        cache_dirs: &[String],
+        untracked: &std::collections::BTreeSet<String>,
+        overlay: &std::collections::BTreeMap<PathBuf, crate::policy::OverlayFile>,
+    ) -> Result<Vec<String>, CheckoutError> {
+        let mut entries = nul_list(&self.git(env).run([
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ])?);
+        entries.extend(untracked.iter().cloned());
+        let kept = |rel: &Path| !self.tree_content(&self.path.join(rel), cache_dirs);
+        let foreign = |rel: &Path| {
+            crate::policy::is_tool_config(rel) && !overlay.contains_key(rel) && !kept(rel)
+        };
+        let mut out = Vec::new();
+        let mut budget = LINK_WALK_BUDGET;
+        for e in entries {
+            let rel = PathBuf::from(e.trim_end_matches('/'));
+            if kept(&rel) {
+                continue;
+            }
+            // A dir entry: name the files in it, not the dir.
+            if !e.ends_with('/') {
+                if foreign(&rel) {
+                    out.push(rel.to_string_lossy().into_owned());
+                }
+                continue;
+            }
+            let mut stack = vec![rel];
+            while let Some(d) = stack.pop() {
+                let Ok(rd) = fs::read_dir(self.path.join(&d)) else {
+                    continue;
+                };
+                for f in rd.flatten() {
+                    if budget == 0 {
+                        out.push(format!("{}/ (too many files to check)", d.display()));
+                        return Ok(out);
+                    }
+                    budget -= 1;
+                    let rel = d.join(f.file_name());
+                    if kept(&rel) {
+                        continue;
+                    }
+                    if f.file_type().is_ok_and(|t| t.is_dir()) {
+                        stack.push(rel);
+                    } else if foreign(&rel) {
+                        out.push(rel.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// R71: the overlay paths that no longer hold what
+    /// [`Checkout::apply_overlay`] wrote: other content or mode, another
+    /// link target, a file where none should be, or a parent dir that is a
+    /// symlink now.
+    #[must_use]
+    pub fn overlay_changes(
+        &self,
+        overlay: &std::collections::BTreeMap<PathBuf, crate::policy::OverlayFile>,
+    ) -> Vec<String> {
+        use crate::policy::OverlayFile;
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut out = Vec::new();
+        for (rel, want) in overlay {
+            let path = self.path.join(rel);
+            let mut dir = self.path.clone();
+            let linked_parent = rel
+                .parent()
+                .into_iter()
+                .flat_map(Path::components)
+                .any(|c| {
+                    dir.push(c);
+                    dir.symlink_metadata()
+                        .is_ok_and(|m| m.file_type().is_symlink())
+                });
+            let md = path.symlink_metadata();
+            let same = !linked_parent
+                && match (want, &md) {
+                    (OverlayFile::Absent, Err(e)) => e.kind() == io::ErrorKind::NotFound,
+                    (OverlayFile::Absent, Ok(_)) => false,
+                    (OverlayFile::File { text, executable }, Ok(m)) if m.file_type().is_file() => {
+                        (m.permissions().mode() & 0o100 != 0) == *executable
+                            && fs::read(&path).is_ok_and(|b| b == text.as_bytes())
+                    }
+                    (OverlayFile::Symlink { target }, Ok(m)) if m.file_type().is_symlink() => {
+                        fs::read_link(&path).is_ok_and(|t| t == Path::new(target))
+                    }
+                    _ => false,
+                };
+            if !same {
+                out.push(rel.to_string_lossy().into_owned());
+            }
+        }
+        out
     }
 
     /// Tracked files whose content differs from the index.
@@ -525,6 +653,122 @@ impl Checkout {
             }
         }
         Ok(())
+    }
+
+    /// R71 after the overlay: refuses a tool config reached through a
+    /// symlink among `links` (the tree's symlinks and the overlay's): a
+    /// symlinked tool config, a `.cargo` symlink whose target holds cargo
+    /// config, and a dir symlink whose target is not tree content (outside
+    /// the checkout, or in a kept dir such as `target/`) and holds a file
+    /// with a tool-config name. The policy commit's own links count too:
+    /// the branch can change what they point at. A dir link inside the
+    /// checkout's tree content needs no walk: every tool config there is a
+    /// tree path, and the overlay already set it.
+    pub fn check_links<'p>(
+        &self,
+        links: impl IntoIterator<Item = &'p Path>,
+        cache_dirs: &[String],
+    ) -> Result<(), CheckoutError> {
+        let mut budget = LINK_WALK_BUDGET;
+        let mut seen = std::collections::BTreeSet::new();
+        for rel in links {
+            let p = self.path.join(rel);
+            if !p
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+            {
+                continue;
+            }
+            let refuse = |why: String| {
+                Err(CheckoutError::Mismatch(format!(
+                    "{} {why} (R71: a tool config must be a regular file in the tree)",
+                    rel.display()
+                )))
+            };
+            let cargo_dir = rel.file_name() == Some(std::ffi::OsStr::new(".cargo"));
+            if crate::policy::is_tool_config(rel) && !cargo_dir {
+                return refuse("is a symlink".into());
+            }
+            // A dangling link or a link to a file reaches no config dir.
+            let Ok(target) = fs::canonicalize(&p) else {
+                continue;
+            };
+            if !target.is_dir() {
+                continue;
+            }
+            if cargo_dir && ["config.toml", "config"].iter().any(|c| p.join(c).exists()) {
+                return refuse("links to a dir that holds cargo config".into());
+            }
+            if let Some(found) = self.foreign_config(&target, cache_dirs, &mut budget, &mut seen)? {
+                return refuse(format!(
+                    "links to {}, which is not tree content and holds the tool config {}",
+                    target.display(),
+                    found.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// True when canonical `path` is tree content: inside the checkout and
+    /// in no kept dir (after [`Checkout::update`] nothing else is there).
+    fn tree_content(&self, path: &Path, cache_dirs: &[String]) -> bool {
+        let Ok(rel) = path.strip_prefix(&self.path) else {
+            return false;
+        };
+        !rel.components().any(|c| {
+            let c = c.as_os_str();
+            KEEP_DIRS.iter().any(|k| c == *k)
+                || cache_dirs
+                    .iter()
+                    .any(|d| c == d.as_str() || rel.starts_with(d.trim_end_matches('/')))
+        })
+    }
+
+    /// A file under `dir` (not tree content) whose name a tool looks for
+    /// (`clippy.toml`, `rustfmt.toml`, `.cargo/config.toml`, ...), walking
+    /// nested dir links the same way; a walk over `budget` entries counts
+    /// as found (fail closed).
+    fn foreign_config(
+        &self,
+        dir: &Path,
+        cache_dirs: &[String],
+        budget: &mut usize,
+        seen: &mut std::collections::BTreeSet<PathBuf>,
+    ) -> Result<Option<PathBuf>, CheckoutError> {
+        if self.tree_content(dir, cache_dirs) || !seen.insert(dir.to_owned()) {
+            return Ok(None);
+        }
+        let mut stack = vec![dir.to_owned()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                if *budget == 0 {
+                    return Ok(Some(d.join("...")));
+                }
+                *budget -= 1;
+                let p = e.path();
+                let Ok(md) = p.symlink_metadata() else {
+                    continue;
+                };
+                let rel = p.strip_prefix(dir).unwrap_or(&p);
+                if crate::policy::is_tool_config(rel)
+                    || crate::policy::is_tool_config(Path::new(&e.file_name()))
+                {
+                    return Ok(Some(p));
+                }
+                if md.is_dir() {
+                    stack.push(p);
+                } else if md.file_type().is_symlink()
+                    && let Ok(t) = fs::canonicalize(&p)
+                    && t.is_dir()
+                    && let Some(f) = self.foreign_config(&t, cache_dirs, budget, seen)?
+                {
+                    return Ok(Some(f));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Updates the meta file with `f`.

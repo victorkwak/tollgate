@@ -62,21 +62,58 @@ fn hook_latency_budgets_l19() {
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v.to_string_lossy().into_owned())),
     );
-    let chained = || {
-        let mut cmd = std::process::Command::new(test_hooks_dir().join("post-commit"));
+    let hook = |name: &str| {
+        let mut cmd = std::process::Command::new(test_hooks_dir().join(name));
         cmd.env_clear()
             .current_dir(&repo)
             .stdin(std::process::Stdio::null());
         for (k, v) in &cmd_env {
             cmd.env(k, v);
         }
-        assert!(cmd.status().unwrap().success());
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    let chained = || {
+        hook("post-checkout");
     };
     chained();
     let t = p95(3, 40, chained);
     assert!(
         t < Duration::from_millis(5),
         "chained hook p95 {t:?} (L19: 5 ms)"
+    );
+    // post-commit after a gate hook of the same git process allowed the
+    // commit (item 17): it takes the marker, no subprocess, same budget.
+    // The test process stands in for that git process.
+    let dirs = tollgate::dirs::Dirs::from_env(&sb.env()).unwrap();
+    let me = i32::try_from(std::process::id()).unwrap();
+    let mut best = Duration::MAX;
+    for _ in 0..3 {
+        let mut t: Vec<Duration> = (0..40)
+            .map(|_| {
+                tollgate::hook::unverified::mark_gate_run_of(&dirs, me);
+                let s = Instant::now();
+                let out = hook("post-commit");
+                let d = s.elapsed();
+                assert!(
+                    out.stderr.is_empty(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                d
+            })
+            .collect();
+        t.sort();
+        best = best.min(t[38]);
+    }
+    assert!(
+        best < Duration::from_millis(5),
+        "post-commit with a gate marker p95 {best:?} (L19: 5 ms)"
     );
 
     // pre-commit on a cache hit: under 200 ms.
@@ -168,10 +205,13 @@ fn docs_only_pre_commit_with_detected_roots_stays_in_budget_l19_r61_r65() {
     }
     sb.git(&repo, &["add", "-A"]);
     sb.git(&repo, &["commit", "-q", "-m", "roots"]);
-    // A trusted remote has the base, so selection is on (R56).
+    // A trusted remote has the base, so selection is on (R56); the server
+    // confirms the fetched value once, then the record of its answer does.
     let url = sb.root().join("remotes/trusted.git");
+    sb.git(&sb.root(), &["init", "-q", "--bare", url.to_str().unwrap()]);
     sb.git(&repo, &["remote", "add", "origin", url.to_str().unwrap()]);
-    sb.git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    sb.git(&repo, &["push", "-q", "origin", "main"]);
+    sb.git(&repo, &["fetch", "-q", "origin"]);
     let effective = sb.tollgate(&repo, &["config", "--effective"]);
     for step in ["web bun test", "py pytest"] {
         assert!(effective.out.contains(step), "{step:?}: {}", effective.out);

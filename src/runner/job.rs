@@ -501,8 +501,28 @@ impl Runner<'_> {
         if let Err(e) = co.update(&self.env, &self.spec.tree, &cache_dirs) {
             return error(ErrorCause::Checkout, e.to_string());
         }
-        // R71: the policy commit's tool configs, never the branch's own.
+        // R71: the policy commit's tool configs, never the branch's own,
+        // and none reached through a symlink.
         if let Err(e) = co.apply_overlay(&self.spec.policy.overlay) {
+            return error(ErrorCause::Checkout, e.to_string());
+        }
+        let entries = match self.repo_git.ls_tree(&self.spec.tree) {
+            Ok(e) => e,
+            Err(e) => return error(ErrorCause::Internal, e.to_string()),
+        };
+        let links = entries
+            .iter()
+            .filter(|e| e.mode == "120000")
+            .map(|e| e.path.as_path())
+            .chain(
+                self.spec
+                    .policy
+                    .overlay
+                    .iter()
+                    .filter(|(_, f)| matches!(f, crate::policy::OverlayFile::Symlink { .. }))
+                    .map(|(p, _)| p.as_path()),
+            );
+        if let Err(e) = co.check_links(links, &cache_dirs) {
             return error(ErrorCause::Checkout, e.to_string());
         }
         self.say(&format!(
@@ -510,10 +530,6 @@ impl Runner<'_> {
             co.path.display(),
             self.spec.tree
         ));
-        let entries = match self.repo_git.ls_tree(&self.spec.tree) {
-            Ok(e) => e,
-            Err(e) => return error(ErrorCause::Internal, e.to_string()),
-        };
         if let Some(end) = self.setup(co, &config, &entries) {
             return end;
         }
@@ -893,19 +909,14 @@ impl Runner<'_> {
         let mut verdict = Verdict::Pass;
         let mut error_end: Option<End> = None;
         // R42: what the checkout holds before the first step (setup and
-        // `cargo metadata` may add untracked files such as `Cargo.lock`);
-        // R71: the tool configs the job replaced itself.
+        // `cargo metadata` may add untracked files such as `Cargo.lock`).
+        // R71: after each step, each overlaid tool config must still hold
+        // what the overlay wrote (setup steps included, as the first
+        // check runs after them).
         let cache_dirs: Vec<String> = config
             .steps
             .iter()
             .flat_map(|s| s.cache_dirs.iter().cloned())
-            .collect();
-        let allowed: BTreeSet<String> = self
-            .spec
-            .policy
-            .overlay
-            .keys()
-            .map(|p| p.to_string_lossy().into_owned())
             .collect();
         let before = match co.map(|c| c.untracked(&self.env, &cache_dirs)).transpose() {
             Ok(b) => b.unwrap_or_default(),
@@ -1244,7 +1255,13 @@ impl Runner<'_> {
             // R42 after every step that ran, so a step that changes the tree
             // is named and its pass is never stored for reuse (L16).
             if !stop && let Some(co) = co {
-                match co.changes(&self.env, &self.spec.tree, &cache_dirs, &before, &allowed) {
+                match co.changes(
+                    &self.env,
+                    &self.spec.tree,
+                    &cache_dirs,
+                    &before,
+                    &self.spec.policy.overlay,
+                ) {
                     Ok(changed) if !changed.is_empty() => {
                         rep.status = StepStatus::Error;
                         rep.message = Some(format!(

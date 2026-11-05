@@ -29,6 +29,7 @@ pub mod merge;
 pub mod plan;
 pub mod policy;
 pub mod procs;
+pub mod remote_refs;
 pub mod report;
 pub mod runner;
 pub mod sched;
