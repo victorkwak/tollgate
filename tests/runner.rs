@@ -1211,6 +1211,118 @@ echo "$(basename "$0") $ch"
     );
 }
 
+/// R51, item 7: the version probe of the plan (hook context) never runs a
+/// tool that the tree chooses. A toolchain file with `path = ...` makes
+/// rustup run `<path>/bin/rustc`: refused. A symlinked toolchain file is
+/// written as the regular file it names in the same tree; one that leaves
+/// the tree is refused. The probe dir never holds a symlink.
+#[test]
+fn the_toolchain_probe_runs_no_tool_the_tree_chooses_r51_r74() {
+    let sb = Sandbox::new();
+    let bin = sb.root().join("fakebin");
+    // A rustup stand-in that honors `path` and `channel` as rustup does.
+    support::write_exe(
+        &bin.join("rustup"),
+        r#"#!/bin/sh
+d=$PWD; ch=default
+while :; do
+  f="$d/rust-toolchain.toml"
+  if [ -f "$f" ]; then
+    p=$(sed -n 's/^path *= *"\(.*\)"/\1/p' "$f")
+    [ -n "$p" ] && exec "$p/bin/$(basename "$0")" "$@"
+    ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$f"); break
+  fi
+  [ "$d" = / ] && break
+  d=$(dirname "$d")
+done
+echo "$(basename "$0") $ch"
+"#,
+    );
+    for name in ["rustc", "cargo", "cargo-nextest"] {
+        std::os::unix::fs::symlink("rustup", bin.join(name)).unwrap();
+    }
+    host(
+        &sb,
+        &format!("[job]\npath_prepend = [\"{}\"]\n", bin.display()),
+    );
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n",
+    );
+    sb.commit_file(&repo, "Cargo.toml", "[workspace]\n", "cargo");
+    // A "toolchain" whose rustc only leaves a mark.
+    let evil = sb.root().join("evil");
+    let mark = sb.root().join("evil-ran");
+    for name in ["rustc", "cargo", "cargo-nextest"] {
+        support::write_exe(
+            &evil.join("bin").join(name),
+            &format!("#!/bin/sh\ntouch '{}'\necho {name} evil\n", mark.display()),
+        );
+    }
+    let fp = |r: &support::Run| -> String {
+        let spec = std::fs::read(
+            sb.state()
+                .join("jobs")
+                .join(job_id(&r.out))
+                .join("spec.json"),
+        )
+        .unwrap();
+        let spec: serde_json::Value = serde_json::from_slice(&spec).unwrap();
+        spec["fingerprint"]["rustc"]
+            .as_str()
+            .unwrap_or("none")
+            .to_owned()
+    };
+    sb.commit_file(
+        &repo,
+        "rust-toolchain.toml",
+        &format!("[toolchain]\npath = \"{}\"\n", evil.display()),
+        "path toolchain",
+    );
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_ne!(r.code, Some(0), "{}", r.out);
+    assert!(r.out.contains("path"), "{}", r.out);
+    assert!(!mark.exists(), "the plan ran the tree's toolchain");
+    // A link out of the tree is refused.
+    let outside = sb.root().join("outside.toml");
+    std::fs::write(&outside, "[toolchain]\nchannel = \"outside\"\n").unwrap();
+    std::fs::remove_file(repo.join("rust-toolchain.toml")).unwrap();
+    std::os::unix::fs::symlink(&outside, repo.join("rust-toolchain.toml")).unwrap();
+    sb.git(&repo, &["add", "rust-toolchain.toml"]);
+    sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "link out"]);
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_ne!(r.code, Some(0), "{}", r.out);
+    assert!(r.out.contains("rust-toolchain.toml"), "{}", r.out);
+    // A link to a file of the same tree reads as that file.
+    sb.commit_file(
+        &repo,
+        "tools/tc.toml",
+        "[toolchain]\nchannel = \"1.91\"\n",
+        "tc",
+    );
+    std::fs::remove_file(repo.join("rust-toolchain.toml")).unwrap();
+    std::os::unix::fs::symlink("tools/tc.toml", repo.join("rust-toolchain.toml")).unwrap();
+    sb.git(&repo, &["add", "rust-toolchain.toml"]);
+    sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "link in"]);
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(fp(&r), "rustc 1.91");
+    assert!(!mark.exists());
+    for e in std::fs::read_dir(sb.state().join("probe"))
+        .unwrap()
+        .flatten()
+    {
+        for f in std::fs::read_dir(e.path()).into_iter().flatten().flatten() {
+            assert!(
+                !f.file_type().unwrap().is_symlink(),
+                "{}",
+                f.path().display()
+            );
+        }
+    }
+}
+
 #[test]
 fn a_dead_runner_leaves_no_step_and_no_free_slot_behind_r35_r85() {
     let sb = Sandbox::new();

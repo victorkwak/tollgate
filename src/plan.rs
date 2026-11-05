@@ -141,24 +141,115 @@ fn toolchain_files<'a>(
     Vec::new()
 }
 
+/// How many symlinks a toolchain file may go through inside the tree.
+const MAX_TOOLCHAIN_LINKS: usize = 8;
+
+/// The content of toolchain file `e` as a regular file (R51): a symlink is
+/// followed only to a file of the same tree. Returns the blob id and its
+/// bytes.
+fn toolchain_blob(
+    git: &Git,
+    entries: &[crate::gitx::TreeEntry],
+    e: &crate::gitx::TreeEntry,
+) -> Result<(Oid, Vec<u8>), PlanError> {
+    let refuse = |why: String| {
+        PlanError::Config(format!(
+            "{}: {why}; the hook runs no tool the tree chooses (R51)",
+            e.path.display()
+        ))
+    };
+    let mut cur = e.clone();
+    for _ in 0..=MAX_TOOLCHAIN_LINKS {
+        match cur.mode.as_str() {
+            "100644" | "100755" => {
+                let bytes = git.run(["cat-file", "blob", cur.oid.as_str()])?;
+                return Ok((cur.oid.clone(), bytes));
+            }
+            "120000" => {
+                let target = git.run(["cat-file", "blob", cur.oid.as_str()])?;
+                let target = PathBuf::from(std::ffi::OsString::from(
+                    String::from_utf8_lossy(&target).into_owned(),
+                ));
+                let mut path = cur.path.parent().map(Path::to_owned).unwrap_or_default();
+                for c in target.components() {
+                    match c {
+                        std::path::Component::Normal(n) => path.push(n),
+                        std::path::Component::CurDir => {}
+                        std::path::Component::ParentDir if path.pop() => {}
+                        _ => {
+                            return Err(refuse(format!(
+                                "a symlink to {}, which is not a file of the same tree",
+                                target.display()
+                            )));
+                        }
+                    }
+                }
+                cur = entries
+                    .iter()
+                    .find(|x| x.path == path && x.kind == "blob")
+                    .cloned()
+                    .ok_or_else(|| {
+                        refuse(format!(
+                            "a symlink to {}, which is not a file of the same tree",
+                            target.display()
+                        ))
+                    })?;
+            }
+            mode => return Err(refuse(format!("mode {mode} is not a file"))),
+        }
+    }
+    Err(refuse("too many symlinks".into()))
+}
+
+/// R51: a toolchain file that names a toolchain dir (`[toolchain] path`,
+/// or a legacy `rust-toolchain` line with a path) would make the version
+/// probe run `<path>/bin/rustc`, a binary the tree chooses, in the hook.
+fn toolchain_path(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    if let Ok(v) = text.parse::<toml::Table>()
+        && let Some(t) = v.get("toolchain").and_then(toml::Value::as_table)
+    {
+        return t.get("path").map(|p| p.as_str().unwrap_or("?").to_owned());
+    }
+    let line = text.trim();
+    (!line.contains('\n') && (line.contains('/') || line.contains('\\'))).then(|| line.to_owned())
+}
+
 /// A dir under the state dir holding `files` under their file names,
 /// content-addressed and made once (R51, R74): version probes run there,
 /// so rustup picks the toolchain the tree names, not one from the agent's
 /// working tree (dirty, untracked or another branch's), and no tool runs in
-/// the agent's checkout.
+/// the agent's checkout. The dir holds regular files only: a symlinked
+/// toolchain file is written as the file it names in `entries` (the same
+/// tree), and one that names a toolchain dir is refused, so the probe never
+/// runs a tool the tree chooses (R51).
 fn probe_dir(
     dirs: &Dirs,
     git: &Git,
     files: &[&crate::gitx::TreeEntry],
+    entries: &[crate::gitx::TreeEntry],
 ) -> Result<PathBuf, PlanError> {
-    let mut h = blake3::Hasher::new();
-    h.update(b"tollgate probe dir 1\0");
+    let mut blobs = Vec::new();
     for e in files {
-        h.update(e.path.file_name().unwrap_or_default().as_encoded_bytes());
+        let (oid, bytes) = toolchain_blob(git, entries, e)?;
+        if let Some(p) = toolchain_path(&bytes) {
+            return Err(PlanError::Config(format!(
+                "{}: names the toolchain path {p}; the hook runs no tool the tree chooses (R51), so use a channel",
+                e.path.display()
+            )));
+        }
+        blobs.push((
+            e.path.file_name().unwrap_or_default().to_owned(),
+            oid,
+            bytes,
+        ));
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"tollgate probe dir 2\0");
+    for (name, oid, _) in &blobs {
+        h.update(name.as_encoded_bytes());
         h.update(b"\0");
-        h.update(e.mode.as_bytes());
-        h.update(b"\0");
-        h.update(e.oid.as_str().as_bytes());
+        h.update(oid.as_str().as_bytes());
         h.update(b"\0");
     }
     let root = dirs.probe_root();
@@ -169,16 +260,8 @@ fn probe_dir(
     let io = |e: std::io::Error| PlanError::Io(format!("{}: {e}", root.display()));
     let tmp = root.join(format!(".tmp-{}", crate::fsx::unique_suffix()));
     std::fs::create_dir_all(&tmp).map_err(io)?;
-    for e in files {
-        let name = e.path.file_name().unwrap_or_default();
-        let bytes = git.run(["cat-file", "blob", e.oid.as_str()])?;
-        if e.mode == "120000" {
-            use std::os::unix::ffi::OsStrExt as _;
-            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&bytes), tmp.join(name))
-                .map_err(io)?;
-        } else {
-            std::fs::write(tmp.join(name), bytes).map_err(io)?;
-        }
+    for (name, _, bytes) in &blobs {
+        std::fs::write(tmp.join(name), bytes).map_err(io)?;
     }
     match std::fs::rename(&tmp, &dir) {
         Ok(()) => Ok(dir),
@@ -204,7 +287,7 @@ fn rust_probe_dirs(
 ) -> Result<Vec<(String, PathBuf)>, PlanError> {
     let mut out: Vec<(String, PathBuf)> = Vec::new();
     for root in roots {
-        let dir = probe_dir(dirs, git, &toolchain_files(entries, root))?;
+        let dir = probe_dir(dirs, git, &toolchain_files(entries, root), entries)?;
         if out.iter().any(|(_, d)| *d == dir) {
             continue;
         }
@@ -571,7 +654,7 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
     let detected = select::detect::roots_from_tree(&entries);
     let mut rust_roots = steps::rust_roots(config, req.tier, Platform::current());
     rust_roots.extend(detected.rust.iter().cloned());
-    let neutral = probe_dir(req.dirs, req.git, &[])?;
+    let neutral = probe_dir(req.dirs, req.git, &[], &[])?;
     let rust_dirs = rust_probe_dirs(req.dirs, req.git, &entries, &rust_roots)?;
     let mut tools = ToolCache::load(&req.dirs.toolcache_file());
     let mut fp = fingerprint::compute(
@@ -909,5 +992,23 @@ pub fn wait(dirs: &Dirs, id: &JobId, deadline: Option<Instant>) -> WaitEnd {
             return WaitEnd::Running;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toolchain_files_that_name_a_dir_are_found_r51() {
+        let path = |t: &str| toolchain_path(t.as_bytes());
+        assert_eq!(
+            path("[toolchain]\npath = \"/opt/tc\"\n").as_deref(),
+            Some("/opt/tc")
+        );
+        assert_eq!(path("[toolchain]\nchannel = \"1.89\"\n"), None);
+        assert_eq!(path("nightly-2026-01-01\n"), None);
+        assert_eq!(path("../tc\n").as_deref(), Some("../tc"));
+        assert_eq!(path("[toolchain]\npath = 3\n").as_deref(), Some("?"));
     }
 }
