@@ -2,7 +2,9 @@
 //! attach to the job, wait (R15, R32, R34, R53, R56, R74, R78-R81, R88,
 //! R89, L2, L16).
 //!
-//! Used by `tollgate check` now and by the gate hooks later. It runs only
+//! Used by `tollgate check` now and by the gate hooks later, through
+//! [`plan`], [`lookup`], [`start`] and [`settle`] (never [`wait`] alone on
+//! an attached job: its selection may differ, R79, R88). It runs only
 //! `git` (R51) and tool version probes that the tool cache usually answers
 //! (R75): no `cargo`. The exact selection a `fast` lookup needs comes from
 //! workspace maps the runner cached for the tree's manifests; without them
@@ -637,7 +639,11 @@ pub fn settle(
                     Lookup::Miss => {}
                     found => return Ok(Settled::Record(Box::new(found))),
                 }
-                current = start(dirs, plan, exe, env)?;
+                // The queue budget (R33) counts from now, not from when
+                // this plan attached.
+                let mut own = plan.clone();
+                own.spec.created = jiff::Timestamp::now();
+                current = start(dirs, &own, exe, env)?;
                 on_start(&current);
             }
         }
