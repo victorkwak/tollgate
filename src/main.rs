@@ -112,6 +112,7 @@ fn run() -> u8 {
             action: BaselineAction::Record { kind, force },
         } => tollgate::steps::baseline::record_cmd(&ctx.env, &ctx.cwd, kind.kind(), force),
         Command::CiSnippet { gitlab: _ } => tollgate::ci::ci_snippet_cmd(),
+        Command::Bench(b) => tollgate::bench::bench(&ctx, &b.args()),
     }
 }
 
@@ -349,6 +350,9 @@ enum Command {
     },
     /// PreToolUse entry point; reads hook JSON on stdin (R23).
     Guard,
+    /// Dev: replay concurrent commits from N worktrees through the real
+    /// hooks and report latency, queue wait, load and reuse (L20).
+    Bench(BenchCmd),
     /// Run a hook by name (same as the hook link).
     Hook {
         name: String,
@@ -374,6 +378,92 @@ enum Command {
         #[arg(long)]
         baseline: Option<PathBuf>,
     },
+}
+
+/// `tollgate bench` (L20). The source repo is never written: the bench
+/// clones it into its own scratch dir, with its own state and host config.
+#[derive(Debug, Args)]
+struct BenchCmd {
+    /// The repo to replay commits on (any dir in it).
+    repo: PathBuf,
+    /// TOML file of `[[scenario]]` tables: name, worktrees, retries, edit.
+    #[arg(long)]
+    scenarios: PathBuf,
+    /// N, the number of worktrees; must equal the scenarios' total.
+    #[arg(long, short = 'n')]
+    worktrees: Option<u32>,
+    /// Commits per worktree (each round edits and commits again).
+    #[arg(long, default_value_t = 1)]
+    rounds: u32,
+    /// Parent dir of the scratch dir (default `$TMPDIR`). Verify
+    /// checkouts and build output go there.
+    #[arg(long)]
+    scratch: Option<PathBuf>,
+    /// Keep the scratch dir for inspection.
+    #[arg(long)]
+    keep: bool,
+    /// `cpu` resource slots.
+    #[arg(long)]
+    cpu: Option<u32>,
+    /// `pg` resource slots.
+    #[arg(long)]
+    pg: Option<u32>,
+    /// `nextest.pg_max_threads`.
+    #[arg(long)]
+    pg_max_threads: Option<u32>,
+    /// Host config to start from (job env, nextest, budgets); scope and
+    /// verify root are always the bench's.
+    #[arg(long)]
+    base_config: Option<PathBuf>,
+    /// `verify.min_free` (default: the base config's, else 30G).
+    #[arg(long)]
+    min_free: Option<String>,
+    /// `TOLLGATE_INLINE_CAP` of the commits, in seconds.
+    #[arg(long)]
+    inline_cap: Option<u64>,
+    /// Postgres URL whose connections to sample with psql.
+    #[arg(long)]
+    pg_url: Option<String>,
+    /// The psql program.
+    #[arg(long, default_value = "psql")]
+    psql: PathBuf,
+    /// Sample interval of CPU load and Postgres, in milliseconds.
+    #[arg(long, default_value_t = 250)]
+    sample_ms: u64,
+    /// Skip the warm-up check of the start commit.
+    #[arg(long)]
+    no_warm: bool,
+    /// Print JSON instead of text.
+    #[arg(long)]
+    json: bool,
+    /// Also write the JSON report to this file.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+impl BenchCmd {
+    fn args(&self) -> tollgate::bench::BenchArgs {
+        tollgate::bench::BenchArgs {
+            repo: self.repo.clone(),
+            scenarios: self.scenarios.clone(),
+            worktrees: self.worktrees,
+            rounds: self.rounds,
+            scratch: self.scratch.clone(),
+            keep: self.keep,
+            cpu: self.cpu,
+            pg: self.pg,
+            pg_max_threads: self.pg_max_threads,
+            base_config: self.base_config.clone(),
+            min_free: self.min_free.clone(),
+            inline_cap: self.inline_cap,
+            pg_url: self.pg_url.clone(),
+            psql: self.psql.clone(),
+            sample_ms: self.sample_ms,
+            warm: !self.no_warm,
+            json: self.json,
+            out: self.out.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Args)]

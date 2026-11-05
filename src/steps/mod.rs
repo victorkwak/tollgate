@@ -65,6 +65,10 @@ impl Scope {
     }
 }
 
+/// The skip reason of every step of a docs-only `fast` job (R61). Reports
+/// carry it; `tollgate bench` finds docs-only jobs by it (L20).
+pub const DOCS_ONLY_SKIP: &str = "docs-only change (R61)";
+
 /// Run or skip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -140,7 +144,7 @@ pub fn plan(
 
 fn fast_decision(s: &Step, p: &Picked, broad: GlobOpts) -> Decision {
     if p.code_paths.is_empty() {
-        return Decision::Skip("docs-only change (R61)".into());
+        return Decision::Skip(DOCS_ONLY_SKIP.into());
     }
     let root = step_root(s);
     if is_rust(s.kind) {

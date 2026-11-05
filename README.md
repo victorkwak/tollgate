@@ -95,6 +95,50 @@ When a hook waits longer than its inline budget, it denies and leaves the job ru
 
 `tollgate ci-snippet --gitlab` prints a `.gitlab-ci.yml` job (R73). It runs `tollgate run --tier full --here --report junit`, which runs the setup steps and every step in the CI clone, writes `tollgate-report/report.json` and `tollgate-report/junit.xml` (one test case per step, plus the nextest test suites), and exits non-zero on a failure (R47). On a runner that shares the workstation's test services, the job takes the host resource slots. On hosted runners, add `--no-host-locks`.
 
+## Benchmark (L20)
+
+`tollgate bench` replays commits concurrently from N worktrees of one repo through the real hooks, and reports what the gate costs. Use it to choose the resource slots before a rollout (R98 step 3).
+
+```sh
+tollgate bench ~/Repos/myapp --scenarios bench.toml -n 6 --rounds 2 \
+  --cpu 3 --pg 2 --pg-max-threads 12 --base-config ~/.config/tollgate/config.toml \
+  --scratch /mnt/devdisk/scratch --pg-url postgres://... --out bench.json
+```
+
+The scenario file lists the commits. Each scenario gives its worktree count, the file edits before each commit, and how many times to commit the same tree again (`retries`). The worktree counts must add up to N.
+
+```toml
+[[scenario]]
+name = "core"
+worktrees = 2
+edit = [{ path = "crates/core/src/lib.rs", append = "\n// bench {worktree}.{round}\n" }]
+
+[[scenario]]
+name = "docs"
+worktrees = 1
+retries = 1
+edit = [{ path = "docs/notes.md", write = "# Notes {worktree}.{round}\n" }]
+```
+
+An edit appends to a file or writes the whole file. `{worktree}`, `{round}` and `{scenario}` are replaced; other braces stay. Give each worktree and round its own text when each commit must have its own tree. A retry after an allowed commit is `git commit --amend --no-edit` (the same tree: a cache hit); after a deny at the inline budget it is `tollgate wait <job>` and the same commit (L17).
+
+What the bench does:
+
+- It never writes the source repo. It clones it (`git clone --shared --no-checkout`, plus the local branches, which are the policy anchors of L2) into a new scratch dir, and adds one worktree per scenario slot at the source's `HEAD` commit.
+- Every git and tollgate process it starts gets its own `XDG_*` dirs in the scratch dir, a host config written from the flags (scope root = the scratch dir), and hooks that are hard links (or copies) of the running binary. A session's hook injection and the installed state are not used.
+- A warm-up `tollgate check` of the start commit gives the worktrees a checked base (R56) and step passes to reuse (L16). `--no-warm` skips it.
+- Each round, all worktrees edit, then start `git commit` together.
+- At the end it cancels the jobs that still run, waits for their runners to exit, kills what is left, and removes the scratch dir (`--keep` keeps it). SIGINT or SIGTERM stops the run early; the cleanup still runs.
+
+The report (text, or JSON with `--json`; `--out FILE` also writes the JSON) gives:
+
+- `pre-commit` latency from hook start to allow (p50, p95, max), from git's own trace2 timing of the hook process, for all commits, cache hits, job runs, docs-only commits, per scenario and per round. The hook's own git calls also write trace events: on a 31 ms cache-hit `pre-commit` this added about 3 ms (2026-11-05), so the numbers are a little high, never low. Chained hooks that run no git are not affected.
+- The other hooks' times, the `git commit` wall time, and the denied commits.
+- Queue wait per resource (each step's wait for its slots, R85) and for the verify checkout (R87), and the fast job overhead beyond the steps (L19).
+- Step reuse (L16), cache hits, the L19 budgets that the run measured, CPU load samples (load average; on Linux also the busy share), and with `--pg-url` the peak client connections of that Postgres (`psql` every `--sample-ms`).
+
+Exit 0 when every commit got a gate decision; 1 when one did not (the repo was out of scope, or there was nothing to commit) or a signal stopped the run; 2 when the bench could not run.
+
 ## Limits
 
 ### Same-user limitation
@@ -127,7 +171,7 @@ v1 installs no `reference-transaction` hook. Commits that `cherry-pick`, `revert
 
 1. **Arch box, two repos.** Install (see above). Set `scope.include = ["baton", "wikiknit"]` in the host config.
 2. **Verify the trigger.** Run the test suite. From a Claude session, run `tollgate doctor --injection` in the main session and in a subagent.
-3. **Benchmark (L20).** Replay realistic commits from 6 worktrees of myapp (a core change, an api-only change, a dashboard-only change, a docs change, a retry). Choose `cpu`, `pg` and `pg_max_threads` from that run, not from guesses.
+3. **Benchmark (L20).** Run `tollgate bench` (see [Benchmark](#benchmark-l20)) with 6 worktrees of myapp and realistic commits (a core change, an api-only change, a dashboard-only change, a docs change, a retry). Choose `cpu`, `pg` and `pg_max_threads` from that run, not from guesses.
 4. **myapp.** Add `myapp*` to `scope.include`. Write `~/Repos/myapp/tollgate.toml`: `select.owners` for `migrations/**`, `select.fast.pg_tests`, the dashboard setup and steps. Add the CI job (`tollgate ci-snippet --gitlab`). Protect `main` on GitLab (Victor).
 5. **All repos.** Set `scope.include = ["*"]`.
 6. **Mac.** Repeat steps 1-5 on the Mac through the board (L13). Use `only_on = ["macos"]` for iOS steps. Teach `scripts/cargo-guard.sh` the `verify.root` (R44).

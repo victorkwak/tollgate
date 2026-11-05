@@ -10,6 +10,7 @@
 #[cfg(not(unix))]
 compile_error!("tollgate supports Linux and macOS only (L13)");
 
+pub mod bench;
 pub mod cache;
 pub mod ci;
 pub mod cli;
