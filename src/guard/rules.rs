@@ -120,6 +120,27 @@ const DENY_SUBSTRINGS: &[(&str, &str)] = &[
     ),
 ];
 
+/// R25: an abbreviation of `--no-verify` anywhere in the normalized text.
+/// git's option parser takes any unambiguous prefix of a long option, so
+/// `--no-veri` is `--no-verify` for `commit` and `push`, and `--no-v` for
+/// `am` (verified with git 2.56). Every prefix from `--no-v` on is denied:
+/// the ones git finds ambiguous fail in git anyway. `--no-verbose` and
+/// other options that only share the start are not prefixes and stay
+/// allowed; the full `--no-verify` is a [`DENY_SUBSTRINGS`] rule.
+fn no_verify_abbrev(norm: &str) -> bool {
+    const FULL: &str = "--no-verify";
+    const SHORTEST: &str = "--no-v";
+    norm.match_indices(SHORTEST).any(|(at, _)| {
+        let rest = &norm[at..];
+        let end = rest
+            .char_indices()
+            .skip(2)
+            .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '-'))
+            .map_or(rest.len(), |(i, _)| i);
+        FULL.starts_with(&rest[..end])
+    })
+}
+
 /// Wrapper commands whose arguments are another command, with the options
 /// that take a separate value.
 const WRAPPERS: &[(&str, &[&str])] = &[
@@ -326,13 +347,18 @@ pub fn git_call(words: &[String]) -> Option<GitCall> {
 }
 
 /// `-n` as a flag of `git commit`/`am`/`push` (R25), short-option
-/// clusters included; values of options that take one are skipped.
+/// clusters included; values of options that take one are skipped. Short
+/// options with a value: `short_value` (the value is the rest of the
+/// cluster or the next word) and `short_glued` (an optional value, only as
+/// the rest of the cluster: `-u[<mode>]`, `-S[<keyid>]`).
 fn has_short_n(sub: &str, args: &[String]) -> bool {
-    let (short_value, long_value): (&str, &[&str]) = match sub {
+    let (short_value, short_glued, long_value): (&str, &str, &[&str]) = match sub {
         "commit" => (
-            "mFcCt",
+            "mFcCtU",
+            "uS",
             &[
                 "--message",
+                "--unified",
                 "--file",
                 "--author",
                 "--date",
@@ -348,10 +374,12 @@ fn has_short_n(sub: &str, args: &[String]) -> bool {
         ),
         "push" => (
             "o",
+            "",
             &["--push-option", "--repo", "--receive-pack", "--exec"],
         ),
         "am" => (
-            "",
+            "Cp",
+            "S",
             &[
                 "--directory",
                 "--exclude",
@@ -381,6 +409,9 @@ fn has_short_n(sub: &str, args: &[String]) -> bool {
         for (k, c) in cluster.char_indices() {
             if c == 'n' {
                 return true;
+            }
+            if short_glued.contains(c) {
+                break;
             }
             if short_value.contains(c) {
                 if k + c.len_utf8() == cluster.len() {
@@ -728,6 +759,9 @@ pub fn bash_ruling(ctx: &Context, command: &str) -> Ruling {
             return Ruling::Deny(format!("{why} (R25)"));
         }
     }
+    if no_verify_abbrev(&norm) {
+        return Ruling::Deny("an abbreviation of --no-verify skips the gate hooks (R25)".into());
+    }
     let mut ruling = Ruling::Allow;
     // `cd <dir>` changes where later relative paths point (best effort).
     let mut here = ctx.clone();
@@ -955,6 +989,56 @@ mod tests {
             "echo $(git commit -n)",
             "find ~/.local/state/tollgate -name '*.json' -delete",
             "TOLLGATE_TEST_INSTALL=1 tollgate install --yes",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+    }
+
+    /// git's option parser takes any unambiguous prefix of a long option:
+    /// `--no-veri` is `--no-verify` for commit and push, `--no-v` for am.
+    #[test]
+    fn no_verify_abbreviations_deny_r25() {
+        for cmd in [
+            "git commit --no-verif -m x",
+            "git commit --no-veri -m x",
+            "git push --no-ver origin feat",
+            "git push --no-veri origin HEAD:refs/heads/f",
+            "git am --no-v a.patch",
+            "git am --no-ve a.patch",
+            "git merge --no-veri feat",
+            "git commit -m x $'--no-verif'",
+            "bash -c 'git commit --no-ver''if -m x'",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+        assert_eq!(
+            bash_ruling(&ctx(), "git commit --no-verbose -m x"),
+            Ruling::Allow
+        );
+        assert_eq!(
+            bash_ruling(&ctx(), "wget --no-verbose https://example.invalid/x"),
+            Ruling::Allow
+        );
+    }
+
+    /// `-u[<mode>]` and `-S[<keyid>]` take a value glued to the flag; an
+    /// `n` in it is not `-n` (R25).
+    #[test]
+    fn optional_values_are_not_short_n_r25() {
+        for cmd in [
+            "git commit -uno -m x",
+            "git commit -Snone -m x",
+            "git commit -aSnokey -m x",
+            "git commit -U5 -m x",
+            "git am -Snone a.patch",
+            "git am -C n a.patch",
+        ] {
+            assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
+        for cmd in [
+            "git commit -un -n -m x",
+            "git commit -vn -m x",
+            "git am -kn a.patch",
         ] {
             assert!(deny(cmd), "{cmd}");
         }

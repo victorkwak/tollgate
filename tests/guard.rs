@@ -25,6 +25,10 @@ fn deny_patterns_exit_2_and_reads_stay_open_t15_r23_r25() {
         "echo x > $XDG_STATE_HOME/tollgate/x".to_owned(),
         "rm -rf ~/../state/tollgate".to_owned(),
         "cd x && git commit -n -m y".to_owned(),
+        // git takes unambiguous prefixes of long options (R25).
+        "git commit --no-verif -m x".to_owned(),
+        "git push --no-ver origin feat".to_owned(),
+        "git am --no-v a.patch".to_owned(),
     ] {
         let (code, out, err) = a.bash(&cmd);
         assert_eq!(code, Some(2), "{cmd}: {out}{err}");
@@ -38,6 +42,13 @@ fn deny_patterns_exit_2_and_reads_stay_open_t15_r23_r25() {
     ] {
         let (code, out, err) = a.bash(&cmd);
         assert_eq!((code, out.as_str()), (Some(0), ""), "{cmd}: {err}");
+    }
+    // Values glued to -u and -S are not -n: allowed, with the R28 rewrite.
+    for cmd in ["git commit -uno -m x", "git commit -Snone -m x"] {
+        let (code, out, err) = a.bash(cmd);
+        assert_eq!(code, Some(0), "{cmd}: {err}");
+        assert!(out.contains("updatedInput"), "{cmd}: {out}");
+        assert!(!out.contains("permissionDecision"), "{cmd}: {out}");
     }
     // Malformed input and a forced panic block (R23).
     for input in [
