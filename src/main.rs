@@ -54,14 +54,25 @@ fn hook_main(name: &str, _args: &[OsString]) -> u8 {
 }
 
 fn config_main(args: &ConfigArgs) -> u8 {
-    let what = if args.check {
-        "config --check"
-    } else if args.effective {
+    if args.check {
+        let cwd = match std::env::current_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("tollgate config --check: cannot read the current dir: {e}");
+                return exit::FAIL;
+            }
+        };
+        let report = tollgate::config::check::check(&cwd, &tollgate::env::EnvSnapshot::capture());
+        for line in &report.lines {
+            println!("{line}");
+        }
+        return if report.ok { exit::OK } else { exit::FAIL };
+    }
+    not_built(if args.effective {
         "config --effective"
     } else {
         "config init"
-    };
-    not_built(what)
+    })
 }
 
 fn not_built(what: &str) -> u8 {

@@ -3,6 +3,7 @@
 //! Detection without a `tollgate.toml` (R65) needs the selection roots and is
 //! built with the `select` module.
 
+pub mod check;
 pub mod glob;
 pub mod host;
 pub mod repo;

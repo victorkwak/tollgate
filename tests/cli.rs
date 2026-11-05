@@ -1,7 +1,11 @@
 //! The binary's dispatch and exit codes, run as a real process.
 
+mod support;
+
 use std::path::Path;
 use std::process::{Command, Output};
+
+use support::Sandbox;
 
 const BIN: &str = env!("CARGO_BIN_EXE_tollgate");
 
@@ -87,4 +91,73 @@ fn version_and_help_exit_zero() {
         let out = run(Path::new(BIN), args, tmp.path());
         assert_eq!(out.status.code(), Some(0), "{args:?}");
     }
+}
+
+/// Runs the binary in `cwd` with the sandbox environment only.
+fn run_in(sb: &Sandbox, cwd: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let mut cmd = Command::new(BIN);
+    cmd.env_clear().current_dir(cwd).args(args);
+    for (k, v) in sb.env().iter() {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.code(), text)
+}
+
+#[test]
+fn config_check_validates_repo_and_host_config_r64() {
+    let sb = Sandbox::new();
+    let repo = sb.repo("r");
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+
+    let (code, text) = run_in(&sb, &repo.join("sub"), &["config", "--check"]);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains("absent: defaults") && text.contains("no tollgate.toml"),
+        "{text}"
+    );
+
+    std::fs::write(
+        repo.join("tollgate.toml"),
+        "version = 1\n[[step]]\nname = \"tests\"\nkind = \"nextest\"\nresources = [\"cpu\", \"minio\"]\n",
+    )
+    .unwrap();
+    let (code, text) = run_in(&sb, &repo, &["config", "--check"]);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains("warning: tollgate.toml") && text.contains("resource minio"),
+        "{text}"
+    );
+    assert!(text.trim_end().ends_with("ok"), "{text}");
+
+    std::fs::write(
+        repo.join("tollgate.toml"),
+        "version = 1\n[[step]]\nname = \"a\"\nkind = \"command\"\n",
+    )
+    .unwrap();
+    let (code, text) = run_in(&sb, &repo, &["config", "--check"]);
+    assert_eq!(code, Some(1), "{text}");
+    assert!(text.contains("needs run"), "{text}");
+
+    std::fs::write(repo.join("tollgate.toml"), "version = 1\nbogus = 1\n").unwrap();
+    let (code, text) = run_in(&sb, &repo, &["config", "--check"]);
+    assert_eq!(code, Some(1), "{text}");
+    assert!(text.contains("bogus"), "{text}");
+
+    std::fs::remove_file(repo.join("tollgate.toml")).unwrap();
+    let host = sb.root().join("config/tollgate/config.toml");
+    std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+    std::fs::write(&host, "[verify]\nslots = { fast = 0 }\n").unwrap();
+    let (code, text) = run_in(&sb, &repo, &["config", "--check"]);
+    assert_eq!(code, Some(1), "{text}");
+    assert!(text.contains("error: host config: verify.slots"), "{text}");
+
+    let (code, text) = run_in(&sb, &sb.root(), &["config", "--check"]);
+    assert_eq!(code, Some(1), "{text}");
+    assert!(text.contains("not in a git repository"), "{text}");
 }
