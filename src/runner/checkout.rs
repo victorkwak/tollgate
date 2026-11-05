@@ -11,7 +11,10 @@
 //! `target`, `node_modules`, `.venv` and the steps' `cache_dirs`, then no
 //! untracked file and no index/worktree difference may be left, and
 //! `write-tree` must equal `T`. After each step, no tracked file, index
-//! entry or untracked file may have changed ([`Checkout::changes`]).
+//! entry or untracked file may have changed, the overlaid tool configs
+//! must hold what the overlay wrote, and no untracked or ignored file
+//! outside the kept dirs may carry a tool-config name ([`Checkout::changes`],
+//! R71).
 
 use std::fs;
 use std::io;
@@ -454,11 +457,8 @@ impl Checkout {
             "-z",
             tree.as_str(),
         ])?));
-        changed.extend(
-            self.untracked(env, cache_dirs)?
-                .into_iter()
-                .filter(|p| !before.contains(p)),
-        );
+        let untracked = self.untracked(env, cache_dirs)?;
+        changed.extend(untracked.iter().filter(|p| !before.contains(*p)).cloned());
         let mut out: Vec<String> = changed
             .into_iter()
             .filter(|p| {
@@ -469,8 +469,77 @@ impl Checkout {
             })
             .collect();
         out.extend(self.overlay_changes(overlay));
+        out.extend(self.foreign_tool_configs(env, cache_dirs, &untracked, overlay)?);
         out.sort();
         out.dedup();
+        Ok(out)
+    }
+
+    /// R71, R42: untracked or ignored files with a tool-config name that
+    /// the overlay did not write, outside the kept dirs. A branch's
+    /// `.gitignore` decides what [`Checkout::untracked`] sees, so it could
+    /// hide a `.cargo/config.toml` that a step (a `build.rs`) writes for
+    /// the next step; other ignored files (caches) do not count. Ignored
+    /// dirs are listed as dirs (git does not list a whole `target/`) and
+    /// walked here, skipping kept dirs; a walk over the budget counts.
+    /// `untracked` is [`Checkout::untracked`] as it is now.
+    pub fn foreign_tool_configs(
+        &self,
+        env: &JobEnv,
+        cache_dirs: &[String],
+        untracked: &std::collections::BTreeSet<String>,
+        overlay: &std::collections::BTreeMap<PathBuf, crate::policy::OverlayFile>,
+    ) -> Result<Vec<String>, CheckoutError> {
+        let mut entries = nul_list(&self.git(env).run([
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ])?);
+        entries.extend(untracked.iter().cloned());
+        let kept = |rel: &Path| !self.tree_content(&self.path.join(rel), cache_dirs);
+        let foreign = |rel: &Path| {
+            crate::policy::is_tool_config(rel) && !overlay.contains_key(rel) && !kept(rel)
+        };
+        let mut out = Vec::new();
+        let mut budget = LINK_WALK_BUDGET;
+        for e in entries {
+            let rel = PathBuf::from(e.trim_end_matches('/'));
+            if kept(&rel) {
+                continue;
+            }
+            // A dir entry: name the files in it, not the dir.
+            if !e.ends_with('/') {
+                if foreign(&rel) {
+                    out.push(rel.to_string_lossy().into_owned());
+                }
+                continue;
+            }
+            let mut stack = vec![rel];
+            while let Some(d) = stack.pop() {
+                let Ok(rd) = fs::read_dir(self.path.join(&d)) else {
+                    continue;
+                };
+                for f in rd.flatten() {
+                    if budget == 0 {
+                        out.push(format!("{}/ (too many files to check)", d.display()));
+                        return Ok(out);
+                    }
+                    budget -= 1;
+                    let rel = d.join(f.file_name());
+                    if kept(&rel) {
+                        continue;
+                    }
+                    if f.file_type().is_ok_and(|t| t.is_dir()) {
+                        stack.push(rel);
+                    } else if foreign(&rel) {
+                        out.push(rel.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
         Ok(out)
     }
 

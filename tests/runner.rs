@@ -349,6 +349,49 @@ fn a_step_that_rewrites_an_overlaid_tool_config_is_an_error_r71_r42() {
     );
 }
 
+/// R42, R71, item 6: a branch's `.gitignore` must not hide a tool config
+/// that a step writes (a `build.rs` writing `.cargo/config.toml`). Other
+/// ignored files a step leaves (caches) still do not count.
+#[test]
+fn an_ignored_tool_config_written_by_a_step_is_an_error_r42_r71() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"build\"\nkind = \"command\"\nrun = \"mkdir -p .cargo dist/sub __pycache__ && echo x > .cargo/config.toml && touch dist/sub/out.js __pycache__/m.pyc\"\n[[step]]\nname = \"after\"\nkind = \"command\"\nrun = \"true\"\n",
+    );
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(
+        &repo,
+        ".gitignore",
+        ".cargo/\ndist/\n__pycache__/\n",
+        "hide",
+    );
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("cause checkout")
+            && r.out
+                .contains("\"build\" changed the checkout: .cargo/config.toml")
+            && !r.out.contains("out.js")
+            && !r.out.contains("m.pyc"),
+        "{}",
+        r.out
+    );
+    // The same caches without the config pass.
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    sb.commit_file(
+        &repo,
+        "tollgate.toml",
+        "version = 1\n[[step]]\nname = \"build\"\nkind = \"command\"\nrun = \"mkdir -p dist/sub __pycache__ && touch dist/sub/out.js __pycache__/m.pyc\"\n",
+        "no config",
+    );
+    sb.commit_file(&repo, ".gitignore", "dist/\n__pycache__/\n", "ignore");
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+}
+
 #[test]
 fn unborn_repo_and_lru_eviction_r41_l15() {
     let sb = Sandbox::new();
