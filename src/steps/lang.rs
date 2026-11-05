@@ -231,6 +231,13 @@ pub fn missing_tool(kind: StepKind, ctx: &LangCtx<'_>) -> Option<String> {
             .is_none()
             .then(|| "bun is not on the job PATH (R46, R52)".to_owned())
     };
+    let test_script = || {
+        let has = std::fs::read_to_string(ctx.root_dir.join("package.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .is_some_and(|v| v["scripts"]["test"].is_string());
+        (!has).then(|| format!("package.json of {root} has no test script for bun run test (R59)"))
+    };
     let python = |tool: &str| {
         if on_path(ctx.path, "uv").is_none() {
             return Some("uv is not on the job PATH (R46, R52)".to_owned());
@@ -246,7 +253,7 @@ pub fn missing_tool(kind: StepKind, ctx: &LangCtx<'_>) -> Option<String> {
         StepKind::Tsc => node("tsc"),
         StepKind::SvelteCheck if svelte_check_script(ctx.root_dir) => bun(),
         StepKind::SvelteCheck => node("svelte-check"),
-        StepKind::BunTest => bun(),
+        StepKind::BunTest => bun().or_else(test_script),
         StepKind::Ruff => python("ruff"),
         StepKind::PyrightBaseline => python("pyright"),
         StepKind::PytestBaseline => python("pytest"),
@@ -483,6 +490,25 @@ mod tests {
         // A parent outside the checkout does not count.
         let outside = LangCtx { top: &root, ..ctx };
         assert!(missing_tool(StepKind::Biome, &outside).is_some());
+        // bun on the PATH, but no test script to run.
+        let bin = top.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("bun"), "").unwrap();
+        let with_bun = LangCtx {
+            path: Some(bin.as_os_str()),
+            ..ctx
+        };
+        assert!(
+            missing_tool(StepKind::BunTest, &with_bun)
+                .unwrap()
+                .contains("package.json of dashboard has no test script")
+        );
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"test":"bun test"}}"#,
+        )
+        .unwrap();
+        assert_eq!(missing_tool(StepKind::BunTest, &with_bun), None);
     }
 
     #[test]

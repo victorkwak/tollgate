@@ -158,15 +158,17 @@ fn fast_decision(s: &Step, p: &Picked, broad: GlobOpts) -> Decision {
             marked: rp.marked.clone(),
         });
     }
-    if s.kind == StepKind::Command && !s.when.is_empty() {
+    // `when` narrows a command step, and a TypeScript or Python step too.
+    if !s.when.is_empty() {
         let Ok(when) = glob::compile(&s.when, broad) else {
             return Decision::Run(Scope::All);
         };
-        return if p.code_paths.iter().any(|c| when.is_match(c)) {
-            Decision::Run(Scope::All)
-        } else {
-            Decision::Skip("no change matches when".into())
-        };
+        if !p.code_paths.iter().any(|c| when.is_match(c)) {
+            return Decision::Skip("no change matches when".into());
+        }
+        if s.kind == StepKind::Command {
+            return Decision::Run(Scope::All);
+        }
     }
     if lang::is_file_scoped(s.kind) {
         // R59, R60: lint the changed files only.
@@ -682,6 +684,25 @@ cwd = "py"
         let f = run(&[("py/pyproject.toml", 'M')]);
         assert_eq!(f.plan[2].decision, Decision::Run(Scope::All));
         assert_eq!(f.plan[3].decision, Decision::Run(Scope::All));
+        // `when` narrows a TypeScript or Python step (R63).
+        let mut narrow = c.clone();
+        narrow.steps[1].when = vec!["web/types/**".into()];
+        let rules = crate::select::Rules::new(&narrow).unwrap();
+        let picked = crate::select::pick(
+            &[ChangedPath {
+                path: PathBuf::from("web/src/a.ts"),
+                status: 'M',
+            }],
+            &rules,
+            &[],
+            &roots,
+        );
+        let planned = plan(&narrow, Tier::Fast, Some(&picked), Platform::Linux);
+        assert!(matches!(&planned[1].decision, Decision::Skip(w) if w == "no change matches when"));
+        assert!(matches!(
+            &planned[0].decision,
+            Decision::Run(Scope::Files { .. })
+        ));
         let f = run(&[("py/old.py", 'D')]);
         assert!(matches!(&f.plan[2].decision, Decision::Skip(w) if w.contains("only deletions")));
         assert_eq!(
