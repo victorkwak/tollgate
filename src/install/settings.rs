@@ -443,6 +443,30 @@ mod tests {
         assert_eq!(keys, ["model", "env", "permissions", "hooks", "zzz"]);
     }
 
+    /// The README's rollback text: uninstall itself puts back the entry
+    /// install removed when its script still exists (R96).
+    #[test]
+    fn uninstall_restores_a_removed_hook_whose_script_exists_r96() {
+        let mut v: Value = serde_json::from_str(FIXTURE).unwrap();
+        let cmd = guard_command(Path::new("/d/tollgate/bin/tollgate"));
+        let rec = apply_install(&mut v, Path::new("/s.json"), &env(), &cmd, None).unwrap();
+        assert!(!v.to_string().contains("pre-commit-checks.sh"));
+        let home = tempfile::tempdir().unwrap();
+        let script = home.path().join(".claude/hooks/pre-commit-checks.sh");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        let notes = apply_uninstall(&mut v, &rec, home.path()).unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n == "restored: ~/.claude/hooks/pre-commit-checks.sh"),
+            "{notes:?}"
+        );
+        let text = v.to_string();
+        assert_eq!(text.matches("pre-commit-checks.sh").count(), 1, "{v:#}");
+        assert!(!text.contains(MARKER), "{v:#}");
+    }
+
     #[test]
     fn install_into_empty_settings_and_back_r96() {
         let mut v = json!({});

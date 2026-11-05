@@ -131,7 +131,7 @@ v1 installs no `reference-transaction` hook. Commits that `cherry-pick`, `revert
 
 v3 changes to the original plan: there is no `reference-transaction` gate (L1), no `tollgate policy approve` (L2: policy changes apply after they merge), and no `tollgate waive` (L3).
 
-Rollback at any step: run `tollgate uninstall`. It removes the settings entries that `install` added and the installed binary and hooks. To use the old hook again, add its PreToolUse entry back to the settings: the backup that `install` made (`settings.json.tollgate-bak-<timestamp>`, R95) has it.
+Rollback at any step: run `tollgate uninstall`. It removes the settings entries that `install` added and the installed binary and hooks. It also puts back the PreToolUse entries that `install` removed (the old `pre-commit-checks.sh` hook) when their script still exists, and prints `settings: restored: <command>` for each; do not add them again by hand. When a script is gone, `uninstall` prints `settings: not restored (its script is gone): <command>`; only then copy the entry from the backup that `install` made (`settings.json.tollgate-bak-<timestamp>`, R95) after you restore the script.
 
 ## Development
 
