@@ -56,7 +56,7 @@ tollgate doctor
 
 `install` copies the binary to `$XDG_DATA_HOME/tollgate/bin/`, links the hooks next to it, writes the host config when it is absent, and shows a diff of `~/.claude/settings.json`. It asks before it changes the settings. Run it again after each `cargo install`.
 
-To check that the hooks reach a session, run `tollgate doctor --injection` from a Bash call in a Claude session, in the main session and in a subagent. That the settings `env` reaches subagents is not verified yet. When it does not, the guard denies every Bash call there, so the gap fails closed.
+To check that the hooks reach a session, run `tollgate doctor --injection` from a Bash call in a Claude session, in the main session and in a subagent. If the settings `env` does not reach one, the guard denies every Bash call there, so the gap fails closed.
 
 To remove it, run `tollgate uninstall`. It removes exactly what `install` added. `tollgate gc --all` removes the stored results, logs and verify checkouts.
 
@@ -81,6 +81,8 @@ To remove it, run `tollgate uninstall`. It removes exactly what `install` added.
    ```
 
    The other sections (`[nextest]`, `[budget]`, `[job]`) can stay as written.
+
+   Add the remote of every repo you gate to `remotes`, with the URL as git has it (an ssh host alias included). Without a trusted remote, policy comes from the local `main`, and a commit whose base has no stored result runs every step. `tollgate doctor --repo .` warns about this.
 
 2. Look at what tollgate detects in your repo:
 

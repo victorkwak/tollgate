@@ -542,9 +542,22 @@ fn check_repo(out: &mut Out, ctx: &Ctx, dirs: &Dirs, host: Option<&HostConfig>, 
                 Ok(n) => n,
                 Err(e) => {
                     out.line(Level::Fail, "remotes", e.to_string());
-                    Vec::new()
+                    return;
                 }
             };
+            if names.is_empty() {
+                out.line(
+                    Level::Warn,
+                    "remotes",
+                    "no remote matches scope.remotes: policy comes from the local main, a commit whose base has no record runs every step, and a push runs the branch's own tier",
+                );
+            } else {
+                out.line(
+                    Level::Ok,
+                    "remotes",
+                    format!("trusted: {}", names.join(", ")),
+                );
+            }
             for name in names {
                 let url = git
                     .run_line(["remote", "get-url", &name])

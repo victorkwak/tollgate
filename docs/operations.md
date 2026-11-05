@@ -119,7 +119,7 @@ v1 installs no `reference-transaction` hook. Commits that `cherry-pick`, `revert
 ### Other limits
 
 - macOS is not built or tested yet (L13). Every platform-specific call has a macOS branch that is expected to compile.
-- That the settings `env` reaches the Bash calls of subagents is not verified (R3). The guard denies every Bash call when the injection is missing, so a gap fails closed.
+- The settings `env` reaches the Bash calls of subagents (R3; checked with Claude Code 2.1.317). The guard denies every Bash call when the injection is missing, so a gap in another version fails closed.
 - A Python root without `uv.lock` gets no `uv sync` setup step: its tools must be on the job `PATH`.
 - In a command that names git or tollgate, the guard denies what it does not check instead of decoding it: ANSI-C quoting (`$'...'`), a `\c` escape, and text fed to a shell (or to python or perl) through a pipe, a heredoc, a here-string or an input redirection (item 31). Give a multi-line commit message with `-F <file>` or `-m "$(cat <<'EOF' ... EOF)"`. The guard is still a parser: a command name built from a variable (`${x}t commit`) or arguments that `xargs` reads from a pipe are not seen. A commit made that way without the hooks is marked unverified by `post-commit`, and the push gate and CI check it.
 

@@ -317,6 +317,13 @@ fn doctor_reports_links_settings_injection_and_stale_locks_r39_r97() {
     let repo = e.sb.repo("r");
     std::fs::write(repo.join(".git/index.lock"), b"").unwrap();
     let r = e.run(&bin, &["doctor", "--repo", repo.to_str().unwrap()], &[]);
+    // The written host config trusts no remote, so this repo has none.
+    assert!(
+        r.out
+            .contains("warn remotes: no remote matches scope.remotes"),
+        "{}",
+        r.out
+    );
     assert!(
         r.out.contains("ok   locks: no git lock file older"),
         "{}",

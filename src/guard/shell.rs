@@ -55,6 +55,8 @@ struct Lexer<'a> {
     pos: usize,
     out: &'a mut Vec<SimpleCommand>,
     depth: usize,
+    /// Set when a word uses ANSI-C quoting.
+    ansi_c: &'a mut bool,
 }
 
 const MAX_DEPTH: usize = 16;
@@ -62,12 +64,20 @@ const MAX_DEPTH: usize = 16;
 /// Parses `src` into simple commands, nested substitutions included.
 #[must_use]
 pub fn parse(src: &str) -> Vec<SimpleCommand> {
-    let mut out = Vec::new();
-    parse_into(src, &mut out, 0);
-    out
+    parse_flagged(src).0
 }
 
-fn parse_into(src: &str, out: &mut Vec<SimpleCommand>, depth: usize) {
+/// [`parse`], and whether a word uses ANSI-C quoting where bash reads it so:
+/// `$'` in single or double quotes or in a heredoc body is data.
+#[must_use]
+pub fn parse_flagged(src: &str) -> (Vec<SimpleCommand>, bool) {
+    let mut out = Vec::new();
+    let mut ansi_c = false;
+    parse_into(src, &mut out, 0, &mut ansi_c);
+    (out, ansi_c)
+}
+
+fn parse_into(src: &str, out: &mut Vec<SimpleCommand>, depth: usize, ansi_c: &mut bool) {
     if depth > MAX_DEPTH {
         return;
     }
@@ -76,6 +86,7 @@ fn parse_into(src: &str, out: &mut Vec<SimpleCommand>, depth: usize) {
         pos: 0,
         out,
         depth,
+        ansi_c,
     };
     lx.run();
 }
@@ -91,7 +102,7 @@ impl Lexer<'_> {
 
     fn nested(&mut self, src: &str) {
         let mut inner = Vec::new();
-        parse_into(src, &mut inner, self.depth + 1);
+        parse_into(src, &mut inner, self.depth + 1, self.ansi_c);
         self.out.extend(inner);
     }
 
@@ -254,6 +265,7 @@ impl Lexer<'_> {
                 }
                 '$' if self.peek_at(1) == Some('\'') => {
                     self.pos += 2;
+                    *self.ansi_c = true;
                     self.read_ansi_c(&mut w);
                     any = true;
                 }
