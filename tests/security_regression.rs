@@ -1694,3 +1694,71 @@ fn s32_cargo_home_from_the_hook_environment_never_reaches_the_job() {
     );
     lab.assert_no_bad_pass();
 }
+
+/// S33 (item 39): `GIT_EXEC_PATH` set for one git command outside the
+/// guard (a script file) goes first on the hooks' `PATH`, so a `git`
+/// there would answer tollgate's own git calls in the hook and the job
+/// (here: one that logs each call and then runs the real git). tollgate
+/// runs git by the absolute path install recorded and removes
+/// `GIT_EXEC_PATH` from every git it starts: the fake never runs, and the
+/// failing test still fails.
+#[test]
+fn s33_git_exec_path_never_picks_the_git_tollgate_runs() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    let root = lab.root();
+    // install.json names the git the hooks run.
+    let rec: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(lab.a.data().join("install.json")).unwrap()).unwrap();
+    let git = PathBuf::from(rec["git"].as_str().expect("install.json records git"));
+    assert!(git.is_absolute() && git.is_file(), "{rec:#}");
+    let exec = lab
+        .plain_in(&root, &["--exec-path"])
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    let fake = root.join("fake-exec");
+    let log = root.join("fake-git.log");
+    std::fs::create_dir_all(&fake).unwrap();
+    // The fake dir holds git's own helpers too (so the commit works) and a
+    // `git` that logs.
+    for e in std::fs::read_dir(&exec).unwrap().flatten() {
+        if e.file_name() != "git" {
+            std::os::unix::fs::symlink(e.path(), fake.join(e.file_name())).unwrap();
+        }
+    }
+    write_exe(
+        &fake.join("git"),
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            git.display()
+        ),
+    );
+    lab.stage_bad_file("exec path");
+    let before = lab.refs();
+    let r = lab.direct_with(
+        &["commit", "-m", "fake git"],
+        &[("GIT_EXEC_PATH", fake.to_str().unwrap())],
+    );
+    assert_ne!(r.code, Some(0), "{}", r.out);
+    assert!(r.out.contains("DENIED pre-commit"), "{}", r.out);
+    assert_eq!(lab.refs(), before);
+    assert!(
+        !log.exists(),
+        "tollgate ran the fake git: {}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    lab.assert_no_bad_pass();
+    // doctor names the recorded git.
+    let out = lab
+        .cmd(lab.a.bin(), &lab.repo)
+        .arg("doctor")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("ok   git: ") && text.contains(git.to_str().unwrap()),
+        "{text}"
+    );
+}

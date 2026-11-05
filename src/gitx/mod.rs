@@ -19,6 +19,12 @@
 //!   keeps read-only calls from writing the agent's index.
 //! - [`Git::for_checkout`] (verify checkout): the job environment (R52) plus
 //!   explicit `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE`.
+//!
+//! Item 39: the binary is [`program`], an absolute path fixed at install
+//! (`install.json`), never `git` looked up on `PATH`: git puts
+//! `GIT_EXEC_PATH` first on its hooks' `PATH`, so a `git` there would answer
+//! tollgate's own calls. `GIT_EXEC_PATH` is removed from every git tollgate
+//! starts.
 
 pub mod config_file;
 pub mod hooks_path;
@@ -40,13 +46,70 @@ use crate::runner::env::JobEnv;
 
 pub use layout::RepoLayout;
 
+/// Dirs searched for git when no install records one (item 39); the same
+/// system dirs as the trusted-server query (X1).
+pub const SYSTEM_GIT_DIRS: [&str; 3] = ["/usr/local/bin", "/usr/bin", "/bin"];
+
+static PROGRAM: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The first executable `git` in `prepend`, then [`SYSTEM_GIT_DIRS`]: never
+/// the caller's `PATH` (item 39).
+#[must_use]
+pub fn find_git(prepend: &[PathBuf]) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    prepend
+        .iter()
+        .cloned()
+        .chain(SYSTEM_GIT_DIRS.iter().map(PathBuf::from))
+        .map(|d| d.join("git"))
+        .find(|p| {
+            p.is_absolute()
+                && std::fs::metadata(p)
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// The git `install.json` records for the install that `exe` belongs to
+/// (`<data dir>/bin/tollgate` or `<data dir>/hooks/<name>`), else for the
+/// install of `env`'s dirs.
+fn recorded_git(exe: &Path, env: &EnvSnapshot) -> Option<PathBuf> {
+    let beside = exe
+        .parent()
+        .and_then(Path::parent)
+        .map(|d| d.join("install.json"));
+    let record = beside.filter(|p| p.is_file()).or_else(|| {
+        crate::dirs::Dirs::from_env(env)
+            .ok()
+            .map(|d| d.install_record())
+    })?;
+    crate::install::InstallRecord::read_at(&record).ok()?.git
+}
+
+/// Fixes the git of this process (item 39): the one `install.json`
+/// records for `exe`'s install (or `env`'s), else [`find_git`]. Call it
+/// before the first git call; later calls change nothing.
+pub fn init_program(exe: &Path, env: &EnvSnapshot) {
+    let _ = PROGRAM.set(
+        recorded_git(exe, env)
+            .or_else(|| find_git(&[]))
+            .unwrap_or_else(|| PathBuf::from("git")),
+    );
+}
+
+/// The git binary every tollgate git call runs (item 39): set by
+/// [`init_program`]; without it (library tests), [`find_git`].
+#[must_use]
+pub fn program() -> &'static Path {
+    PROGRAM.get_or_init(|| find_git(&[]).unwrap_or_else(|| PathBuf::from("git")))
+}
+
 /// `GIT_*` variables a scrubbed call keeps from tollgate's environment.
+/// Never `GIT_EXEC_PATH` (item 39).
 const GIT_PASS_THROUGH: &[&str] = &[
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
     "GIT_CONFIG_NOSYSTEM",
     "GIT_CEILING_DIRECTORIES",
-    "GIT_EXEC_PATH",
     "GIT_SSH",
     "GIT_SSH_COMMAND",
     "GIT_SSH_VARIANT",
@@ -242,8 +305,9 @@ impl Git {
     fn with_env(mut vars: BTreeMap<OsString, OsString>, dir: PathBuf) -> Self {
         vars.insert("GIT_NO_REPLACE_OBJECTS".into(), "1".into());
         vars.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+        vars.remove(OsStr::new("GIT_EXEC_PATH"));
         Self {
-            program: "git".into(),
+            program: program().as_os_str().to_owned(),
             dir,
             env: vars,
         }

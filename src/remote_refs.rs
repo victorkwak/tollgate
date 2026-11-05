@@ -198,7 +198,7 @@ impl Site {
     /// cannot change which server answers, so the query keeps them (an
     /// https remote with a helper keeps working).
     fn user_credentials(&self) -> Vec<(String, String)> {
-        let out = Command::new("git")
+        let out = Command::new(crate::gitx::program())
             .env_clear()
             .envs(self.env.iter().filter(|(k, _)| {
                 !matches!(
@@ -225,7 +225,7 @@ impl Site {
     /// [`query_env`], the user's credential settings and [`QUERY_SSH`].
     fn query_command(&self, args: &[&str]) -> Result<Command, String> {
         fsx::ensure_dir(&self.neutral).map_err(|e| format!("{}: {e}", self.neutral.display()))?;
-        let mut cmd = Command::new("git");
+        let mut cmd = Command::new(crate::gitx::program());
         cmd.env_clear().envs(&self.env);
         let creds = self.user_credentials();
         if !creds.is_empty() {

@@ -45,6 +45,8 @@ fn run() -> u8 {
             return exit::BLOCK;
         }
     };
+    // Item 39: git by the absolute path install recorded.
+    tollgate::gitx::init_program(&ctx.exe, &ctx.env);
     match cli.command {
         Command::Hook { name, args } => match tollgate::hook::hook_name(&name) {
             Some(name) => hook_main(name, &args),

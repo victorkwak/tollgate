@@ -268,8 +268,8 @@ fn check_injection(out: &mut Out, ctx: &Ctx, rec: Option<&InstallRecord>) {
     }
 }
 
-/// `git` on this process's `PATH` (hooks and verify checkouts run it with
-/// tollgate's own environment); the step tools on the job `PATH` (R52),
+/// The git `install.json` records, which hooks, jobs and the CLI run by
+/// its absolute path (item 39); the step tools on the job `PATH` (R52),
 /// which is what steps get. A tool only this process can find is a warning
 /// that names the `[job] path_prepend` fix (R46, R97).
 fn check_tools(out: &mut Out, ctx: &Ctx, dirs: &Dirs, job: &JobConfig) {
@@ -278,9 +278,29 @@ fn check_tools(out: &mut Out, ctx: &Ctx, dirs: &Dirs, job: &JobConfig) {
         let v = version_of(p, args, &ctx.env).unwrap_or_else(|| "no version".into());
         format!("{v} ({})", p.display())
     };
-    match which("git", path) {
-        Some(p) => out.line(Level::Ok, "git", found(&p, &["--version"])),
-        None => out.line(Level::Fail, "git", "not on PATH"),
+    match InstallRecord::read(dirs).ok().map(|r| r.git) {
+        Some(Some(git)) => match version_of(&git, &["--version"], &ctx.env) {
+            Some(v) if v.starts_with("git version") => {
+                out.line(Level::Ok, "git", format!("{v} ({})", git.display()));
+            }
+            _ => out.line(
+                Level::Fail,
+                "git",
+                format!(
+                    "{} (recorded in install.json) does not run; run: tollgate install",
+                    git.display()
+                ),
+            ),
+        },
+        Some(None) => out.line(
+            Level::Fail,
+            "git",
+            "install.json records no git (an older install); run: tollgate install",
+        ),
+        None => match crate::gitx::find_git(&[]) {
+            Some(p) => out.line(Level::Ok, "git", found(&p, &["--version"])),
+            None => out.line(Level::Fail, "git", "no git in the system dirs"),
+        },
     }
     let job_env = JobEnv::base(&BaseInputs {
         env: &ctx.env,

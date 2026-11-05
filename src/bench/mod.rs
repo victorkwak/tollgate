@@ -177,7 +177,6 @@ const PASS_THROUGH: &[&str] = &[
     "GIT_CONFIG_NOSYSTEM",
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
-    "GIT_EXEC_PATH",
 ];
 
 /// The environment of the bench's git and tollgate processes.
@@ -226,7 +225,7 @@ impl BenchEnv {
     /// git with `core.hooksPath` = `hooks` and the user config's
     /// background work and signing turned off.
     fn git(&self, hooks: &Path, dir: &Path) -> Command {
-        let mut cmd = self.command(Path::new("git"), dir);
+        let mut cmd = self.command(crate::gitx::program(), dir);
         let config: [(&str, &std::ffi::OsStr); 5] = [
             ("core.hooksPath", hooks.as_os_str()),
             ("commit.gpgSign", "false".as_ref()),

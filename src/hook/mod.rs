@@ -121,6 +121,8 @@ const READS_STDIN: &[&str] = &["pre-push"];
 
 /// Runs hook `name` with git's arguments; returns the exit code.
 pub fn run(name: &'static str, args: &[OsString], ctx: &HookCtx) -> u8 {
+    // Item 39: never a `git` that `GIT_EXEC_PATH` put first on PATH.
+    crate::gitx::init_program(&ctx.exe, &ctx.env);
     let gate_hook = GATE_HOOKS.contains(&name);
     let stdin = if READS_STDIN.contains(&name) {
         let mut buf = Vec::new();

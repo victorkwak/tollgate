@@ -16,7 +16,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::cache::toolcache::{self, BinaryIdentity, ToolCache};
+use crate::cache::toolcache::{BinaryIdentity, ToolCache};
 use crate::dirs::Dirs;
 use crate::env::EnvSnapshot;
 use crate::gitx::config_file;
@@ -55,9 +55,13 @@ fn system_default(
             })
             .map_err(|_| ())
     };
-    let identity = toolcache::which("git", env.get("PATH")).and_then(|p| {
-        BinaryIdentity::of(&p, "git", &JobEnv::from_vars::<_, &str, &str>([]), cwd).ok()
-    });
+    let identity = BinaryIdentity::of(
+        crate::gitx::program(),
+        "git",
+        &JobEnv::from_vars::<_, &str, &str>([]),
+        cwd,
+    )
+    .ok();
     let text = match (identity, dirs) {
         (Some(id), Some(dirs)) => {
             let mut cache = ToolCache::load(&dirs.toolcache_file());

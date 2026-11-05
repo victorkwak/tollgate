@@ -45,7 +45,6 @@ const RUNNER_ENV: &[&str] = &[
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
     "GIT_CONFIG_NOSYSTEM",
-    "GIT_EXEC_PATH",
     "GIT_SSH",
     "GIT_SSH_COMMAND",
     "GIT_SSH_VARIANT",

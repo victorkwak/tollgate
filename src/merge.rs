@@ -35,12 +35,14 @@ fn fail(msg: impl std::fmt::Display) -> u8 {
 
 /// git with tollgate's own environment (the hooks run), stdin closed.
 fn git_plain(ctx: &Ctx, dir: &Path) -> Command {
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(crate::gitx::program());
     cmd.env_clear();
     for (k, v) in ctx.env.iter() {
         cmd.env(k, v);
     }
-    cmd.env("GIT_NO_REPLACE_OBJECTS", "1")
+    // Item 39: the recorded git, never one from GIT_EXEC_PATH.
+    cmd.env_remove("GIT_EXEC_PATH")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .arg("-C")
         .arg(dir)
         .stdin(Stdio::null());

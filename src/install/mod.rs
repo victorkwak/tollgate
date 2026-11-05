@@ -67,6 +67,12 @@ pub struct InstallRecord {
     /// builds: the guard and doctor then ask for `tollgate install`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dirs: Option<Dirs>,
+    /// The git binary every tollgate git call of this install runs, by
+    /// absolute path (item 39): found at install on `[job] path_prepend`
+    /// and the system dirs, never on `PATH`. `None` in records of older
+    /// builds (doctor asks for `tollgate install`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<PathBuf>,
 }
 
 impl InstallRecord {
@@ -516,6 +522,20 @@ pub fn install(ctx: &Ctx, yes: bool) -> u8 {
     }
     let previous = InstallRecord::read(&dirs).ok();
     let env = injection(&hooks_dir);
+    // Item 39: the git the hooks and jobs run, fixed now.
+    let prepend: Vec<PathBuf> = HostConfig::load(&dirs)
+        .map(|h| h.config.job.path_prepend)
+        .unwrap_or_default()
+        .iter()
+        .map(|p| dirs.expand_tilde(p))
+        .collect();
+    let Some(git) = crate::gitx::find_git(&prepend) else {
+        return fail(format!(
+            "no git in [job] path_prepend or {} (item 39: tollgate runs git by an absolute path)",
+            crate::gitx::SYSTEM_GIT_DIRS.join(", ")
+        ));
+    };
+    println!("git: {}", git.display());
     let mut record = InstallRecord {
         version: RECORD_VERSION,
         tollgate_version: crate::VERSION.to_owned(),
@@ -526,6 +546,7 @@ pub fn install(ctx: &Ctx, yes: bool) -> u8 {
         env: env.clone(),
         settings: previous.as_ref().and_then(|p| p.settings.clone()),
         dirs: Some(dirs.clone()),
+        git: Some(git),
     };
     // (c) the settings edit.
     let path = settings_path(&ctx.env, &dirs);

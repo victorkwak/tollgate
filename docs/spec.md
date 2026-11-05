@@ -149,6 +149,7 @@ Reason: none caches by tree hash, none checks the exact index tree without mutat
 
 Decision D3: tollgate shells out to the `git` binary. No libgit2, no gix.
 Reason: same semantics as the git that runs the hook (worktrees, index file, config). Every tollgate git call runs with `GIT_NO_REPLACE_OBJECTS=1` and a scrubbed environment (R52).
+Note (item 39): git puts `GIT_EXEC_PATH` first on its hooks' `PATH`, so `git` looked up on `PATH` could be any binary the caller chose. tollgate runs git by an absolute path that `install` fixes (the first `git` in `[job] path_prepend`, then `/usr/local/bin`, `/usr/bin`, `/bin`, never the caller's `PATH`) and records in `install.json`; hooks, runners and the CLI read it from the install they belong to, `doctor` checks that it runs. Without a record (a dev build) the same system dirs decide. `GIT_EXEC_PATH` is removed from every git tollgate starts and from the runner's environment.
 
 Decision D4: the hard gate for full refs is `pre-push` to a trusted remote plus GitLab branch protection. Local full-ref tips are gated too, but local bypasses that git does not show to hooks (branch rename, reftable) are detected and reported, not prevented.
 Reason: git branch rename does not show the new value to `reference-transaction` and runs no hook on reftable (verified). What leaves the machine is what matters: push and merge are gated by tree record.
