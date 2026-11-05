@@ -531,10 +531,10 @@ fn base_trusted(
     for tier in [Tier::Full, Tier::Fast] {
         let key = record_key(&base.tree, tier, fp);
         if store
-            .read(&key)
+            .read_usable(&key)
             .ok()
             .flatten()
-            .is_some_and(|r| r.verdict == Verdict::Pass && store_report_exists(store, &r.job_id))
+            .is_some_and(|r| r.verdict == Verdict::Pass)
         {
             return Ok(true);
         }
@@ -569,10 +569,6 @@ fn base_trusted(
         }
     }
     Ok(false)
-}
-
-fn store_report_exists(store: &RecordStore, job: &JobId) -> bool {
-    store.dirs().job_report(job).is_file()
 }
 
 /// The exact fast selection when every Rust workspace map of the tree's

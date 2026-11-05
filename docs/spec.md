@@ -468,7 +468,8 @@ R79. Lookup for `fast`: a `full` pass; or a `fast` pass whose `selection` is `al
 
 R80. `selection` in a record: `all`, or `{base, packages: [..], roots: [..], steps: [..]}`.
 
-R81. A `pass` record whose `report.json` is missing from `jobs/<job id>/` is invalid and treated as no record.
+R81. A `pass` record whose `report.json` is missing from `jobs/<job id>/` is invalid and treated as no record. A record also counts only as the record of its own key (its tree, tier and fingerprint hash to the file name) and only when its `report.json` says the same job, tree, tier and verdict; the store refuses to write any other (S11).
+Reason: a one-word edit of a record file (`fail` to `pass`) or a copy of another tree's pass record must not let a tree through. Same-user code can still write two consistent files: that is out of scope (section 1).
 
 R82. Job dirs `$XDG_STATE_HOME/tollgate/jobs/<job id>/` hold `<step>.log`, `report.json`, `junit.xml`. `report.json` and `junit.xml` live as long as the record (R48).
 

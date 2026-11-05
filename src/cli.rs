@@ -503,12 +503,10 @@ fn tier_status(found: Lookup) -> Option<TierStatus> {
 fn pass_of(store: &RecordStore, tree: &Oid, fps: &[(Tier, Fingerprint)]) -> bool {
     fps.iter().any(|(tier, fp)| {
         store
-            .read(&record_key(tree, *tier, fp))
+            .read_usable(&record_key(tree, *tier, fp))
             .ok()
             .flatten()
-            .is_some_and(|r| {
-                r.verdict == Verdict::Pass && store.dirs().job_report(&r.job_id).is_file()
-            })
+            .is_some_and(|r| r.verdict == Verdict::Pass)
     })
 }
 

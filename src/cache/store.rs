@@ -10,7 +10,17 @@ use crate::config::Tier;
 use crate::dirs::Dirs;
 use crate::fsx;
 use crate::gitx::Oid;
-use crate::ids::RecordKey;
+use crate::ids::{JobId, RecordKey};
+
+/// The fields of a job's `report.json` that its record must agree with
+/// (R81); the rest of the report is not read here.
+#[derive(Debug, serde::Deserialize)]
+struct ReportFacts {
+    job_id: JobId,
+    tree: Oid,
+    tier: Tier,
+    verdict: Option<Verdict>,
+}
 
 /// Error from the store.
 #[derive(Debug, thiserror::Error)]
@@ -118,14 +128,54 @@ impl RecordStore {
             })
     }
 
-    /// R81: a record whose job `report.json` is gone is no record. A corrupt
-    /// file is no record either: the job runs again.
-    fn read_usable(&self, key: &RecordKey) -> Result<Option<Record>, StoreError> {
+    /// The record of `key` when it counts (R81, S11): it is the record of
+    /// that key (its tree, tier and fingerprint hash to it) and its job's
+    /// `report.json` exists and agrees on job, tree, tier and verdict. A
+    /// record whose report is gone, an edited verdict, a record copied to
+    /// another key and a corrupt file are no record: the job runs again.
+    /// Same-user code can still write two consistent files; this stops the
+    /// one-word edit and the copy.
+    pub fn read_usable(&self, key: &RecordKey) -> Result<Option<Record>, StoreError> {
         match self.read(key) {
-            Ok(Some(r)) if self.dirs.job_report(&r.job_id).is_file() => Ok(Some(r)),
+            Ok(Some(r))
+                if r.key == *key
+                    && r.key == record_key(&r.tree, r.tier, &r.fingerprint)
+                    && self.report_backs(&r).is_ok() =>
+            {
+                Ok(Some(r))
+            }
             Ok(_) | Err(StoreError::Corrupt { .. }) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// R81: the job report of `r` exists and says the same job, tree, tier
+    /// and verdict (the runner writes it before the record).
+    fn report_backs(&self, r: &Record) -> Result<(), String> {
+        let path = self.dirs.job_report(&r.job_id);
+        let bytes = match fsx::read_optional(&path) {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                return Err(format!(
+                    "job {} has no report.json (write it first, R81)",
+                    r.job_id
+                ));
+            }
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let facts: ReportFacts =
+            serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        if facts.job_id != r.job_id
+            || facts.tree != r.tree
+            || facts.tier != r.tier
+            || facts.verdict != Some(r.verdict)
+        {
+            return Err(format!(
+                "job {} report.json does not say this record's tree, tier and verdict (R81)",
+                r.job_id
+            ));
+        }
+        Ok(())
     }
 
     fn check(&self, r: &Record) -> Result<(), String> {
@@ -149,13 +199,7 @@ impl RecordStore {
         if r.tier == Tier::Full && r.selection != Selection::All {
             return Err("a full record checks everything (R54)".into());
         }
-        if !self.dirs.job_report(&r.job_id).is_file() {
-            return Err(format!(
-                "job {} has no report.json (write it first, R81)",
-                r.job_id
-            ));
-        }
-        Ok(())
+        self.report_backs(r)
     }
 
     /// Writes `r` by atomic rename (R76). Refuses records that break R34,

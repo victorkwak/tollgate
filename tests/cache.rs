@@ -197,6 +197,17 @@ fn store(sb: &Sandbox) -> Store {
     }
 }
 
+/// A job `report.json` with the fields a record must agree with (R81).
+fn write_report(dirs: &Dirs, job: &JobId, tree: &Oid, tier: Tier, verdict: Option<Verdict>) {
+    let v = serde_json::json!({
+        "job_id": job,
+        "tree": tree,
+        "tier": tier,
+        "verdict": verdict,
+    });
+    tollgate::fsx::write_atomic(&dirs.job_report(job), v.to_string().as_bytes()).unwrap();
+}
+
 fn subset(packages: &[&str]) -> Selection {
     Selection::Subset(SubsetSelection {
         base: tree(9),
@@ -213,7 +224,7 @@ impl Store {
     fn record(&self, tree: &Oid, tier: Tier, verdict: Verdict, selection: Selection) -> Record {
         let now = jiff::Timestamp::now();
         let job = JobId::generate(now);
-        tollgate::fsx::write_atomic(&self.dirs.job_report(&job), b"{}").unwrap();
+        write_report(&self.dirs, &job, tree, tier, Some(verdict));
         Record {
             schema: RECORD_SCHEMA,
             key: record_key(tree, tier, &self.fp),
@@ -353,6 +364,59 @@ fn missing_report_invalidates_a_pass_r81_t37() {
     s.store.write(&full).unwrap();
     std::fs::remove_file(s.dirs.job_report(&full.job_id)).unwrap();
     assert_eq!(s.lookup(&t, Tier::Full, &Selection::All), Lookup::Miss);
+}
+
+/// R81, S11: a record counts only as the record of its own key, with a
+/// job report that agrees on job, tree, tier and verdict. A verdict edited
+/// in place, a record copied to another tree's key, and a record that
+/// names another job's report are misses (the job runs again).
+#[test]
+fn edited_or_copied_records_are_misses_r81_s11() {
+    let sb = Sandbox::new();
+    let s = store(&sb);
+    let (good, bad) = (tree(3), tree(4));
+    let pass = s.record(&good, Tier::Full, Verdict::Pass, Selection::All);
+    s.store.write(&pass).unwrap();
+    let fail = s.record(&bad, Tier::Full, Verdict::Fail, Selection::All);
+    s.store.write(&fail).unwrap();
+    assert!(matches!(
+        s.lookup(&bad, Tier::Full, &Selection::All),
+        Lookup::Fail(_)
+    ));
+    let forge = |r: &Record| {
+        let json = serde_json::to_vec(r).unwrap();
+        tollgate::fsx::write_atomic(&s.dirs.record_file(&fail.key), &json).unwrap();
+    };
+    // The verdict edited in place: the report still says fail.
+    let mut edited = fail.clone();
+    edited.verdict = Verdict::Pass;
+    forge(&edited);
+    assert_eq!(s.lookup(&bad, Tier::Full, &Selection::All), Lookup::Miss);
+    // The good tree's pass copied to the bad tree's key.
+    forge(&pass);
+    assert_eq!(s.lookup(&bad, Tier::Full, &Selection::All), Lookup::Miss);
+    // The copy with the key field changed too: its tree does not hash to
+    // that key.
+    let mut rekeyed = pass.clone();
+    rekeyed.key = fail.key.clone();
+    forge(&rekeyed);
+    assert_eq!(s.lookup(&bad, Tier::Full, &Selection::All), Lookup::Miss);
+    // A consistent record that names the good tree's job: that report is
+    // of another tree.
+    let mut borrowed = edited.clone();
+    borrowed.job_id = pass.job_id.clone();
+    forge(&borrowed);
+    assert_eq!(s.lookup(&bad, Tier::Full, &Selection::All), Lookup::Miss);
+    // The good tree's own pass still answers, and the store refuses to
+    // write a record its report does not back.
+    assert!(matches!(
+        s.lookup(&good, Tier::Full, &Selection::All),
+        Lookup::Pass(_)
+    ));
+    assert!(matches!(
+        s.store.write(&edited),
+        Err(StoreError::Invalid(_))
+    ));
 }
 
 #[test]
