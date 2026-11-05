@@ -780,8 +780,7 @@ fn worktree_config(root: &Path) -> Result<(RepoConfig, ConfigSource, Vec<String>
             Ok((c, ConfigSource::File { blob }, Vec::new()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let roots = detect::roots_from_dir(root).map_err(|e| e.to_string())?;
-            let (c, notes) = detect::detected_config(&roots);
+            let (c, notes) = detect::detect_dir(root).map_err(|e| e.to_string())?;
             Ok((c, ConfigSource::Detected, notes))
         }
         Err(e) => Err(format!("{}: {e}", path.display())),
@@ -875,6 +874,7 @@ pub fn run_here(ctx: &Ctx, a: HereArgs) -> u8 {
             nextest_configs: BTreeMap::new(),
             line: None,
             overlay: BTreeMap::new(),
+            baselines: BTreeMap::new(),
             config: config.clone(),
             source,
             notes,
@@ -908,17 +908,25 @@ pub fn run_here(ctx: &Ctx, a: HereArgs) -> u8 {
             spec.policy.nextest_configs.insert(root, text);
         }
     }
+    // The baselines in the tree apply in CI (no policy base, R94).
+    for s in &config.steps {
+        let kind = match s.kind {
+            crate::config::repo::StepKind::PyrightBaseline => crate::steps::baseline::Kind::Pyright,
+            crate::config::repo::StepKind::PytestBaseline => crate::steps::baseline::Kind::Pytest,
+            _ => continue,
+        };
+        let rel = crate::steps::step_root(s).join(kind.file());
+        if let Ok(text) = std::fs::read_to_string(workdir.join(&rel)) {
+            spec.policy.baselines.insert(rel, text);
+        }
+    }
     let use_locks = host.exists && !a.no_host_locks;
     let r = job::run_here(&dirs, spec, &workdir, &out, &ctx.env, use_locks);
+    // R47, R73: a case per step plus the nextest suites.
     if a.junit
-        && let Some(step) = r
-            .steps
-            .iter()
-            .find(|s| s.kind == crate::config::repo::StepKind::Nextest && s.log.is_some())
-        && let Some(log) = &step.log
+        && let Err(e) = std::fs::write(out.join("junit.xml"), crate::ci::junit(&r, &out))
     {
-        let junit = out.join(log.replace(".log", ".junit.xml"));
-        let _ = std::fs::copy(&junit, out.join("junit.xml"));
+        eprintln!("tollgate: cannot write junit.xml: {e}");
     }
     print_report(&r);
     report_exit(&r)
@@ -1002,11 +1010,10 @@ pub fn config_init(ctx: &Ctx, nextest: bool) -> u8 {
     if path.exists() {
         return fail(format!("{} exists; not overwritten", path.display()));
     }
-    let roots = match detect::roots_from_dir(&root) {
-        Ok(r) => r,
+    let (config, notes) = match detect::detect_dir(&root) {
+        Ok(d) => d,
         Err(e) => return fail(e),
     };
-    let (config, notes) = detect::detected_config(&roots);
     let mut text = String::from(
         "# tollgate repo config (R63), written by `tollgate config init` from detection (R65).\n# Review it, then commit it; it applies after it merges to a full ref (L2).\n",
     );

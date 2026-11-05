@@ -183,6 +183,8 @@ impl RustPick {
 pub struct Picked {
     /// Changed paths that are not docs-only.
     pub code_paths: Vec<PathBuf>,
+    /// The code paths that were deleted (a linter cannot check them).
+    pub deleted: BTreeSet<PathBuf>,
     /// Per Rust workspace, in input order.
     pub rust: Vec<RustPick>,
     /// TypeScript/Python roots with changes.
@@ -251,6 +253,9 @@ pub fn pick(
             continue;
         }
         out.code_paths.push(p.to_owned());
+        if c.status == 'D' {
+            out.deleted.insert(p.to_owned());
+        }
         if rules.global.is_match(p) {
             whole.iter_mut().for_each(|w| *w = true);
             continue;

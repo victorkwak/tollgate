@@ -1,6 +1,6 @@
 //! The record of one tier on one tree (R76, R80, R34).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -103,6 +103,26 @@ pub struct SubsetSelection {
     pub roots: BTreeSet<String>,
     /// Steps that ran.
     pub steps: BTreeSet<String>,
+    /// Steps that linted only changed files (`biome`, `ruff`; R59, R60):
+    /// step name -> repo-relative files. A step that ran and is not listed
+    /// checked its whole root.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl SubsetSelection {
+    /// True when every step of `need` linted at least the files it needs
+    /// here: a whole-root run covers any file list, a file list covers only
+    /// its subsets.
+    fn files_cover(&self, need: &Self) -> bool {
+        need.steps
+            .iter()
+            .all(|step| match (self.files.get(step), need.files.get(step)) {
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some(have), Some(want)) => have.is_superset(want),
+            })
+    }
 }
 
 impl Selection {
@@ -120,6 +140,7 @@ impl Selection {
                     && have.marked.is_superset(&need.marked)
                     && have.roots.is_superset(&need.roots)
                     && have.steps.is_superset(&need.steps)
+                    && have.files_cover(need)
             }
         }
     }
@@ -283,7 +304,32 @@ mod tests {
             marked: packages.iter().map(|s| (*s).to_owned()).collect(),
             roots: BTreeSet::new(),
             steps: steps.iter().map(|s| (*s).to_owned()).collect(),
+            files: BTreeMap::new(),
         })
+    }
+
+    #[test]
+    fn linted_files_must_cover_the_needed_files_r79_r80() {
+        let with = |files: Option<&[&str]>| {
+            let Selection::Subset(mut s) = subset(&[], &["biome", "tsc"]) else {
+                unreachable!()
+            };
+            if let Some(f) = files {
+                s.files
+                    .insert("biome".into(), f.iter().map(|x| (*x).to_owned()).collect());
+            }
+            Selection::Subset(s)
+        };
+        let a = with(Some(&["web/a.ts"]));
+        let ab = with(Some(&["web/a.ts", "web/b.ts"]));
+        let whole = with(None);
+        assert!(ab.covers(&a));
+        assert!(
+            !a.covers(&ab),
+            "a lint of a.ts says nothing about b.ts from another base"
+        );
+        assert!(whole.covers(&ab), "a whole-root lint covers any file list");
+        assert!(!ab.covers(&whole));
     }
 
     #[test]

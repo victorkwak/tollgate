@@ -102,7 +102,16 @@ fn run() -> u8 {
             &tollgate::install::doctor::Options { repo, injection },
         ),
         Command::Guard => guard_main(&ctx),
-        other => not_built(other.name()),
+        Command::Step {
+            kind,
+            findings,
+            root,
+            baseline,
+        } => tollgate::steps::baseline::step(kind.kind(), baseline.as_deref(), &findings, &root),
+        Command::Baseline {
+            action: BaselineAction::Record { kind, force },
+        } => tollgate::steps::baseline::record_cmd(&ctx.env, &ctx.cwd, kind.kind(), force),
+        Command::CiSnippet { gitlab: _ } => tollgate::ci::ci_snippet_cmd(),
     }
 }
 
@@ -174,11 +183,6 @@ fn config_main(ctx: &cli::Ctx, args: &ConfigArgs) -> u8 {
     }
 }
 
-fn not_built(what: &str) -> u8 {
-    eprintln!("tollgate {what}: not built yet");
-    exit::BLOCK
-}
-
 #[derive(Debug, Parser)]
 #[command(
     name = "tollgate",
@@ -214,6 +218,30 @@ enum ReportFormat {
 enum BaselineKind {
     Pyright,
     Pytest,
+}
+
+impl BaselineKind {
+    fn kind(self) -> tollgate::steps::baseline::Kind {
+        match self {
+            Self::Pyright => tollgate::steps::baseline::Kind::Pyright,
+            Self::Pytest => tollgate::steps::baseline::Kind::Pytest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BaselineStep {
+    PyrightBaseline,
+    PytestBaseline,
+}
+
+impl BaselineStep {
+    fn kind(self) -> tollgate::steps::baseline::Kind {
+        match self {
+            Self::PyrightBaseline => tollgate::steps::baseline::Kind::Pyright,
+            Self::PytestBaseline => tollgate::steps::baseline::Kind::Pytest,
+        }
+    }
 }
 
 /// L14: the v1 CLI subset. `pick`, `policy approve` and `waive` are CUT.
@@ -334,33 +362,18 @@ enum Command {
         #[arg(long)]
         lock_fd: Option<i32>,
     },
-}
-
-impl Command {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Install { .. } => "install",
-            Self::Uninstall { .. } => "uninstall",
-            Self::Doctor { .. } => "doctor",
-            Self::Check { .. } => "check",
-            Self::Wait { .. } => "wait",
-            Self::Cancel { .. } => "cancel",
-            Self::Status { .. } => "status",
-            Self::Report { .. } => "report",
-            Self::Log { .. } => "log",
-            Self::Run { .. } => "run",
-            Self::Merge { .. } => "merge",
-            Self::Config(_) => "config",
-            Self::CiSnippet { .. } => "ci-snippet",
-            Self::Baseline { .. } => "baseline",
-            Self::Flaky { .. } => "flaky",
-            Self::Audit { .. } => "audit",
-            Self::Gc { .. } => "gc",
-            Self::Guard => "guard",
-            Self::Hook { .. } => "hook",
-            Self::RunJob { .. } => "__run-job",
-        }
-    }
+    /// Internal: a Python baseline step in a job (R94).
+    #[command(name = "__step", hide = true)]
+    Step {
+        #[arg(value_enum)]
+        kind: BaselineStep,
+        #[arg(long)]
+        findings: PathBuf,
+        #[arg(long, default_value = ".")]
+        root: String,
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Args)]

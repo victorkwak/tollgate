@@ -80,6 +80,9 @@ pub struct StepReport {
     /// nextest failures (R91).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failing: Vec<FailingTest>,
+    /// New pyright diagnostics or failing pytest node ids (R91, R94).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<String>,
     /// One rerun command per binary (R91).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rerun: Vec<String>,
@@ -104,6 +107,7 @@ impl StepReport {
             reused_from: None,
             message: Some(why.to_owned()),
             failing: Vec::new(),
+            items: Vec::new(),
             rerun: Vec::new(),
             tail: Vec::new(),
         }
@@ -339,6 +343,9 @@ pub fn render(r: &JobReport, header: &str) -> Vec<String> {
         if s.failing.len() > 20 {
             body.push(format!("  ... {} more failing tests", s.failing.len() - 20));
         }
+        for i in &s.items {
+            body.push(format!("  - {i}"));
+        }
         for c in &s.rerun {
             body.push(format!("  rerun: {c}"));
         }
@@ -428,10 +435,10 @@ pub fn flaky_counts(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn report() -> JobReport {
+    pub(crate) fn report() -> JobReport {
         let now = jiff::Timestamp::now();
         JobReport {
             schema: REPORT_SCHEMA,

@@ -204,6 +204,7 @@ fn subset(packages: &[&str]) -> Selection {
         marked: packages.iter().map(|s| (*s).to_owned()).collect(),
         roots: BTreeSet::new(),
         steps: ["clippy".to_owned(), "tests".to_owned()].into(),
+        files: Default::default(),
     })
 }
 

@@ -80,6 +80,9 @@ pub struct PolicySpec {
     /// version.
     #[serde(default)]
     pub overlay: BTreeMap<PathBuf, crate::policy::OverlayFile>,
+    /// R94: the policy commit's Python baseline files by path.
+    #[serde(default)]
+    pub baselines: BTreeMap<PathBuf, String>,
 }
 
 impl PolicySpec {
@@ -96,6 +99,7 @@ impl PolicySpec {
             nextest_configs: p.nextest_configs.clone(),
             line: p.line(),
             overlay: p.overlay.clone(),
+            baselines: p.baselines.clone(),
         }
     }
 }
@@ -241,6 +245,8 @@ struct Runner<'a> {
     here: bool,
     /// Take resource slots (R85; `run --here --no-host-locks` turns it off).
     use_locks: bool,
+    /// This binary, for `tollgate __step` (R94).
+    tollgate: PathBuf,
 }
 
 /// The runner entry point (`tollgate __run-job <id>`). Returns the exit
@@ -281,6 +287,7 @@ pub fn run_here(
     let end = match fsx::ensure_dir(&out.join("tmp")) {
         Ok(()) => r
             .validate(&config)
+            .or_else(|| r.setup_here(workdir, &config))
             .unwrap_or_else(|| r.check_tree(workdir, None, &config, &[])),
         Err(e) => error(ErrorCause::Internal, e.to_string()),
     };
@@ -347,8 +354,21 @@ impl<'a> Runner<'a> {
             maps: BTreeMap::new(),
             here,
             use_locks,
+            tollgate: tollgate_exe(),
         }
     }
+}
+
+/// The running tollgate binary. On Linux a binary replaced while the runner
+/// runs (`tollgate install` after `cargo install`) shows as `<path>
+/// (deleted)`; `/proc/self/exe` still execs it from the forked step.
+fn tollgate_exe() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tollgate"));
+    #[cfg(target_os = "linux")]
+    if exe.to_string_lossy().ends_with(" (deleted)") || !exe.is_file() {
+        return PathBuf::from("/proc/self/exe");
+    }
+    exe
 }
 
 impl Runner<'_> {
@@ -626,7 +646,44 @@ impl Runner<'_> {
                         m.setup.insert(name, hash);
                     });
                 }
-                SetupResult::Failed(m) => return Some(error(ErrorCause::Setup, m)),
+                SetupResult::Failed(m) => {
+                    return Some(error(
+                        ErrorCause::Setup,
+                        format!(
+                            "{m}; tollgate log {} setup-{}",
+                            self.spec.id,
+                            report::slug(&s.name)
+                        ),
+                    ));
+                }
+                SetupResult::Aborted(_) => return Some(End::Cancelled),
+            }
+        }
+        None
+    }
+
+    /// `run --here` (R45, R47): every `[[setup]]` step runs in the work
+    /// dir (a CI clone has no `node_modules` or `.venv`; there is no
+    /// checkout meta to say what is up to date).
+    fn setup_here(&mut self, workdir: &Path, config: &RepoConfig) -> Option<End> {
+        for s in &config.setup {
+            let log = self
+                .job_dir
+                .join(format!("setup-{}.log", report::slug(&s.name)));
+            let mut never = || None;
+            match setup::run(s, "", None, workdir, &self.env, &log, None, &mut never, &[]) {
+                SetupResult::Ran(d) => self.say(&format!(
+                    "setup {:?}: ran in {:.1}s",
+                    s.name,
+                    d.as_secs_f64()
+                )),
+                SetupResult::UpToDate => {}
+                SetupResult::Failed(m) => {
+                    return Some(error(
+                        ErrorCause::Setup,
+                        format!("{m}; log: {}", log.display()),
+                    ));
+                }
                 SetupResult::Aborted(_) => return Some(End::Cancelled),
             }
         }
@@ -908,6 +965,14 @@ impl Runner<'_> {
                 ));
                 break;
             }
+            let env = match self.step_env(s) {
+                Ok(e) if steps::is_rust(s.kind) => self.target_env(&e, workdir, &root),
+                Ok(e) => e,
+                Err(end) => {
+                    error_end = Some(end);
+                    break;
+                }
+            };
             let mut slug = report::slug(&s.name);
             if !used_logs.insert(slug.clone()) {
                 slug = format!("{slug}-{}", used_logs.len());
@@ -917,6 +982,48 @@ impl Runner<'_> {
             let nextest_cfg = self.job_dir.join(format!("{slug}.nextest.toml"));
             let tool_config = self.job_dir.join(format!("{slug}.nextest-tool.toml"));
             let junit = self.job_dir.join(format!("{slug}.junit.xml"));
+            let findings = self.job_dir.join(format!("{slug}.findings.json"));
+            let _ = std::fs::remove_file(&findings);
+            // R49, R94: the baseline of the policy commit, never the tree's.
+            let baseline_kind = match s.kind {
+                StepKind::PyrightBaseline => Some(steps::baseline::Kind::Pyright),
+                StepKind::PytestBaseline => Some(steps::baseline::Kind::Pytest),
+                _ => None,
+            };
+            let baseline_file = self.job_dir.join(format!("{slug}.baseline.json"));
+            let baseline = match baseline_kind
+                .and_then(|k| self.spec.policy.baselines.get(&root.join(k.file())))
+            {
+                Some(text) => match std::fs::write(&baseline_file, text) {
+                    Ok(()) => Some(baseline_file.as_path()),
+                    Err(e) => {
+                        error_end = Some(error(ErrorCause::Internal, e.to_string()));
+                        break;
+                    }
+                },
+                None => None,
+            };
+            let root_dir = workdir.join(&root);
+            let lang_ctx = steps::lang::LangCtx {
+                root_dir: &root_dir,
+                top: workdir,
+                path: env.get("PATH"),
+                tollgate: &self.tollgate,
+                baseline,
+                findings: &findings,
+            };
+            if (steps::lang::is_ts(s.kind) || steps::lang::is_python(s.kind))
+                && let Some(missing) = steps::lang::missing_tool(s.kind, &lang_ctx)
+            {
+                let mut rep = StepReport::skipped(&s.name, s.kind, &missing);
+                rep.status = StepStatus::Error;
+                self.report.steps.push(rep);
+                error_end = Some(error(
+                    ErrorCause::Setup,
+                    format!("step {:?}: {missing}", s.name),
+                ));
+                break;
+            }
             if s.kind == StepKind::Nextest {
                 // R49: the policy commit's nextest config (empty when it has
                 // none, so the tree's own file is not read); R72: the tool
@@ -951,11 +1058,17 @@ impl Runner<'_> {
                     nextest_config: &nextest_cfg,
                     tool_config: &tool_config,
                     map,
+                    lang: Some(lang_ctx),
                 },
             ) {
                 Ok(Some(i)) => i,
                 Ok(None) => {
-                    let mut rep = StepReport::skipped(&s.name, s.kind, "no library target");
+                    let why = if s.kind == StepKind::CargoDoctest {
+                        "no library target"
+                    } else {
+                        "no changed file left to lint"
+                    };
+                    let mut rep = StepReport::skipped(&s.name, s.kind, why);
                     rep.status = StepStatus::Pass;
                     self.report.steps.push(rep);
                     self.step_results.push(StepResult {
@@ -970,14 +1083,6 @@ impl Runner<'_> {
                 }
                 Err(e) => {
                     error_end = Some(error(ErrorCause::Config, e));
-                    break;
-                }
-            };
-            let env = match self.step_env(s) {
-                Ok(e) if steps::is_rust(s.kind) => self.target_env(&e, workdir, &root),
-                Ok(e) => e,
-                Err(end) => {
-                    error_end = Some(end);
                     break;
                 }
             };
@@ -1086,6 +1191,7 @@ impl Runner<'_> {
                 reused_from: None,
                 message: None,
                 failing: Vec::new(),
+                items: Vec::new(),
                 rerun: Vec::new(),
                 tail: Vec::new(),
             };
@@ -1115,7 +1221,9 @@ impl Runner<'_> {
                     stop = true;
                 }
                 ExecEnd::Exited(status) => {
-                    if s.kind == StepKind::Nextest {
+                    if baseline_kind.is_some() {
+                        Self::baseline_result(&mut rep, status.success(), &findings, &log);
+                    } else if s.kind == StepKind::Nextest {
                         self.nextest_result(
                             &mut rep,
                             status.code(),
@@ -1187,6 +1295,7 @@ impl Runner<'_> {
                     .failing
                     .iter()
                     .map(|f| format!("{} {} {}", f.package, f.binary_id, f.name))
+                    .chain(rep.items.iter().cloned())
                     .collect(),
             });
             self.report.steps.push(rep);
@@ -1242,6 +1351,8 @@ impl Runner<'_> {
         None
     }
 
+    /// The step's environment: the job's, the kind's own variables, then
+    /// the step's `env` and `env_file` (R52).
     fn step_env(&self, s: &crate::config::repo::Step) -> Result<JobEnv, End> {
         let file = match &s.env_file {
             Some(p) => {
@@ -1263,7 +1374,8 @@ impl Runner<'_> {
             None => None,
         };
         self.env
-            .for_step(&s.env, file.as_ref())
+            .for_step(&steps::lang::step_env(s.kind), None)
+            .and_then(|e| e.for_step(&s.env, file.as_ref()))
             .map_err(|e| error(ErrorCause::Config, e.to_string()))
     }
 
@@ -1319,6 +1431,32 @@ impl Runner<'_> {
                 &self.job_dir.join(format!("{slug}.log")),
                 report::TAIL_LINES,
             );
+        }
+    }
+
+    /// The report of a baseline step (R91, R94): what `tollgate __step`
+    /// wrote to `findings`, else the log tail.
+    fn baseline_result(rep: &mut StepReport, passed: bool, findings: &Path, log: &Path) {
+        let found: Option<steps::baseline::Findings> = std::fs::read(findings)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        if passed {
+            if let Some(f) = found.filter(|f| !f.notes.is_empty()) {
+                rep.message = Some(f.notes.join(" "));
+            }
+            return;
+        }
+        rep.status = StepStatus::Fail;
+        match found {
+            Some(f) => {
+                rep.message = f.summary;
+                rep.items = f.items;
+                rep.rerun = f.rerun;
+                if rep.items.is_empty() {
+                    rep.tail = report::tail(log, report::TAIL_LINES);
+                }
+            }
+            None => rep.tail = report::tail(log, report::TAIL_LINES),
         }
     }
 
