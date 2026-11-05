@@ -384,3 +384,250 @@ pub fn eventually(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
     }
     cond()
 }
+
+/// Every hook name `install` links (R2 minus `reference-transaction`, L1).
+pub const HOOK_NAMES: &[&str] = &[
+    "pre-commit",
+    "pre-merge-commit",
+    "pre-push",
+    "applypatch-msg",
+    "pre-applypatch",
+    "post-applypatch",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-commit",
+    "pre-rebase",
+    "post-checkout",
+    "post-merge",
+    "post-rewrite",
+    "pre-auto-gc",
+];
+
+/// A test hooks dir of hard links to the built binary (R1). Hard links need
+/// the binary's file system, so the dir lives in the target tmp dir, keyed
+/// by the binary's inode and mtime; it is made once by an atomic rename and
+/// shared by every test of this build.
+pub fn test_hooks_dir() -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(BIN).unwrap();
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let dir = base.join(format!(
+        "hooks-{}-{}-{}",
+        md.dev(),
+        md.ino(),
+        md.mtime_nsec() + md.mtime() * 1_000_000_000
+    ));
+    if dir.join("pre-commit").exists() {
+        return dir;
+    }
+    let tmp = tempfile::tempdir_in(base).unwrap();
+    for name in HOOK_NAMES {
+        std::fs::hard_link(BIN, tmp.path().join(name)).unwrap();
+    }
+    let staged = tmp.keep();
+    if std::fs::rename(&staged, &dir).is_err() {
+        // Another test made it first.
+        let _ = std::fs::remove_dir_all(&staged);
+    }
+    // The links of earlier builds keep those 80 MB binaries on disk.
+    if let Ok(rd) = std::fs::read_dir(base) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let stale = p != dir
+                && e.file_name().to_string_lossy().starts_with("hooks-")
+                && std::fs::metadata(p.join("pre-commit")).is_ok_and(|m| m.ino() != md.ino());
+            if stale {
+                let _ = std::fs::remove_dir_all(&p);
+            }
+        }
+    }
+    dir
+}
+
+impl Sandbox {
+    /// The hook injection (R3) pointing at [`test_hooks_dir`].
+    pub fn injection(&self) -> Vec<(&'static str, std::ffi::OsString)> {
+        vec![
+            ("GIT_CONFIG_COUNT", "1".into()),
+            ("GIT_CONFIG_KEY_0", "core.hooksPath".into()),
+            ("GIT_CONFIG_VALUE_0", test_hooks_dir().into_os_string()),
+        ]
+    }
+
+    /// Runs git in `dir` under the injection plus `extra`.
+    pub fn hooked_with(&self, dir: &Path, args: &[&str], extra: &[(&str, &str)]) -> Run {
+        let inj = self.injection();
+        let mut all: Vec<(&str, &OsStr)> = inj.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
+        all.extend(extra.iter().map(|(k, v)| (*k, OsStr::new(*v))));
+        let out = self.git_output(dir, args, &all);
+        Run {
+            code: out.status.code(),
+            out: format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        }
+    }
+
+    /// Runs git in `dir` under the injection.
+    pub fn hooked(&self, dir: &Path, args: &[&str]) -> Run {
+        self.hooked_with(dir, args, &[])
+    }
+
+    /// Host config with the sandbox root as the scope root, a tiny disk
+    /// floor (tests run in /tmp) and `extra` appended.
+    pub fn scoped_host(&self, extra: &str) {
+        self.host_config(&format!(
+            "[scope]\nroots = [\"{}\"]\n{extra}\n[verify]\nmin_free = \"1M\"\n",
+            self.root().display()
+        ));
+    }
+}
+
+impl Sandbox {
+    /// Runs hook link `name` from [`test_hooks_dir`] directly in `repo`
+    /// with the sandbox env, the injection and `extra`.
+    pub fn run_hook(
+        &self,
+        repo: &Path,
+        name: &str,
+        extra: &[(&str, &str)],
+    ) -> std::process::Output {
+        let mut cmd = std::process::Command::new(test_hooks_dir().join(name));
+        cmd.env_clear()
+            .current_dir(repo)
+            .stdin(std::process::Stdio::null());
+        for (k, v) in self.env().iter() {
+            cmd.env(k, v);
+        }
+        for (k, v) in self.injection() {
+            cmd.env(k, v);
+        }
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        cmd.output().unwrap()
+    }
+}
+
+/// A sandbox with tollgate installed (fake claude, sandbox settings).
+pub struct Armed {
+    pub sb: Sandbox,
+    pub path: String,
+}
+
+impl Armed {
+    pub fn new() -> Self {
+        let sb = Sandbox::new();
+        let bin_dir = sb.root().join("bin");
+        write_exe(
+            &bin_dir.join("claude"),
+            "#!/bin/sh\necho '2.1.317 (Claude Code)'\n",
+        );
+        sb.host_config("[verify]\nmin_free = \"1M\"\n");
+        std::fs::create_dir_all(sb.home.join(".claude")).unwrap();
+        std::fs::write(sb.home.join(".claude/settings.json"), "{}\n").unwrap();
+        let a = Self {
+            path: format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap()),
+            sb,
+        };
+        let r = a.install();
+        assert_eq!(r.0, Some(0), "{}", r.1);
+        a
+    }
+
+    pub fn install(&self) -> (Option<i32>, String) {
+        let out = self
+            .cmd(Path::new(BIN), &["install", "--yes"], &[])
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    }
+
+    pub fn data(&self) -> PathBuf {
+        self.sb.root().join("data/tollgate")
+    }
+
+    pub fn bin(&self) -> PathBuf {
+        self.data().join("bin/tollgate")
+    }
+
+    pub fn cmd(&self, program: &Path, args: &[&str], extra: &[(&str, &str)]) -> Command {
+        let mut cmd = Command::new(program);
+        cmd.env_clear().current_dir(self.sb.root()).args(args);
+        for (k, v) in self.sb.env().iter() {
+            cmd.env(k, v);
+        }
+        let root = self.sb.root();
+        cmd.env("PATH", &self.path)
+            .env("TMPDIR", &root)
+            .env("TOLLGATE_TEST_INSTALL", "1");
+        let hooks = self.data().join("hooks");
+        cmd.env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", hooks);
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+
+    /// Runs the installed guard on `input`; returns (exit, stdout, stderr).
+    pub fn guard_raw(&self, input: &str, extra: &[(&str, &str)]) -> (Option<i32>, String, String) {
+        let mut child = self
+            .cmd(&self.bin(), &["guard"], extra)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    pub fn bash(&self, command: &str) -> (Option<i32>, String, String) {
+        self.bash_with(command, &[])
+    }
+
+    pub fn bash_with(
+        &self,
+        command: &str,
+        extra: &[(&str, &str)],
+    ) -> (Option<i32>, String, String) {
+        let input = serde_json::json!({
+            "session_id": "s",
+            "hook_event_name": "PreToolUse",
+            "cwd": self.sb.root(),
+            "tool_name": "Bash",
+            "tool_input": {"command": command, "description": "d"},
+        });
+        self.guard_raw(&input.to_string(), extra)
+    }
+
+    pub fn write(&self, file: &str) -> (Option<i32>, String, String) {
+        let input = serde_json::json!({
+            "cwd": self.sb.root(),
+            "tool_name": "Write",
+            "tool_input": {"file_path": file, "content": "x"},
+        });
+        self.guard_raw(&input.to_string(), &[])
+    }
+}

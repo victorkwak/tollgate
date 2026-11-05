@@ -24,6 +24,7 @@ pub mod hook;
 pub mod ids;
 pub mod install;
 pub mod locks;
+pub mod merge;
 pub mod plan;
 pub mod policy;
 pub mod procs;

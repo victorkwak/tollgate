@@ -28,29 +28,50 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+/// Runs `program` in `cwd`, which is in no git repository: discovery does
+/// not go above `cwd` (GIT_CEILING_DIRECTORIES names its parent).
+fn run_outside_repo(program: &Path, args: &[&str], cwd: &Path) -> Output {
+    Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", cwd)
+        .env("XDG_CONFIG_HOME", cwd.join("config"))
+        .env("XDG_STATE_HOME", cwd.join("state"))
+        .env("XDG_DATA_HOME", cwd.join("data"))
+        .env("GIT_CEILING_DIRECTORIES", cwd.parent().unwrap())
+        .output()
+        .expect("run tollgate")
+}
+
 #[test]
-fn hook_hard_link_dispatches_on_argv0_and_denies_until_built_r1_r31() {
+fn hook_hard_link_dispatches_on_argv0_r1_r31() {
     // Hard links need the same filesystem as the binary.
     let tmp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let link = tmp.path().join("pre-commit");
-    std::fs::hard_link(BIN, &link).unwrap();
-    let out = run(&link, &[], tmp.path());
+    let dir = tmp.path().canonicalize().unwrap();
+    for name in ["pre-commit", "post-commit"] {
+        std::fs::hard_link(BIN, dir.join(name)).unwrap();
+    }
+    // R31: a gate hook outside any repository denies; a chained hook has
+    // nothing to chain to and allows.
+    let out = run_outside_repo(&dir.join("pre-commit"), &[], &dir);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("DENIED pre-commit"),
+        stderr(&out).contains("DENIED pre-commit")
+            && stderr(&out).contains("not in a git repository"),
         "{}",
         stderr(&out)
     );
+    let out = run_outside_repo(&dir.join("post-commit"), &[], &dir);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
 }
 
 #[test]
 fn hook_subcommand_dispatches_by_name() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = run(
-        Path::new(BIN),
-        &["hook", "pre-push", "origin", "url"],
-        tmp.path(),
-    );
+    let dir = tmp.path().canonicalize().unwrap();
+    let out = run_outside_repo(Path::new(BIN), &["hook", "pre-push", "origin", "url"], &dir);
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("DENIED pre-push"), "{}", stderr(&out));
 }
@@ -68,7 +89,7 @@ fn reference_transaction_is_not_a_known_hook_l1() {
 }
 
 #[test]
-fn guard_blocks_until_built_r23() {
+fn guard_blocks_on_empty_input_r23() {
     let tmp = tempfile::tempdir().unwrap();
     let out = run(Path::new(BIN), &["guard"], tmp.path());
     assert_eq!(out.status.code(), Some(2));
