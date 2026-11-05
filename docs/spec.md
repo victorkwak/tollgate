@@ -37,6 +37,31 @@ L13. macOS: build and unit-test on the Mac later through the board; Linux first.
 
 L14. CLI subset for v1: `install`, `uninstall`, `doctor`, `check`, `wait`, `cancel`, `status`, `report`, `log`, `run --here`, `merge`, `config --effective|--check|init`, `ci-snippet --gitlab`, `baseline record`, `flaky`, `audit`, `gc`, `guard`, `hook`. CUT: `pick`, `policy approve`, `waive`.
 
+
+## Performance and autonomy decisions (v3.1, 2026-11-05)
+
+Victor: agents as autonomous as practical without giving up safety or quality; 2026-11-04 showed what slow, rerun-from-zero gates cost. These decisions are binding for the Runner, Hooks and later phases.
+
+L15. **Sticky verify checkouts.** A fast verify checkout is keyed by origin (the agent worktree path that started the job, from the hook's repo toplevel), not taken from a shared pool: each agent worktree gets its own `fast` checkout with its own target dir, created on first use, so its incremental build stays warm and it never rebuilds another branch's tree. `verify.max_checkouts` (default 12 per repo) with LRU eviction (`cargo clean` is not needed: the whole checkout is removed). Full checkouts: keyed the same way, `verify.max_full_checkouts` default 4, LRU. Concurrency is limited by resource slots (R85), not by checkout count. `verify.slots` (R41) is CUT.
+Reason: a shared checkout that alternates between diverged branches recompiles most of the workspace on each switch (minutes for myapp), which would recreate the 2026-11-04 slowness.
+
+L16. **Step-level reuse by inputs.** A step may declare `inputs` (globs, default `["**"]`) and `exclude_inputs` in policy (from the policy commit, L2). The step's result is stored under a step key = blake3(step definition, fingerprint, sorted list of (path, blob oid, mode) of the tree entries matching its inputs). A job reuses a stored `pass` for a step whose step key matches, and reports it as `REUSED <step> from <job>`. Reuse applies to `fast` jobs and to pushes of non-full refs. `full` jobs for full refs (`tollgate merge`, pushes to `main`) and CI run every step fresh: no reuse there.
+Reason: in myapp an iOS-only or dashboard-only change must not rerun the Rust suite on every commit. A wrong `exclude_inputs` can delay detection only until the merge to a full ref, which always runs everything.
+
+L17. **Long checks without retry loops.** The guard (R28) sets `TOLLGATE_INLINE_CAP` to the `fast` budget (default 20 min) when the Bash call has `run_in_background: true`, and to 540 s otherwise. The deny message after the inline budget gives one command that waits and then commits: `tollgate wait <job> && git commit <same args>` (tollgate prints the exact command, with the original arguments, from the hook's view of argv where git exposes it, else a placeholder). `tollgate wait` exits 0 on pass, 1 on fail (and prints the report), 3 on still running after its timeout.
+
+L18. **Self-repair before deny.** When the guard's self-check (R24) finds a missing or dangling hook link or a missing hooks dir, and `install.json` and the installed binary copy are intact, the guard recreates the links (same inode checks after) and allows the call, writing one line to `$XDG_STATE_HOME/tollgate/repairs.log`. It denies only when repair fails or the settings env is wrong (settings are never edited by the guard).
+
+L19. **Performance budgets** (p95 on the Arch box, tested where marked):
+- Guard per call: under 10 ms (test: 200 calls).
+- Chained non-gate hook (for example `post-commit` with no repo hook): under 5 ms (test).
+- `pre-commit` on a cache hit: under 200 ms (test).
+- `pre-commit` on a docs-only tree: under 200 ms (test).
+- Fast job overhead beyond the steps themselves (checkout update, metadata, selection, record write): under 3 s for a myapp-sized workspace (bench).
+- No tollgate code on the path of git commands that run no hooks (`status`, `diff`, `log`, `show`, `fetch`).
+
+L20. **Benchmark before rollout.** `tollgate bench` (dev command, or `benches/` harness) replays commits concurrently from N worktrees of one repo through the real hooks and reports p50/p95 commit latency (hook start to allow), queue wait per resource, CPU load, peak test-Postgres connections, cache hits and step reuse. Rollout to myapp (R98 step 3) needs a run with 6 worktrees and realistic commits (a core change, an api-only change, a dashboard-only change, a docs change, a retry) and resource slot values (`cpu`, `pg`, `pg_max_threads`) chosen from that run, not guessed. L5's slot numbers are starting values only.
+
 ---
 
 # tollgate: design specification
