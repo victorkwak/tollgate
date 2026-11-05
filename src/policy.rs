@@ -492,13 +492,15 @@ pub fn resolve(
     };
     let mut found = config_at(git, &base_entries)?;
     // The anchor commit's own config may name other anchors; it sits on a
-    // protected ref, so its list can be trusted.
+    // protected ref, so its list can be trusted. The second pass counts
+    // only when it found one of them: with none, `policy_base` falls back
+    // to the tip itself, the branch's own policy, so the first pass stays.
     if base.anchor.is_some()
         && let Some((_, c)) = &found
         && c.policy.anchors != default_anchors
     {
         let again = policy_base(git, tip, trusted, &c.policy.anchors, own_ref)?;
-        if again.commit != base.commit {
+        if again.anchor.is_some() && again.commit != base.commit {
             base = again;
             base_entries = match &base.commit {
                 Some(c) => git.ls_tree(c)?,

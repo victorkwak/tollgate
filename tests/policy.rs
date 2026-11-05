@@ -288,6 +288,30 @@ fn the_anchor_commits_config_names_the_anchors_l2() {
 }
 
 #[test]
+fn anchors_named_by_the_policy_that_do_not_exist_keep_the_first_pass_l2() {
+    let sb = Sandbox::new();
+    let repo = sb.repo("r");
+    // main's config names an anchor that no ref has; no trusted remote.
+    sb.commit_file(
+        &repo,
+        "tollgate.toml",
+        &format!("{MAIN_POLICY}[policy]\nanchors = [\"trunk\"]\n"),
+        "policy",
+    );
+    let main_tip = rev(&sb, &repo, "HEAD");
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(&repo, "tollgate.toml", WEAK_POLICY, "weaken");
+    let tip = rev(&sb, &repo, "HEAD");
+    // The second pass finds no anchor: the first pass (main) still
+    // decides, never the branch's own tip.
+    let p = resolve_at(&sb, &repo, &tip, &[], "refs/heads/feat").unwrap();
+    assert_eq!(p.base.commit.as_ref(), Some(&main_tip));
+    assert_eq!(p.base.anchor.as_deref(), Some("refs/heads/main"));
+    assert_eq!(p.config.steps.len(), 1, "main's policy applies");
+    assert_eq!(p.changed, [PathBuf::from("tollgate.toml")]);
+}
+
+#[test]
 fn tool_configs_come_from_the_policy_commit_r71() {
     let sb = Sandbox::new();
     let repo = sb.repo("r");
