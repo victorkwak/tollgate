@@ -6,6 +6,14 @@
 //! - `biome`, `tsc`, `svelte-check`: `node_modules/.bin/<tool>` of the root
 //!   (or of a parent dir inside the checkout, for hoisted workspaces), made
 //!   by the setup step `bun install --frozen-lockfile` (R45).
+//! - `tsc`: `tsc --noEmit` on the root's `tsconfig.json`. A solution-style
+//!   config (one with `references`, such as `"files": []` plus references
+//!   in the Vite TypeScript templates) checks no file itself, so the step
+//!   runs `tsc -b --force` instead: every referenced project is built and
+//!   checked from scratch (no stale up-to-date skip in a sticky checkout).
+//!   Build mode writes `.tsbuildinfo` files and any outputs the projects
+//!   emit: they must be in `.gitignore`, or the R42 clean-tree check names
+//!   them.
 //! - `bun-test`: `bun run test`. `svelte-check` runs `bun run check` when the
 //!   root's `check` script calls `svelte-check` (it usually runs
 //!   `svelte-kit sync` first), else `node_modules/.bin/svelte-check`.
@@ -206,6 +214,106 @@ pub fn svelte_check_script(root_dir: &Path) -> bool {
         .is_some_and(|s| s.contains("svelte-check"))
 }
 
+/// Parses JSON with comments and trailing commas (tsconfig.json is read
+/// that way by tsc).
+pub fn parse_jsonc(text: &str) -> Result<serde_json::Value, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '"' => {
+                out.push(c);
+                i += 1;
+                while i < chars.len() {
+                    out.push(chars[i]);
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        out.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    if chars[i - 1] == '"' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.get(i + 1) == Some(&'/') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                i += 2;
+                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                    i += 1;
+                }
+                i += 2;
+                out.push(' ');
+            }
+            ',' => {
+                // A comma whose next significant char closes the list.
+                let mut j = i + 1;
+                loop {
+                    match chars.get(j) {
+                        Some(w) if w.is_whitespace() => j += 1,
+                        Some('/') if chars.get(j + 1) == Some(&'/') => {
+                            while j < chars.len() && chars[j] != '\n' {
+                                j += 1;
+                            }
+                        }
+                        Some('/') if chars.get(j + 1) == Some(&'*') => {
+                            j += 2;
+                            while j < chars.len()
+                                && !(chars[j] == '*' && chars.get(j + 1) == Some(&'/'))
+                            {
+                                j += 1;
+                            }
+                            j += 2;
+                        }
+                        _ => break,
+                    }
+                }
+                if !matches!(chars.get(j), Some('}' | ']')) {
+                    out.push(c);
+                }
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    serde_json::from_str(&out).map_err(|e| e.to_string())
+}
+
+/// The `tsc` arguments for the root's `tsconfig.json` (R59): `-b --force`
+/// when it has `references` (a solution-style config checks nothing with
+/// `--noEmit`), else `--noEmit`. An unreadable or invalid tsconfig.json is
+/// an error: tsc would fail on it too, and it must not hide references.
+pub fn tsc_args(root_dir: &Path) -> Result<Vec<&'static str>, String> {
+    let path = root_dir.join("tsconfig.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        // tsc finds no project and fails with its own message.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec!["--noEmit"]),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let v = parse_jsonc(&text).map_err(|e| format!("tsconfig.json is not valid JSON: {e}"))?;
+    let solution = v
+        .get("references")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|r| !r.is_empty());
+    Ok(if solution {
+        vec!["-b", "--force"]
+    } else {
+        vec!["--noEmit"]
+    })
+}
+
 fn show(root_dir: &Path, top: &Path) -> String {
     match root_dir.strip_prefix(top) {
         Ok(r) if r.as_os_str().is_empty() => ".".to_owned(),
@@ -328,7 +436,7 @@ pub fn invocation(
         StepKind::Tsc => Invocation {
             program: node("tsc")?.into(),
             arg0: None,
-            args: os(&["--noEmit"]),
+            args: os(&tsc_args(ctx.root_dir)?),
         },
         StepKind::SvelteCheck if svelte_check_script(ctx.root_dir) => Invocation {
             program: "bun".into(),
@@ -392,6 +500,42 @@ mod tests {
 
     fn set(p: &[&str]) -> BTreeSet<String> {
         p.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn jsonc_comments_and_trailing_commas_r59() {
+        let v = parse_jsonc(
+            "\u{feff}// top\n{\n  /* c */ \"files\": [], // x\n  \"references\": [{\"path\": \"a//b\",}, /* y */],\n  \"s\": \"q\\\"/*\",\n}\n",
+        )
+        .unwrap();
+        assert_eq!(v["files"], serde_json::json!([]));
+        assert_eq!(v["references"][0]["path"], "a//b");
+        assert_eq!(v["s"], "q\"/*");
+        assert!(parse_jsonc("{\"a\": }").is_err());
+    }
+
+    #[test]
+    fn tsc_builds_solution_style_configs_r59() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        assert_eq!(tsc_args(d).unwrap(), ["--noEmit"]);
+        for (text, want) in [
+            (r#"{"include":["src"]}"#, &["--noEmit"][..]),
+            (r#"{"files":[],"references":[]}"#, &["--noEmit"][..]),
+            (
+                "{\"files\": [], // vite\n \"references\": [{\"path\": \"./tsconfig.app.json\"},],}",
+                &["-b", "--force"][..],
+            ),
+            (
+                r#"{"include":["src"],"references":[{"path":"../lib"}]}"#,
+                &["-b", "--force"][..],
+            ),
+        ] {
+            std::fs::write(d.join("tsconfig.json"), text).unwrap();
+            assert_eq!(tsc_args(d).unwrap(), want, "{text}");
+        }
+        std::fs::write(d.join("tsconfig.json"), "{nope").unwrap();
+        assert!(tsc_args(d).is_err());
     }
 
     #[test]

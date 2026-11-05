@@ -235,6 +235,56 @@ fn bun_project_full_then_fast_lints_only_changed_files_r59_r46_t25() {
     assert!(!own.status.success());
 }
 
+/// R59: a solution-style tsconfig.json (`"files": []` plus `references`,
+/// as the Vite TypeScript templates ship) makes `tsc --noEmit` check no
+/// file at all. The step builds the references with `tsc -b`, so a type
+/// error in a referenced project fails it.
+#[test]
+fn a_solution_style_tsconfig_checks_its_references_r59() {
+    let Some(p) = project(
+        "a_solution_style_tsconfig_checks_its_references",
+        Some(POLICY),
+    ) else {
+        return;
+    };
+    p.write(
+        "web/tsconfig.json",
+        "// solution\n{\n  \"files\": [],\n  \"references\": [{ \"path\": \"./tsconfig.app.json\" },],\n}\n",
+    );
+    p.write(
+        "web/tsconfig.app.json",
+        r#"{"compilerOptions":{"strict":true,"noEmit":true,"target":"es2022","module":"esnext","moduleResolution":"bundler","types":[],"tsBuildInfoFile":"./node_modules/.tmp/app.tsbuildinfo"},"include":["src"],"exclude":["src/**/*.test.ts"]}"#,
+    );
+    p.write(
+        "web/src/a.ts",
+        "export const one = (x: number): number => x + 1;\nexport const bad: number = \"one\";\n",
+    );
+    // biome checks the new files too: write them as it formats them.
+    let web = p.repo.join("web");
+    let env = p.sb.env();
+    let offline = tools::offline_env(&p.sb.root());
+    tools::run(&p.biome, &["format", "--write", "."], &web, &env, &offline);
+    p.sb.git(&p.repo, &["add", "-A"]);
+    let (code, out, report) = p.check(&["check", "--tier", "full", "--wait"]);
+    assert_eq!(code, Some(1), "{out}\n{report}");
+    assert_eq!(step(&report, "biome")["status"], "pass", "{report}");
+    assert_eq!(step(&report, "tsc")["status"], "fail", "{report}");
+    assert!(out.contains("TS2322"), "{out}");
+    assert!(
+        command(&report, "tsc").ends_with("/web/node_modules/.bin/tsc -b --force"),
+        "{report}"
+    );
+    // Fixed: the build passes; its tsbuildinfo goes to node_modules, which
+    // .gitignore lists, so the checkout stays clean (R42).
+    p.write(
+        "web/src/a.ts",
+        "export const one = (x: number): number => x + 1;\n",
+    );
+    let (code, out, report) = p.check(&["check", "--tier", "full", "--wait"]);
+    assert_eq!(code, Some(0), "{out}\n{report}");
+    assert_eq!(step(&report, "tsc")["status"], "pass", "{report}");
+}
+
 #[test]
 fn changes_outside_the_root_skip_its_steps_and_docs_pass_r59_r61() {
     let Some(p) = project("changes_outside_the_root_skip_its_steps", Some(POLICY)) else {
