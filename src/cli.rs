@@ -840,6 +840,7 @@ pub fn run_here(ctx: &Ctx, a: HereArgs) -> u8 {
             committer_date: None,
             nextest_configs: BTreeMap::new(),
             line: None,
+            overlay: BTreeMap::new(),
             config: config.clone(),
             source,
             notes,

@@ -196,6 +196,9 @@ mkdir -p target && touch target/marker junk.txt
 "#;
     let repo = repo_with(&sb, "r", steps);
     sb.commit_file(&repo, "a.txt", "1\n", "a");
+    // An ignored file a step leaves behind is not a change (R42), and the
+    // next job's `clean -x` removes it.
+    sb.commit_file(&repo, ".gitignore", "junk.txt\n", "ignore");
     // Unstaged and untracked files in the agent checkout are not checked.
     std::fs::write(repo.join("unstaged.txt"), "x").unwrap();
     std::fs::write(repo.join("a.txt"), "dirty\n").unwrap();
@@ -540,4 +543,64 @@ when = ["b/**"]
     let hit = sb.tollgate(&repo, &["check", "--wait"]);
     assert_eq!(hit.code, Some(0), "{}", hit.out);
     assert_eq!(sb.jobs().len(), jobs, "{}", hit.out);
+}
+
+#[test]
+fn steps_must_leave_the_checkout_as_read_and_are_not_reused_r42_l16() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"writes\"\nkind = \"command\"\nrun = \"echo rewritten > src/a.rs\"\ninputs = [\"src/**\"]\n",
+    );
+    sb.commit_file(&repo, "src/a.rs", "orig\n", "src");
+    sb.commit_file(&repo, "other.cfg", "1\n", "cfg");
+    std::fs::write(repo.join("other.cfg"), "2\n").unwrap();
+    sb.git(&repo, &["add", "other.cfg"]);
+    let first = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(first.code, Some(1), "{}", first.out);
+    assert!(
+        first.out.contains("cause checkout")
+            && first
+                .out
+                .contains("\"writes\" changed the checkout: src/a.rs"),
+        "{}",
+        first.out
+    );
+    // A tree that differs only outside the step's inputs must run the step
+    // again, not reuse a pass the R42 check never accepted.
+    std::fs::write(repo.join("other.cfg"), "3\n").unwrap();
+    sb.git(&repo, &["add", "other.cfg"]);
+    let second = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(second.code, Some(1), "{}", second.out);
+    assert!(!second.out.contains("REUSED"), "{}", second.out);
+    assert!(second.out.contains("cause checkout"), "{}", second.out);
+    assert!(
+        !sb.state().join("steps").exists()
+            || std::fs::read_dir(sb.state().join("steps")).unwrap().count() == 0,
+        "no stored step pass"
+    );
+    sb.git(&repo, &["reset", "-q", "--hard"]);
+
+    // An untracked file and an index change count too (R42: `git status
+    // --porcelain` empty, `write-tree` equal to T).
+    for (run, needle) in [
+        ("touch new.txt", "new.txt"),
+        ("echo x >> README && git add README", "README"),
+    ] {
+        sb.commit_file(
+            &repo,
+            "tollgate.toml",
+            &format!("version = 1\n[[step]]\nname = \"s\"\nkind = \"command\"\nrun = '{run}'\n"),
+            run,
+        );
+        let r = sb.tollgate(&repo, &["check", "--wait"]);
+        assert_eq!(r.code, Some(1), "{run}: {}", r.out);
+        assert!(
+            r.out.contains("cause checkout") && r.out.contains(needle),
+            "{run}: {}",
+            r.out
+        );
+    }
 }

@@ -10,8 +10,8 @@
 //! Before a job (R42): `read-tree -u --reset <T>`, `clean -ffdx` keeping
 //! `target`, `node_modules`, `.venv` and the steps' `cache_dirs`, then no
 //! untracked file and no index/worktree difference may be left, and
-//! `write-tree` must equal `T`. After the steps, tracked files must be
-//! unchanged.
+//! `write-tree` must equal `T`. After each step, no tracked file, index
+//! entry or untracked file may have changed ([`Checkout::changes`]).
 
 use std::fs;
 use std::io;
@@ -391,13 +391,132 @@ impl Checkout {
         Ok(())
     }
 
-    /// Tracked files whose content differs from the index (R42 after the
-    /// steps).
+    /// Untracked, non-ignored files outside the kept dirs (R42), one path
+    /// per file.
+    pub fn untracked(
+        &self,
+        env: &JobEnv,
+        cache_dirs: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, CheckoutError> {
+        let mut args = vec![
+            "ls-files".to_owned(),
+            "--others".to_owned(),
+            "--exclude-standard".to_owned(),
+            "-z".to_owned(),
+        ];
+        for k in KEEP_DIRS
+            .iter()
+            .copied()
+            .chain(cache_dirs.iter().map(String::as_str))
+        {
+            args.push(format!("--exclude={k}"));
+        }
+        Ok(nul_list(&self.git(env).run(&args)?).into_iter().collect())
+    }
+
+    /// R42 after a step: tracked files whose content differs from the
+    /// index, index entries that differ from `tree` (a step ran `git add`),
+    /// and untracked files that were not in `before`. Paths in `allowed`
+    /// (the R71 tool configs the job itself replaced) do not count.
+    pub fn changes(
+        &self,
+        env: &JobEnv,
+        tree: &Oid,
+        cache_dirs: &[String],
+        before: &std::collections::BTreeSet<String>,
+        allowed: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<String>, CheckoutError> {
+        let git = self.git(env);
+        let mut changed: std::collections::BTreeSet<String> =
+            self.tracked_changes(env)?.into_iter().collect();
+        changed.extend(nul_list(&git.run([
+            "diff-index",
+            "--cached",
+            "--name-only",
+            "-z",
+            tree.as_str(),
+        ])?));
+        changed.extend(
+            self.untracked(env, cache_dirs)?
+                .into_iter()
+                .filter(|p| !before.contains(p)),
+        );
+        Ok(changed
+            .into_iter()
+            .filter(|p| {
+                !allowed.contains(p)
+                    && !allowed
+                        .iter()
+                        .any(|a| p.ends_with('/') && a.starts_with(p.as_str()))
+            })
+            .collect())
+    }
+
+    /// Tracked files whose content differs from the index.
     pub fn tracked_changes(&self, env: &JobEnv) -> Result<Vec<String>, CheckoutError> {
         let git = self.git(env);
         // Refresh stat data first so only real content changes count.
         let _ = git.output(["update-index", "-q", "--refresh"]);
         Ok(nul_list(&git.run(["diff-files", "--name-only", "-z"])?))
+    }
+
+    /// R71: writes the policy commit's version of each tool config into the
+    /// checkout (or removes the tree's), after [`Checkout::update`]. The
+    /// next update's `read-tree --reset` and `clean` undo it.
+    pub fn apply_overlay(
+        &self,
+        overlay: &std::collections::BTreeMap<PathBuf, crate::policy::OverlayFile>,
+    ) -> Result<(), CheckoutError> {
+        use crate::policy::OverlayFile;
+        for (rel, file) in overlay {
+            if !rel
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            {
+                return Err(CheckoutError::Mismatch(format!(
+                    "tool config path {} leaves the checkout",
+                    rel.display()
+                )));
+            }
+            let path = self.path.join(rel);
+            // Never follow a symlinked parent out of the checkout.
+            let mut dir = self.path.clone();
+            for c in rel.parent().into_iter().flat_map(Path::components) {
+                dir.push(c);
+                if dir
+                    .symlink_metadata()
+                    .is_ok_and(|m| m.file_type().is_symlink())
+                {
+                    fs::remove_file(&dir)?;
+                }
+            }
+            match path.symlink_metadata() {
+                Ok(m) if m.is_dir() => fs::remove_dir_all(&path)?,
+                Ok(_) => fs::remove_file(&path)?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            match file {
+                OverlayFile::Absent => {}
+                OverlayFile::File { text, executable } => {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&path, text)?;
+                    if *executable {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+                    }
+                }
+                OverlayFile::Symlink { target } => {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    std::os::unix::fs::symlink(target, &path)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Updates the meta file with `f`.

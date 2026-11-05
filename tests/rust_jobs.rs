@@ -278,3 +278,35 @@ fn full_tier_flaky_quarantine_and_fast_selection_t41_t30_l2() {
         r.out
     );
 }
+
+#[test]
+fn a_branch_cargo_config_does_not_reach_the_steps_r71() {
+    let sb = Sandbox::new();
+    host(&sb);
+    let repo = sb.rust_repo("ws", Scratch { failing: true });
+    commit_policy(
+        &sb,
+        &repo,
+        "version = 1\n[[step]]\nname = \"tests\"\nkind = \"nextest\"\n",
+        "policy",
+    );
+    // A target runner of `true` makes every test binary "pass" (and list no
+    // tests). The branch's own cargo config must not apply before it
+    // merges (L2); the policy commit's (none here) does.
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(
+        &repo,
+        ".cargo/config.toml",
+        "[target.'cfg(all())']\nrunner = \"true\"\n",
+        "runner",
+    );
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(r.out.contains("FAIL b b tests::fails"), "{}", r.out);
+    assert!(
+        r.out
+            .contains("POLICY: this branch changes .cargo/config.toml"),
+        "{}",
+        r.out
+    );
+}

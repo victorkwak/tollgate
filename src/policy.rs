@@ -30,14 +30,56 @@ use crate::select::detect;
 pub const CONFIG_FILE: &str = "tollgate.toml";
 
 /// Built-in policy files (R71). `.config/nextest.toml` also one level down,
-/// for a Rust root there; baselines at any depth.
+/// for a Rust root there; baselines and [`TOOL_CONFIGS`] at any depth.
 const BUILTIN: &[&str] = &[
     "tollgate.toml",
     ".config/nextest.toml",
     "*/.config/nextest.toml",
     "**/.pyright-baseline.json",
     "**/.pytest-baseline.json",
+    "**/.cargo/config.toml",
+    "**/.cargo/config",
+    "**/clippy.toml",
+    "**/.clippy.toml",
+    "**/rustfmt.toml",
+    "**/.rustfmt.toml",
 ];
+
+/// Tool configs that steps read from the checkout itself (R71): cargo
+/// config (target runners, aliases, rustflags, env) and clippy and rustfmt
+/// config. A branch could weaken every check with one of them, so a job
+/// replaces each in the verify checkout with the policy commit's version
+/// ([`Policy::overlay`]); cargo reads config from the step's dir and its
+/// parents, clippy and rustfmt from package and source dirs, so any depth.
+const TOOL_CONFIGS: &[&str] = &[
+    "**/.cargo/config.toml",
+    "**/.cargo/config",
+    "**/clippy.toml",
+    "**/.clippy.toml",
+    "**/rustfmt.toml",
+    "**/.rustfmt.toml",
+];
+
+/// What the verify checkout must hold at one tool-config path (R71): the
+/// policy commit's version, or nothing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase", tag = "kind")]
+pub enum OverlayFile {
+    /// The policy commit has no file there: remove the tree's.
+    Absent,
+    /// A regular file with this content.
+    File {
+        /// Content.
+        text: String,
+        /// Mode 100755.
+        executable: bool,
+    },
+    /// A symlink with this target.
+    Symlink {
+        /// Link target.
+        target: String,
+    },
+}
 
 /// Error while resolving the policy.
 #[derive(Debug, thiserror::Error)]
@@ -286,13 +328,17 @@ pub struct Policy {
     pub source: ConfigSource,
     /// Notes from detection.
     pub notes: Vec<String>,
-    /// Policy files of the policy commit: path -> blob.
-    pub files: BTreeMap<PathBuf, Oid>,
+    /// Policy files of the policy commit: path -> (mode, blob).
+    pub files: BTreeMap<PathBuf, (String, Oid)>,
     /// `.config/nextest.toml` contents of the policy commit by Rust root
     /// dir (R49).
     pub nextest_configs: BTreeMap<PathBuf, String>,
     /// Policy files that differ between the tree and the policy commit.
     pub changed: Vec<PathBuf>,
+    /// Tool configs (R71) whose tree version differs from the policy
+    /// commit's: the job writes the policy commit's version (or removes the
+    /// file) in the verify checkout before setup and steps.
+    pub overlay: BTreeMap<PathBuf, OverlayFile>,
 }
 
 impl Policy {
@@ -301,8 +347,10 @@ impl Policy {
     #[must_use]
     pub fn files_hash(&self) -> String {
         let mut h = blake3::Hasher::new();
-        for (p, oid) in &self.files {
+        for (p, (mode, oid)) in &self.files {
             h.update(p.as_os_str().as_encoded_bytes());
+            h.update(b"\0");
+            h.update(mode.as_bytes());
             h.update(b"\0");
             h.update(oid.as_str().as_bytes());
             h.update(b"\0");
@@ -342,12 +390,67 @@ impl Policy {
     }
 }
 
-fn policy_entries(entries: &[TreeEntry], m: &PolicyMatcher) -> BTreeMap<PathBuf, Oid> {
+fn policy_entries(
+    entries: &[TreeEntry],
+    m: impl Fn(&Path) -> bool,
+) -> BTreeMap<PathBuf, (String, Oid)> {
     entries
         .iter()
-        .filter(|e| e.kind == "blob" && m.is_policy_file(&e.path))
-        .map(|e| (e.path.clone(), e.oid.clone()))
+        .filter(|e| e.kind == "blob" && m(&e.path))
+        .map(|e| (e.path.clone(), (e.mode.clone(), e.oid.clone())))
         .collect()
+}
+
+/// R71: the tool configs whose tree version differs from the policy
+/// commit's, with what the checkout must hold instead.
+fn overlay(
+    git: &Git,
+    base: &[TreeEntry],
+    tree: &[TreeEntry],
+) -> Result<BTreeMap<PathBuf, OverlayFile>, PolicyError> {
+    let tools = glob::compile(
+        TOOL_CONFIGS,
+        GlobOpts {
+            case_insensitive: false,
+            literal_separator: true,
+        },
+    )
+    .map_err(PolicyError::Config)?;
+    // Gitlinks and trees cannot be tool configs; a tree entry of another
+    // kind at the same path still has to go.
+    let pick = |entries: &[TreeEntry]| -> BTreeMap<PathBuf, (String, Oid)> {
+        entries
+            .iter()
+            .filter(|e| tools.is_match(&e.path))
+            .map(|e| (e.path.clone(), (e.mode.clone(), e.oid.clone())))
+            .collect()
+    };
+    let (want, have) = (pick(base), pick(tree));
+    let mut out = BTreeMap::new();
+    for path in want.keys().chain(have.keys()) {
+        let w = want.get(path);
+        if w == have.get(path) || out.contains_key(path) {
+            continue;
+        }
+        let file = match w {
+            None => OverlayFile::Absent,
+            Some((mode, oid)) if mode == "120000" => OverlayFile::Symlink {
+                target: read_blob(git, oid)?,
+            },
+            Some((mode, oid)) if mode == "100644" || mode == "100755" => OverlayFile::File {
+                text: read_blob(git, oid)?,
+                executable: mode == "100755",
+            },
+            Some((mode, _)) => {
+                return Err(PolicyError::Config(format!(
+                    "{} at the policy commit has mode {mode}; a tool config must be a file",
+                    path.display()
+                )));
+            }
+        };
+        out.insert(path.clone(), file);
+    }
+    Ok(out)
 }
 
 fn read_blob(git: &Git, oid: &Oid) -> Result<String, PolicyError> {
@@ -408,8 +511,8 @@ pub fn resolve(
         }
     };
     let matcher = PolicyMatcher::new(&config).map_err(PolicyError::Config)?;
-    let files = policy_entries(&base_entries, &matcher);
-    let mine = policy_entries(tree_entries, &matcher);
+    let files = policy_entries(&base_entries, |p| matcher.is_policy_file(p));
+    let mine = policy_entries(tree_entries, |p| matcher.is_policy_file(p));
     let mut changed: Vec<PathBuf> = files
         .iter()
         .filter(|(p, oid)| mine.get(*p) != Some(*oid))
@@ -419,7 +522,7 @@ pub fn resolve(
     changed.sort();
     changed.dedup();
     let mut nextest_configs = BTreeMap::new();
-    for (p, oid) in &files {
+    for (p, (_, oid)) in &files {
         if p.ends_with(".config/nextest.toml") {
             let root = p
                 .parent()
@@ -429,6 +532,7 @@ pub fn resolve(
             nextest_configs.insert(root, read_blob(git, oid)?);
         }
     }
+    let overlay = overlay(git, &base_entries, tree_entries)?;
     Ok(Policy {
         base,
         config,
@@ -437,5 +541,6 @@ pub fn resolve(
         files,
         nextest_configs,
         changed,
+        overlay,
     })
 }

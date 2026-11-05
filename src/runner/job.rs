@@ -76,6 +76,10 @@ pub struct PolicySpec {
     pub nextest_configs: BTreeMap<PathBuf, String>,
     /// The `POLICY:` line.
     pub line: Option<String>,
+    /// R71: tool configs the checkout must hold in the policy commit's
+    /// version.
+    #[serde(default)]
+    pub overlay: BTreeMap<PathBuf, crate::policy::OverlayFile>,
 }
 
 impl PolicySpec {
@@ -91,6 +95,7 @@ impl PolicySpec {
             notes: p.notes.clone(),
             nextest_configs: p.nextest_configs.clone(),
             line: p.line(),
+            overlay: p.overlay.clone(),
         }
     }
 }
@@ -219,6 +224,13 @@ struct Runner<'a> {
     record_selection: Selection,
     step_results: Vec<StepResult>,
     known_tests_full: Option<BTreeSet<String>>,
+    /// L16 step passes of this job, stored only when the job ends with a
+    /// verdict of `pass` or `fail` (never after a config, checkout or
+    /// environmental end, R42).
+    pending_steps: Vec<StoredStep>,
+    /// L16: at least one step result was reused, so this job did not run
+    /// every step fresh.
+    reused: bool,
     /// `run --here` (R47): no checkout, no record, report in this dir.
     here: bool,
     /// Take resource slots (R85; `run --here --no-host-locks` turns it off).
@@ -321,6 +333,8 @@ impl<'a> Runner<'a> {
             record_selection: Selection::All,
             step_results: Vec::new(),
             known_tests_full: None,
+            pending_steps: Vec::new(),
+            reused: false,
             here,
             use_locks,
         }
@@ -440,6 +454,10 @@ impl Runner<'_> {
             .flat_map(|s| s.cache_dirs.iter().cloned())
             .collect();
         if let Err(e) = co.update(&self.env, &self.spec.tree, &cache_dirs) {
+            return error(ErrorCause::Checkout, e.to_string());
+        }
+        // R71: the policy commit's tool configs, never the branch's own.
+        if let Err(e) = co.apply_overlay(&self.spec.policy.overlay) {
             return error(ErrorCause::Checkout, e.to_string());
         }
         self.say(&format!(
@@ -746,6 +764,25 @@ impl Runner<'_> {
         let mut used_logs: BTreeSet<String> = BTreeSet::new();
         let mut verdict = Verdict::Pass;
         let mut error_end: Option<End> = None;
+        // R42: what the checkout holds before the first step (setup and
+        // `cargo metadata` may add untracked files such as `Cargo.lock`);
+        // R71: the tool configs the job replaced itself.
+        let cache_dirs: Vec<String> = config
+            .steps
+            .iter()
+            .flat_map(|s| s.cache_dirs.iter().cloned())
+            .collect();
+        let allowed: BTreeSet<String> = self
+            .spec
+            .policy
+            .overlay
+            .keys()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let before = match co.map(|c| c.untracked(&self.env, &cache_dirs)).transpose() {
+            Ok(b) => b.unwrap_or_default(),
+            Err(e) => return error(ErrorCause::Checkout, e.to_string()),
+        };
         for ps in plan {
             let s = &ps.step;
             let scope = match &ps.decision {
@@ -780,6 +817,7 @@ impl Runner<'_> {
                 rep.message = None;
                 rep.scope = Some(stored.scope.clone());
                 rep.reused_from = Some(stored.job.clone());
+                self.reused = true;
                 self.report.steps.push(rep);
                 self.step_results.push(StepResult {
                     name: s.name.clone(),
@@ -935,6 +973,7 @@ impl Runner<'_> {
             let cancel_id = self.spec.id.clone();
             let mut abort = || running_abort(&cancel_store, &cancel_id);
             let cwd = workdir.join(&root);
+            let quarantined_before = self.report.quarantined.len();
             let out = exec::run(ExecSpec {
                 program: inv.program.clone(),
                 args: inv.args.clone(),
@@ -1005,22 +1044,51 @@ impl Runner<'_> {
                     }
                 }
             }
+            // R42 after every step that ran, so a step that changes the tree
+            // is named and its pass is never stored for reuse (L16).
+            if !stop && let Some(co) = co {
+                match co.changes(&self.env, &self.spec.tree, &cache_dirs, &before, &allowed) {
+                    Ok(changed) if !changed.is_empty() => {
+                        rep.status = StepStatus::Error;
+                        rep.message = Some(format!(
+                            "changed the checkout (R42): {}",
+                            changed.join(", ")
+                        ));
+                        error_end = Some(error(
+                            ErrorCause::Checkout,
+                            format!(
+                                "step {:?} changed the checkout: {}",
+                                s.name,
+                                changed.join(", ")
+                            ),
+                        ));
+                        stop = true;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        rep.status = StepStatus::Error;
+                        error_end = Some(error(ErrorCause::Checkout, e.to_string()));
+                        stop = true;
+                    }
+                }
+            }
             if rep.status == StepStatus::Fail && verdict == Verdict::Pass {
                 verdict = Verdict::Fail;
             }
+            // A pass that relied on a quarantine is not reused: the entry
+            // expires, the stored pass would not.
+            let quarantined_here = self.report.quarantined.len() > quarantined_before;
             if rep.status == StepStatus::Pass
+                && !quarantined_here
                 && let Some(k) = key
             {
-                let _ = step_store::write_stored(
-                    self.dirs,
-                    &StoredStep {
-                        key: k,
-                        step: s.name.clone(),
-                        job: self.spec.id.clone(),
-                        scope: scope.clone(),
-                        finished: jiff::Timestamp::now(),
-                    },
-                );
+                self.pending_steps.push(StoredStep {
+                    key: k,
+                    step: s.name.clone(),
+                    job: self.spec.id.clone(),
+                    scope: scope.clone(),
+                    finished: jiff::Timestamp::now(),
+                });
             }
             self.step_results.push(StepResult {
                 name: rep.name.clone(),
@@ -1041,19 +1109,6 @@ impl Runner<'_> {
         }
         if let Some(end) = error_end {
             return end;
-        }
-        // R42: steps must not change tracked files.
-        if let Some(co) = co {
-            match co.tracked_changes(&self.env) {
-                Ok(changed) if !changed.is_empty() => {
-                    return error(
-                        ErrorCause::Checkout,
-                        format!("steps changed tracked files: {}", changed.join(", ")),
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => return error(ErrorCause::Checkout, e.to_string()),
-            }
         }
         // R64: quarantine entries must name a listed test.
         if let Some(known) = &self.known_tests_full {
@@ -1256,6 +1311,19 @@ impl Runner<'_> {
             && self.report.covered_by.is_none()
         {
             self.write_record(*verdict, now);
+        }
+        // L16, R42: step passes only from a job that ended with a verdict
+        // its steps decided.
+        if matches!(
+            &state,
+            JobState::Finished {
+                verdict: Verdict::Pass | Verdict::Fail
+            }
+        ) && self.report.cause.is_none()
+        {
+            for p in std::mem::take(&mut self.pending_steps) {
+                let _ = step_store::write_stored(self.dirs, &p);
+            }
         }
         self.flaky_log(now);
         let from = [StateKind::Queued, StateKind::Running];

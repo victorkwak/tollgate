@@ -288,3 +288,70 @@ fn the_anchor_commits_config_names_the_anchors_l2() {
     assert_eq!(p.base.commit.as_ref(), Some(&trunk));
     assert_eq!(p.config.steps.len(), 1);
 }
+
+#[test]
+fn tool_configs_come_from_the_policy_commit_r71() {
+    let sb = Sandbox::new();
+    let repo = sb.repo("r");
+    sb.commit_file(&repo, "rustfmt.toml", "max_width = 100\n", "fmt");
+    let main_tip = rev(&sb, &repo, "HEAD");
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(
+        &repo,
+        "rustfmt.toml",
+        "disable_all_formatting = true\n",
+        "weaken",
+    );
+    sb.commit_file(
+        &repo,
+        "crates/x/clippy.toml",
+        "too-many-lines-threshold = 9999\n",
+        "lint",
+    );
+    sb.commit_file(
+        &repo,
+        "tools/.cargo/config.toml",
+        "[alias]\nnextest = \"version\"\n",
+        "alias",
+    );
+    sb.commit_file(&repo, "src/fine.rs", "\n", "code");
+    let tip = rev(&sb, &repo, "HEAD");
+    let p = resolve_at(&sb, &repo, &tip, &[], "refs/heads/feat").unwrap();
+    assert_eq!(p.base.commit.as_ref(), Some(&main_tip));
+    assert_eq!(
+        p.changed,
+        [
+            PathBuf::from("crates/x/clippy.toml"),
+            PathBuf::from("rustfmt.toml"),
+            PathBuf::from("tools/.cargo/config.toml"),
+        ]
+    );
+    let got: Vec<(String, policy::OverlayFile)> = p
+        .overlay
+        .iter()
+        .map(|(k, v)| (k.display().to_string(), v.clone()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (
+                "crates/x/clippy.toml".to_owned(),
+                policy::OverlayFile::Absent
+            ),
+            (
+                "rustfmt.toml".to_owned(),
+                policy::OverlayFile::File {
+                    text: "max_width = 100\n".into(),
+                    executable: false
+                }
+            ),
+            (
+                "tools/.cargo/config.toml".to_owned(),
+                policy::OverlayFile::Absent
+            ),
+        ]
+    );
+    // On the anchor itself nothing differs.
+    let p = resolve_at(&sb, &repo, &main_tip, &[], "refs/heads/feat").unwrap();
+    assert!(p.overlay.is_empty() && p.changed.is_empty());
+}
