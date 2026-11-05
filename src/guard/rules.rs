@@ -1079,38 +1079,56 @@ fn runs_git_or_tollgate(ctx: &Context, words: &[String]) -> bool {
 /// inside a longer word (`github`, `digit`, `.gitignore`, `tollgate.toml`)
 /// and not a directory part (`state/tollgate/x`). `.git/` stays a mention:
 /// it is the repo's own dir, hooks included.
-fn names_program(text: &str, name: &str) -> bool {
+fn names_program(text: &str, name: &str) -> usize {
     let word = |c: char| c.is_alphanumeric() || c == '_';
-    text.match_indices(name).any(|(at, _)| {
+    text.match_indices(name)
+        .filter(|(at, _)| {
+            let before = text[..*at].chars().next_back();
+            let after = text[*at + name.len()..].chars().next();
+            !(before.is_some_and(|c| word(c) || c == '-')
+                || after.is_some_and(|c| word(c) || c == '.')
+                || (after == Some('/') && before != Some('.'))
+                // `git-commit` is git; `tollgate-core2` is a checkout's name.
+                || (name == "tollgate" && after == Some('-')))
+        })
+        .count()
+}
+
+/// True when `text` has `cd <dir>` spelled out as its own words. A target
+/// written any other way (quotes, escapes, a line continuation) is not
+/// found, so its name still counts as a mention.
+fn plain_cd(text: &str, dir: &str) -> bool {
+    let wanted = format!("cd {dir}");
+    text.match_indices(&wanted).any(|(at, _)| {
         let before = text[..at].chars().next_back();
-        let after = text[at + name.len()..].chars().next();
-        !(before.is_some_and(|c| word(c) || c == '-')
-            || after.is_some_and(|c| word(c) || c == '.')
-            || (after == Some('/') && before != Some('.'))
-            // `git-commit` is git; `tollgate-core2` is a checkout's name.
-            || (name == "tollgate" && after == Some('-')))
+        let after = text[at + wanted.len()..].chars().next();
+        before.is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '('))
+            && after.is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
     })
 }
 
 /// True when the command text names git or tollgate as a program: in the
 /// raw text or the normalized text (quotes and backslashes inside the name
 /// do not hide it), heredoc bodies and messages included. The target of a
-/// plain `cd` is a place, not a program. One occurrence goes per `cd`, so
-/// `cd git; git status` still names git.
+/// plain `cd` is a place, not a program: names are counted, and only a
+/// count above what the `cd` targets account for is a mention. The text is
+/// never edited, so a target cannot delete part of another word
+/// (`printf 'git push' | sh; cd g`).
 fn mentions_git_or_tollgate(command: &str, cmds: &[SimpleCommand]) -> bool {
-    let mut text = command.to_owned();
-    for cmd in cmds {
-        if let [cd, dir] = cmd.words.as_slice()
-            && cd == "cd"
-        {
-            text = text.replacen(dir.as_str(), "", 1);
-        }
-    }
-    let raw = text.to_lowercase();
-    let norm = normalize(&text);
-    ["git", "tollgate"]
+    let raw = command.to_lowercase();
+    let norm = normalize(command);
+    let dirs: Vec<String> = cmds
         .iter()
-        .any(|n| names_program(&raw, n) || names_program(&norm, n))
+        .filter_map(|cmd| match cmd.words.as_slice() {
+            [cd, dir] if cd == "cd" => Some(dir.to_lowercase()),
+            _ => None,
+        })
+        .filter(|dir| plain_cd(&raw, dir))
+        .collect();
+    ["git", "tollgate"].iter().any(|n| {
+        let places: usize = dirs.iter().map(|dir| names_program(dir, n)).sum();
+        names_program(&raw, n) > places || names_program(&norm, n) > places
+    })
 }
 
 /// Shells, and the builtins that run a file as shell code, whose stdin
@@ -1614,6 +1632,15 @@ mod tests {
             "cd git; git status; python3 - <<'EOF'\nprint(1)\nEOF",
             "cd /h/git; python3 - <<'EOF'\nimport os; os.system('git push')\nEOF",
             "cd /h/Repos/tollgate; echo 'git commit -m x' | sh",
+            // A `cd` target never removes part of another word.
+            "printf 'git commit -n' | sh; cd g",
+            "printf 'git commit -n' | sh; cd i",
+            "abcd git commit | sh; cd g",
+            "printf 'git commit -n' | sh; cd git",
+            // A target that is not spelled out does not account for a name.
+            "cd g\\\nit; printf 'git commit -n' | sh",
+            "cd 'git'; printf 'git commit -n' | sh",
+            r"cd $'\x67it'; printf 'git commit -n' | sh",
         ] {
             assert!(deny(cmd), "{cmd}");
         }
