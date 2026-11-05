@@ -77,6 +77,7 @@ pub fn run(
     let deadline = Some(deadline.map_or(limit, |d| d.min(limit)));
     let out = exec::run(ExecSpec {
         program: "sh".into(),
+        arg0: None,
         args: vec!["-c".into(), step.run.clone().into()],
         cwd: &cwd,
         env: &env,

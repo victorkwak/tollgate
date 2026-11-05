@@ -35,6 +35,8 @@ const POLL: Duration = Duration::from_millis(25);
 pub struct ExecSpec<'a> {
     /// Program (looked up on the job `PATH`).
     pub program: OsString,
+    /// argv\[0\], when it is not `program` (see `steps::Invocation::arg0`).
+    pub arg0: Option<OsString>,
     /// Arguments.
     pub args: Vec<OsString>,
     /// Working dir.
@@ -197,6 +199,9 @@ pub fn run(spec: ExecSpec<'_>) -> ExecOutcome {
         Err(e) => return failed(e),
     };
     let mut cmd = Command::new(&spec.program);
+    if let Some(a0) = &spec.arg0 {
+        cmd.arg0(a0);
+    }
     spec.env
         .apply(&mut cmd)
         .args(&spec.args)
@@ -321,6 +326,7 @@ mod tests {
         let mut never = || None;
         let out = run(ExecSpec {
             program: "sh".into(),
+            arg0: None,
             args: sh("echo out; echo err >&2; exit 3"),
             cwd: tmp.path(),
             env: &env,
@@ -338,6 +344,31 @@ mod tests {
     }
 
     #[test]
+    fn arg0_is_what_the_program_sees_r1() {
+        // With no operand after the script, sh's $0 is its own argv[0].
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("s.log");
+        let env = env();
+        let mut never = || None;
+        let out = run(ExecSpec {
+            program: "sh".into(),
+            arg0: Some("tollgate".into()),
+            args: sh("echo \"argv0=$0\""),
+            cwd: tmp.path(),
+            env: &env,
+            log: &log,
+            stdout: None,
+            deadline: None,
+            grace: Duration::from_secs(1),
+            abort: &mut never,
+            inherit: &[],
+        });
+        assert!(out.success());
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(text.trim(), "argv0=tollgate", "{text}");
+    }
+
+    #[test]
     fn expiry_kills_a_term_ignoring_group_r33_r35() {
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("s.log");
@@ -351,6 +382,7 @@ mod tests {
         let start = Instant::now();
         let out = run(ExecSpec {
             program: "sh".into(),
+            arg0: None,
             args: sh(&script),
             cwd: tmp.path(),
             env: &env,
@@ -383,6 +415,7 @@ mod tests {
         };
         let out = run(ExecSpec {
             program: "sleep".into(),
+            arg0: None,
             args: vec!["30".into()],
             cwd: tmp.path(),
             env: &env,
@@ -410,6 +443,7 @@ mod tests {
         let mut never = || None;
         let out = run(ExecSpec {
             program: "sh".into(),
+            arg0: None,
             args: sh(&format!(
                 "sleep 30 & echo $! > {}; exit 0",
                 pid_file.display()
@@ -440,6 +474,7 @@ mod tests {
         let mut never = || None;
         let out = run(ExecSpec {
             program: "tollgate-no-such-program".into(),
+            arg0: None,
             args: Vec::new(),
             cwd: tmp.path(),
             env: &env,

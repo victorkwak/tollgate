@@ -291,6 +291,11 @@ pub fn fast_plan(
 pub struct Invocation {
     /// Program.
     pub program: OsString,
+    /// argv\[0\] when it is not `program`. tollgate itself dispatches on
+    /// argv\[0\] (R1), and a runner started by a hook has a hook link as its
+    /// own path: a `tollgate __step` started under that path would run the
+    /// hook instead of the step.
+    pub arg0: Option<OsString>,
     /// Arguments.
     pub args: Vec<OsString>,
 }
@@ -299,14 +304,26 @@ impl Invocation {
     fn cargo<I: IntoIterator<Item = S>, S: Into<OsString>>(args: I) -> Self {
         Self {
             program: "cargo".into(),
+            arg0: None,
             args: args.into_iter().map(Into::into).collect(),
         }
     }
 
-    /// The command line for logs and reports.
+    /// The tollgate binary at `exe` with argv\[0\] `tollgate`, so it runs
+    /// the subcommand in `args` whatever name `exe` has (R1).
+    #[must_use]
+    pub fn tollgate(exe: &std::path::Path, args: Vec<OsString>) -> Self {
+        Self {
+            program: exe.into(),
+            arg0: Some("tollgate".into()),
+            args,
+        }
+    }
+
+    /// The command line (argv) for logs and reports.
     #[must_use]
     pub fn display(&self) -> String {
-        std::iter::once(&self.program)
+        std::iter::once(self.arg0.as_ref().unwrap_or(&self.program))
             .chain(&self.args)
             .map(|a| {
                 let s = a.to_string_lossy();
@@ -420,6 +437,7 @@ pub fn invocation(
         }
         StepKind::Command => Invocation {
             program: "sh".into(),
+            arg0: None,
             args: vec![
                 "-c".into(),
                 step.run.clone().ok_or("kind \"command\" needs run")?.into(),

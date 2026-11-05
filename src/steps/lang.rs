@@ -321,23 +321,28 @@ pub fn invocation(
             }
             Invocation {
                 program: node("biome")?.into(),
+                arg0: None,
                 args,
             }
         }
         StepKind::Tsc => Invocation {
             program: node("tsc")?.into(),
+            arg0: None,
             args: os(&["--noEmit"]),
         },
         StepKind::SvelteCheck if svelte_check_script(ctx.root_dir) => Invocation {
             program: "bun".into(),
+            arg0: None,
             args: os(&["run", "check"]),
         },
         StepKind::SvelteCheck => Invocation {
             program: node("svelte-check")?.into(),
+            arg0: None,
             args: os(&["--output", "human"]),
         },
         StepKind::BunTest => Invocation {
             program: "bun".into(),
+            arg0: None,
             args: os(&["run", "test"]),
         },
         StepKind::Ruff => {
@@ -345,6 +350,7 @@ pub fn invocation(
             args.extend(files.unwrap_or_default());
             Invocation {
                 program: "sh".into(),
+                arg0: None,
                 args,
             }
         }
@@ -365,10 +371,7 @@ pub fn invocation(
                 args.push("--baseline".into());
                 args.push(b.into());
             }
-            Invocation {
-                program: ctx.tollgate.into(),
-                args,
-            }
+            Invocation::tollgate(ctx.tollgate, args)
         }
         other => {
             return Err(format!(
@@ -577,19 +580,23 @@ mod tests {
         assert!(ruff.ends_with(" ruff"), "{ruff}");
         assert_eq!(
             line(StepKind::PyrightBaseline, &Scope::All).unwrap(),
-            "/bin/tollgate __step pyright-baseline --findings /j/pyright.findings.json --root web --baseline /j/pyright.baseline.json"
+            "tollgate __step pyright-baseline --findings /j/pyright.findings.json --root web --baseline /j/pyright.baseline.json"
         );
         let no_base = LangCtx {
             baseline: None,
             ..ctx
         };
+        let inv = invocation(StepKind::PytestBaseline, &Scope::All, &no_base)
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            invocation(StepKind::PytestBaseline, &Scope::All, &no_base)
-                .unwrap()
-                .unwrap()
-                .display(),
-            "/bin/tollgate __step pytest-baseline --findings /j/pyright.findings.json --root web"
+            inv.display(),
+            "tollgate __step pytest-baseline --findings /j/pyright.findings.json --root web"
         );
+        // R1: the runner's own path may be a hook link; argv[0] keeps
+        // `__step` from dispatching as that hook.
+        assert_eq!(inv.program, "/bin/tollgate");
+        assert_eq!(inv.arg0.as_deref(), Some(std::ffi::OsStr::new("tollgate")));
         assert_eq!(step_env(StepKind::Ruff)["PYTHONDONTWRITEBYTECODE"], "1");
         assert!(step_env(StepKind::Tsc).is_empty());
     }

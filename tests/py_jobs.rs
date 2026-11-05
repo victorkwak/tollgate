@@ -560,3 +560,62 @@ fn baseline_record_needs_a_tty_and_a_clean_tree_and_matches_the_scripts_t42_r94(
     let (code, out, _) = p.check(&["check", "--tier", "full", "--wait"]);
     assert_eq!(code, Some(0), "{out}");
 }
+
+/// A job started by a hook runs its baseline steps as `tollgate __step`,
+/// never as that hook: the runner's own binary path is the hook link it was
+/// started through, and argv\[0\] picks the hook (R1, R17, R94).
+#[test]
+fn a_hooked_commit_gates_on_the_python_baseline_steps_r1_r17_r94() {
+    let test = "a_hooked_commit_gates_on_the_python_baseline_steps";
+    let Some(p) = project(test, Some(POLICY), false) else {
+        return;
+    };
+    let Some(pyright) = tools::which("pyright") else {
+        tools::skip(test, "pyright is not on PATH");
+        return;
+    };
+    p.sb.scoped_host(&tools::job_config(&[&p.uv, &pyright]));
+    p.commit("python project");
+
+    // No baselines: the pre-commit gate denies on legacy.py's type error
+    // and test_old's failure.
+    p.write(
+        "py/app.py",
+        &format!("{APP}\n\ndef sub(a: int, b: int) -> int:\n    return a - b\n"),
+    );
+    let r = p.sb.hooked(&p.repo, &["commit", "-q", "-m", "sub"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    let jobs = p.sb.jobs();
+    assert_eq!(jobs.len(), 1, "{jobs:?}\n{}", r.out);
+    let report = p.sb.report(&jobs[0]);
+    assert_eq!(report["tier"], "fast", "{report}");
+    assert_eq!(step(&report, "pyright")["status"], "fail", "{report}");
+    assert_eq!(step(&report, "pytest")["status"], "fail", "{report}");
+    for needle in ["1 pyright error(s).", "1 failing test(s)."] {
+        assert!(r.out.contains(needle), "{needle:?} in\n{}", r.out);
+    }
+
+    // Baselines on HEAD (the policy commit, L2): the same commit passes.
+    let pyright_json = p.pyright_baseline();
+    std::fs::write(p.py().join(baseline::PYRIGHT_FILE), &pyright_json).unwrap();
+    std::fs::write(
+        p.py().join(baseline::PYTEST_FILE),
+        baseline::pytest_baseline_json(
+            &["tests/test_app.py::test_old".to_owned()].into(),
+            "2026-11-05T00:00:00+00:00",
+            "test",
+        ),
+    )
+    .unwrap();
+    p.sb.git(&p.repo, &["stash", "-q"]);
+    p.commit("baselines");
+    p.sb.git(&p.repo, &["stash", "pop", "-q"]);
+    p.sb.git(&p.repo, &["add", "py/app.py"]);
+    let r = p.sb.hooked(&p.repo, &["commit", "-q", "-m", "sub"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let jobs = p.sb.jobs();
+    let report = p.sb.report(jobs.last().unwrap());
+    assert_eq!(report["verdict"], "pass", "{report}");
+    assert_eq!(step(&report, "pyright")["status"], "pass", "{report}");
+    assert_eq!(step(&report, "pytest")["status"], "pass", "{report}");
+}

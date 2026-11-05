@@ -709,6 +709,7 @@ impl Runner<'_> {
         let env = self.target_env(&self.env, workdir, root);
         let out = exec::run(ExecSpec {
             program: "cargo".into(),
+            arg0: None,
             args: vec!["metadata".into(), "--format-version".into(), "1".into()],
             cwd: &cwd,
             env: &env,
@@ -1167,6 +1168,7 @@ impl Runner<'_> {
                 .collect();
             let out = exec::run(ExecSpec {
                 program: inv.program.clone(),
+                arg0: inv.arg0.clone(),
                 args: inv.args.clone(),
                 cwd: &cwd,
                 env: &env,
@@ -1521,6 +1523,7 @@ impl Runner<'_> {
             let env = self.target_env(&self.env, &co.path, &root);
             let _ = exec::run(ExecSpec {
                 program: "cargo".into(),
+                arg0: None,
                 args: vec!["clean".into()],
                 cwd: &co.path.join(&root),
                 env: &env,
