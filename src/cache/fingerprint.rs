@@ -5,8 +5,8 @@
 //! the first root's), `bun` (TypeScript roots), `uv` (Python roots), `uname`
 //! (`<sysname> <machine>`), `host-config`, `effective-config`, `job-env`,
 //! `env-file:<path>` per step env file, `image:<resource>` per configured
-//! image of a resource a step takes. A tool not on the job `PATH` is
-//! `absent`.
+//! image of a resource a step takes, `cargo-config` (cargo config outside
+//! the tree, Rust roots). A tool not on the job `PATH` is `absent`.
 
 use std::collections::BTreeMap;
 use std::ffi::CStr;
@@ -90,6 +90,39 @@ pub struct FingerprintInputs<'a> {
     pub env_files: &'a [EnvFile],
     /// Configured images of the resources the steps take.
     pub images: &'a BTreeMap<ResourceName, String>,
+    /// The verify root: cargo reads `.cargo/config(.toml)` in every
+    /// ancestor of the checkout (`cargo-config`).
+    pub verify_root: Option<&'a Path>,
+}
+
+/// blake3 of the cargo config files that apply in a verify checkout but lie
+/// outside the tree (R74): `$CARGO_HOME/config(.toml)` (default
+/// `~/.cargo`) and `.cargo/config(.toml)` in every ancestor of the verify
+/// root. They can change target runners, aliases, sources and patches.
+#[must_use]
+pub fn cargo_config_hash(job_env: &JobEnv, verify_root: Option<&Path>) -> String {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    match (job_env.get("CARGO_HOME"), job_env.get("HOME")) {
+        (Some(c), _) => dirs.push(std::path::PathBuf::from(c)),
+        (None, Some(h)) => dirs.push(Path::new(h).join(".cargo")),
+        (None, None) => {}
+    }
+    if let Some(root) = verify_root {
+        dirs.extend(root.ancestors().map(|a| a.join(".cargo")));
+    }
+    let mut h = blake3::Hasher::new();
+    for d in dirs {
+        for name in ["config.toml", "config"] {
+            let p = d.join(name);
+            if let Ok(bytes) = std::fs::read(&p) {
+                h.update(p.as_os_str().as_encoded_bytes());
+                h.update(b"\0");
+                h.update(&bytes);
+                h.update(b"\0");
+            }
+        }
+    }
+    h.finalize().to_hex().to_string()
 }
 
 /// Error while computing a fingerprint.
@@ -180,6 +213,10 @@ pub fn compute(
                 fp.insert(format!("{}{suffix}", p.id), r.fingerprint_value());
             }
         }
+        fp.insert(
+            "cargo-config",
+            cargo_config_hash(inputs.job_env, inputs.verify_root),
+        );
     }
     fp.insert("uname", uname_sm());
     fp.insert("host-config", inputs.host_config_hash);
@@ -200,6 +237,29 @@ pub fn compute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cargo_config_outside_the_tree_is_in_the_fingerprint_r74() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let root = tmp.path().join("disk/tollgate/verify");
+        std::fs::create_dir_all(&root).unwrap();
+        let env = JobEnv::from_vars([("HOME", home.as_os_str())]);
+        let empty = cargo_config_hash(&env, Some(&root));
+        std::fs::create_dir_all(home.join(".cargo")).unwrap();
+        std::fs::write(home.join(".cargo/config.toml"), "[alias]\nt = \"test\"\n").unwrap();
+        let with_home = cargo_config_hash(&env, Some(&root));
+        assert_ne!(empty, with_home);
+        std::fs::create_dir_all(tmp.path().join("disk/.cargo")).unwrap();
+        std::fs::write(
+            tmp.path().join("disk/.cargo/config"),
+            "[target.'cfg(all())']\nrunner = \"true\"\n",
+        )
+        .unwrap();
+        assert_ne!(cargo_config_hash(&env, Some(&root)), with_home);
+        let other_home = JobEnv::from_vars([("CARGO_HOME", tmp.path().join("nope").as_os_str())]);
+        assert_ne!(cargo_config_hash(&other_home, Some(&root)), with_home);
+    }
 
     #[test]
     fn uname_matches_the_uname_command() {

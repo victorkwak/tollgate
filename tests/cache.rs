@@ -76,6 +76,7 @@ fn compute_with(
             effective_config_hash: "e",
             env_files,
             images,
+            verify_root: None,
         },
         cache,
     )

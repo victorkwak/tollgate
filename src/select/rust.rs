@@ -160,26 +160,56 @@ fn is_map_input(path: &Path) -> bool {
             .is_some_and(|d| d == ".cargo")
 }
 
-/// The cache key of the workspace map of `root` in a tree: cargo's
-/// version and the `(path, blob)` of every manifest, lockfile, toolchain
-/// file and `.cargo/` file in the tree. Two trees with the same key give
-/// the same members, manifest dirs and dependency edges, so a hook (which
-/// runs no cargo, R51) can select exactly with a map the runner stored.
+/// Fingerprint inputs that shape `cargo metadata` besides the tree: cargo
+/// itself, the job environment, the host config and cargo config outside
+/// the tree (R74).
+const MAP_FINGERPRINT_KEYS: &[&str] = &["cargo", "job-env", "host-config", "cargo-config"];
+
+/// The cache key of the workspace map of `root` in a tree, or `None` when
+/// the tree's content does not decide the map: a symlink or a submodule
+/// under the root (a symlinked manifest or crate dir changes with its
+/// target, a submodule's manifests are not in the tree).
+///
+/// The key covers the `(path, mode, kind, blob)` of every manifest,
+/// lockfile, toolchain file and `.cargo/` file in the tree, and the
+/// fingerprint inputs of [`MAP_FINGERPRINT_KEYS`]. Two trees with the same
+/// key give the same members, manifest dirs and dependency edges, so a hook
+/// (which runs no cargo, R51) can select exactly with a map the runner
+/// stored.
 #[must_use]
-pub fn map_key(entries: &[crate::gitx::TreeEntry], root: &Path, cargo_version: &str) -> String {
+pub fn map_key(
+    entries: &[crate::gitx::TreeEntry],
+    root: &Path,
+    fingerprint: &crate::cache::Fingerprint,
+) -> Option<String> {
+    let under: Vec<&crate::gitx::TreeEntry> = entries
+        .iter()
+        .filter(|e| e.path.starts_with(root))
+        .collect();
+    if under.iter().any(|e| e.kind != "blob" || e.mode == "120000") {
+        return None;
+    }
     let mut h = blake3::Hasher::new();
-    h.update(b"tollgate workspace map 1\0");
+    h.update(b"tollgate workspace map 2\0");
     h.update(root.as_os_str().as_encoded_bytes());
     h.update(b"\0");
-    h.update(cargo_version.as_bytes());
-    h.update(b"\0");
+    for k in MAP_FINGERPRINT_KEYS {
+        h.update(k.as_bytes());
+        h.update(b"=");
+        h.update(fingerprint.get(k).unwrap_or("-").as_bytes());
+        h.update(b"\0");
+    }
     for e in entries.iter().filter(|e| is_map_input(&e.path)) {
         h.update(e.path.as_os_str().as_encoded_bytes());
+        h.update(b"\0");
+        h.update(e.mode.as_bytes());
+        h.update(b"\0");
+        h.update(e.kind.as_bytes());
         h.update(b"\0");
         h.update(e.oid.as_str().as_bytes());
         h.update(b"\0");
     }
-    h.finalize().to_hex().to_string()
+    Some(h.finalize().to_hex().to_string())
 }
 
 /// A stored map for `key`.
@@ -259,12 +289,23 @@ pub(crate) mod tests {
 
     #[test]
     fn map_key_tracks_only_manifest_inputs() {
+        use crate::cache::Fingerprint;
         use crate::gitx::{Oid, TreeEntry};
         let e = |p: &str, o: char| TreeEntry {
             mode: "100644".into(),
             kind: "blob".into(),
             oid: Oid::parse(&o.to_string().repeat(40)).unwrap(),
             path: PathBuf::from(p),
+        };
+        let fp = |cargo: &str| {
+            let mut f = Fingerprint::new();
+            f.insert("cargo", cargo);
+            f.insert("job-env", "env");
+            f.insert("rustc", "ignored");
+            f
+        };
+        let key = |entries: &[TreeEntry], root: &str, f: &Fingerprint| {
+            map_key(entries, Path::new(root), f).unwrap()
         };
         let base = vec![
             e("Cargo.toml", '1'),
@@ -273,19 +314,62 @@ pub(crate) mod tests {
             e("crates/a/src/lib.rs", '4'),
             e("README.md", '5'),
         ];
-        let k = map_key(&base, Path::new(""), "cargo 1.99");
+        let k = key(&base, "", &fp("cargo 1.99"));
         let mut src = base.clone();
         src[3] = e("crates/a/src/lib.rs", '9');
         src[4] = e("README.md", '9');
-        assert_eq!(map_key(&src, Path::new(""), "cargo 1.99"), k);
+        assert_eq!(key(&src, "", &fp("cargo 1.99")), k);
+        let mut other_rustc = fp("cargo 1.99");
+        other_rustc.insert("rustc", "changed");
+        assert_eq!(key(&base, "", &other_rustc), k);
         let mut manifest = base.clone();
         manifest[2] = e("crates/a/Cargo.toml", '9');
-        assert_ne!(map_key(&manifest, Path::new(""), "cargo 1.99"), k);
+        assert_ne!(key(&manifest, "", &fp("cargo 1.99")), k);
         let mut config = base.clone();
         config.push(e(".cargo/config.toml", '7'));
-        assert_ne!(map_key(&config, Path::new(""), "cargo 1.99"), k);
-        assert_ne!(map_key(&base, Path::new(""), "cargo 2.0"), k);
-        assert_ne!(map_key(&base, Path::new("rust"), "cargo 1.99"), k);
+        assert_ne!(key(&config, "", &fp("cargo 1.99")), k);
+        assert_ne!(key(&base, "", &fp("cargo 2.0")), k);
+        assert_ne!(key(&base, "rust", &fp("cargo 1.99")), k);
+        let mut env = fp("cargo 1.99");
+        env.insert("job-env", "other");
+        assert_ne!(key(&base, "", &env), k, "the job env shapes cargo metadata");
+        let mut home = fp("cargo 1.99");
+        home.insert("cargo-config", "x");
+        assert_ne!(key(&base, "", &home), k, "cargo config outside the tree");
+        let mut exec = base.clone();
+        exec[2].mode = "100755".into();
+        assert_ne!(key(&exec, "", &fp("cargo 1.99")), k, "mode counts");
+    }
+
+    #[test]
+    fn no_map_key_when_symlinks_or_submodules_decide_the_map_r57() {
+        use crate::cache::Fingerprint;
+        use crate::gitx::{Oid, TreeEntry};
+        let e = |p: &str, mode: &str, kind: &str| TreeEntry {
+            mode: mode.into(),
+            kind: kind.into(),
+            oid: Oid::parse(&"1".repeat(40)).unwrap(),
+            path: PathBuf::from(p),
+        };
+        let fp = Fingerprint::new();
+        let plain = vec![e("Cargo.toml", "100644", "blob")];
+        assert!(map_key(&plain, Path::new(""), &fp).is_some());
+        // A symlinked manifest: its target's content is not in the key.
+        let mut link = plain.clone();
+        link.push(e("crates/b/Cargo.toml", "120000", "blob"));
+        assert!(map_key(&link, Path::new(""), &fp).is_none());
+        // A symlinked crate dir.
+        let mut dir = plain.clone();
+        dir.push(e("crates/b", "120000", "blob"));
+        assert!(map_key(&dir, Path::new(""), &fp).is_none());
+        // A submodule: its manifests are not in the tree.
+        let mut sub = plain.clone();
+        sub.push(e("vendor/dep", "160000", "commit"));
+        assert!(map_key(&sub, Path::new(""), &fp).is_none());
+        // Outside a root one level down, they do not matter.
+        let mut outside = vec![e("rust/Cargo.toml", "100644", "blob")];
+        outside.push(e("docs/link", "120000", "blob"));
+        assert!(map_key(&outside, Path::new("rust"), &fp).is_some());
     }
 
     #[test]

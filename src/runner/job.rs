@@ -650,9 +650,9 @@ impl Runner<'_> {
         let _ = std::fs::remove_file(&out_file);
         match parsed {
             Ok(m) => {
-                if !self.here {
-                    let cargo = self.spec.fingerprint.get("cargo").unwrap_or("absent");
-                    let key = select::rust::map_key(entries, root, cargo);
+                if !self.here
+                    && let Some(key) = select::rust::map_key(entries, root, &self.spec.fingerprint)
+                {
                     let _ = select::rust::store_cached(self.dirs, &key, &m);
                 }
                 Some(m)
@@ -714,10 +714,9 @@ impl Runner<'_> {
         }
         let config = self.spec.policy.config.clone();
         let platform = Platform::current();
-        let cargo = self.spec.fingerprint.get("cargo").unwrap_or("absent");
         let mut maps = BTreeMap::new();
         for root in steps::rust_roots(&config, Tier::Fast, platform) {
-            let key = select::rust::map_key(&entries, &root, cargo);
+            let key = select::rust::map_key(&entries, &root, &self.spec.fingerprint)?;
             maps.insert(root, Some(select::rust::load_cached(self.dirs, &key)?));
         }
         let other = detect::roots_from_tree(&entries).other();

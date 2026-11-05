@@ -326,10 +326,9 @@ fn exact_selection(
         return None;
     }
     let platform = Platform::current();
-    let cargo = fp.get("cargo").unwrap_or("absent");
     let mut maps = BTreeMap::new();
     for root in steps::rust_roots(config, Tier::Fast, platform) {
-        let key = select::rust::map_key(entries, &root, cargo);
+        let key = select::rust::map_key(entries, &root, fp)?;
         maps.insert(root, Some(select::rust::load_cached(req.dirs, &key)?));
     }
     let other = select::detect::roots_from_tree(entries).other();
@@ -400,6 +399,7 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
             job_env: &job_env,
             cwd: &neutral,
             rust_dirs: &rust_dirs,
+            verify_root: Some(&host.verify.root(req.dirs)),
             host_config_hash: &req.host.hash,
             effective_config_hash: &config.effective_hash(),
             env_files: &env_files,
