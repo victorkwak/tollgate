@@ -922,15 +922,11 @@ pub fn run_here(ctx: &Ctx, a: HereArgs) -> u8 {
     }
     let use_locks = host.exists && !a.no_host_locks;
     let r = job::run_here(&dirs, spec, &workdir, &out, &ctx.env, use_locks);
+    // R47, R73: a case per step plus the nextest suites.
     if a.junit
-        && let Some(step) = r
-            .steps
-            .iter()
-            .find(|s| s.kind == crate::config::repo::StepKind::Nextest && s.log.is_some())
-        && let Some(log) = &step.log
+        && let Err(e) = std::fs::write(out.join("junit.xml"), crate::ci::junit(&r, &out))
     {
-        let junit = out.join(log.replace(".log", ".junit.xml"));
-        let _ = std::fs::copy(&junit, out.join("junit.xml"));
+        eprintln!("tollgate: cannot write junit.xml: {e}");
     }
     print_report(&r);
     report_exit(&r)

@@ -162,3 +162,25 @@ fn gc_removes_checkouts_of_gone_repos_and_all_state_r48() {
     assert_eq!(sb.record_count(), 0);
     assert!(sb.jobs().is_empty());
 }
+
+#[test]
+fn ci_snippet_prints_a_gitlab_job_with_junit_r73() {
+    let sb = Sandbox::new();
+    let r = sb.tollgate(&sb.root(), &["ci-snippet", "--gitlab"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    for needle in [
+        "tollgate:\n  stage: test\n",
+        "    - tollgate run --tier full --here --report junit\n",
+        "      - tollgate-report/\n",
+        "      junit: tollgate-report/junit.xml\n",
+    ] {
+        assert!(r.out.contains(needle), "{needle:?} in\n{}", r.out);
+    }
+    let usage = sb.tollgate(&sb.root(), &["ci-snippet"]);
+    assert_eq!(
+        usage.code,
+        Some(2),
+        "--gitlab is the only format: {}",
+        usage.out
+    );
+}

@@ -435,10 +435,10 @@ pub fn flaky_counts(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn report() -> JobReport {
+    pub(crate) fn report() -> JobReport {
         let now = jiff::Timestamp::now();
         JobReport {
             schema: REPORT_SCHEMA,

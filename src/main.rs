@@ -103,6 +103,7 @@ fn run() -> u8 {
         Command::Baseline {
             action: BaselineAction::Record { kind, force },
         } => tollgate::steps::baseline::record_cmd(&ctx.env, &ctx.cwd, kind.kind(), force),
+        Command::CiSnippet { gitlab: _ } => tollgate::ci::ci_snippet_cmd(),
         other => not_built(other.name()),
     }
 }

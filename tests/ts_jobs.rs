@@ -321,4 +321,13 @@ fn detection_installs_and_checks_a_bun_root_t25_r65_r45_r47() {
         serde_json::from_slice(&std::fs::read(ci.join("tollgate-report/report.json")).unwrap())
             .unwrap();
     assert_eq!(report["verdict"], "pass", "{report}");
+    // R47, R73: the JUnit report has a case per step.
+    let junit = std::fs::read_to_string(ci.join("tollgate-report/junit.xml")).unwrap();
+    for s in ["web biome", "web tsc", "web bun test"] {
+        assert!(
+            junit.contains(&format!("<testcase name=\"{s}\" classname=\"tollgate\"")),
+            "{s}: {junit}"
+        );
+    }
+    assert!(junit.contains("failures=\"0\" errors=\"0\""), "{junit}");
 }
