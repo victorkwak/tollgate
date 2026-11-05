@@ -402,3 +402,52 @@ fn detection_installs_and_checks_a_bun_root_t25_r65_r45_r47() {
     }
     assert!(junit.contains("failures=\"0\" errors=\"0\""), "{junit}");
 }
+
+/// L2, R65, D5: with no tollgate.toml, a branch cannot drop detected steps.
+/// Detection also runs on the policy commit, and its steps stay: a branch
+/// that deletes the `test` script still runs `bun test`, which then fails
+/// as a setup error, not as a silent pass.
+#[test]
+fn a_branch_cannot_drop_detected_steps_l2_r65() {
+    let Some(p) = project("a_branch_cannot_drop_detected_steps", None) else {
+        return;
+    };
+    p.sb.git(&p.repo, &["checkout", "-q", "-b", "feat"]);
+    let web = p.repo.join("web");
+    std::fs::write(
+        web.join("package.json"),
+        r#"{"name":"web","private":true,"devDependencies":{"@biomejs/biome":"file:./vendor/biome","typescript":"file:./vendor/typescript"}}"#,
+    )
+    .unwrap();
+    let env = p.sb.env();
+    let offline = tools::offline_env(&p.sb.root());
+    tools::run(&p.biome, &["format", "--write", "."], &web, &env, &offline);
+    p.sb.git(&p.repo, &["add", "-A"]);
+    p.sb.git(
+        &p.repo,
+        &["commit", "-q", "--no-verify", "-m", "drop tests"],
+    );
+    let (code, out, report) = p.check(&["check", "--tier", "full", "--wait"]);
+    assert_eq!(code, Some(1), "{out}\n{report}");
+    let test = step(&report, "web bun test");
+    assert_eq!(test["status"], "error", "{report}");
+    assert!(
+        test["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("test"),
+        "{report}"
+    );
+    for s in ["web biome", "web tsc"] {
+        assert_eq!(step(&report, s)["status"], "pass", "{s}: {report}");
+    }
+    let warnings = report["warnings"].to_string();
+    assert!(
+        warnings.contains("web bun test") && warnings.contains("policy commit"),
+        "{report}"
+    );
+    // On main itself (the policy commit is the tree), nothing changes.
+    p.sb.git(&p.repo, &["checkout", "-q", "main"]);
+    let (code, out, _) = p.check(&["check", "--tier", "full", "--wait"]);
+    assert_eq!(code, Some(0), "{out}");
+}

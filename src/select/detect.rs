@@ -337,6 +337,34 @@ pub fn detect_tree(git: &Git, entries: &[TreeEntry]) -> (RepoConfig, Vec<String>
     detected_config(&roots_from_tree(entries), &read)
 }
 
+/// L2, D5: adds to `tree` (detection on the tree under test) every setup
+/// and step that `policy` (detection on the policy commit) has and `tree`
+/// lacks, by name, each with a note. Removing a detected step is a policy
+/// change: a branch that deletes a test script, a linter dependency or a
+/// root still runs those steps, which then fail with a setup error, until
+/// the change merges to a full ref. Steps that only the tree has (a new
+/// root) stay.
+pub fn keep_policy_steps(tree: &mut RepoConfig, policy: RepoConfig, notes: &mut Vec<String>) {
+    for s in policy.setup {
+        if !tree.setup.iter().any(|t| t.name == s.name) {
+            notes.push(format!(
+                "setup {:?} comes from detection on the policy commit; this tree no longer gets it from detection (L2)",
+                s.name
+            ));
+            tree.setup.push(s);
+        }
+    }
+    for s in policy.steps {
+        if !tree.steps.iter().any(|t| t.name == s.name) {
+            notes.push(format!(
+                "step {:?} comes from detection on the policy commit; this tree no longer gets it from detection, and removing a step applies only after it merges to a full ref (L2)",
+                s.name
+            ));
+            tree.steps.push(s);
+        }
+    }
+}
+
 /// Detection on a work dir (`run --here`, `config init`, `config --check`).
 pub fn detect_dir(root: &Path) -> std::io::Result<(RepoConfig, Vec<String>)> {
     let roots = roots_from_dir(root)?;
@@ -350,6 +378,30 @@ mod tests {
 
     fn roots(paths: &[&str]) -> Roots {
         roots_from_paths(paths.iter().map(Path::new))
+    }
+
+    #[test]
+    fn policy_commit_steps_stay_l2_r65() {
+        let read = |_: &Path| -> Option<String> { None };
+        let (base, _) = detected_config(&roots(&["Cargo.toml", "py/pyproject.toml"]), &read);
+        let (mut tree, _) = detected_config(
+            &roots(&["Cargo.toml", "web/package.json", "web/bun.lock"]),
+            &read,
+        );
+        let mut notes = Vec::new();
+        keep_policy_steps(&mut tree, base, &mut notes);
+        let names: Vec<&str> = tree.steps.iter().map(|s| s.name.as_str()).collect();
+        for want in ["fmt", "tests", "py ruff", "py pytest"] {
+            assert!(names.contains(&want), "{want}: {names:?}");
+        }
+        assert_eq!(names.iter().filter(|n| **n == "fmt").count(), 1);
+        assert!(tree.setup.iter().any(|s| s.name == "web bun install"));
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("\"py ruff\"") && n.contains("policy commit"))
+        );
+        assert!(!notes.iter().any(|n| n.contains("\"fmt\"")));
     }
 
     #[test]

@@ -105,7 +105,9 @@ tollgate runs as the same user as the agents. Code that runs as one user cannot 
 - Your own terminal is not gated (L3). You are the override.
 - The last line is GitLab: protect `main` (no direct push, merge through a merge request, pipelines must succeed) and run the CI job on every merge request. A tree that leaves the machine is checked there again.
 
-A branch cannot weaken `tollgate.toml`, nextest config, the Python baselines, or cargo, clippy and rustfmt configs, because they come from the policy commit (L2, R71). A branch can still change its own code, tests, `package.json` scripts, `tsconfig.json`, `biome.json`, and the tool sections of `pyproject.toml`. Those changes are visible in review and in the diff, and the full check at merge runs on them as they are.
+A branch cannot weaken `tollgate.toml`, nextest config, the Python baselines, or cargo, clippy and rustfmt configs, because they come from the policy commit (L2, R71). Without a `tollgate.toml`, detection (R65) runs on the tree under test and on the policy commit, and every setup and step the policy commit's detection finds stays in the job. So a branch that deletes the `test` script, the `@biomejs/biome` dependency, `tsconfig.json` or a whole root still runs those steps; they fail with a setup error until the change merges to a full ref, and the report names each step that comes only from the policy commit. A branch that adds a root gets that root's steps at once.
+
+A branch can still change its own code, tests, `package.json` scripts, `tsconfig.json`, `biome.json`, and the tool sections of `pyproject.toml`. Those changes are visible in review and in the diff, and the full check at merge runs on them as they are.
 
 ### Known gap: commits without a `fast` check (L1)
 

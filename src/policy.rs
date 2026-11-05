@@ -510,7 +510,13 @@ pub fn resolve(
     let (config, source, notes) = match found {
         Some((blob, c)) => (c, ConfigSource::File { blob }, Vec::new()),
         None => {
-            let (c, notes) = detect::detect_tree(git, tree_entries);
+            let (mut c, mut notes) = detect::detect_tree(git, tree_entries);
+            // L2, D5: the policy commit's detected steps stay, so a branch
+            // cannot drop them by deleting what detection keys on.
+            if base.commit.is_some() && base_entries != tree_entries {
+                let (from_base, _) = detect::detect_tree(git, &base_entries);
+                detect::keep_policy_steps(&mut c, from_base, &mut notes);
+            }
             (c, ConfigSource::Detected, notes)
         }
     };
