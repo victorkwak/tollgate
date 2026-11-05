@@ -319,6 +319,7 @@ fn skeleton(spec: &JobSpec) -> JobReport {
         record_written: false,
         created: spec.created,
         started: None,
+        checkout_wait_ms: None,
         finished: now,
         host: hostname(),
         tollgate_version: crate::VERSION.to_owned(),
@@ -415,9 +416,11 @@ impl Runner<'_> {
             reap_holder(&dirs, &lock_path, &id);
             queued_abort(&store, &id)
         };
+        let asked = Instant::now();
         let lock = match checkout::lock(&place, self.queue_deadline(), &mut abort) {
             Ok(l) => {
                 let _ = l.set_holder(self.spec.id.as_str());
+                self.report.checkout_wait_ms = Some(millis(asked.elapsed()));
                 l
             }
             Err(LockWait::Deadline) => {
@@ -1122,6 +1125,7 @@ impl Runner<'_> {
                 }
                 running_abort(&store, &id)
             };
+            let asked = Instant::now();
             let held = match locks::acquire(
                 &sems,
                 AcquireOptions {
@@ -1149,6 +1153,7 @@ impl Runner<'_> {
                     break;
                 }
             };
+            let queue_ms = (!sems.is_empty()).then(|| millis(asked.elapsed()));
             if self.started.is_none() {
                 self.started = Some(Instant::now());
                 self.report.started = Some(jiff::Timestamp::now());
@@ -1196,12 +1201,14 @@ impl Runner<'_> {
                 name: s.name.clone(),
                 kind: s.kind,
                 status: StepStatus::Pass,
-                duration_ms: u64::try_from(out.duration.as_millis()).unwrap_or(u64::MAX),
+                duration_ms: millis(out.duration),
                 exit: out.exit_code(),
                 log: Some(format!("{slug}.log")),
                 command: Some(inv.display()),
                 scope: Some(scope.clone()),
                 reused_from: None,
+                resources: s.resources.iter().map(|r| r.as_str().to_owned()).collect(),
+                queue_ms,
                 message: None,
                 failing: Vec::new(),
                 items: Vec::new(),
@@ -1702,6 +1709,11 @@ fn unreachable_meta(co: &Checkout) -> checkout::CheckoutMeta {
         last_used: now,
         setup: BTreeMap::new(),
     }
+}
+
+/// A duration in whole milliseconds for a report.
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// While queued: cancelled (state) or superseded (R89).

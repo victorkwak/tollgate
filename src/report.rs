@@ -74,6 +74,13 @@ pub struct StepReport {
     /// L16: the job whose pass was reused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reused_from: Option<JobId>,
+    /// Host resources the step took (R85), in config order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<String>,
+    /// How long the step waited for its resources, in milliseconds
+    /// (R85, R86, L20); set when it took at least one slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_ms: Option<u64>,
     /// Why it did not run or what went wrong.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -105,6 +112,8 @@ impl StepReport {
             command: None,
             scope: None,
             reused_from: None,
+            resources: Vec::new(),
+            queue_ms: None,
             message: Some(why.to_owned()),
             failing: Vec::new(),
             items: Vec::new(),
@@ -172,6 +181,10 @@ pub struct JobReport {
     /// First step start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started: Option<jiff::Timestamp>,
+    /// How long the job waited for its verify checkout lock, in
+    /// milliseconds (R87, L20); unset when it took no checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_wait_ms: Option<u64>,
     /// End.
     pub finished: jiff::Timestamp,
     /// Host name.
@@ -469,6 +482,7 @@ pub(crate) mod tests {
             record_written: true,
             created: now,
             started: Some(now),
+            checkout_wait_ms: None,
             finished: now,
             host: "h".into(),
             tollgate_version: "0".into(),

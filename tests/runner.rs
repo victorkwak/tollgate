@@ -1444,3 +1444,51 @@ fn an_unchecked_or_empty_base_disables_selection_r56() {
     let (s, log) = status(&r.out);
     assert_eq!(s, "skipped", "{log}");
 }
+
+/// L20: a report names the resources each step took and how long it
+/// waited for them (R85), and how long the job waited for its verify
+/// checkout (R87), so `tollgate bench` can report queue wait per resource.
+#[test]
+fn reports_record_queue_wait_per_resource_and_for_the_checkout_r85_r87_l20() {
+    let sb = Sandbox::new();
+    host(&sb, "[resources]\ncpu = 1\n");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"busy\"\nkind = \"command\"\nresources = [\"cpu\"]\nrun = \"true\"\n[[step]]\nname = \"free\"\nkind = \"command\"\nrun = \"true\"\n",
+    );
+    // This test holds the only cpu slot until the job waits in its queue.
+    let lock_dir = sb.state().join("locks/cpu");
+    std::fs::create_dir_all(&lock_dir).unwrap();
+    let held = tollgate::locks::LockFile::try_acquire(&lock_dir.join("slot-0"))
+        .unwrap()
+        .expect("the slot is free");
+    let r = sb.tollgate(&repo, &["check", "--detach"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let job = job_id(&r.out);
+    let waiting = || {
+        std::fs::read_dir(lock_dir.join("queue")).is_ok_and(|rd| {
+            rd.flatten()
+                .any(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        })
+    };
+    assert!(eventually(20, waiting), "the job never queued for cpu");
+    std::thread::sleep(Duration::from_millis(300));
+    drop(held);
+    let w = sb.tollgate(&repo, &["wait", &job, "--timeout", "30s"]);
+    assert_eq!(w.code, Some(0), "{}", w.out);
+    let rep = sb.report(&job);
+    let busy = &rep["steps"][0];
+    assert_eq!(busy["name"], "busy", "{rep}");
+    assert_eq!(busy["resources"], serde_json::json!(["cpu"]), "{rep}");
+    let waited = busy["queue_ms"].as_u64().expect("queue_ms");
+    assert!(waited >= 300, "waited {waited} ms: {rep}");
+    // A step that takes no resource has no queue entry.
+    let free = &rep["steps"][1];
+    assert_eq!(free["name"], "free", "{rep}");
+    assert!(free.get("resources").is_none(), "{rep}");
+    assert!(free.get("queue_ms").is_none(), "{rep}");
+    // Nobody else held the checkout.
+    let checkout = rep["checkout_wait_ms"].as_u64().expect("checkout_wait_ms");
+    assert!(checkout < 300, "checkout wait {checkout} ms: {rep}");
+}
