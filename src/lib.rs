@@ -15,6 +15,7 @@ pub mod dirs;
 pub mod env;
 pub mod exit;
 pub mod fsx;
+pub mod gitx;
 pub mod guard;
 pub mod hook;
 pub mod ids;
