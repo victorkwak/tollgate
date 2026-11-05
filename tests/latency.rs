@@ -144,3 +144,65 @@ fn the_guard_answers_in_under_10_ms_l19() {
         "guard p95 {best:?} (L19: 10 ms)"
     );
 }
+
+/// Detection runs on the `pre-commit` path when the policy commit has no
+/// `tollgate.toml` (one `git cat-file` per TypeScript root, R65). A
+/// docs-only commit next to detected Bun and Python roots stays in the
+/// docs-only budget (L19, R61).
+#[test]
+fn docs_only_pre_commit_with_detected_roots_stays_in_budget_l19_r61_r65() {
+    let sb = Sandbox::new();
+    sb.scoped_host("remotes = [\"*/remotes/trusted*\"]");
+    let repo = sb.repo("r");
+    for (path, text) in [
+        (
+            "web/package.json",
+            "{\"name\":\"web\",\"scripts\":{\"test\":\"bun test\"}}\n",
+        ),
+        ("web/bun.lock", "{}\n"),
+        ("py/pyproject.toml", "[project]\nname = \"py\"\n"),
+        ("py/uv.lock", "version = 1\n"),
+    ] {
+        std::fs::create_dir_all(repo.join(path).parent().unwrap()).unwrap();
+        std::fs::write(repo.join(path), text).unwrap();
+    }
+    sb.git(&repo, &["add", "-A"]);
+    sb.git(&repo, &["commit", "-q", "-m", "roots"]);
+    // A trusted remote has the base, so selection is on (R56).
+    let url = sb.root().join("remotes/trusted.git");
+    sb.git(&repo, &["remote", "add", "origin", url.to_str().unwrap()]);
+    sb.git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let effective = sb.tollgate(&repo, &["config", "--effective"]);
+    for step in ["web bun test", "py pytest"] {
+        assert!(effective.out.contains(step), "{step:?}: {}", effective.out);
+    }
+    let mut n = 0;
+    let t = p95(3, 5, || {
+        n += 1;
+        std::fs::write(repo.join("NOTES.md"), format!("note {n}\n")).unwrap();
+        sb.git(&repo, &["add", "NOTES.md"]);
+        let o = sb.run_hook(&repo, "pre-commit", &[]);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.success(), "{err}");
+        assert!(err.contains("tollgate: pass pre-commit"), "{err}");
+    });
+    assert!(
+        t < Duration::from_millis(200),
+        "docs-only pre-commit with detected roots p95 {t:?} (L19: 200 ms)"
+    );
+    // Each run was docs-only: no job ran a step.
+    let jobs = sb.jobs();
+    assert_eq!(jobs.len(), 15, "one job per run: {jobs:?}");
+    for job in jobs {
+        let report = sb.report(&job);
+        assert_eq!(report["verdict"], "pass", "{report}");
+        assert!(
+            report["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["status"] == "skipped"),
+            "{report}"
+        );
+    }
+}
