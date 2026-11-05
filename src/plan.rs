@@ -202,18 +202,76 @@ fn toolchain_blob(
     Err(refuse("too many symlinks".into()))
 }
 
-/// R51: a toolchain file that names a toolchain dir (`[toolchain] path`,
-/// or a legacy `rust-toolchain` line with a path) would make the version
-/// probe run `<path>/bin/rustc`, a binary the tree chooses, in the hook.
-fn toolchain_path(bytes: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(bytes);
-    if let Ok(v) = text.parse::<toml::Table>()
-        && let Some(t) = v.get("toolchain").and_then(toml::Value::as_table)
-    {
-        return t.get("path").map(|p| p.as_str().unwrap_or("?").to_owned());
+/// A channel, component, target or profile name rustup takes as a name,
+/// never as a path.
+fn plain_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && !s.starts_with('.')
+}
+
+/// R51, item 28: the toolchain file shapes that rustup reads one way only.
+/// A toolchain dir (`[toolchain] path`, a legacy path line) would make the
+/// version probe run `<path>/bin/rustc`, a binary the tree chooses, in the
+/// hook; a file rustup reads otherwise than tollgate (not UTF-8, keys
+/// tollgate does not know, several lines of non-TOML) could do the same.
+/// So only an allowlist passes: a `[toolchain]` table (and nothing else)
+/// whose keys are `channel` and `profile` (names) and `components` and
+/// `targets` (arrays of names), or, in `rust-toolchain` only, one line
+/// holding a channel name. Anything else is refused.
+fn toolchain_shape(name: &std::ffi::OsStr, bytes: &[u8]) -> Result<(), String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "is not UTF-8; use a [toolchain] table with a channel".to_owned())?;
+    if let Ok(top) = text.parse::<toml::Table>() {
+        if let Some(key) = top.keys().find(|k| *k != "toolchain") {
+            return Err(format!(
+                "has the key {key} outside [toolchain], which tollgate does not take"
+            ));
+        }
+        let Some(table) = top.get("toolchain").and_then(toml::Value::as_table) else {
+            return Err("has no [toolchain] table; use [toolchain] with a channel".to_owned());
+        };
+        for (key, value) in table {
+            let ok = match key.as_str() {
+                "channel" | "profile" => value.as_str().is_some_and(plain_name),
+                "components" | "targets" => value
+                    .as_array()
+                    .is_some_and(|a| a.iter().all(|v| v.as_str().is_some_and(plain_name))),
+                "path" => {
+                    return Err(format!(
+                        "names the toolchain path {}; use a channel",
+                        value.as_str().unwrap_or("?")
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "has the key toolchain.{key}, which tollgate does not take (only channel, components, targets, profile)"
+                    ));
+                }
+            };
+            if !ok {
+                return Err(format!(
+                    "toolchain.{key} = {value} is not a plain name (or a list of names)"
+                ));
+            }
+        }
+        return Ok(());
+    }
+    if name != "rust-toolchain" {
+        return Err("is not TOML; use a [toolchain] table with a channel".to_owned());
     }
     let line = text.trim();
-    (!line.contains('\n') && (line.contains('/') || line.contains('\\'))).then(|| line.to_owned())
+    if line.contains('\n') || line.contains('\r') {
+        return Err("has several lines and is not TOML; use one channel name".to_owned());
+    }
+    if line.contains('/') || line.contains('\\') {
+        return Err(format!("names the toolchain path {line}; use a channel"));
+    }
+    if !plain_name(line) {
+        return Err(format!("{line:?} is not a channel name"));
+    }
+    Ok(())
 }
 
 /// A dir under the state dir holding `files` under their file names,
@@ -233,9 +291,9 @@ fn probe_dir(
     let mut blobs = Vec::new();
     for e in files {
         let (oid, bytes) = toolchain_blob(git, entries, e)?;
-        if let Some(p) = toolchain_path(&bytes) {
+        if let Err(why) = toolchain_shape(e.path.file_name().unwrap_or_default(), &bytes) {
             return Err(PlanError::Config(format!(
-                "{}: names the toolchain path {p}; the hook runs no tool the tree chooses (R51), so use a channel",
+                "{}: {why} (R51, item 28: the hook runs no tool the tree chooses, so only plain toolchain files are read)",
                 e.path.display()
             )));
         }
@@ -1006,17 +1064,52 @@ pub fn wait(dirs: &Dirs, id: &JobId, deadline: Option<Instant>) -> WaitEnd {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
+    /// Item 28: only the shapes rustup reads one way are allowed; anything
+    /// else is refused, so no reading of a file decides which binary the
+    /// probe runs (R51).
     #[test]
-    fn toolchain_files_that_name_a_dir_are_found_r51() {
-        let path = |t: &str| toolchain_path(t.as_bytes());
-        assert_eq!(
-            path("[toolchain]\npath = \"/opt/tc\"\n").as_deref(),
-            Some("/opt/tc")
-        );
-        assert_eq!(path("[toolchain]\nchannel = \"1.89\"\n"), None);
-        assert_eq!(path("nightly-2026-01-01\n"), None);
-        assert_eq!(path("../tc\n").as_deref(), Some("../tc"));
-        assert_eq!(path("[toolchain]\npath = 3\n").as_deref(), Some("?"));
+    fn only_plain_toolchain_files_are_allowed_item28() {
+        let toml = |t: &[u8]| toolchain_shape(OsStr::new("rust-toolchain.toml"), t);
+        let legacy = |t: &[u8]| toolchain_shape(OsStr::new("rust-toolchain"), t);
+        for ok in [
+            &b"[toolchain]\nchannel = \"1.91\"\n"[..],
+            b"[toolchain]\nchannel = \"nightly-2026-01-01\"\ncomponents = [\"rustfmt\", \"clippy\"]\ntargets = [\"wasm32-unknown-unknown\"]\nprofile = \"minimal\"\n",
+            b"[toolchain]\n",
+        ] {
+            assert_eq!(toml(ok), Ok(()), "{}", String::from_utf8_lossy(ok));
+            assert_eq!(legacy(ok), Ok(()), "{}", String::from_utf8_lossy(ok));
+        }
+        for ok in [&b"stable\n"[..], b"1.91.0", b"  nightly-2026-01-01  \n"] {
+            assert_eq!(legacy(ok), Ok(()), "{}", String::from_utf8_lossy(ok));
+            assert!(toml(ok).is_err(), "{}", String::from_utf8_lossy(ok));
+        }
+        for bad in [
+            // A toolchain dir, by key or by a legacy path line.
+            &b"[toolchain]\npath = \"/opt/tc\"\n"[..],
+            b"../tc\n",
+            b"/opt/tc",
+            // Keys rustup may read now or later.
+            b"[toolchain]\nchannel = \"1.91\"\nfoo = \"x\"\n",
+            b"[toolchain]\nchannel = \"1.91\"\n[other]\nx = 1\n",
+            // `toolchain` not a table, values of other types or shapes.
+            b"toolchain = \"1.91\"\n",
+            b"[toolchain]\nchannel = 1\n",
+            b"[toolchain]\nchannel = \"../x\"\n",
+            b"[toolchain]\ncomponents = \"rustfmt\"\n",
+            b"[toolchain]\ncomponents = [1]\n",
+            b"[toolchain]\nprofile = [\"minimal\"]\n",
+            // Not UTF-8, several lines of non-TOML, empty.
+            b"stable\xff\n",
+            b"\xff\xfe[toolchain]\n",
+            b"stable\nnightly\n",
+            b"",
+            b"\n",
+        ] {
+            let text = String::from_utf8_lossy(bad).into_owned();
+            assert!(legacy(bad).is_err(), "rust-toolchain allowed {text:?}");
+            assert!(toml(bad).is_err(), "rust-toolchain.toml allowed {text:?}");
+        }
     }
 }

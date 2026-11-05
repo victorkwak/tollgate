@@ -1284,10 +1284,31 @@ echo "$(basename "$0") $ch"
     assert_ne!(r.code, Some(0), "{}", r.out);
     assert!(r.out.contains("path"), "{}", r.out);
     assert!(!mark.exists(), "the plan ran the tree's toolchain");
+    // Item 28: only plain shapes are read; a key tollgate does not know
+    // and a legacy file of several lines are refused.
+    for (file, text, why) in [
+        (
+            "rust-toolchain.toml",
+            "[toolchain]\nchannel = \"1.91\"\nfoo = \"x\"\n",
+            "toolchain.foo",
+        ),
+        ("rust-toolchain", "stable\nnightly\n", "several lines"),
+    ] {
+        let _ = std::fs::remove_file(repo.join("rust-toolchain.toml"));
+        sb.commit_file(&repo, file, text, "odd toolchain");
+        let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+        assert_ne!(r.code, Some(0), "{}", r.out);
+        assert!(
+            r.out.contains(why) && r.out.contains("item 28"),
+            "{}",
+            r.out
+        );
+        sb.git(&repo, &["rm", "-q", file]);
+        sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "rm"]);
+    }
     // A link out of the tree is refused.
     let outside = sb.root().join("outside.toml");
     std::fs::write(&outside, "[toolchain]\nchannel = \"outside\"\n").unwrap();
-    std::fs::remove_file(repo.join("rust-toolchain.toml")).unwrap();
     std::os::unix::fs::symlink(&outside, repo.join("rust-toolchain.toml")).unwrap();
     sb.git(&repo, &["add", "rust-toolchain.toml"]);
     sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "link out"]);
