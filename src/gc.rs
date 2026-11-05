@@ -235,6 +235,7 @@ pub fn gc(dirs: &Dirs, host: &HostConfig, env: &EnvSnapshot, all: bool) -> GcRep
     if all {
         let _ = fs::remove_file(dirs.toolcache_file());
         let _ = fs::remove_file(dirs.flaky_log());
+        let _ = fs::remove_dir_all(dirs.probe_root());
     }
     rep
 }

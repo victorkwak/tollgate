@@ -315,6 +315,9 @@ impl ToolCache {
             env.apply(&mut cmd)
                 .args(probe.args)
                 .current_dir(cwd)
+                // A probe never downloads: a toolchain file that names a
+                // missing toolchain fails the probe instead (R51).
+                .env("RUSTUP_AUTO_INSTALL", "0")
                 .stdin(Stdio::null());
             let out = cmd.output().map_err(io_err)?;
             if !out.status.success() {

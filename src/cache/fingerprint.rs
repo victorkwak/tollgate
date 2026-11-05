@@ -1,7 +1,8 @@
 //! Fingerprint computation (R74).
 //!
 //! Keys: `tollgate` (version), `git`, `rustc`, `cargo`, `cargo-nextest`
-//! (Rust roots), `bun` (TypeScript roots), `uv` (Python roots), `uname`
+//! (Rust roots; `<key>@<root>` for a root whose toolchain files differ from
+//! the first root's), `bun` (TypeScript roots), `uv` (Python roots), `uname`
 //! (`<sysname> <machine>`), `host-config`, `effective-config`, `job-env`,
 //! `env-file:<path>` per step env file, `image:<resource>` per configured
 //! image of a resource a step takes. A tool not on the job `PATH` is
@@ -73,8 +74,14 @@ pub struct FingerprintInputs<'a> {
     pub roots: Roots,
     /// The base job environment (R52).
     pub job_env: &'a JobEnv,
-    /// Where tools are probed (the verify checkout): rust-toolchain files.
+    /// Where tools are probed: a dir under the state dir, never the agent's
+    /// checkout (R51).
     pub cwd: &'a Path,
+    /// Where the Rust tools are probed, per group of Rust roots with the
+    /// same toolchain files in `T` (R74): a key suffix (`""` for the first
+    /// group, `@<root>` for others) and a dir that holds those files.
+    /// Empty: `cwd`.
+    pub rust_dirs: &'a [(String, std::path::PathBuf)],
     /// blake3 of the host config file.
     pub host_config_hash: &'a str,
     /// Hash of the effective repo config (R65).
@@ -150,9 +157,6 @@ pub fn compute(
     let mut fp = Fingerprint::new();
     fp.insert("tollgate", crate::VERSION);
     let mut probes = vec![GIT];
-    if inputs.roots.rust {
-        probes.extend([RUSTC, CARGO, NEXTEST]);
-    }
     if inputs.roots.typescript {
         probes.push(BUN);
     }
@@ -162,6 +166,20 @@ pub fn compute(
     for p in &probes {
         let r = tools.probe(p, inputs.job_env, inputs.cwd)?;
         fp.insert(p.id, r.fingerprint_value());
+    }
+    if inputs.roots.rust {
+        let fallback = [(String::new(), inputs.cwd.to_owned())];
+        let dirs = if inputs.rust_dirs.is_empty() {
+            &fallback[..]
+        } else {
+            inputs.rust_dirs
+        };
+        for (suffix, dir) in dirs {
+            for p in [RUSTC, CARGO, NEXTEST] {
+                let r = tools.probe(&p, inputs.job_env, dir)?;
+                fp.insert(format!("{}{suffix}", p.id), r.fingerprint_value());
+            }
+        }
     }
     fp.insert("uname", uname_sm());
     fp.insert("host-config", inputs.host_config_hash);

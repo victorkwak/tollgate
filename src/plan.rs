@@ -110,8 +110,124 @@ pub struct Plan {
     pub fresh_only: bool,
 }
 
-fn kinds_roots(spec_config: &crate::config::RepoConfig, tier: Tier) -> Roots {
-    let mut r = Roots::default();
+/// rustup's toolchain files.
+const TOOLCHAIN_FILES: &[&str] = &["rust-toolchain", "rust-toolchain.toml"];
+
+/// The toolchain files that apply to Rust root `root` in the tree: those of
+/// the nearest dir from `root` up to the repo root that has any (rustup
+/// searches from the step's dir upward).
+fn toolchain_files<'a>(
+    entries: &'a [crate::gitx::TreeEntry],
+    root: &Path,
+) -> Vec<&'a crate::gitx::TreeEntry> {
+    let mut dir = Some(root);
+    while let Some(d) = dir {
+        let found: Vec<&crate::gitx::TreeEntry> = entries
+            .iter()
+            .filter(|e| e.kind == "blob" && TOOLCHAIN_FILES.iter().any(|f| e.path == d.join(f)))
+            .collect();
+        if !found.is_empty() {
+            return found;
+        }
+        dir = if d.as_os_str().is_empty() {
+            None
+        } else {
+            Some(d.parent().unwrap_or(Path::new("")))
+        };
+    }
+    Vec::new()
+}
+
+/// A dir under the state dir holding `files` under their file names,
+/// content-addressed and made once (R51, R74): version probes run there,
+/// so rustup picks the toolchain the tree names, not one from the agent's
+/// working tree (dirty, untracked or another branch's), and no tool runs in
+/// the agent's checkout.
+fn probe_dir(
+    dirs: &Dirs,
+    git: &Git,
+    files: &[&crate::gitx::TreeEntry],
+) -> Result<PathBuf, PlanError> {
+    let mut h = blake3::Hasher::new();
+    h.update(b"tollgate probe dir 1\0");
+    for e in files {
+        h.update(e.path.file_name().unwrap_or_default().as_encoded_bytes());
+        h.update(b"\0");
+        h.update(e.mode.as_bytes());
+        h.update(b"\0");
+        h.update(e.oid.as_str().as_bytes());
+        h.update(b"\0");
+    }
+    let root = dirs.probe_root();
+    let dir = root.join(&h.finalize().to_hex()[..32]);
+    if dir.is_dir() {
+        return Ok(dir);
+    }
+    let io = |e: std::io::Error| PlanError::Io(format!("{}: {e}", root.display()));
+    let tmp = root.join(format!(".tmp-{}", crate::fsx::unique_suffix()));
+    std::fs::create_dir_all(&tmp).map_err(io)?;
+    for e in files {
+        let name = e.path.file_name().unwrap_or_default();
+        let bytes = git.run(["cat-file", "blob", e.oid.as_str()])?;
+        if e.mode == "120000" {
+            use std::os::unix::ffi::OsStrExt as _;
+            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&bytes), tmp.join(name))
+                .map_err(io)?;
+        } else {
+            std::fs::write(tmp.join(name), bytes).map_err(io)?;
+        }
+    }
+    match std::fs::rename(&tmp, &dir) {
+        Ok(()) => Ok(dir),
+        Err(_) if dir.is_dir() => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            Ok(dir)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            Err(io(e))
+        }
+    }
+}
+
+/// Probe dirs per group of Rust roots with the same toolchain files (R74):
+/// the first group (the first root in order) gives the plain fingerprint
+/// keys, each other group `<key>@<root>`.
+fn rust_probe_dirs(
+    dirs: &Dirs,
+    git: &Git,
+    entries: &[crate::gitx::TreeEntry],
+    roots: &std::collections::BTreeSet<PathBuf>,
+) -> Result<Vec<(String, PathBuf)>, PlanError> {
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    for root in roots {
+        let dir = probe_dir(dirs, git, &toolchain_files(entries, root))?;
+        if out.iter().any(|(_, d)| *d == dir) {
+            continue;
+        }
+        let suffix = if out.is_empty() {
+            String::new()
+        } else {
+            format!("@{}", root.display())
+        };
+        out.push((suffix, dir));
+    }
+    Ok(out)
+}
+
+/// Root kinds whose tools go into the fingerprint (R74): those of the
+/// steps that run, and those detected in `T` (a `command` step can run
+/// `cargo` too).
+fn kinds_roots(
+    spec_config: &crate::config::RepoConfig,
+    tier: Tier,
+    detected: &select::detect::Roots,
+) -> Roots {
+    let mut r = Roots {
+        rust: !detected.rust.is_empty(),
+        typescript: !detected.typescript.is_empty(),
+        python: !detected.python.is_empty(),
+    };
     for s in spec_config.steps.iter().filter(|s| s.runs_in(tier)) {
         match s.kind {
             StepKind::CargoFmt
@@ -267,17 +383,23 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
             }
         }
     }
-    let probe_dir: PathBuf = req
+    let origin_dir: PathBuf = req
         .layout
         .worktree
         .clone()
         .unwrap_or_else(|| req.layout.common_dir.clone());
+    let detected = select::detect::roots_from_tree(&entries);
+    let mut rust_roots = steps::rust_roots(config, req.tier, Platform::current());
+    rust_roots.extend(detected.rust.iter().cloned());
+    let neutral = probe_dir(req.dirs, req.git, &[])?;
+    let rust_dirs = rust_probe_dirs(req.dirs, req.git, &entries, &rust_roots)?;
     let mut tools = ToolCache::load(&req.dirs.toolcache_file());
     let mut fp = fingerprint::compute(
         &FingerprintInputs {
-            roots: kinds_roots(config, req.tier),
+            roots: kinds_roots(config, req.tier, &detected),
             job_env: &job_env,
-            cwd: &probe_dir,
+            cwd: &neutral,
+            rust_dirs: &rust_dirs,
             host_config_hash: &req.host.hash,
             effective_config_hash: &config.effective_hash(),
             env_files: &env_files,
@@ -322,7 +444,7 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
         }
     };
     let origin = Origin {
-        worktree: probe_dir,
+        worktree: origin_dir,
         refname: req.refname.clone(),
     };
     let mut env_pairs = Vec::new();

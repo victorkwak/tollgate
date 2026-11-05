@@ -71,6 +71,7 @@ fn compute_with(
             },
             job_env: env,
             cwd,
+            rust_dirs: &[],
             host_config_hash: "h",
             effective_config_hash: "e",
             env_files,

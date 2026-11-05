@@ -888,3 +888,86 @@ fn ci_mode_caps_quarantine_like_jobs_do_r69_r47() {
     assert_eq!(r.code, Some(1), "{}", r.out);
     assert!(r.out.contains("more than 30 days"), "{}", r.out);
 }
+
+#[test]
+fn tool_probes_see_the_trees_toolchain_not_the_worktrees_r74_r51() {
+    let sb = Sandbox::new();
+    let bin = sb.root().join("fakebin");
+    let log = sb.root().join("probe-cwds");
+    // A rustup stand-in: proxies dispatch on argv[0] and pick the channel
+    // from the nearest rust-toolchain.toml above the working dir.
+    support::write_exe(
+        &bin.join("rustup"),
+        &format!(
+            r#"#!/bin/sh
+echo "$PWD" >> "{}"
+d=$PWD; ch=default
+while :; do
+  if [ -f "$d/rust-toolchain.toml" ]; then ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$d/rust-toolchain.toml"); break; fi
+  [ "$d" = / ] && break
+  d=$(dirname "$d")
+done
+echo "$(basename "$0") $ch"
+"#,
+            log.display()
+        ),
+    );
+    for name in ["rustc", "cargo", "cargo-nextest"] {
+        std::os::unix::fs::symlink("rustup", bin.join(name)).unwrap();
+    }
+    host(
+        &sb,
+        &format!("[job]\npath_prepend = [\"{}\"]\n", bin.display()),
+    );
+    // Only command steps: the detected Rust root still puts the toolchain
+    // into the fingerprint (R74).
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n",
+    );
+    sb.commit_file(&repo, "Cargo.toml", "[workspace]\n", "cargo");
+    // An untracked toolchain file in the agent's checkout is not T's.
+    std::fs::write(
+        repo.join("rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"1.85\"\n",
+    )
+    .unwrap();
+    let rustc = |r: &support::Run| {
+        assert_eq!(r.code, Some(0), "{}", r.out);
+        let spec = std::fs::read(
+            sb.state()
+                .join("jobs")
+                .join(job_id(&r.out))
+                .join("spec.json"),
+        )
+        .unwrap();
+        let spec: serde_json::Value = serde_json::from_slice(&spec).unwrap();
+        spec["fingerprint"]["rustc"]
+            .as_str()
+            .unwrap_or("none")
+            .to_owned()
+    };
+    let first = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(rustc(&first), "rustc default");
+    std::fs::remove_file(repo.join("rust-toolchain.toml")).unwrap();
+    sb.commit_file(
+        &repo,
+        "rust-toolchain.toml",
+        "[toolchain]\nchannel = \"1.90\"\n",
+        "toolchain",
+    );
+    let pinned = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(rustc(&pinned), "rustc 1.90");
+    // Another rev gets its own tree's toolchain, not the checkout's.
+    let older = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD~1", "--rerun"]);
+    assert_eq!(rustc(&older), "rustc default");
+    // R51: no probe ran in the agent's checkout.
+    let cwds = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        !cwds
+            .lines()
+            .any(|l| std::path::Path::new(l).starts_with(&repo)),
+        "{cwds}"
+    );
+}

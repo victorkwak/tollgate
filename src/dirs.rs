@@ -137,6 +137,13 @@ impl Dirs {
         self.state_home.join(APP)
     }
 
+    /// `$XDG_STATE_HOME/tollgate/probe`: content-addressed dirs where tool
+    /// version probes run, holding a tree's toolchain files (R51, R74).
+    #[must_use]
+    pub fn probe_root(&self) -> PathBuf {
+        self.state_dir().join("probe")
+    }
+
     /// Tool version cache (R75).
     #[must_use]
     pub fn toolcache_file(&self) -> PathBuf {
