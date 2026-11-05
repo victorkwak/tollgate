@@ -12,11 +12,14 @@
 //!
 //! - `toolcache.json` (R75)
 //! - `results/<key[..2]>/<key>.json` (R76)
-//! - `jobs/<job id>/` with `report.json`, `<step>.log`, `junit.xml`, `tmp/` (R82),
-//!   `waiters/` (R89), `job.json`
+//! - `jobs/<job id>/` (R82): `job.json` (state), `spec.json` (the planned
+//!   job), `report.json`, `<step>.log`, `<step>.junit.xml`, `setup-<name>.log`,
+//!   `job.log`, `runner.log`, `runner.pid`, `tmp/` (the job's `TMPDIR`),
+//!   `waiters/` (R89), `cancel`
 //! - `jobs/by-key/<key>.lock` (R88), `jobs/queue/<origin>/` (R89)
 //! - `locks/<resource>/slot-<i>`, `locks/<resource>/queue/` (R85, R86)
 //! - `steps/<key[..2]>/<key>.json`: stored step passes (L16)
+//! - `metadata/<key>.json`: workspace maps for selection without cargo
 //! - `flaky.jsonl` (R93)
 //! - `verify/` (default `verify.root`, R41)
 //!
@@ -165,6 +168,15 @@ impl Dirs {
     pub fn step_result_file(&self, key: &StepKey) -> PathBuf {
         self.step_results_dir()
             .join(key.shard())
+            .join(format!("{key}.json"))
+    }
+
+    /// `metadata/<key>.json`: workspace maps by manifest key, written by
+    /// the runner, read by front ends that run no cargo (R51).
+    #[must_use]
+    pub fn workspace_map_file(&self, key: &str) -> PathBuf {
+        self.state_dir()
+            .join("metadata")
             .join(format!("{key}.json"))
     }
 

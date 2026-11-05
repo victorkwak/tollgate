@@ -33,8 +33,7 @@ use super::env::{EnvFile, JobEnv};
 use super::exec::{self, ExecEnd, ExecSpec};
 use super::setup::{self, SetupResult};
 use crate::cache::record::{
-    ENVIRONMENTAL_TTL, ErrorCause, Needed, Record, Selection, StepResult, StepStatus,
-    SubsetSelection, Verdict,
+    ENVIRONMENTAL_TTL, ErrorCause, Needed, Record, Selection, StepResult, StepStatus, Verdict,
 };
 use crate::cache::step::{self as step_store, StoredStep};
 use crate::cache::store::{Lookup, LookupRequest, RecordStore};
@@ -51,7 +50,7 @@ use crate::locks::{self, AcquireError, AcquireOptions, Priority, Semaphore};
 use crate::policy::ConfigSource;
 use crate::report::{self, FlakyEntry, JobReport, Outcome, StepReport};
 use crate::sched::{JobState, JobStore, Origin, StateKind, Transition};
-use crate::select::{self, Rules, RustRoot, WorkspaceMap, detect};
+use crate::select::{self, WorkspaceMap, detect};
 use crate::steps::junit::{self, QuarantineHit};
 use crate::steps::{self, Decision, InvocationCtx, PlannedStep, Scope, nextest};
 
@@ -348,6 +347,9 @@ impl Runner<'_> {
     }
 
     fn run(&mut self) -> End {
+        if let Some(end) = self.docs_only_shortcut() {
+            return end;
+        }
         let place = Place::new(
             &self.spec.host.verify.root(self.dirs),
             &self.spec.repo_key,
@@ -485,21 +487,22 @@ impl Runner<'_> {
             return error(ErrorCause::Config, errs.join("; "));
         }
         let platform = Platform::current();
-        let rust_roots: BTreeSet<PathBuf> = config
-            .steps
-            .iter()
-            .filter(|s| steps::is_rust(s.kind) && s.runs_in(self.spec.tier) && s.runs_on(platform))
-            .map(steps::step_root)
-            .collect();
+        let rust_roots = steps::rust_roots(config, self.spec.tier, platform);
         let maps: BTreeMap<PathBuf, Option<WorkspaceMap>> = rust_roots
             .iter()
-            .map(|root| (root.clone(), self.metadata(workdir, root)))
+            .map(|root| (root.clone(), self.metadata(workdir, root, entries)))
             .collect();
-        let picked = match self.select(config, entries, &maps) {
+        let fast = match self.select(config, entries, &maps) {
             Ok(p) => p,
             Err(end) => return end,
         };
-        let plan = steps::plan(config, self.spec.tier, picked.as_ref(), platform);
+        let (picked, plan) = match fast {
+            Some(f) => {
+                self.record_selection = f.selection;
+                (Some(f.picked), f.plan)
+            }
+            None => (None, steps::plan(config, self.spec.tier, None, platform)),
+        };
         if let Some(p) = plan
             .iter()
             .find(|p| matches!(p.decision, Decision::Run(_)) && !steps::is_built(p.step.kind))
@@ -513,31 +516,6 @@ impl Runner<'_> {
                 ),
             );
         }
-        self.record_selection = match (&picked, &self.spec.base_tree) {
-            (Some(p), Some(base)) => Selection::Subset(SubsetSelection {
-                base: base.clone(),
-                packages: p
-                    .rust
-                    .iter()
-                    .flat_map(|rp| {
-                        rp.affected.iter().map(move |n| {
-                            if rp.root.as_os_str().is_empty() {
-                                n.clone()
-                            } else {
-                                format!("{}:{n}", rp.root.display())
-                            }
-                        })
-                    })
-                    .collect(),
-                roots: p.roots.iter().map(|r| r.display().to_string()).collect(),
-                steps: plan
-                    .iter()
-                    .filter(|s| matches!(s.decision, Decision::Run(_)))
-                    .map(|s| s.step.name.clone())
-                    .collect(),
-            }),
-            _ => Selection::All,
-        };
         self.report.selection = Some(self.record_selection.clone());
         if let Some(p) = &picked {
             self.report.warnings.extend(p.warnings.iter().cloned());
@@ -598,7 +576,12 @@ impl Runner<'_> {
 
     /// `cargo metadata` in the checkout (R50); `None` (and a warning) on
     /// failure, which makes the workspace whole (R58).
-    fn metadata(&mut self, workdir: &Path, root: &Path) -> Option<WorkspaceMap> {
+    fn metadata(
+        &mut self,
+        workdir: &Path,
+        root: &Path,
+        entries: &[TreeEntry],
+    ) -> Option<WorkspaceMap> {
         let out_file = self.job_dir.join(format!(
             "metadata-{}.json",
             report::slug(&root.display().to_string())
@@ -628,7 +611,14 @@ impl Runner<'_> {
         };
         let _ = std::fs::remove_file(&out_file);
         match parsed {
-            Ok(m) => Some(m),
+            Ok(m) => {
+                if !self.here {
+                    let cargo = self.spec.fingerprint.get("cargo").unwrap_or("absent");
+                    let key = select::rust::map_key(entries, root, cargo);
+                    let _ = select::rust::store_cached(self.dirs, &key, &m);
+                }
+                Some(m)
+            }
             Err(e) => {
                 self.report.warnings.push(format!(
                     "WARN metadata for {}: {e}; selecting the whole workspace (R58)",
@@ -643,13 +633,13 @@ impl Runner<'_> {
         }
     }
 
-    /// The fast selection (R55-R57); `Ok(None)` when selection is disabled.
+    /// The fast selection (R55-R58); `Ok(None)` when selection is disabled.
     fn select(
         &mut self,
         config: &RepoConfig,
         entries: &[TreeEntry],
         maps: &BTreeMap<PathBuf, Option<WorkspaceMap>>,
-    ) -> Result<Option<select::Picked>, End> {
+    ) -> Result<Option<steps::FastPlan>, End> {
         if self.spec.tier == Tier::Full || !self.spec.select {
             if let Some(n) = &self.spec.select_note {
                 self.say(&format!("selection disabled: {n}"));
@@ -665,16 +655,59 @@ impl Runner<'_> {
             // R56: an empty diff selects everything.
             return Ok(None);
         }
-        let rules = Rules::new(config).map_err(|e| error(ErrorCause::Config, e))?;
-        let roots: Vec<RustRoot<'_>> = maps
-            .iter()
-            .map(|(dir, m)| RustRoot {
-                dir: dir.as_path(),
-                map: m.as_ref(),
-            })
-            .collect();
         let other = detect::roots_from_tree(entries).other();
-        Ok(Some(select::pick(&changes, &rules, &roots, &other)))
+        steps::fast_plan(config, &base, &changes, maps, &other, Platform::current())
+            .map(Some)
+            .map_err(|e| error(ErrorCause::Config, e))
+    }
+
+    /// R61 without a checkout: when the workspace maps of `T`'s manifests
+    /// are cached and every change is docs-only, the job passes with zero
+    /// steps at once (no checkout lock, no cargo).
+    fn docs_only_shortcut(&mut self) -> Option<End> {
+        if self.spec.tier != Tier::Fast || !self.spec.select {
+            return None;
+        }
+        let base = self.spec.base_tree.clone()?;
+        let entries = self.repo_git.ls_tree(&self.spec.tree).ok()?;
+        let changes = select::changed_paths(&self.repo_git, &base, &self.spec.tree).ok()?;
+        if changes.is_empty() {
+            return None;
+        }
+        let config = self.spec.policy.config.clone();
+        let platform = Platform::current();
+        let cargo = self.spec.fingerprint.get("cargo").unwrap_or("absent");
+        let mut maps = BTreeMap::new();
+        for root in steps::rust_roots(&config, Tier::Fast, platform) {
+            let key = select::rust::map_key(&entries, &root, cargo);
+            maps.insert(root, Some(select::rust::load_cached(self.dirs, &key)?));
+        }
+        let other = detect::roots_from_tree(&entries).other();
+        let fast = steps::fast_plan(&config, &base, &changes, &maps, &other, platform).ok()?;
+        if !fast.picked.docs_only(&changes) {
+            return None;
+        }
+        self.say("docs-only change (R61): no steps run, no checkout needed");
+        self.record_selection = fast.selection;
+        self.report.selection = Some(self.record_selection.clone());
+        for p in &fast.plan {
+            let why = match &p.decision {
+                Decision::Skip(w) => w.clone(),
+                Decision::Run(_) => return None,
+            };
+            self.report
+                .steps
+                .push(StepReport::skipped(&p.step.name, p.step.kind, &why));
+            self.step_results.push(StepResult {
+                name: p.step.name.clone(),
+                status: StepStatus::Skipped,
+                duration_ms: 0,
+                exit: None,
+                log: None,
+                failing: Vec::new(),
+            });
+        }
+        Some(End::Verdict(Verdict::Pass, None, None))
     }
 
     /// A pass that covers the exact selection exists already (another job

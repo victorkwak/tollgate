@@ -4,9 +4,10 @@
 //!
 //! Used by `tollgate check` now and by the gate hooks later. It runs only
 //! `git` (R51) and tool version probes that the tool cache usually answers
-//! (R75): no `cargo`, so the selection a `fast` lookup needs is not known
-//! exactly; [`Needed::SameBase`] accepts a record of the same base tree,
-//! and the runner re-checks with the exact selection.
+//! (R75): no `cargo`. The exact selection a `fast` lookup needs comes from
+//! workspace maps the runner cached for the tree's manifests; without them
+//! [`Needed::SameBase`] accepts a record of the same base tree, and the
+//! runner re-checks with the exact selection.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use crate::cache::store::{Lookup, LookupRequest, RecordStore, StoreError};
 use crate::cache::toolcache::ToolCache;
 use crate::cache::{Fingerprint, record_key};
 use crate::config::repo::StepKind;
-use crate::config::{CompiledScope, LoadedHost, Tier};
+use crate::config::{CompiledScope, LoadedHost, Platform, Tier};
 use crate::dirs::Dirs;
 use crate::env::EnvSnapshot;
 use crate::gitx::{Git, GitError, Oid, RepoLayout};
@@ -30,6 +31,7 @@ use crate::runner::env::{BaseInputs, EnvFile, JobEnv};
 use crate::runner::job::{JobSpec, PolicySpec, SPEC_SCHEMA};
 use crate::runner::spawn;
 use crate::sched::{self, Claim, JobMeta, JobState, JobStore, Origin};
+use crate::{select, steps};
 
 /// Error while planning or starting a job.
 #[derive(Debug, thiserror::Error)]
@@ -190,6 +192,33 @@ fn store_report_exists(store: &RecordStore, job: &JobId) -> bool {
     store.dirs().job_report(job).is_file()
 }
 
+/// The exact fast selection when every Rust workspace map of the tree's
+/// manifests is cached (the runner stores them); `None` otherwise. Runs
+/// only `git diff-tree` (R51).
+fn exact_selection(
+    req: &PlanRequest<'_>,
+    config: &crate::config::RepoConfig,
+    entries: &[crate::gitx::TreeEntry],
+    base: &Oid,
+    fp: &Fingerprint,
+) -> Option<Selection> {
+    let changes = select::changed_paths(req.git, base, &req.tree).ok()?;
+    if changes.is_empty() {
+        return None;
+    }
+    let platform = Platform::current();
+    let cargo = fp.get("cargo").unwrap_or("absent");
+    let mut maps = BTreeMap::new();
+    for root in steps::rust_roots(config, Tier::Fast, platform) {
+        let key = select::rust::map_key(entries, &root, cargo);
+        maps.insert(root, Some(select::rust::load_cached(req.dirs, &key)?));
+    }
+    let other = select::detect::roots_from_tree(entries).other();
+    steps::fast_plan(config, base, &changes, &maps, &other, platform)
+        .ok()
+        .map(|f| f.selection)
+}
+
 /// Plans a job for `req` (R74, L2, R56).
 pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
     let host = &req.host.config;
@@ -270,7 +299,9 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
                     Needed::Exact(Selection::All),
                 )
             } else if base_trusted(req.git, &store, b, &fp, &trusted)? {
-                (true, None, Needed::SameBase(b.tree.clone()))
+                let needed = exact_selection(req, config, &entries, &b.tree, &fp)
+                    .map_or_else(|| Needed::SameBase(b.tree.clone()), Needed::Exact);
+                (true, None, needed)
             } else {
                 (
                     false,

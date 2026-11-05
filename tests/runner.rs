@@ -491,3 +491,53 @@ fn quarantine_beyond_30_days_of_the_policy_commit_is_a_config_error_r69_t34() {
         r.out
     );
 }
+
+#[test]
+fn exact_selection_hits_a_covering_record_of_another_base_r79_t35() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        r#"version = 1
+[[step]]
+name = "s1"
+kind = "command"
+run = "true"
+when = ["a/**"]
+[[step]]
+name = "s2"
+kind = "command"
+run = "true"
+when = ["b/**"]
+"#,
+    );
+    let r = sb.tollgate(&repo, &["check", "--rev", "HEAD", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    std::fs::create_dir_all(repo.join("a")).unwrap();
+    std::fs::create_dir_all(repo.join("b")).unwrap();
+    std::fs::write(repo.join("a/x.sh"), "1").unwrap();
+    std::fs::write(repo.join("b/y.sh"), "1").unwrap();
+    sb.git(&repo, &["add", "-A"]);
+    let both = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(both.code, Some(0), "{}", both.out);
+    let rep = sb.report(&job_id(&both.out));
+    assert_eq!(
+        rep["selection"]["subset"]["steps"],
+        serde_json::json!(["s1", "s2"]),
+        "{rep}"
+    );
+    // Commit only a/; the index tree stays the same (b/ still staged).
+    sb.git(
+        &repo,
+        &["commit", "-q", "--no-verify", "-m", "a", "--", "a/x.sh"],
+    );
+    let r = sb.tollgate(&repo, &["check", "--rev", "HEAD", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let jobs = sb.jobs().len();
+    // Relative to the new base only s2 is needed; the record of the same
+    // tree from the older base covers it: no job.
+    let hit = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(hit.code, Some(0), "{}", hit.out);
+    assert_eq!(sb.jobs().len(), jobs, "{}", hit.out);
+}

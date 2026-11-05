@@ -4,6 +4,10 @@
 //! ids of its `when` paths (or its command, cwd or env) differ from its last
 //! successful run in this checkout, kept in the checkout's meta file. A
 //! failed setup is verdict `error`, cause `setup`.
+//!
+//! Setup outputs must live in dirs `git clean` keeps (`node_modules`,
+//! `.venv`, `target`, the steps' `cache_dirs`, R42): anything else is
+//! removed before the next job while the setup counts as up to date.
 
 use std::path::Path;
 use std::time::{Duration, Instant};

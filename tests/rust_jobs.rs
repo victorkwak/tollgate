@@ -225,6 +225,18 @@ fn full_tier_flaky_quarantine_and_fast_selection_t41_t30_l2() {
     );
     sb.git(&repo, &["reset", "-q", "--hard"]);
 
+    // Docs-only with cached workspace maps: the runner passes at once, with
+    // no checkout and no cargo (R61, L19).
+    std::fs::write(repo.join("NOTES.md"), "notes\n").unwrap();
+    sb.git(&repo, &["add", "NOTES.md"]);
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let docs_job = job_id(&r.out);
+    let log =
+        std::fs::read_to_string(sb.state().join("jobs").join(&docs_job).join("job.log")).unwrap();
+    assert!(log.contains("no checkout needed"), "{log}");
+    sb.git(&repo, &["reset", "-q", "--hard"]);
+
     // An expired quarantine no longer applies.
     let expired = today.checked_sub(jiff::Span::new().days(1)).unwrap();
     commit_policy(&sb, &repo, &policy(&quarantine(expired)), "expired");

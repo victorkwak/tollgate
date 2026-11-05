@@ -142,6 +142,65 @@ impl WorkspaceMap {
     }
 }
 
+/// File names whose blobs shape `cargo metadata` (with cargo's version).
+const MAP_INPUTS: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+];
+
+fn is_map_input(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| MAP_INPUTS.contains(&n))
+        || path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|d| d == ".cargo")
+}
+
+/// The cache key of the workspace map of `root` in a tree: cargo's
+/// version and the `(path, blob)` of every manifest, lockfile, toolchain
+/// file and `.cargo/` file in the tree. Two trees with the same key give
+/// the same members, manifest dirs and dependency edges, so a hook (which
+/// runs no cargo, R51) can select exactly with a map the runner stored.
+#[must_use]
+pub fn map_key(entries: &[crate::gitx::TreeEntry], root: &Path, cargo_version: &str) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"tollgate workspace map 1\0");
+    h.update(root.as_os_str().as_encoded_bytes());
+    h.update(b"\0");
+    h.update(cargo_version.as_bytes());
+    h.update(b"\0");
+    for e in entries.iter().filter(|e| is_map_input(&e.path)) {
+        h.update(e.path.as_os_str().as_encoded_bytes());
+        h.update(b"\0");
+        h.update(e.oid.as_str().as_bytes());
+        h.update(b"\0");
+    }
+    h.finalize().to_hex().to_string()
+}
+
+/// A stored map for `key`.
+#[must_use]
+pub fn load_cached(dirs: &crate::dirs::Dirs, key: &str) -> Option<WorkspaceMap> {
+    let bytes = crate::fsx::read_optional(&dirs.workspace_map_file(key))
+        .ok()
+        .flatten()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Stores a map computed by `cargo metadata` in a verify checkout.
+pub fn store_cached(
+    dirs: &crate::dirs::Dirs,
+    key: &str,
+    map: &WorkspaceMap,
+) -> std::io::Result<()> {
+    let json = serde_json::to_vec(map).map_err(std::io::Error::other)?;
+    crate::fsx::write_atomic(&dirs.workspace_map_file(key), &json)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -196,6 +255,37 @@ pub(crate) mod tests {
         assert_eq!(m.closure(&set(&["b"])), set(&["a", "b", "c"]));
         assert_eq!(m.closure(&set(&["a"])), set(&["a", "c"]));
         assert_eq!(m.closure(&set(&["d", "zzz"])), set(&["d"]));
+    }
+
+    #[test]
+    fn map_key_tracks_only_manifest_inputs() {
+        use crate::gitx::{Oid, TreeEntry};
+        let e = |p: &str, o: char| TreeEntry {
+            mode: "100644".into(),
+            kind: "blob".into(),
+            oid: Oid::parse(&o.to_string().repeat(40)).unwrap(),
+            path: PathBuf::from(p),
+        };
+        let base = vec![
+            e("Cargo.toml", '1'),
+            e("Cargo.lock", '2'),
+            e("crates/a/Cargo.toml", '3'),
+            e("crates/a/src/lib.rs", '4'),
+            e("README.md", '5'),
+        ];
+        let k = map_key(&base, Path::new(""), "cargo 1.99");
+        let mut src = base.clone();
+        src[3] = e("crates/a/src/lib.rs", '9');
+        src[4] = e("README.md", '9');
+        assert_eq!(map_key(&src, Path::new(""), "cargo 1.99"), k);
+        let mut manifest = base.clone();
+        manifest[2] = e("crates/a/Cargo.toml", '9');
+        assert_ne!(map_key(&manifest, Path::new(""), "cargo 1.99"), k);
+        let mut config = base.clone();
+        config.push(e(".cargo/config.toml", '7'));
+        assert_ne!(map_key(&config, Path::new(""), "cargo 1.99"), k);
+        assert_ne!(map_key(&base, Path::new(""), "cargo 2.0"), k);
+        assert_ne!(map_key(&base, Path::new("rust"), "cargo 1.99"), k);
     }
 
     #[test]

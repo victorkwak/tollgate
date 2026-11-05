@@ -166,6 +166,84 @@ fn fast_decision(s: &Step, p: &Picked, broad: GlobOpts) -> Decision {
     Decision::Run(Scope::All)
 }
 
+/// The Rust workspace roots of the steps that run in `tier` on `platform`.
+#[must_use]
+pub fn rust_roots(config: &RepoConfig, tier: Tier, platform: Platform) -> BTreeSet<PathBuf> {
+    config
+        .steps
+        .iter()
+        .filter(|s| is_rust(s.kind) && s.runs_in(tier) && s.runs_on(platform))
+        .map(step_root)
+        .collect()
+}
+
+/// A fast job's selection: what [`crate::select::pick`] marks, the step
+/// plan, and the record selection (R80). Shared by the runner (maps from
+/// `cargo metadata`) and the front end (cached maps), so both compute the
+/// same selection.
+#[derive(Debug, Clone)]
+pub struct FastPlan {
+    /// Marked and affected packages and roots.
+    pub picked: Picked,
+    /// The steps.
+    pub plan: Vec<PlannedStep>,
+    /// The record selection.
+    pub selection: crate::cache::record::Selection,
+}
+
+/// Plans a fast job relative to `base` (R55-R58, R61, R80).
+pub fn fast_plan(
+    config: &RepoConfig,
+    base: &crate::gitx::Oid,
+    changes: &[crate::select::ChangedPath],
+    maps: &std::collections::BTreeMap<PathBuf, Option<WorkspaceMap>>,
+    other_roots: &[PathBuf],
+    platform: Platform,
+) -> Result<FastPlan, String> {
+    let rules = crate::select::Rules::new(config)?;
+    let roots: Vec<crate::select::RustRoot<'_>> = maps
+        .iter()
+        .map(|(dir, m)| crate::select::RustRoot {
+            dir: dir.as_path(),
+            map: m.as_ref(),
+        })
+        .collect();
+    let picked = crate::select::pick(changes, &rules, &roots, other_roots);
+    let plan = plan(config, Tier::Fast, Some(&picked), platform);
+    let selection =
+        crate::cache::record::Selection::Subset(crate::cache::record::SubsetSelection {
+            base: base.clone(),
+            packages: picked
+                .rust
+                .iter()
+                .flat_map(|rp| {
+                    rp.affected.iter().map(move |n| {
+                        if rp.root.as_os_str().is_empty() {
+                            n.clone()
+                        } else {
+                            format!("{}:{n}", rp.root.display())
+                        }
+                    })
+                })
+                .collect(),
+            roots: picked
+                .roots
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect(),
+            steps: plan
+                .iter()
+                .filter(|s| matches!(s.decision, Decision::Run(_)))
+                .map(|s| s.step.name.clone())
+                .collect(),
+        });
+    Ok(FastPlan {
+        picked,
+        plan,
+        selection,
+    })
+}
+
 /// A command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
