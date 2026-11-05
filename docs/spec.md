@@ -59,11 +59,16 @@ L18. **Self-repair before deny.** When the guard's self-check (R24) finds a miss
 
 L19. **Performance budgets** (p95 on the Arch box, tested where marked):
 - Guard per call: under 10 ms (test: 200 calls).
-- Chained non-gate hook (for example `post-commit` with no repo hook): under 5 ms (test).
-- `pre-commit` on a cache hit: under 200 ms (test).
-- `pre-commit` on a docs-only tree: under 200 ms (test).
+- Chained non-gate hook (for example `post-commit` with no repo hook): under 5 ms (test, bench).
+- `pre-commit` on a cache hit: under 200 ms (test, bench).
+- `pre-commit` on a docs-only tree: under 200 ms (test, bench).
 - Fast job overhead beyond the steps themselves (checkout update, metadata, selection, record write): under 3 s for a myapp-sized workspace (bench).
 - No tollgate code on the path of git commands that run no hooks (`status`, `diff`, `log`, `show`, `fetch`).
+
+Where the budgets are enforced:
+- "test" is `tests/latency.rs`. It runs in both tiers (`fast`, `full`) and asserts the p95 of **CPU time** (user + system) of the hook and of every process it starts, against the budget above. On Linux the test process is a child subreaper, so the detached runner of a docs-only job is counted too (on macOS it is not). This work is sequential, so CPU time is a lower bound of wall-clock time: a CPU time over the budget is a breach on any host. Load does not move CPU time much (at load 30-40 on 16 threads: docs-only 55-75 ms CPU against 200-600 ms wall). The wall-clock p95 is printed next to it, not asserted.
+- "bench" is `tollgate bench --enforce-budgets` (L20, docs/benchmark.md): it asserts the **wall-clock** p95 under the bench's own concurrent commits and exits 1 when a measured budget is over. Run it on a quiet host before a rollout and after a change to a hook path. The guard is not in the bench; its test is its only check.
+- Reason: a gate verdict is stored by tree (R15). A wall-clock assertion in a tier made the verdict depend on host load: on 2026-11-05, at load 25-40 from other sessions, the `fast` job of this repo failed the docs-only budget (205-610 ms) and the chained-hook budget (5.5-42 ms), and a rerun of the same tree passed. A CPU-time assertion still catches a hook that does more work. It does not catch a new sleep or lock wait; the bench does.
 
 L20. **Benchmark before rollout.** `tollgate bench` (dev command, or `benches/` harness) replays commits concurrently from N worktrees of one repo through the real hooks and reports p50/p95 commit latency (hook start to allow), queue wait per resource, CPU load, peak test-Postgres connections, cache hits and step reuse. Rollout to myapp (R98 step 3) needs a run with 6 worktrees and realistic commits (a core change, an api-only change, a dashboard-only change, a docs change, a retry) and resource slot values (`cpu`, `pg`, `pg_max_threads`) chosen from that run, not guessed. L5's slot numbers are starting values only.
 Note (built, 2026-11-05): `tollgate bench <repo> --scenarios <file> [-n N]` (README "Benchmark"). The source repo is never written: the bench clones it (`--shared`, plus its local branches as L2 anchors) into a new scratch dir and makes N worktrees there; its git and tollgate processes get their own `XDG_*` dirs, a host config from the flags (scope root = the scratch dir) and hooks linked from the running binary, so neither a session's injection nor the installed state takes part (R8). Hook latency is git's trace2 time of the hook process. Queue wait per resource comes from the job reports (`steps[].resources`, `steps[].queue_ms`, `checkout_wait_ms`). Cleanup cancels running jobs, waits for their runners, kills what is left (Linux: by the state dir in the environment) and removes the scratch dir.

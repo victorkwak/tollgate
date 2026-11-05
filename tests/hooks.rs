@@ -872,13 +872,16 @@ fn a_killed_hook_leaves_no_commit_and_no_record_t18_r31_r37() {
         cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         let mut git = cmd.spawn().unwrap();
+        // Signal the hook only once its job runs: the job dir appears
+        // before job.json and the runner, and a busy host can stretch that
+        // window past the first poll.
         let mut pid = None;
         assert!(
-            eventually(20, || {
+            eventually(60, || {
                 pid = hook_pid(git.id(), "pre-commit");
-                pid.is_some() && !sb.jobs().is_empty()
+                pid.is_some() && sb.first_job_running()
             }),
-            "the hook never started a job"
+            "the hook never started a running job"
         );
         tollgate::procs::signal(pid.unwrap(), signal).unwrap();
         let status = git.wait().unwrap();

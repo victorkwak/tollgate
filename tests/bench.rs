@@ -165,6 +165,7 @@ edit = [{ path = "docs/guide.md", write = "# Guide {worktree}\n" }]
             "50",
             "--out",
             out_file.to_str().unwrap(),
+            "--enforce-budgets",
         ],
     );
     let report: serde_json::Value =
@@ -175,7 +176,26 @@ edit = [{ path = "docs/guide.md", write = "# Guide {worktree}\n" }]
     } else {
         bench_processes(&scratch)
     };
-    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    // --enforce-budgets: exit 1 exactly when a measured wall-clock budget
+    // is over (L19). Whether one is over depends on the host's load, so the
+    // test checks that the exit code and the message follow the report.
+    let over: Vec<&str> = report["budgets"]
+        .as_array()
+        .map(|bs| {
+            bs.iter()
+                .filter(|b| b["ok"] == false)
+                .filter_map(|b| b["name"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    if over.is_empty() {
+        assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+        assert!(!stderr.contains("budget(s) over"), "{stderr}");
+    } else {
+        assert_eq!(code, Some(1), "{stdout}\n{stderr}");
+        let line = format!("tollgate bench: L19 budget(s) over: {}", over.join(", "));
+        assert!(stderr.contains(&line), "{line:?} in:\n{stderr}");
+    }
     assert_eq!(leftover, 0, "bench processes left running");
 
     // Text on stdout.
@@ -309,8 +329,11 @@ fn bench_cancels_the_jobs_it_leaves_running_and_removes_its_scratch_l20() {
             "--scenarios",
             scenarios.to_str().unwrap(),
             "--no-warm",
+            // The hook denies at this cap and cleanup then cancels the job.
+            // The step must have started by then: at load 70 the runner
+            // took more than 1 s to reach it, so the cap leaves 10 s.
             "--inline-cap",
-            "1",
+            "10",
             "--min-free",
             "1M",
             "--scratch",

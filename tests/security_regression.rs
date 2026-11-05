@@ -753,13 +753,15 @@ fn s8_a_killed_hook_leaves_no_commit_and_no_record() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
+    // Kill the hook only once its job runs ("while its job runs"): the job
+    // dir appears before job.json and the runner.
     let mut pid = None;
     assert!(
-        eventually(20, || {
+        eventually(60, || {
             pid = hook_pid(child.id(), "pre-commit");
-            pid.is_some() && !lab.sb().jobs().is_empty()
+            pid.is_some() && lab.sb().first_job_running()
         }),
-        "the hook never started a job"
+        "the hook never started a running job"
     );
     tollgate::procs::signal(pid.unwrap(), libc::SIGKILL).unwrap();
     let st = wait_or_kill(&mut child, 20);
