@@ -735,6 +735,93 @@ pub fn record(kind: Kind, root: &Path, commit: &str) -> Result<String, String> {
     ))
 }
 
+/// The nearest dir from `cwd` up to `top` that holds `pyproject.toml`.
+fn python_root(cwd: &Path, top: &Path) -> Option<PathBuf> {
+    cwd.ancestors()
+        .take_while(|a| a.starts_with(top))
+        .find(|a| a.join("pyproject.toml").is_file())
+        .map(Path::to_owned)
+}
+
+/// `tollgate baseline record pyright|pytest [--force]` (R94): at an
+/// interactive terminal only (stdin and stdout are TTYs; Claude's Bash has
+/// none), on a clean tree unless `--force`, in the nearest dir with
+/// `pyproject.toml`. Returns the exit code.
+pub fn record_cmd(env: &crate::env::EnvSnapshot, cwd: &Path, kind: Kind, force: bool) -> u8 {
+    use std::io::IsTerminal as _;
+    let tool = kind.tool();
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        eprintln!(
+            "tollgate baseline record: needs an interactive terminal on stdin and stdout (R94); a baseline is recorded by a person, not by an agent"
+        );
+        return crate::exit::FAIL;
+    }
+    let git = crate::gitx::Git::scrubbed(env, cwd);
+    let top = match crate::gitx::RepoLayout::discover(&git) {
+        Ok(l) => match l.worktree {
+            Some(w) => w,
+            None => {
+                eprintln!("tollgate baseline record: bare repository: no work tree");
+                return crate::exit::BLOCK;
+            }
+        },
+        Err(e) => {
+            eprintln!("tollgate baseline record: not in a git repository: {e}");
+            return crate::exit::BLOCK;
+        }
+    };
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_owned());
+    let top = std::fs::canonicalize(&top).unwrap_or(top);
+    let Some(root) = python_root(&cwd, &top) else {
+        eprintln!(
+            "tollgate baseline record: no pyproject.toml in {} or a parent inside the repo",
+            cwd.display()
+        );
+        return crate::exit::BLOCK;
+    };
+    let git = git.in_dir(&root);
+    if !force {
+        let status = git.run([
+            "status",
+            "--porcelain",
+            "--",
+            ".",
+            ":(exclude).pytest-baseline.json",
+            ":(exclude).pyright-baseline.json",
+        ]);
+        let dirty = match status {
+            Ok(out) => !out.trim_ascii().is_empty(),
+            Err(e) => {
+                eprintln!("tollgate baseline record: git status: {e}");
+                return crate::exit::BLOCK;
+            }
+        };
+        if dirty {
+            let what = match kind {
+                Kind::Pyright => "errors",
+                Kind::Pytest => "failures",
+            };
+            eprintln!(
+                "tollgate baseline record: the working tree is dirty.\nRecording now would bake your in-progress {what} into the baseline, which\nis the one thing a baseline must never contain. Stash first:\n\n  git stash -u && tollgate baseline record {tool} && git stash pop\n\nOr pass --force if the current state really is the intended baseline."
+            );
+            return crate::exit::FAIL;
+        }
+    }
+    let commit = git
+        .run_line(["rev-parse", "--short", "HEAD"])
+        .unwrap_or_else(|_| "unknown".to_owned());
+    match record(kind, &root, &commit) {
+        Ok(msg) => {
+            println!("{msg}");
+            crate::exit::OK
+        }
+        Err(e) => {
+            eprintln!("tollgate baseline record: {e}");
+            crate::exit::FAIL
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

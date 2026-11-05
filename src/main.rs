@@ -100,6 +100,9 @@ fn run() -> u8 {
             root,
             baseline,
         } => tollgate::steps::baseline::step(kind.kind(), baseline.as_deref(), &findings, &root),
+        Command::Baseline {
+            action: BaselineAction::Record { kind, force },
+        } => tollgate::steps::baseline::record_cmd(&ctx.env, &ctx.cwd, kind.kind(), force),
         other => not_built(other.name()),
     }
 }
@@ -171,6 +174,15 @@ enum ReportFormat {
 enum BaselineKind {
     Pyright,
     Pytest,
+}
+
+impl BaselineKind {
+    fn kind(self) -> tollgate::steps::baseline::Kind {
+        match self {
+            Self::Pyright => tollgate::steps::baseline::Kind::Pyright,
+            Self::Pytest => tollgate::steps::baseline::Kind::Pytest,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

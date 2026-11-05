@@ -393,3 +393,170 @@ fn detection_syncs_and_checks_a_python_root_t25_r65_r45() {
     let log = std::fs::read_to_string(p.sb.state().join("jobs").join(job).join("job.log")).unwrap();
     assert!(log.contains("setup \"py uv sync\": ran"), "T25: {log}");
 }
+
+/// Runs tollgate with stdin and stdout on a new pty (an interactive
+/// terminal) and stderr piped; returns the exit code and all output.
+fn on_pty(
+    sb: &Sandbox,
+    cwd: &std::path::Path,
+    args: &[&str],
+    extra: &[(&str, PathBuf)],
+) -> (Option<i32>, String) {
+    use std::io::Read as _;
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    let (mut m, mut s) = (0, 0);
+    // SAFETY: openpty writes two fds into the given ints; the null name,
+    // termios and winsize pointers are allowed.
+    let r = unsafe {
+        libc::openpty(
+            &raw mut m,
+            &raw mut s,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(r, 0, "openpty");
+    // SAFETY: both fds were just opened and are owned here only. CLOEXEC:
+    // children other test threads fork must not keep the pty open.
+    let (master, slave) = unsafe {
+        libc::fcntl(m, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(s, libc::F_SETFD, libc::FD_CLOEXEC);
+        (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s))
+    };
+    let child = {
+        let mut cmd = Command::new(support::BIN);
+        cmd.env_clear()
+            .current_dir(cwd)
+            .args(args)
+            .stdin(std::process::Stdio::from(slave.try_clone().unwrap()))
+            .stdout(std::process::Stdio::from(slave))
+            .stderr(std::process::Stdio::piped());
+        for (k, v) in sb.env().iter() {
+            cmd.env(k, v);
+        }
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        cmd.spawn().unwrap()
+    };
+    let out = child.wait_with_output().unwrap();
+    // SAFETY: `m` is the master fd owned by `master`.
+    unsafe {
+        libc::fcntl(m, libc::F_SETFL, libc::O_NONBLOCK);
+    }
+    let mut tty = Vec::new();
+    let mut f = std::fs::File::from(master);
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = f.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        tty.extend_from_slice(&buf[..n]);
+    }
+    (
+        out.status.code(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&tty).replace("\r\n", "\n"),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+#[test]
+fn baseline_record_needs_a_tty_and_a_clean_tree_and_matches_the_scripts_t42_r94() {
+    let Some(p) = project("baseline_record", Some(POLICY), false) else {
+        return;
+    };
+    p.commit("python project");
+    let py = p.py();
+    let offline = tools::offline_env(&p.sb.root());
+    let extra: Vec<(&str, &str)> = offline
+        .iter()
+        .map(|(k, v)| (*k, v.to_str().unwrap()))
+        .collect();
+    // No TTY (Claude's Bash): refused.
+    let r =
+        p.sb.tollgate_with(&py, &["baseline", "record", "pyright"], &extra);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(r.out.contains("needs an interactive terminal"), "{}", r.out);
+    assert!(!py.join(baseline::PYRIGHT_FILE).exists());
+
+    // A TTY but a dirty tree: refused.
+    std::fs::write(py.join("app.py"), format!("{APP}# wip\n")).unwrap();
+    let (code, out) = on_pty(&p.sb, &py, &["baseline", "record", "pytest"], &offline);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("the working tree is dirty"), "{out}");
+    assert!(
+        out.contains("git stash -u && tollgate baseline record pytest && git stash pop"),
+        "{out}"
+    );
+    p.sb.git(&p.repo, &["checkout", "--", "py/app.py"]);
+
+    // Clean, at a TTY: both baselines are recorded in the scripts' format.
+    for (kind, msg) in [
+        ("pyright", "Recorded 1 pre-existing pyright error(s) to "),
+        ("pytest", "Recorded 1 pre-existing test failure(s) to "),
+    ] {
+        let (code, out) = on_pty(&p.sb, &py, &["baseline", "record", kind], &offline);
+        assert_eq!(code, Some(0), "{out}");
+        assert!(out.contains(msg), "{out}");
+    }
+    let read = |f: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(py.join(f)).unwrap()).unwrap()
+    };
+    let pyright = read(baseline::PYRIGHT_FILE);
+    let pytest = read(baseline::PYTEST_FILE);
+    assert_eq!(
+        pytest["tests"],
+        serde_json::json!({"tests/test_app.py::test_old": true})
+    );
+    assert_eq!(pyright["total"], 1);
+    assert_eq!(
+        pyright["commit"].as_str().unwrap(),
+        p.sb.git(&p.repo, &["rev-parse", "--short", "HEAD"])
+    );
+
+    // The scripts themselves, where this machine still has them, record the
+    // same fingerprints (R94). They run as copies in the sandbox.
+    let hooks = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude/hooks"));
+    let scripts = hooks
+        .as_ref()
+        .map(|h| (h.join("pyright-baseline.sh"), h.join("pytest-baseline.sh")))
+        .filter(|(a, b)| a.is_file() && b.is_file() && tools::which("jq").is_some());
+    if let Some((pr, pt)) = scripts {
+        let copies = p.sb.root().join("scripts");
+        tools::copy(&pr, &copies.join("pyright-baseline.sh"));
+        tools::copy(&pt, &copies.join("pytest-baseline.sh"));
+        let ours = (pyright.clone(), pytest.clone());
+        p.sb.git(&p.repo, &["add", "-A"]);
+        p.sb.git(&p.repo, &["commit", "-q", "--no-verify", "-m", "ours"]);
+        let env = p.sb.env();
+        for s in ["pyright-baseline.sh", "pytest-baseline.sh"] {
+            tools::run(
+                std::path::Path::new("bash"),
+                &[copies.join(s).to_str().unwrap(), "--record"],
+                &py,
+                &env,
+                &offline,
+            );
+        }
+        let theirs = (read(baseline::PYRIGHT_FILE), read(baseline::PYTEST_FILE));
+        assert_eq!(ours.0["counts"], theirs.0["counts"], "pyright fingerprints");
+        assert_eq!(ours.0["total"], theirs.0["total"]);
+        assert_eq!(ours.0["pyright"], theirs.0["pyright"]);
+        assert_eq!(ours.1["tests"], theirs.1["tests"], "pytest node ids");
+        assert_eq!(ours.1["total"], theirs.1["total"]);
+    } else {
+        tools::skip(
+            "baseline_record (script comparison)",
+            "~/.claude/hooks/*-baseline.sh or jq not present",
+        );
+    }
+
+    // The recorded baselines, once merged, make full pass.
+    p.commit("baselines");
+    let (code, out, _) = p.check(&["check", "--tier", "full", "--wait"]);
+    assert_eq!(code, Some(0), "{out}");
+}
