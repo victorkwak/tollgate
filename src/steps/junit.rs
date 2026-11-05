@@ -12,6 +12,7 @@ use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, Event};
 use serde::{Deserialize, Serialize};
 
+use crate::config::Tier;
 use crate::config::repo::Quarantine;
 
 /// The outcome of one test case.
@@ -173,12 +174,15 @@ pub struct Summary {
 }
 
 /// Applies the flaky and quarantine policy (R93) to `cases`. A quarantine
-/// entry applies while `until >= today`; an expired one does not.
+/// entry covers only a flaky failure in `full` (a test that passed on retry
+/// and failed through `--flaky-result fail`), while `until >= today`. A test
+/// that failed every try always fails, quarantined or not.
 #[must_use]
 pub fn summarize(
     cases: &[TestCase],
     quarantine: &[Quarantine],
     today: jiff::civil::Date,
+    tier: Tier,
 ) -> Summary {
     let mut s = Summary::default();
     for c in cases {
@@ -194,7 +198,10 @@ pub fn summarize(
         if !matches!(c.outcome, CaseOutcome::Failed | CaseOutcome::FlakyFailed) {
             continue;
         }
-        match quarantine.iter().find(|q| q.test == id && q.until >= today) {
+        let entry = (tier == Tier::Full && c.outcome == CaseOutcome::FlakyFailed)
+            .then(|| quarantine.iter().find(|q| q.test == id && q.until >= today))
+            .flatten();
+        match entry {
             Some(q) => s.quarantined.push(QuarantineHit {
                 test: id,
                 until: q.until.to_string(),
@@ -286,7 +293,7 @@ mod tests {
     fn flaky_and_quarantine_policy_r93_t41() {
         let cases = parse(REPORT).unwrap();
         let today = jiff::civil::date(2026, 11, 5);
-        let s = summarize(&cases, &[], today);
+        let s = summarize(&cases, &[], today, Tier::Full);
         assert_eq!(s.failing.len(), 2);
         assert_eq!(s.flaky.len(), 2);
         assert_eq!(s.flaky[0].passed_on_try, 2);
@@ -297,12 +304,33 @@ mod tests {
             until,
             issue: "Issues/open/x".into(),
         };
-        let valid = summarize(&cases, &[q(today)], today);
+        let valid = summarize(&cases, &[q(today)], today, Tier::Full);
         assert_eq!(valid.failing.len(), 1, "{valid:?}");
         assert_eq!(valid.quarantined[0].until, "2026-11-05");
-        let expired = summarize(&cases, &[q(jiff::civil::date(2026, 11, 4))], today);
+        let expired = summarize(
+            &cases,
+            &[q(jiff::civil::date(2026, 11, 4))],
+            today,
+            Tier::Full,
+        );
         assert_eq!(expired.failing.len(), 2);
         assert!(expired.quarantined.is_empty());
+        // A test that fails every try is never quarantined, in either tier.
+        let broken = Quarantine {
+            test: "b tests::fails".into(),
+            until: today,
+            issue: "Issues/open/x".into(),
+        };
+        for tier in [Tier::Full, Tier::Fast] {
+            let s = summarize(&cases, std::slice::from_ref(&broken), today, tier);
+            assert!(
+                s.failing.iter().any(|f| f.name == "tests::fails") && s.quarantined.is_empty(),
+                "{tier}: {s:?}"
+            );
+        }
+        // Quarantine is a full-tier rule (R93): fast has no flaky failures.
+        let fast = summarize(&cases, &[q(today)], today, Tier::Fast);
+        assert!(fast.quarantined.is_empty(), "{fast:?}");
     }
 
     #[test]

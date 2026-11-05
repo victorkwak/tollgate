@@ -366,3 +366,28 @@ fn a_record_covers_only_the_integration_tests_it_ran_r79_r80() {
     assert_eq!(r.code, Some(1), "{}", r.out);
     assert!(r.out.contains("FAIL a a::ait four_is_four"), "{}", r.out);
 }
+
+#[test]
+fn quarantine_never_hides_a_test_that_fails_every_try_r93() {
+    let sb = Sandbox::new();
+    host(&sb);
+    let repo = sb.rust_repo("ws", Scratch { failing: true });
+    let valid = jiff::Zoned::now()
+        .date()
+        .checked_add(jiff::Span::new().days(10))
+        .unwrap();
+    commit_policy(
+        &sb,
+        &repo,
+        &format!(
+            "version = 1\n[[step]]\nname = \"tests\"\nkind = \"nextest\"\n[[quarantine]]\ntest = \"b tests::fails\"\nuntil = \"{valid}\"\nissue = \"i\"\n"
+        ),
+        "policy",
+    );
+    for tier in ["full", "fast"] {
+        let r = sb.tollgate(&repo, &["check", "--tier", tier, "--rev", "HEAD", "--wait"]);
+        assert_eq!(r.code, Some(1), "{tier}: {}", r.out);
+        assert!(r.out.contains("FAIL b b tests::fails"), "{tier}: {}", r.out);
+        assert!(!r.out.contains("QUARANTINED"), "{tier}: {}", r.out);
+    }
+}

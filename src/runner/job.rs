@@ -273,7 +273,9 @@ pub fn run_here(
     let mut r = Runner::new(dirs, spec, out.to_owned(), runner_env, true, use_locks);
     let config = r.spec.policy.config.clone();
     let end = match fsx::ensure_dir(&out.join("tmp")) {
-        Ok(()) => r.check_tree(workdir, None, &config, &[]),
+        Ok(()) => r
+            .validate(&config)
+            .unwrap_or_else(|| r.check_tree(workdir, None, &config, &[])),
         Err(e) => error(ErrorCause::Internal, e.to_string()),
     };
     r.finish(end);
@@ -361,6 +363,10 @@ impl Runner<'_> {
     }
 
     fn run(&mut self) -> End {
+        let config = self.spec.policy.config.clone();
+        if let Some(end) = self.validate(&config) {
+            return end;
+        }
         if let Some(end) = self.docs_only_shortcut() {
             return end;
         }
@@ -476,6 +482,39 @@ impl Runner<'_> {
         self.check_tree(&workdir, Some(co), &config, &entries)
     }
 
+    /// R64 per-job validation that needs no test list, before anything
+    /// else of the job (R31): a config error ends every job, the docs-only
+    /// shortcut included. R69: the quarantine cap counts from the policy
+    /// commit's committer date, but never from a date after today (a commit
+    /// can carry any date), and from today when there is no policy commit.
+    fn validate(&mut self, config: &RepoConfig) -> Option<End> {
+        let today = jiff::Zoned::now().date();
+        let date = self
+            .spec
+            .policy
+            .committer_date
+            .map_or(today, |d| d.min(today));
+        let v = config.validate_with(&ValidationContext {
+            workspace_packages: None,
+            known_tests: None,
+            policy_commit_date: Some(date),
+            host: Some(&self.spec.host),
+        });
+        self.report
+            .warnings
+            .extend(v.validation.warnings.iter().map(|w| format!("WARN {w}")));
+        if v.validation.is_ok() {
+            return None;
+        }
+        let errs: Vec<String> = v
+            .validation
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        Some(error(ErrorCause::Config, errs.join("; ")))
+    }
+
     /// Selection, planning and steps in `workdir` (the checkout, or the
     /// current dir for `run --here`).
     fn check_tree(
@@ -485,25 +524,6 @@ impl Runner<'_> {
         config: &RepoConfig,
         entries: &[TreeEntry],
     ) -> End {
-        // R64 per-job validation that needs no test list.
-        let v = config.validate_with(&ValidationContext {
-            workspace_packages: None,
-            known_tests: None,
-            policy_commit_date: self.spec.policy.committer_date,
-            host: Some(&self.spec.host),
-        });
-        self.report
-            .warnings
-            .extend(v.validation.warnings.iter().map(|w| format!("WARN {w}")));
-        if !v.validation.is_ok() {
-            let errs: Vec<String> = v
-                .validation
-                .errors
-                .iter()
-                .map(ToString::to_string)
-                .collect();
-            return error(ErrorCause::Config, errs.join("; "));
-        }
         let platform = Platform::current();
         let rust_roots = steps::rust_roots(config, self.spec.tier, platform);
         let maps: BTreeMap<PathBuf, Option<WorkspaceMap>> = rust_roots
@@ -704,6 +724,32 @@ impl Runner<'_> {
         let fast = steps::fast_plan(&config, &base, &changes, &maps, &other, platform).ok()?;
         if !fast.picked.docs_only(&changes) {
             return None;
+        }
+        // R89: a cancelled or superseded job writes no pass, here as on the
+        // checkout path.
+        if let Some(r) = queued_abort(&self.store, &self.spec.id) {
+            return Some(if r == "superseded" {
+                End::Superseded
+            } else {
+                End::Cancelled
+            });
+        }
+        match self.store.transition(
+            &self.spec.id,
+            &[StateKind::Queued],
+            JobState::Running {
+                started: jiff::Timestamp::now(),
+                pid: std::process::id(),
+            },
+        ) {
+            Ok(Transition::Done(_)) => {}
+            Ok(Transition::Refused(meta)) => {
+                return Some(match meta.state {
+                    JobState::Superseded => End::Superseded,
+                    _ => End::Cancelled,
+                });
+            }
+            Err(e) => return Some(error(ErrorCause::Internal, e.to_string())),
         }
         self.say("docs-only change (R61): no steps run, no checkout needed");
         self.record_selection = fast.selection;
@@ -1185,7 +1231,12 @@ impl Runner<'_> {
             .ok()
             .map(|xml| junit::parse(&xml));
         let summary = match parsed {
-            Some(Ok(cases)) => Some(junit::summarize(&cases, &config.quarantine, today)),
+            Some(Ok(cases)) => Some(junit::summarize(
+                &cases,
+                &config.quarantine,
+                today,
+                self.spec.tier,
+            )),
             Some(Err(e)) => {
                 rep.message = Some(format!("JUnit report unreadable: {e}"));
                 None

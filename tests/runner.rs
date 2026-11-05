@@ -745,3 +745,146 @@ when = ["b/**"]
     let w1 = sb.tollgate(&repo, &["wait", &job1, "--timeout", "30s"]);
     assert_eq!(w1.code, Some(0), "wt1 needs only stepA: {}", w1.out);
 }
+
+/// A repo whose `main` is also `origin/main` of a trusted remote, so every
+/// commit on it is a trusted base (R56) without a record.
+fn trusted_repo(sb: &Sandbox, policy: &str) -> std::path::PathBuf {
+    host(sb, "[scope]\nremotes = [\"*example.invalid*\"]\n");
+    let repo = repo_with(sb, "r", policy);
+    sb.git(
+        &repo,
+        &["remote", "add", "origin", "https://example.invalid/r.git"],
+    );
+    let head = sb.git(&repo, &["rev-parse", "HEAD"]);
+    sb.git(&repo, &["update-ref", "refs/remotes/origin/main", &head]);
+    repo
+}
+
+#[test]
+fn a_docs_only_change_still_needs_a_valid_policy_r64_r61() {
+    let sb = Sandbox::new();
+    let until = jiff::Zoned::now()
+        .date()
+        .checked_add(jiff::Span::new().days(60))
+        .unwrap();
+    let repo = trusted_repo(
+        &sb,
+        &format!(
+            "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n[[quarantine]]\ntest = \"a tests::x\"\nuntil = \"{until}\"\nissue = \"i\"\n"
+        ),
+    );
+    sb.commit_file(&repo, "NOTES.md", "docs\n", "docs");
+    let r = sb.tollgate(&repo, &["check", "--rev", "HEAD", "--wait"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("cause config") && r.out.contains("more than 30 days"),
+        "{}",
+        r.out
+    );
+    assert_eq!(sb.record_count(), 1, "only the config error record");
+}
+
+#[test]
+fn a_cancelled_docs_only_job_writes_no_pass_r89_r61() {
+    use tollgate::plan::{Base, PlanRequest};
+    use tollgate::sched::{CancelOutcome, JobMeta, JobState, JobStore};
+
+    let sb = Sandbox::new();
+    let repo = trusted_repo(
+        &sb,
+        "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n",
+    );
+    sb.commit_file(&repo, "NOTES.md", "docs\n", "docs");
+    let env = sb.env();
+    let dirs = tollgate::dirs::Dirs::from_env(&env).unwrap();
+    let host = tollgate::config::HostConfig::load(&dirs).unwrap();
+    let git = tollgate::gitx::Git::scrubbed(&env, &repo);
+    let layout = tollgate::gitx::RepoLayout::discover(&git).unwrap();
+    let oid = |r: &str| tollgate::gitx::Oid::parse(&sb.git(&repo, &["rev-parse", r])).unwrap();
+    let plan = tollgate::plan::plan(&PlanRequest {
+        env: &env,
+        dirs: &dirs,
+        host: &host,
+        layout: &layout,
+        git: &git,
+        tree: oid("HEAD^{tree}"),
+        tier: tollgate::config::Tier::Fast,
+        tip: Some(oid("HEAD")),
+        base: Some(Base {
+            tree: oid("HEAD~1^{tree}"),
+            commit: Some(oid("HEAD~1")),
+        }),
+        refname: "refs/heads/main".into(),
+        allow_reuse: true,
+        priority: tollgate::locks::Priority::Hook,
+        rerun: false,
+    })
+    .unwrap();
+    // A queued job (as plan::start makes it), cancelled before its runner
+    // gets to run.
+    let spec = &plan.spec;
+    spec.write(&dirs).unwrap();
+    let store = JobStore::new(&dirs);
+    store
+        .create(&JobMeta {
+            id: spec.id.clone(),
+            key: spec.key.clone(),
+            tree: spec.tree.clone(),
+            tier: spec.tier,
+            origin: spec.origin.clone(),
+            priority: spec.priority,
+            created: spec.created,
+            state: JobState::Queued,
+        })
+        .unwrap();
+    assert_eq!(
+        store.request_cancel(&spec.id).unwrap(),
+        CancelOutcome::Cancelled
+    );
+    let r = sb.tollgate(&repo, &["__run-job", spec.id.as_str()]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(sb.record_count(), 0, "a cancelled job writes no record");
+    assert_eq!(sb.report(spec.id.as_str())["outcome"], "cancelled");
+}
+
+#[test]
+fn ci_mode_caps_quarantine_like_jobs_do_r69_r47() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n[[quarantine]]\ntest = \"a tests::x\"\nuntil = \"2099-01-01\"\nissue = \"i\"\n",
+    );
+    let r = sb.tollgate(&repo, &["run", "--tier", "full", "--here"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("cause config") && r.out.contains("more than 30 days"),
+        "{}",
+        r.out
+    );
+    // A commit dated in the future does not move the cap.
+    sb.commit_file(&repo, "x.txt", "x\n", "plain");
+    let until = jiff::Zoned::now()
+        .date()
+        .checked_add(jiff::Span::new().days(40))
+        .unwrap();
+    let file = repo.join("tollgate.toml");
+    std::fs::write(
+        &file,
+        format!("version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n[[quarantine]]\ntest = \"a tests::x\"\nuntil = \"{until}\"\nissue = \"i\"\n"),
+    )
+    .unwrap();
+    sb.git(&repo, &["add", "tollgate.toml"]);
+    sb.git_with(
+        &repo,
+        &["commit", "-q", "--no-verify", "-m", "future"],
+        &[(
+            "GIT_COMMITTER_DATE",
+            std::ffi::OsStr::new("2099-01-01T00:00:00Z"),
+        )],
+    );
+    let r = sb.tollgate(&repo, &["run", "--tier", "full", "--here"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(r.out.contains("more than 30 days"), "{}", r.out);
+}

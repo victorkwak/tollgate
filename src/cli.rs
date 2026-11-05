@@ -857,7 +857,13 @@ pub fn run_here(ctx: &Ctx, a: HereArgs) -> u8 {
         policy: PolicySpec {
             commit: None,
             anchor: None,
-            committer_date: None,
+            // R69 in CI: the cap counts from HEAD's committer date (never
+            // after today, see the runner); an unborn HEAD counts from
+            // today.
+            committer_date: git
+                .run_line(["log", "-1", "--format=%cs", "HEAD"])
+                .ok()
+                .and_then(|d| d.parse().ok()),
             nextest_configs: BTreeMap::new(),
             line: None,
             overlay: BTreeMap::new(),
