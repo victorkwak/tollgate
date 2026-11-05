@@ -429,6 +429,18 @@ pub fn test_hooks_dir() -> PathBuf {
         // Another test made it first.
         let _ = std::fs::remove_dir_all(&staged);
     }
+    // The links of earlier builds keep those 80 MB binaries on disk.
+    if let Ok(rd) = std::fs::read_dir(base) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let stale = p != dir
+                && e.file_name().to_string_lossy().starts_with("hooks-")
+                && std::fs::metadata(p.join("pre-commit")).is_ok_and(|m| m.ino() != md.ino());
+            if stale {
+                let _ = std::fs::remove_dir_all(&p);
+            }
+        }
+    }
     dir
 }
 

@@ -341,7 +341,7 @@ fn push_tiers_tags_and_deletions_t13_r20_r22() {
 }
 
 #[test]
-fn a_full_push_miss_is_allowed_for_the_trusted_remote_tip_r14() {
+fn a_full_miss_is_allowed_for_the_trusted_remote_tip_r14() {
     let sb = Sandbox::new();
     let (repo, bare) = trusted_repo(&sb, PASS);
     // Another clone advances the trusted main without hooks (CI-protected
@@ -358,23 +358,44 @@ fn a_full_push_miss_is_allowed_for_the_trusted_remote_tip_r14() {
     );
     sb.commit_file(&other, "o.txt", "1\n", "o");
     sb.git(&other, &["push", "-q", "origin", "main"]);
-    sb.git(&repo, &["pull", "-q", "--ff-only", "origin", "main"]);
-    // Handoff of main to an untrusted remote: main needs full; the tip is
-    // the trusted remote's main, so ls-remote verifies it (no job).
+    sb.git(&repo, &["fetch", "-q", "origin"]);
+    // A merge commit on main whose tree is the trusted main's tree: no job
+    // (R14 outcome 2 for merges, L1).
+    let r = sb.hooked(&repo, &["merge", "--no-ff", "--no-edit", "origin/main"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        r.out.contains("pre-merge-commit refs/heads/main")
+            && r.out.contains("remote-verified (R14)"),
+        "{}",
+        r.out
+    );
+    assert!(sb.jobs().is_empty());
+    // Handoff of the trusted main to an untrusted remote: main needs full;
+    // the pushed commit is the trusted remote's main (ls-remote), no job.
     let mac = sb.root().join("mac.git");
     sb.git(&sb.root(), &["init", "-q", "--bare", mac.to_str().unwrap()]);
     sb.git(&repo, &["remote", "add", "mac", mac.to_str().unwrap()]);
-    let jobs = sb.jobs().len();
-    let r = sb.hooked(&repo, &["push", "-q", "mac", "main"]);
+    let r = sb.hooked(&repo, &["push", "-q", "mac", "origin/main:refs/heads/main"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
-    assert!(r.out.contains("remote-verified (R14)"), "{}", r.out);
-    assert_eq!(sb.jobs().len(), jobs);
-    // A local commit the trusted remote does not have needs a full job.
-    sb.commit_file(&repo, "l.txt", "1\n", "local");
+    assert!(
+        r.out.contains("pre-push refs/heads/main") && r.out.contains("remote-verified (R14)"),
+        "{}",
+        r.out
+    );
+    assert!(sb.jobs().is_empty());
+    // The local merge commit is not on the trusted remote: a full job.
     let r = sb.hooked(&repo, &["push", "-q", "mac", "main"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
     assert!(!r.out.contains("remote-verified"), "{}", r.out);
-    assert_eq!(sb.jobs().len(), jobs + 1);
+    assert_eq!(tiers_of_jobs(&sb), ["full"]);
+    // A forged remote-tracking ref is only a hint: ls-remote decides.
+    sb.commit_file(&repo, "l.txt", "1\n", "local");
+    let local = head(&sb, &repo);
+    sb.git(&repo, &["update-ref", "refs/remotes/origin/main", &local]);
+    let r = sb.hooked(&repo, &["push", "-q", "mac", "main"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(!r.out.contains("remote-verified"), "{}", r.out);
+    assert_eq!(tiers_of_jobs(&sb), ["full", "full"]);
 }
 
 #[test]

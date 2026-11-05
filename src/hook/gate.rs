@@ -229,14 +229,36 @@ fn ls_remote(git: &crate::gitx::Git, remote: &str, refname: &str) -> Option<Vec<
 }
 
 /// R14 outcome 2: `git ls-remote <remote> refs/heads/<branch>` on each of
-/// `remotes` (trusted remotes) at hook time.
+/// `remotes` (trusted remotes) at hook time. The remote-tracking ref is
+/// only a hint: a remote whose fetched tip does not match is not asked
+/// (no network wait for a merge or push that cannot match); a match is
+/// confirmed by `ls-remote`, which the agent cannot forge locally.
 fn remote_verified(gate: &Gate<'_>, check: &Check, remotes: &[String]) -> Option<String> {
     let rv = check.remote_verify.as_ref()?;
     let branch = match rv {
         RemoteVerify::Commit { branch, .. } | RemoteVerify::Tree { branch } => branch,
     };
     let refname = format!("refs/heads/{branch}");
+    let matches = |oid: &Oid| match rv {
+        RemoteVerify::Commit { oid: mine, .. } => mine == oid,
+        RemoteVerify::Tree { .. } => gate
+            .git
+            .tree_of(oid.as_str())
+            .ok()
+            .flatten()
+            .is_some_and(|t| t == check.tree),
+    };
     for remote in remotes {
+        let tracking = format!("refs/remotes/{remote}/{branch}");
+        if !gate
+            .git
+            .rev_parse_verify(&tracking)
+            .ok()
+            .flatten()
+            .is_some_and(|o| matches(&o))
+        {
+            continue;
+        }
         let Some(out) = ls_remote(&gate.git, remote, &refname) else {
             continue;
         };
@@ -247,16 +269,7 @@ fn remote_verified(gate: &Gate<'_>, check: &Check, remotes: &[String]) -> Option
         }) else {
             continue;
         };
-        let ok = match rv {
-            RemoteVerify::Commit { oid: mine, .. } => *mine == oid,
-            RemoteVerify::Tree { .. } => gate
-                .git
-                .tree_of(oid.as_str())
-                .ok()
-                .flatten()
-                .is_some_and(|t| t == check.tree),
-        };
-        if ok {
+        if matches(&oid) {
             return Some(format!("{remote} {refname} at {}", oid.short(12)));
         }
     }
