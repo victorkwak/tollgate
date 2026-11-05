@@ -138,10 +138,7 @@ fn kill_all(set: &BTreeSet<i32>, leader: i32) {
         let _ = procs::signal(*pid, libc::SIGKILL);
     }
     // The group too, in case a member appeared after the snapshot.
-    // SAFETY: killpg with the step's own group id only sends a signal.
-    unsafe {
-        libc::killpg(leader, libc::SIGKILL);
-    }
+    let _ = procs::signal_group(leader, libc::SIGKILL);
 }
 
 /// SIGTERM `term_targets`, wait up to `grace` for the step's set to go,

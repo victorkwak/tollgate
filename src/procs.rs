@@ -85,6 +85,21 @@ impl ProcTable {
     pub fn alive(&self, pid: i32) -> bool {
         self.procs.get(&pid).is_some_and(|p| !p.zombie)
     }
+
+    /// `pid` and every process above it, through parent links (pid 1 and
+    /// the kernel's pid 0 included when the chain reaches them).
+    #[must_use]
+    pub fn ancestors(&self, pid: i32) -> BTreeSet<i32> {
+        let mut out = BTreeSet::from([pid]);
+        let mut at = pid;
+        while let Some(p) = self.procs.get(&at) {
+            if !out.insert(p.ppid) {
+                break;
+            }
+            at = p.ppid;
+        }
+        out
+    }
 }
 
 /// When process `pid` started, in a platform unit (clock ticks since boot
@@ -132,31 +147,71 @@ pub fn signal(pid: i32, signal: i32) -> io::Result<()> {
     }
 }
 
+/// Sends `signal` to process group `pgid`. A group that is already gone is
+/// not an error. Groups 0 and 1 (the caller's own, init's) are refused.
+pub fn signal_group(pgid: i32, signal: i32) -> io::Result<()> {
+    if pgid <= 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing to signal process group {pgid}"),
+        ));
+    }
+    // SAFETY: killpg with a positive group id only sends a signal.
+    if unsafe { libc::killpg(pgid, signal) } == 0 {
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(e)
+    }
+}
+
 /// R35 after a runner died: the live processes (other than this one) whose
 /// environment has the entry `marker` (`TMPDIR=<job dir>/tmp`, unique per
 /// job, R52), plus the members of their process groups. A pid number seen
 /// in a table proves nothing after reuse; the marker does. Linux reads
 /// `/proc/<pid>/environ`; on macOS the set is empty (no portable way to
 /// read another process's environment), so nothing is killed there.
+///
+/// This process and its ancestors are never in the set, and neither is any
+/// process group that holds one of them. A marked process can share a
+/// group with the process that started the caller (a hook that `git`
+/// started in the bench's group, which is its caller's group); widening
+/// to that group would kill the caller's own parents.
 #[must_use]
 pub fn marked(table: &ProcTable, marker: &[u8]) -> BTreeSet<i32> {
-    let me = std::process::id().cast_signed();
+    marked_by(table, std::process::id().cast_signed(), |pid| {
+        platform::environ_has(pid, marker)
+    })
+}
+
+/// [`marked`] for the process `me`, with `has_marker` deciding which
+/// processes carry the marker.
+fn marked_by(table: &ProcTable, me: i32, has_marker: impl Fn(i32) -> bool) -> BTreeSet<i32> {
+    let kept = table.ancestors(me);
+    let kept_groups: BTreeSet<i32> = kept
+        .iter()
+        .filter_map(|p| table.get(*p).map(|i| i.pgid))
+        .collect();
     let mut out: BTreeSet<i32> = table
         .procs
         .values()
-        .filter(|p| p.pid != me && !p.zombie && platform::environ_has(p.pid, marker))
+        .filter(|p| !kept.contains(&p.pid) && !p.zombie && has_marker(p.pid))
         .map(|p| p.pid)
         .collect();
     let groups: BTreeSet<i32> = out
         .iter()
         .filter_map(|p| table.get(*p).map(|i| i.pgid))
+        .filter(|g| !kept_groups.contains(g))
         .collect();
     for g in groups {
         out.extend(
             table
                 .group_members(g)
                 .into_iter()
-                .filter(|p| *p != me && table.alive(*p)),
+                .filter(|p| !kept.contains(p) && table.alive(*p)),
         );
     }
     out
@@ -359,6 +414,47 @@ mod tests {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+
+    fn table(rows: &[(i32, i32, i32)]) -> ProcTable {
+        ProcTable {
+            procs: rows
+                .iter()
+                .map(|&(pid, ppid, pgid)| {
+                    (
+                        pid,
+                        ProcInfo {
+                            pid,
+                            ppid,
+                            pgid,
+                            zombie: false,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The bench (200) runs in its caller's group (100). A hook (300) that
+    /// git left behind is in that group too and carries the marker. The
+    /// hook dies; the caller (100), the bench and an unmarked neighbour in
+    /// the group (500) do not. A step group (400) is still widened to its
+    /// unmarked child (401). A marked ancestor is never in the set.
+    #[test]
+    fn the_callers_group_and_ancestors_are_never_marked_r35() {
+        let t = table(&[
+            (1, 0, 1),
+            (100, 1, 100),
+            (200, 100, 100),
+            (300, 1, 100),
+            (400, 1, 400),
+            (401, 400, 400),
+            (500, 100, 100),
+        ]);
+        assert_eq!(t.ancestors(200), BTreeSet::from([0, 1, 100, 200]));
+        let marks = [100, 300, 400];
+        let set = marked_by(&t, 200, |p| marks.contains(&p));
+        assert_eq!(set, BTreeSet::from([300, 400, 401]));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

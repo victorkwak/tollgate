@@ -36,6 +36,7 @@ pub mod trace;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Barrier;
@@ -286,24 +287,27 @@ struct Ran {
 }
 
 /// Runs `cmd` with stdout and stderr in `<base>.out` and `<base>.err`
-/// (no pipe can fill and block it), polling every `poll`. A signal to the
-/// bench (SIGINT, SIGTERM) kills the child, so cleanup starts at once;
-/// a hook the child started is left to cleanup (its job is cancelled, and
-/// it carries the bench's state dir in its environment).
+/// (no pipe can fill and block it), polling every `poll`. The child leads
+/// its own process group, which the hooks git starts join. A signal to the
+/// bench (SIGINT, SIGTERM) kills that whole group, so cleanup starts at
+/// once with no hook left waiting; the jobs the hooks started run detached
+/// and are cancelled by cleanup.
 fn run_stoppable(cmd: &mut Command, base: &Path, poll: Duration) -> std::io::Result<Ran> {
     let out_path = base.with_extension("out");
     let err_path = base.with_extension("err");
     let mut child = cmd
         .stdout(std::fs::File::create(&out_path)?)
         .stderr(std::fs::File::create(&err_path)?)
+        .process_group(0)
         .spawn()?;
     let status = loop {
         if let Some(s) = child.try_wait()? {
             break s;
         }
         if stopped() {
-            // The child is not reaped yet, so its pid cannot be reused.
-            let _ = child.kill();
+            // The child is not reaped yet, so its pid (the group id)
+            // cannot be reused.
+            let _ = crate::procs::signal_group(child.id().cast_signed(), libc::SIGKILL);
             break child.wait()?;
         }
         std::thread::sleep(poll);
