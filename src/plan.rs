@@ -258,15 +258,49 @@ pub struct RemoteUrls {
     pub name: String,
     /// `remote.<name>.url` and `remote.<name>.pushurl` values.
     pub configured: Vec<String>,
-    /// The URL `fetch` and `ls-remote` use.
-    pub fetch: Option<String>,
+    /// The URLs `fetch` and `ls-remote` use, in order (git uses the
+    /// first).
+    pub fetch: Vec<String>,
     /// The URLs `push` uses.
     pub push: Vec<String>,
 }
 
-/// Every remote's URLs: the config values (`git config`) and the URLs git
-/// uses for them (`git remote -v`, which applies the rewrites).
-pub fn remote_urls(git: &Git) -> Result<Vec<RemoteUrls>, GitError> {
+impl RemoteUrls {
+    /// Every URL of the remote: configured and as git uses them.
+    pub fn all(&self) -> impl Iterator<Item = &String> {
+        self.configured.iter().chain(&self.fetch).chain(&self.push)
+    }
+}
+
+/// True when `url` holds a control character (a newline or tab can fake
+/// lines in git's text output).
+fn has_control(url: &str) -> bool {
+    url.chars().any(char::is_control)
+}
+
+/// `git remote get-url [--push] --all <name>`: the URLs after rewrites, one
+/// per line. Configured URLs hold no newline (checked first), and a
+/// rewrite base is a config subsection name, which holds none either.
+fn get_urls(git: &Git, name: &str, push: bool) -> Result<Vec<String>, GitError> {
+    let mut args = vec!["remote", "get-url"];
+    if push {
+        args.push("--push");
+    }
+    args.extend(["--all", "--", name]);
+    let out = git.run(&args)?;
+    Ok(String::from_utf8_lossy(&out)
+        .split('\n')
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Every remote's URLs: the config values (`git config -z`, NUL-separated)
+/// and the URLs git uses for them (`git remote get-url --all`, which
+/// applies the rewrites). Never the text of `git remote -v`, whose lines a
+/// URL with a newline can fake (R14, L2). A URL with a control character
+/// is an error.
+pub fn remote_urls(git: &Git) -> Result<Vec<RemoteUrls>, PlanError> {
     let mut remotes: Vec<RemoteUrls> = Vec::new();
     fn entry<'r>(remotes: &'r mut Vec<RemoteUrls>, name: &str) -> &'r mut RemoteUrls {
         if let Some(i) = remotes.iter().position(|r| r.name == name) {
@@ -278,9 +312,16 @@ pub fn remote_urls(git: &Git) -> Result<Vec<RemoteUrls>, GitError> {
         });
         remotes.last_mut().expect("just pushed")
     }
-    let out = git.output(["config", "--get-regexp", r"^remote\..*\.(url|pushurl)$"])?;
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let Some((key, url)) = line.split_once(' ') else {
+    // Records are `<key>\n<value>\0`; keys hold no newline.
+    let out = git.output([
+        "config",
+        "-z",
+        "--get-regexp",
+        r"^remote\..*\.(url|pushurl)$",
+    ])?;
+    for rec in out.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let text = String::from_utf8_lossy(rec);
+        let Some((key, url)) = text.split_once('\n') else {
             continue;
         };
         let Some(name) = key.strip_prefix("remote.").and_then(|k| {
@@ -291,15 +332,28 @@ pub fn remote_urls(git: &Git) -> Result<Vec<RemoteUrls>, GitError> {
         };
         entry(&mut remotes, name).configured.push(url.to_owned());
     }
-    let out = git.run(["remote", "-v"])?;
-    for line in String::from_utf8_lossy(&out).lines() {
-        let Some((name, rest)) = line.split_once('\t') else {
-            continue;
-        };
-        if let Some(url) = rest.strip_suffix(" (fetch)") {
-            entry(&mut remotes, name).fetch = Some(url.to_owned());
-        } else if let Some(url) = rest.strip_suffix(" (push)") {
-            entry(&mut remotes, name).push.push(url.to_owned());
+    // Remote names are config subsection names: no newline.
+    let out = git.run(["remote"])?;
+    for name in String::from_utf8_lossy(&out)
+        .split('\n')
+        .filter(|n| !n.is_empty())
+    {
+        entry(&mut remotes, name);
+    }
+    for r in &mut remotes {
+        if let Some(u) = r.configured.iter().find(|u| has_control(u)) {
+            return Err(PlanError::Config(format!(
+                "remote {}: its URL {u:?} holds a control character; fix it with: git remote set-url {} <url>",
+                r.name, r.name
+            )));
+        }
+        r.fetch = get_urls(git, &r.name, false)?;
+        r.push = get_urls(git, &r.name, true)?;
+        if let Some(u) = r.fetch.iter().chain(&r.push).find(|u| has_control(u)) {
+            return Err(PlanError::Config(format!(
+                "remote {}: git uses the URL {u:?}, which holds a control character (a url.<base>.insteadOf rewrite); remove the rewrite",
+                r.name
+            )));
         }
     }
     Ok(remotes)
@@ -328,13 +382,21 @@ pub struct RemoteTrust {
 pub fn remote_trust(git: &Git, scope: &CompiledScope) -> Result<RemoteTrust, PlanError> {
     let mut t = RemoteTrust::default();
     for r in remote_urls(git)? {
+        if r.fetch.len() > 1 && r.all().any(|u| scope.remote_trusted(u)) {
+            return Err(PlanError::Config(format!(
+                "remote {}: it has more than one fetch URL ({}) and one matches scope.remotes; git fetches only the first, so keep one: git config --get-all remote.{}.url",
+                r.name,
+                r.fetch.join(", "),
+                r.name
+            )));
+        }
         let configured = r.configured.iter().find(|u| scope.remote_trusted(u));
-        let fetch = r.fetch.as_deref().is_some_and(|u| scope.remote_trusted(u));
+        let fetch = r.fetch.first().is_some_and(|u| scope.remote_trusted(u));
         if let (Some(c), false) = (configured, fetch) {
             return Err(PlanError::Config(format!(
                 "remote {}: its URL {c} matches scope.remotes, but git fetches it from {} (a url.<base>.insteadOf rewrite); its refs cannot be trusted. Remove the rewrite (git config --get-regexp '^url\\.'), or add that URL to scope.remotes in the host config",
                 r.name,
-                r.fetch.as_deref().unwrap_or("nowhere")
+                r.fetch.first().map_or("nowhere", String::as_str)
             )));
         }
         if fetch {

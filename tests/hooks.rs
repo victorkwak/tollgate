@@ -536,6 +536,72 @@ fn url_rewrites_do_not_move_remote_trust_r14_r5_r20() {
     );
 }
 
+/// R14, R5, L2: remote URLs are read NUL-separated, never from
+/// `git remote -v` lines. A URL with a newline and a tab could add a fake
+/// `origin <trusted URL> (fetch)` line, so the remote would count as
+/// trusted while git fetches it from the first line's path. Such a URL,
+/// and a trusted remote with more than one fetch URL, deny.
+#[test]
+fn remote_urls_with_control_characters_or_two_fetch_urls_deny_r14_l2() {
+    let sb = Sandbox::new();
+    let (repo, bare) = trusted_repo(&sb, PASS);
+    let fake = sb.root().join("fake.git");
+    let injected = format!("{}\norigin\t{}", fake.display(), bare.display());
+    sb.git(&repo, &["config", "remote.origin.url", &injected]);
+    let git = tollgate::gitx::Git::scrubbed(&sb.env(), &repo);
+    let scope = tollgate::config::CompiledScope::new(
+        &tollgate::config::HostConfig::from_toml("[scope]\nremotes = [\"*/remotes/trusted*\"]\n")
+            .unwrap()
+            .scope,
+        &tollgate::dirs::Dirs::from_env(&sb.env()).unwrap(),
+    )
+    .unwrap();
+    let err = tollgate::plan::remote_trust(&git, &scope).expect_err("a newline in a URL");
+    assert!(
+        err.to_string().contains("remote origin") && err.to_string().contains("control"),
+        "{err}"
+    );
+    stage(&sb, &repo, "a.txt", "1\n");
+    let before = head(&sb, &repo);
+    let r = sb.hooked(&repo, &["commit", "-m", "a"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(r.out.contains("control character"), "{}", r.out);
+    assert_eq!(head(&sb, &repo), before);
+
+    // Two fetch URLs: git fetches the first only, ls-remote too; which
+    // one counts is not worth guessing.
+    sb.git(
+        &repo,
+        &["config", "remote.origin.url", bare.to_str().unwrap()],
+    );
+    sb.git(
+        &repo,
+        &[
+            "config",
+            "--add",
+            "remote.origin.url",
+            fake.to_str().unwrap(),
+        ],
+    );
+    let err = tollgate::plan::remote_trust(&git, &scope).expect_err("two fetch URLs");
+    assert!(err.to_string().contains("more than one fetch URL"), "{err}");
+    let r = sb.hooked(&repo, &["commit", "-m", "a"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert_eq!(head(&sb, &repo), before);
+    // One URL again: the commit passes.
+    sb.git(
+        &repo,
+        &[
+            "config",
+            "--unset",
+            "remote.origin.url",
+            fake.to_str().unwrap(),
+        ],
+    );
+    let r = sb.hooked(&repo, &["commit", "-m", "a"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+}
+
 #[test]
 fn partial_commit_in_a_linked_worktree_checks_the_commit_tree_t14_r17_r52() {
     let sb = Sandbox::new();
