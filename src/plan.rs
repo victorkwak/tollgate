@@ -250,25 +250,112 @@ fn kinds_roots(
     r
 }
 
-/// Remote names whose URL matches `scope.remotes` (R5, R20).
-pub fn trusted_remotes(git: &Git, scope: &CompiledScope) -> Result<Vec<String>, GitError> {
-    let out = git.output(["config", "--get-regexp", r"^remote\..*\.url$"])?;
-    let mut names = Vec::new();
+/// One remote's URLs: as configured, and as git uses them after
+/// `url.<base>.insteadOf` and `pushInsteadOf` rewrites.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteUrls {
+    /// Remote name.
+    pub name: String,
+    /// `remote.<name>.url` and `remote.<name>.pushurl` values.
+    pub configured: Vec<String>,
+    /// The URL `fetch` and `ls-remote` use.
+    pub fetch: Option<String>,
+    /// The URLs `push` uses.
+    pub push: Vec<String>,
+}
+
+/// Every remote's URLs: the config values (`git config`) and the URLs git
+/// uses for them (`git remote -v`, which applies the rewrites).
+pub fn remote_urls(git: &Git) -> Result<Vec<RemoteUrls>, GitError> {
+    let mut remotes: Vec<RemoteUrls> = Vec::new();
+    fn entry<'r>(remotes: &'r mut Vec<RemoteUrls>, name: &str) -> &'r mut RemoteUrls {
+        if let Some(i) = remotes.iter().position(|r| r.name == name) {
+            return &mut remotes[i];
+        }
+        remotes.push(RemoteUrls {
+            name: name.to_owned(),
+            ..RemoteUrls::default()
+        });
+        remotes.last_mut().expect("just pushed")
+    }
+    let out = git.output(["config", "--get-regexp", r"^remote\..*\.(url|pushurl)$"])?;
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let Some((key, url)) = line.split_once(' ') else {
             continue;
         };
-        let Some(name) = key
-            .strip_prefix("remote.")
-            .and_then(|k| k.strip_suffix(".url"))
-        else {
+        let Some(name) = key.strip_prefix("remote.").and_then(|k| {
+            k.strip_suffix(".url")
+                .or_else(|| k.strip_suffix(".pushurl"))
+        }) else {
             continue;
         };
-        if scope.remote_trusted(url) && !names.iter().any(|n| n == name) {
-            names.push(name.to_owned());
+        entry(&mut remotes, name).configured.push(url.to_owned());
+    }
+    let out = git.run(["remote", "-v"])?;
+    for line in String::from_utf8_lossy(&out).lines() {
+        let Some((name, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        if let Some(url) = rest.strip_suffix(" (fetch)") {
+            entry(&mut remotes, name).fetch = Some(url.to_owned());
+        } else if let Some(url) = rest.strip_suffix(" (push)") {
+            entry(&mut remotes, name).push.push(url.to_owned());
         }
     }
-    Ok(names)
+    Ok(remotes)
+}
+
+/// Which remotes `scope.remotes` trusts (R5, R14, R20, L2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteTrust {
+    /// Remotes whose fetch URL, as git uses it, is trusted: their
+    /// remote-tracking refs (L2 anchors, R56) and `ls-remote` answers
+    /// (R14(2)) come from the trusted server.
+    pub trusted: Vec<String>,
+    /// Remotes with any trusted URL, configured or as git uses it: a push
+    /// to one is a push to a trusted remote (R5, R20), wherever a
+    /// `pushInsteadOf` sends it.
+    pub push_trusted: Vec<String>,
+    /// Every configured and rewritten URL, for the scope test (L4).
+    pub urls: Vec<String>,
+}
+
+/// Remote trust from the URLs git really uses. A remote whose configured
+/// URL is trusted but whose fetch URL a rewrite sends elsewhere is an
+/// error: its refs and `ls-remote` would answer from a repo the agent may
+/// control, and treating it as untrusted would move the policy anchor to
+/// local refs (L2).
+pub fn remote_trust(git: &Git, scope: &CompiledScope) -> Result<RemoteTrust, PlanError> {
+    let mut t = RemoteTrust::default();
+    for r in remote_urls(git)? {
+        let configured = r.configured.iter().find(|u| scope.remote_trusted(u));
+        let fetch = r.fetch.as_deref().is_some_and(|u| scope.remote_trusted(u));
+        if let (Some(c), false) = (configured, fetch) {
+            return Err(PlanError::Config(format!(
+                "remote {}: its URL {c} matches scope.remotes, but git fetches it from {} (a url.<base>.insteadOf rewrite); its refs cannot be trusted. Remove the rewrite (git config --get-regexp '^url\\.'), or add that URL to scope.remotes in the host config",
+                r.name,
+                r.fetch.as_deref().unwrap_or("nowhere")
+            )));
+        }
+        if fetch {
+            t.trusted.push(r.name.clone());
+        }
+        if fetch || configured.is_some() || r.push.iter().any(|u| scope.remote_trusted(u)) {
+            t.push_trusted.push(r.name.clone());
+        }
+        t.urls.extend(r.configured);
+        t.urls.extend(r.fetch);
+        t.urls.extend(r.push);
+    }
+    t.urls.sort();
+    t.urls.dedup();
+    Ok(t)
+}
+
+/// Remote names whose fetch URL, as git uses it, matches `scope.remotes`
+/// (R5, R14, L2); see [`remote_trust`].
+pub fn trusted_remotes(git: &Git, scope: &CompiledScope) -> Result<Vec<String>, PlanError> {
+    remote_trust(git, scope).map(|t| t.trusted)
 }
 
 /// R56: a base is trusted when its tree has a pass at `fast` or above, or

@@ -82,6 +82,7 @@ fn ask_rules_return_an_ask_decision_t16_r26() {
         "git config core.hooksPath .githooks",
         "rm .git/index.lock",
         "git branch -m a b",
+        "git config url./tmp/fake.git.insteadOf git@gitlab.example:v/r.git",
     ] {
         let (code, out, err) = a.bash(cmd);
         assert_eq!(code, Some(0), "{cmd}: {err}");

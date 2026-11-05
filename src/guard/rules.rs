@@ -635,13 +635,17 @@ fn dangerous_config_key(value: &str) -> bool {
         || key.starts_with("alias.")
 }
 
-/// R26: `git config` writes of these keys ask.
+/// R26: `git config` writes of these keys ask. `url.*` rewrites
+/// (`insteadOf`, `pushInsteadOf`) change which server a remote reaches,
+/// which decides remote trust (R5, R14).
 fn config_key_asks(key: &str) -> bool {
     let key = key.to_lowercase();
     key.starts_with("core.hooks")
         || key == "core"
         || key.starts_with("include")
         || key.starts_with("alias")
+        || key == "url"
+        || key.starts_with("url.")
 }
 
 /// R26: a `git config` call that writes a hook, include or alias key.
@@ -889,6 +893,15 @@ fn command_ruling(ctx: &Context, words: &[String], redirects: &[shell::Redirect]
         return Ruling::Deny(format!(
             "git -c {v}: changes hooks, includes or aliases (R25)"
         ));
+    }
+    if let Some(v) = call
+        .config
+        .iter()
+        .find(|v| v.to_lowercase().starts_with("url."))
+    {
+        ruling = ruling.max(Ruling::Ask(format!(
+            "git -c {v}: rewrites remote URLs, which decide remote trust (R26, R5, R14)"
+        )));
     }
     let Some(sub) = call.sub.as_deref() else {
         return ruling;
@@ -1421,6 +1434,11 @@ mod tests {
             "git branch -C a b",
             "rm .git/index.lock",
             "rm -f /w/repo/.git/worktrees/x/index.lock",
+            "git config url./tmp/fake.git.insteadOf git@gitlab.example:v/r.git",
+            "git config --global url.x.pushInsteadOf y",
+            "git config set url.x.insteadOf y",
+            "git -c url./tmp/f.git.insteadOf=git@h:r.git fetch origin",
+            "git --config-env=url.x.insteadOf=V fetch",
         ] {
             assert!(ask(cmd), "{cmd}");
         }

@@ -444,6 +444,98 @@ fn a_full_miss_is_allowed_for_the_trusted_remote_tip_r14() {
     assert_eq!(tiers_of_jobs(&sb), ["full", "full"]);
 }
 
+/// R14(2), R5, R20: trust follows the URL git really uses. A local
+/// `url.<x>.insteadOf` that sends the trusted origin to a repo the agent
+/// controls must not make `ls-remote` vouch for a failing main, and a
+/// `pushInsteadOf` must not turn a push to the trusted origin into a push
+/// that needs only `fast`.
+#[test]
+fn url_rewrites_do_not_move_remote_trust_r14_r5_r20() {
+    let sb = Sandbox::new();
+    let (repo, bare) = trusted_repo(
+        &sb,
+        "version = 1\n[push]\nfast_refs = []\n[[step]]\nname = \"lint\"\nkind = \"command\"\nrun = \"test ! -f bad\"\n",
+    );
+    let bare_s = bare.to_str().unwrap();
+    // A failing main made without hooks (as Victor's terminal could).
+    sb.commit_file(&repo, "bad", "x\n", "bad");
+    let fake = sb.root().join("fake.git");
+    sb.git(
+        &sb.root(),
+        &["init", "-q", "--bare", fake.to_str().unwrap()],
+    );
+    sb.git(&fake, &["fetch", "-q", repo.to_str().unwrap(), "main:main"]);
+    sb.git(
+        &repo,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", fake.display()),
+            bare_s,
+        ],
+    );
+    sb.git(&repo, &["fetch", "-q", "origin"]);
+    let mac = sb.root().join("mac.git");
+    sb.git(&sb.root(), &["init", "-q", "--bare", mac.to_str().unwrap()]);
+    sb.git(&repo, &["remote", "add", "mac", mac.to_str().unwrap()]);
+    let r = sb.hooked(&repo, &["push", "-q", "mac", "main"]);
+    assert_ne!(r.code, Some(0), "{}", r.out);
+    assert!(!r.out.contains("remote-verified"), "{}", r.out);
+    assert!(
+        r.out.contains("remote origin") && r.out.contains("insteadOf"),
+        "{}",
+        r.out
+    );
+    assert_eq!(
+        sb.git_output(
+            &mac,
+            &["rev-parse", "-q", "--verify", "refs/heads/main"],
+            &[]
+        )
+        .status
+        .code(),
+        Some(1),
+        "main reached mac"
+    );
+    // A rewrite that keeps the URL inside scope.remotes is fine.
+    sb.git(
+        &repo,
+        &[
+            "config",
+            "--unset",
+            &format!("url.{}.insteadOf", fake.display()),
+        ],
+    );
+    sb.git(
+        &repo,
+        &["fetch", "-q", "origin", "+main:refs/remotes/origin/main"],
+    );
+    sb.git(&repo, &["reset", "-q", "--hard", "origin/main"]);
+    // pushInsteadOf: the push to origin goes to another URL, but it is
+    // still a push to the trusted remote: full, not fast (R5, R20).
+    let elsewhere = sb.root().join("elsewhere.git");
+    sb.git(
+        &sb.root(),
+        &["init", "-q", "--bare", elsewhere.to_str().unwrap()],
+    );
+    sb.git(
+        &repo,
+        &[
+            "config",
+            &format!("url.{}.pushInsteadOf", elsewhere.display()),
+            bare_s,
+        ],
+    );
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(&repo, "f.txt", "1\n", "f");
+    let r = sb.hooked(&repo, &["push", "-q", "origin", "feat"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        r.out.contains("pre-push refs/heads/feat") && r.out.contains("tier full"),
+        "{}",
+        r.out
+    );
+}
+
 #[test]
 fn partial_commit_in_a_linked_worktree_checks_the_commit_tree_t14_r17_r52() {
     let sb = Sandbox::new();

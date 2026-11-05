@@ -44,21 +44,12 @@ pub struct Gate<'a> {
     pub git: Git,
     /// Compiled `[scope]` (L4).
     pub scope: CompiledScope,
-    /// Every `remote.*.url` and `remote.*.pushurl`.
+    /// Every remote URL, configured and as git uses it.
     pub remote_urls: Vec<String>,
-    /// Names of remotes whose URL matches `scope.remotes` (R5).
+    /// Remotes whose fetch URL, as git uses it, is trusted (R14(2), L2).
     pub trusted: Vec<String>,
-}
-
-/// `remote.<name>.url` and `remote.<name>.pushurl` values.
-fn remote_urls(git: &Git) -> Result<Vec<String>, String> {
-    let out = git
-        .output(["config", "--get-regexp", r"^remote\..*\.(url|pushurl)$"])
-        .map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.split_once(' ').map(|(_, v)| v.to_owned()))
-        .collect())
+    /// Remotes a push to which is a push to a trusted remote (R5, R20).
+    pub push_trusted: Vec<String>,
 }
 
 impl<'a> Gate<'a> {
@@ -83,8 +74,7 @@ impl<'a> Gate<'a> {
         }
         let git = Git::scrubbed(env, layout.hooks_cwd());
         let scope = CompiledScope::new(&host.config.scope, &dirs)?;
-        let remote_urls = remote_urls(&git)?;
-        let trusted = plan::trusted_remotes(&git, &scope).map_err(|e| e.to_string())?;
+        let trust = plan::remote_trust(&git, &scope).map_err(|e| e.to_string())?;
         Ok(Self {
             hook,
             env,
@@ -94,8 +84,9 @@ impl<'a> Gate<'a> {
             layout,
             git,
             scope,
-            remote_urls,
-            trusted,
+            remote_urls: trust.urls,
+            trusted: trust.trusted,
+            push_trusted: trust.push_trusted,
         })
     }
 

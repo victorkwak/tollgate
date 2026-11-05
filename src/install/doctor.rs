@@ -538,7 +538,13 @@ fn check_repo(out: &mut Out, ctx: &Ctx, dirs: &Dirs, host: Option<&HostConfig>, 
         }
         // R97: GitLab protection of main per trusted remote.
         if let Ok(scope) = CompiledScope::new(&host.scope, dirs) {
-            let names = crate::plan::trusted_remotes(&git, &scope).unwrap_or_default();
+            let names = match crate::plan::trusted_remotes(&git, &scope) {
+                Ok(n) => n,
+                Err(e) => {
+                    out.line(Level::Fail, "remotes", e.to_string());
+                    Vec::new()
+                }
+            };
             for name in names {
                 let url = git
                     .run_line(["remote", "get-url", &name])
