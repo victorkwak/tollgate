@@ -94,15 +94,30 @@ fn run() -> u8 {
         Command::Audit { since } => cli::audit(&ctx, since.as_deref()),
         Command::Flaky { days } => cli::flaky(&ctx, days),
         Command::RunJob { job, lock_fd } => cli::run_job(&ctx, &job, lock_fd),
+        Command::Merge { branch } => tollgate::merge::merge(&ctx, &branch),
         other => not_built(other.name()),
     }
 }
 
-/// Gate and chained hooks are built in a later phase. Until then a hook
-/// denies (R31: every exit path is an explicit decision; fail closed).
-fn hook_main(name: &str, _args: &[OsString]) -> u8 {
-    eprintln!("tollgate: DENIED {name}: hook handling is not built yet");
-    exit::FAIL
+/// Runs a gate or chained hook (R1, R7, R17, R20). R31: a hook that cannot
+/// even read its cwd denies.
+fn hook_main(name: &'static str, args: &[OsString]) -> u8 {
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("tollgate: DENIED {name}: cannot read the current dir: {e}");
+            return exit::FAIL;
+        }
+    };
+    tollgate::hook::run(
+        name,
+        args,
+        &tollgate::hook::HookCtx {
+            env: tollgate::env::EnvSnapshot::capture(),
+            cwd,
+            exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tollgate")),
+        },
+    )
 }
 
 fn config_main(ctx: &cli::Ctx, args: &ConfigArgs) -> u8 {

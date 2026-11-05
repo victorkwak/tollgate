@@ -384,3 +384,117 @@ pub fn eventually(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
     }
     cond()
 }
+
+/// Every hook name `install` links (R2 minus `reference-transaction`, L1).
+pub const HOOK_NAMES: &[&str] = &[
+    "pre-commit",
+    "pre-merge-commit",
+    "pre-push",
+    "applypatch-msg",
+    "pre-applypatch",
+    "post-applypatch",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-commit",
+    "pre-rebase",
+    "post-checkout",
+    "post-merge",
+    "post-rewrite",
+    "pre-auto-gc",
+];
+
+/// A test hooks dir of hard links to the built binary (R1). Hard links need
+/// the binary's file system, so the dir lives in the target tmp dir, keyed
+/// by the binary's inode and mtime; it is made once by an atomic rename and
+/// shared by every test of this build.
+pub fn test_hooks_dir() -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(BIN).unwrap();
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let dir = base.join(format!(
+        "hooks-{}-{}-{}",
+        md.dev(),
+        md.ino(),
+        md.mtime_nsec() + md.mtime() * 1_000_000_000
+    ));
+    if dir.join("pre-commit").exists() {
+        return dir;
+    }
+    let tmp = tempfile::tempdir_in(base).unwrap();
+    for name in HOOK_NAMES {
+        std::fs::hard_link(BIN, tmp.path().join(name)).unwrap();
+    }
+    let staged = tmp.keep();
+    if std::fs::rename(&staged, &dir).is_err() {
+        // Another test made it first.
+        let _ = std::fs::remove_dir_all(&staged);
+    }
+    dir
+}
+
+impl Sandbox {
+    /// The hook injection (R3) pointing at [`test_hooks_dir`].
+    pub fn injection(&self) -> Vec<(&'static str, std::ffi::OsString)> {
+        vec![
+            ("GIT_CONFIG_COUNT", "1".into()),
+            ("GIT_CONFIG_KEY_0", "core.hooksPath".into()),
+            ("GIT_CONFIG_VALUE_0", test_hooks_dir().into_os_string()),
+        ]
+    }
+
+    /// Runs git in `dir` under the injection plus `extra`.
+    pub fn hooked_with(&self, dir: &Path, args: &[&str], extra: &[(&str, &str)]) -> Run {
+        let inj = self.injection();
+        let mut all: Vec<(&str, &OsStr)> = inj.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
+        all.extend(extra.iter().map(|(k, v)| (*k, OsStr::new(*v))));
+        let out = self.git_output(dir, args, &all);
+        Run {
+            code: out.status.code(),
+            out: format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        }
+    }
+
+    /// Runs git in `dir` under the injection.
+    pub fn hooked(&self, dir: &Path, args: &[&str]) -> Run {
+        self.hooked_with(dir, args, &[])
+    }
+
+    /// Host config with the sandbox root as the scope root, a tiny disk
+    /// floor (tests run in /tmp) and `extra` appended.
+    pub fn scoped_host(&self, extra: &str) {
+        self.host_config(&format!(
+            "[scope]\nroots = [\"{}\"]\n{extra}\n[verify]\nmin_free = \"1M\"\n",
+            self.root().display()
+        ));
+    }
+}
+
+impl Sandbox {
+    /// Runs hook link `name` from [`test_hooks_dir`] directly in `repo`
+    /// with the sandbox env, the injection and `extra`.
+    pub fn run_hook(
+        &self,
+        repo: &Path,
+        name: &str,
+        extra: &[(&str, &str)],
+    ) -> std::process::Output {
+        let mut cmd = std::process::Command::new(test_hooks_dir().join(name));
+        cmd.env_clear()
+            .current_dir(repo)
+            .stdin(std::process::Stdio::null());
+        for (k, v) in self.env().iter() {
+            cmd.env(k, v);
+        }
+        for (k, v) in self.injection() {
+            cmd.env(k, v);
+        }
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        cmd.output().unwrap()
+    }
+}

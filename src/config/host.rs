@@ -621,15 +621,31 @@ impl CompiledScope {
         self.remotes.is_match(url)
     }
 
+    /// True when `include`/`exclude` allow the repo name `name`.
+    #[must_use]
+    pub fn name_allowed(&self, name: &str) -> bool {
+        self.include.is_match(name) && !self.exclude.is_match(name)
+    }
+
     /// L4: in scope when a remote URL is trusted or `repo_dir` (realpath of
     /// the parent of the common dir) is a direct child of a root, and the
-    /// basename passes `include`/`exclude`.
+    /// basename passes `include`/`exclude`. A trusted remote also counts
+    /// when its project name (the URL's last path part without `.git`)
+    /// passes them: a clone renamed during rollout (R98 step 1) stays in
+    /// scope (R4 reason, R5).
     #[must_use]
     pub fn contains(&self, repo_dir: &Path, remote_urls: &[String]) -> bool {
-        let Some(base) = repo_dir.file_name().and_then(|n| n.to_str()) else {
+        let base = repo_dir.file_name().and_then(|n| n.to_str());
+        let by_project = remote_urls.iter().any(|u| {
+            self.remote_trusted(u) && remote_project_name(u).is_some_and(|n| self.name_allowed(n))
+        });
+        if by_project {
+            return true;
+        }
+        let Some(base) = base else {
             return false;
         };
-        if !self.include.is_match(base) || self.exclude.is_match(base) {
+        if !self.name_allowed(base) {
             return false;
         }
         remote_urls.iter().any(|u| self.remote_trusted(u))
@@ -637,6 +653,16 @@ impl CompiledScope {
                 .parent()
                 .is_some_and(|p| self.roots.iter().any(|r| r == p))
     }
+}
+
+/// The project name of a remote URL: its last path part without `.git`
+/// (`git@host:group/proj.git` -> `proj`).
+#[must_use]
+pub fn remote_project_name(url: &str) -> Option<&str> {
+    let trimmed = url.trim_end_matches('/');
+    let last = trimmed.rsplit(['/', ':']).next()?;
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    (!name.is_empty()).then_some(name)
 }
 
 #[cfg(test)]
@@ -846,7 +872,26 @@ SQLX_OFFLINE = "true"
         assert!(s.contains(&home.join("elsewhere/clone"), &remote));
         assert!(s.remote_trusted("git@gitlab.com:victorkwak/a/b.git"));
         assert!(!s.remote_trusted("git@github.com:victorkwak/baton.git"));
-        // include/exclude still apply to remote matches.
-        assert!(!s.contains(&home.join("elsewhere/agent_v"), &remote));
+        // include/exclude still apply to remote matches: by the local name
+        // or the project name; an excluded project in an excluded dir is
+        // out, a clone of an allowed project is in whatever its dir name.
+        assert!(s.contains(&home.join("elsewhere/agent_v"), &remote));
+        let excluded = ["git@gitlab.com:victorkwak/agent_v.git".to_owned()];
+        assert!(!s.contains(&home.join("elsewhere/agent_v"), &excluded));
+        // Rollout: a renamed clone of an included project stays in scope by
+        // its trusted remote's project name.
+        let only = ScopeConfig {
+            include: vec!["baton".into()],
+            ..scope
+        };
+        let s = CompiledScope::new(&only, &dirs).unwrap();
+        assert!(s.contains(&home.join("elsewhere/clone"), &remote));
+        assert!(!s.contains(&home.join("elsewhere/clone"), &excluded));
+        assert_eq!(
+            remote_project_name("https://gitlab.com/a/b.git/"),
+            Some("b")
+        );
+        assert_eq!(remote_project_name("git@gitlab.com:a/b"), Some("b"));
+        assert_eq!(remote_project_name("/srv/repo.git"), Some("repo"));
     }
 }
