@@ -397,12 +397,13 @@ impl Lexer<'_> {
     }
 }
 
-/// `NAME=value` with a valid shell name.
+/// `NAME=value` (or bash's `NAME+=value`) with a valid shell name.
 #[must_use]
 pub fn is_assignment(word: &str) -> bool {
     let Some((name, _)) = word.split_once('=') else {
         return false;
     };
+    let name = name.strip_suffix('+').unwrap_or(name);
     let mut chars = name.chars();
     chars
         .next()
@@ -484,5 +485,6 @@ mod tests {
         assert_eq!(words("echo $'a\\'b'"), vec![vec!["echo", "a'b"]]);
         assert!(words("").is_empty());
         assert!(is_assignment("X_1=2") && !is_assignment("1X=2") && !is_assignment("--a=b"));
+        assert!(is_assignment("P+=x") && !is_assignment("+=x"));
     }
 }

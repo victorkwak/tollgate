@@ -29,6 +29,14 @@ fn deny_patterns_exit_2_and_reads_stay_open_t15_r23_r25() {
         "git commit --no-verif -m x".to_owned(),
         "git push --no-ver origin feat".to_owned(),
         "git am --no-v a.patch".to_owned(),
+        // Every way to start git with an empty environment (R25).
+        "env --ignore-environment PATH=/usr/bin git commit -m x".to_owned(),
+        "env - PATH=/usr/bin git commit -m x".to_owned(),
+        "env -S '-i git commit -m x'".to_owned(),
+        "exec -c git commit -m x".to_owned(),
+        // HOME and XDG decide where tollgate finds its config (R8).
+        "HOME=/tmp/x git commit -m x".to_owned(),
+        "XDG_CONFIG_HOME=/tmp/c git commit -m x".to_owned(),
     ] {
         let (code, out, err) = a.bash(&cmd);
         assert_eq!(code, Some(2), "{cmd}: {out}{err}");

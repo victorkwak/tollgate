@@ -201,61 +201,258 @@ fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
-/// The command a wrapper runs: wrappers, their options and (for `env`)
-/// assignments stripped. `timeout` also drops its duration, `flock` its
-/// lock file.
-#[must_use]
-pub fn strip_wrappers(words: &[String]) -> &[String] {
-    let mut w = words;
-    'outer: loop {
-        let Some(first) = w.first() else {
-            return w;
+/// A command after its wrappers (R25).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unwrapped {
+    /// The command and its arguments.
+    pub words: Vec<String>,
+    /// `NAME=VALUE` words that `env` sets for it.
+    pub assigns: Vec<String>,
+    /// Why a wrapper changes its environment in a way that can drop or
+    /// replace the hook injection (`env -i`, `exec -c`, ...).
+    pub env_loss: Option<String>,
+}
+
+/// The R25 reason for an `env` that starts with an empty environment.
+const ENV_CLEARS: &str = "env -i (also --ignore-environment, a bare -, or -i inside -S) starts the command with an empty environment and drops the hook injection";
+
+/// How many `env -S` strings one command may splice. Each string is
+/// shorter than the word it came from; the cap only bounds the work.
+const MAX_SPLITS: usize = 8;
+
+fn lose(out: &mut Unwrapped, why: &str) {
+    out.env_loss.get_or_insert_with(|| why.to_owned());
+}
+
+/// The words of an `env -S` string, split like shell words.
+fn split_string(value: &str) -> Vec<String> {
+    shell::parse(value)
+        .into_iter()
+        .flat_map(|c| c.assignments.into_iter().chain(c.words))
+        .collect()
+}
+
+/// One `env` option word: the words it takes, or an `-S` string to splice.
+enum EnvOpt {
+    Words(usize),
+    Split { value: String, words: usize },
+}
+
+/// Parses `env` option word `a` (GNU coreutils 9: long options may be
+/// abbreviated; `-u`, `-C`, `-a`, `-S` take a value, glued or as the next
+/// word).
+fn env_option(a: &str, next: Option<&str>, out: &mut Unwrapped) -> EnvOpt {
+    if let Some(long) = a.strip_prefix("--") {
+        let (name, value) = match long.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (long, None),
         };
-        let name = basename(first);
-        let Some((_, takes_value)) = WRAPPERS.iter().find(|(n, _)| *n == name) else {
-            return w;
-        };
-        let mut i = 1;
-        while i < w.len() {
-            let a = w[i].as_str();
-            if a == "--" {
-                i += 1;
-                break;
-            }
-            if name == "env" && shell::is_assignment(a) {
-                i += 1;
-                continue;
-            }
-            if a.starts_with('-') && a.len() > 1 {
-                let opt = a.split_once('=').map_or(a, |(o, _)| o);
-                i += if takes_value.contains(&opt) && !a.contains('=') {
-                    2
+        let abbrev = |full: &str| !name.is_empty() && full.starts_with(name);
+        if abbrev("ignore-environment") {
+            // `--i` and `--ignore-` are ambiguous; env fails on them.
+            lose(out, ENV_CLEARS);
+        } else if abbrev("env0-from") {
+            lose(
+                out,
+                "env --env0-from sets variables from a file, which can replace the hook injection",
+            );
+        } else if abbrev("split-string") {
+            return match (value, next) {
+                (Some(v), _) => EnvOpt::Split {
+                    value: v.to_owned(),
+                    words: 1,
+                },
+                (None, Some(v)) => EnvOpt::Split {
+                    value: v.to_owned(),
+                    words: 2,
+                },
+                (None, None) => EnvOpt::Words(1),
+            };
+        } else if (abbrev("unset") || abbrev("chdir") || abbrev("argv0")) && value.is_none() {
+            return EnvOpt::Words(2);
+        }
+        return EnvOpt::Words(1);
+    }
+    let cluster = &a[1..];
+    for (k, c) in cluster.char_indices() {
+        match c {
+            'i' => lose(out, ENV_CLEARS),
+            'u' | 'C' | 'a' | 'S' => {
+                let rest = &cluster[k + c.len_utf8()..];
+                let (value, words) = if rest.is_empty() {
+                    (next, 2)
                 } else {
-                    1
+                    (Some(rest), 1)
                 };
-                continue;
+                return match (c, value) {
+                    ('S', Some(v)) => EnvOpt::Split {
+                        value: v.to_owned(),
+                        words,
+                    },
+                    _ => EnvOpt::Words(words),
+                };
             }
+            _ => {}
+        }
+    }
+    EnvOpt::Words(1)
+}
+
+/// `env`'s options, `-` and assignments; returns the index of the command
+/// in `w`. An `-S` string is spliced into `w` and parsed again, as env
+/// does, so `env -S '-i git commit'` clears the environment and
+/// `env -S 'git commit -n'` runs `git commit -n`.
+fn env_args(w: &mut Vec<String>, out: &mut Unwrapped) -> usize {
+    let mut i = 1;
+    let mut splits = 0;
+    // Options end at the first operand (getopt with a leading `+`).
+    while i < w.len() {
+        let a = w[i].as_str();
+        if a == "--" {
+            i += 1;
             break;
         }
-        // Positional arguments that come before the command.
-        let skip = match name {
-            "timeout" | "flock" | "chrt" | "taskset" => 1,
-            _ => 0,
-        };
-        i += skip;
-        if i >= w.len() {
-            return &w[w.len()..];
+        if a == "-" || !a.starts_with('-') {
+            break;
         }
-        w = &w[i..];
-        continue 'outer;
+        match env_option(a, w.get(i + 1).map(String::as_str), out) {
+            EnvOpt::Words(n) => i += n,
+            EnvOpt::Split { value, words } => {
+                splits += 1;
+                if splits > MAX_SPLITS {
+                    lose(out, "env -S nested too deep to check");
+                    return w.len();
+                }
+                let end = (i + words).min(w.len());
+                w.splice(i..end, split_string(&value));
+            }
+        }
     }
+    // POSIX: a bare `-` before the assignments means `-i`.
+    if w.get(i).is_some_and(|a| a == "-") {
+        lose(out, ENV_CLEARS);
+        i += 1;
+    }
+    while let Some(a) = w.get(i)
+        && shell::is_assignment(a)
+    {
+        out.assigns.push(a.clone());
+        i += 1;
+    }
+    i
+}
+
+/// bash's `exec [-cl] [-a name]`: returns the index of the command.
+fn exec_args(w: &[String], out: &mut Unwrapped) -> usize {
+    let mut i = 1;
+    while let Some(a) = w.get(i) {
+        if a == "--" {
+            return i + 1;
+        }
+        if !a.starts_with('-') || a.len() == 1 {
+            break;
+        }
+        let cluster = &a[1..];
+        let mut words = 1;
+        for (k, c) in cluster.char_indices() {
+            match c {
+                'c' => lose(
+                    out,
+                    "exec -c starts the command with an empty environment and drops the hook injection",
+                ),
+                'a' => {
+                    if cluster[k + 1..].is_empty() {
+                        words = 2;
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+        i += words;
+    }
+    i
+}
+
+/// The other wrappers: their options (with the values [`WRAPPERS`] lists)
+/// and, for `timeout`, `flock`, `chrt` and `taskset`, one positional
+/// argument before the command.
+fn wrapper_args(name: &str, takes_value: &[&str], w: &[String]) -> usize {
+    let mut i = 1;
+    while let Some(a) = w.get(i).map(String::as_str) {
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if a.starts_with('-') && a.len() > 1 {
+            let opt = a.split_once('=').map_or(a, |(o, _)| o);
+            i += if takes_value.contains(&opt) && !a.contains('=') {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        break;
+    }
+    i + match name {
+        "timeout" | "flock" | "chrt" | "taskset" => 1,
+        _ => 0,
+    }
+}
+
+/// The command a wrapper runs: wrappers, their options and (for `env`)
+/// assignments stripped, with what `env` sets and whether a wrapper drops
+/// the environment. `timeout` also drops its duration, `flock` its lock
+/// file.
+#[must_use]
+pub fn strip_wrappers(words: &[String]) -> Unwrapped {
+    let mut out = Unwrapped::default();
+    let mut w = words.to_vec();
+    while let Some(first) = w.first() {
+        let name = basename(first).to_owned();
+        let Some((_, takes_value)) = WRAPPERS.iter().find(|(n, _)| *n == name) else {
+            break;
+        };
+        let i = match name.as_str() {
+            "env" => env_args(&mut w, &mut out),
+            "exec" => exec_args(&w, &mut out),
+            _ => wrapper_args(&name, takes_value, &w),
+        };
+        w.drain(..i.min(w.len()));
+    }
+    out.words = w;
+    out
+}
+
+/// One command a Bash command runs.
+#[derive(Debug, Clone, Default)]
+struct Run {
+    /// The command and its arguments, after wrappers.
+    words: Vec<String>,
+    /// Assignments in front of it: its own, its wrappers' and those of the
+    /// shell (`VAR=x sh -c '...'`) that runs it.
+    assigns: Vec<String>,
+    /// See [`Unwrapped::env_loss`].
+    env_loss: Option<String>,
 }
 
 /// The commands a simple command runs: itself after wrappers, plus the
 /// script of `sh -c`/`bash -c`/`eval` parsed again.
-fn expand(cmd: &SimpleCommand, depth: usize, out: &mut Vec<Vec<String>>) {
-    let words = strip_wrappers(&cmd.words).to_vec();
+fn expand(cmd: &SimpleCommand, inherited: &[String], depth: usize, out: &mut Vec<Run>) {
+    let un = strip_wrappers(&cmd.words);
+    let mut assigns = inherited.to_vec();
+    assigns.extend(cmd.assignments.iter().cloned());
+    assigns.extend(un.assigns);
+    let words = un.words;
     if words.is_empty() {
+        // An assignment statement, a lone redirection, or a wrapper with
+        // no command: kept for the env and redirection rules.
+        out.push(Run {
+            words,
+            assigns,
+            env_loss: un.env_loss,
+        });
         return;
     }
     let name = basename(&words[0]);
@@ -271,11 +468,15 @@ fn expand(cmd: &SimpleCommand, depth: usize, out: &mut Vec<Vec<String>>) {
         };
         if let Some(s) = script {
             for inner in shell::parse(&s) {
-                expand(&inner, depth + 1, out);
+                expand(&inner, &assigns, depth + 1, out);
             }
         }
     }
-    out.push(words);
+    out.push(Run {
+        words,
+        assigns,
+        env_loss: un.env_loss,
+    });
 }
 
 /// A parsed `git` invocation.
@@ -750,6 +951,49 @@ fn command_ruling(ctx: &Context, words: &[String], redirects: &[shell::Redirect]
     ruling
 }
 
+/// Variables that decide where tollgate finds its host config, install
+/// record and records, and which config files git reads (R8). Hooks take
+/// their dirs from `install.json`, not from these; the guard still denies
+/// setting them for git or tollgate, so a CLI check cannot run against a
+/// planted state dir either.
+const DIR_VARS: &[&str] = &[
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+    "XDG_DATA_HOME",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+];
+
+/// The [`DIR_VARS`] name that assignment word `a` (`NAME=v`, `NAME+=v`)
+/// sets.
+fn sets_dir_var(a: &str) -> Option<&'static str> {
+    let (name, _) = a.split_once('=')?;
+    let name = name.strip_suffix('+').unwrap_or(name);
+    DIR_VARS.iter().find(|v| **v == name).copied()
+}
+
+/// A [`DIR_VARS`] name that run `r` sets for the rest of the shell: an
+/// assignment statement (`HOME=/x;`) or `export`/`declare -x`/... with an
+/// assignment.
+fn shell_dir_var(r: &Run) -> Option<&'static str> {
+    match r.words.first().map(|w| basename(w)) {
+        None => r.assigns.iter().find_map(|a| sets_dir_var(a)),
+        Some("export" | "declare" | "typeset" | "readonly" | "local") => {
+            r.words[1..].iter().find_map(|a| sets_dir_var(a))
+        }
+        Some(_) => None,
+    }
+}
+
+/// True when `words` runs git or tollgate.
+fn runs_git_or_tollgate(ctx: &Context, words: &[String]) -> bool {
+    words
+        .first()
+        .is_some_and(|w| git_call(words).is_some() || is_tollgate(ctx, w))
+}
+
 /// R25/R26 for a Bash command.
 #[must_use]
 pub fn bash_ruling(ctx: &Context, command: &str) -> Ruling {
@@ -762,29 +1006,50 @@ pub fn bash_ruling(ctx: &Context, command: &str) -> Ruling {
     if no_verify_abbrev(&norm) {
         return Ruling::Deny("an abbreviation of --no-verify skips the gate hooks (R25)".into());
     }
+    let cmds = shell::parse(command);
+    let runs: Vec<Vec<Run>> = cmds
+        .iter()
+        .map(|cmd| {
+            let mut runs = Vec::new();
+            expand(cmd, &[], 0, &mut runs);
+            runs
+        })
+        .collect();
+    // R8: HOME or XDG set for the rest of the shell counts for every git
+    // and tollgate in the command (best effort: order is not followed).
+    let shell_sets = runs.iter().flatten().find_map(shell_dir_var);
     let mut ruling = Ruling::Allow;
     // `cd <dir>` changes where later relative paths point (best effort).
     let mut here = ctx.clone();
-    for cmd in shell::parse(command) {
+    for (cmd, runs) in cmds.iter().zip(&runs) {
         if let [cd, dir] = cmd.words.as_slice()
             && cd == "cd"
         {
             here.cwd = resolve_path(&here, dir);
         }
         let ctx = &here;
-        let mut runs = Vec::new();
-        expand(&cmd, 0, &mut runs);
-        if runs.is_empty() {
-            ruling = ruling.max(command_ruling(ctx, &[], &cmd.redirects));
-        }
-        for (k, words) in runs.iter().enumerate() {
+        for (k, run) in runs.iter().enumerate() {
+            if let Some(why) = &run.env_loss {
+                return Ruling::Deny(format!("{why} (R25)"));
+            }
+            if runs_git_or_tollgate(ctx, &run.words)
+                && let Some(var) = run
+                    .assigns
+                    .iter()
+                    .find_map(|a| sets_dir_var(a))
+                    .or(shell_sets)
+            {
+                return Ruling::Deny(format!(
+                    "{var} set for git or tollgate changes which config and records tollgate uses (R8, R25)"
+                ));
+            }
             // Redirections belong to the outer command only.
             let redirects: &[shell::Redirect] = if k + 1 == runs.len() {
                 &cmd.redirects
             } else {
                 &[]
             };
-            ruling = ruling.max(command_ruling(ctx, words, redirects));
+            ruling = ruling.max(command_ruling(ctx, &run.words, redirects));
             if matches!(ruling, Ruling::Deny(_)) {
                 return ruling;
             }
@@ -812,8 +1077,12 @@ const WAITING_GIT: &[&str] = &[
 pub fn needs_long_timeout(ctx: &Context, command: &str) -> bool {
     shell::parse(command).iter().any(|cmd| {
         let mut runs = Vec::new();
-        expand(cmd, 0, &mut runs);
-        runs.iter().any(|w| {
+        expand(cmd, &[], 0, &mut runs);
+        runs.iter().any(|run| {
+            let w = &run.words;
+            if w.is_empty() {
+                return false;
+            }
             if let Some(call) = git_call(w) {
                 return call
                     .sub
@@ -1019,6 +1288,79 @@ mod tests {
             bash_ruling(&ctx(), "wget --no-verbose https://example.invalid/x"),
             Ruling::Allow
         );
+    }
+
+    /// Every way `env` and `exec` start a command with an empty
+    /// environment drops the hook injection (R25).
+    #[test]
+    fn cleared_environments_deny_r25() {
+        for cmd in [
+            "env --ignore-environment PATH=/usr/bin git commit -m x",
+            "env --ignore-env PATH=/usr/bin git commit -m x",
+            "env --ign PATH=/usr/bin git status",
+            "env - PATH=/usr/bin git commit -m x",
+            "env -- - git commit -m x",
+            "env -vi git commit -m x",
+            "env -C /tmp -0i git status",
+            "env -S '-i git commit -m x'",
+            "env -vS'-i git commit -m x'",
+            "env --split-string='-i git commit -m x'",
+            "env -S 'git commit -n -m x'",
+            "env --env0-from=/tmp/e git commit -m x",
+            "exec -c git commit -m x",
+            "exec -lc git commit -m x",
+            "exec -a name -c git commit -m x",
+            "bash -c 'exec -c git commit -m x'",
+            "nohup env - git push origin feat",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+        for cmd in [
+            "env -u FOO git status",
+            "env FOO=1 git status",
+            "env -C /w git status",
+            "env --chdir=/w git status",
+            "env --ignore-signal=PIPE git status",
+            "env -a name git status",
+            "exec git status",
+            "exec -a name git status",
+            "env",
+        ] {
+            assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
+    }
+
+    /// HOME, XDG and git's config-file variables set for git or tollgate
+    /// are denied; the same for other programs stays allowed (R8, R25).
+    #[test]
+    fn dir_variables_in_front_of_git_deny_r8_r25() {
+        for cmd in [
+            "HOME=/tmp/x git commit -m x",
+            "XDG_CONFIG_HOME=/tmp/c git commit -m x",
+            "XDG_STATE_HOME=/tmp/s git push origin feat",
+            "XDG_DATA_HOME=/tmp/d tollgate check",
+            "env HOME=/tmp/x git commit -m x",
+            "export HOME=/tmp/x; git commit -m x",
+            "HOME=/tmp/x; git commit -m x",
+            "declare -x XDG_STATE_HOME=/tmp/s && git push",
+            "HOME=/tmp/x bash -c 'git commit -m x'",
+            "bash -c 'export HOME=/tmp/x; git commit -m x'",
+            "GIT_CONFIG_GLOBAL=/tmp/g git push origin feat",
+            "GIT_CONFIG_SYSTEM=/tmp/g git commit -m x",
+            "GIT_CONFIG_NOSYSTEM=1 git commit -m x",
+            "HOME+=/x git status",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+        for cmd in [
+            "HOME=/tmp/x cargo test",
+            "export HOME=/tmp/x && cargo test",
+            "XDG_STATE_HOME=/tmp/s bun test",
+            "GIT_AUTHOR_NAME=a git status",
+            "export HOME",
+        ] {
+            assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
     }
 
     /// `-u[<mode>]` and `-S[<keyid>]` take a value glued to the flag; an
