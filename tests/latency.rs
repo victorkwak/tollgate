@@ -6,7 +6,7 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use support::{Sandbox, test_hooks_dir};
+use support::{Armed, Sandbox, test_hooks_dir};
 
 const PASS: &str = "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n";
 
@@ -111,5 +111,36 @@ fn hook_latency_budgets_l19() {
     assert!(
         t < Duration::from_millis(200),
         "docs-only pre-commit p95 {t:?} (L19: 200 ms)"
+    );
+}
+
+#[test]
+fn the_guard_answers_in_under_10_ms_l19() {
+    let a = Armed::new();
+    let input = serde_json::json!({
+        "cwd": a.sb.root(),
+        "tool_name": "Bash",
+        "tool_input": {"command": "cd r && git commit -m 'msg' && git push origin feat"},
+    })
+    .to_string();
+    let mut best = Duration::MAX;
+    for _ in 0..3 {
+        let mut t: Vec<Duration> = (0..200)
+            .map(|_| {
+                let s = Instant::now();
+                let (code, _, err) = a.guard_raw(&input, &[]);
+                assert_eq!(code, Some(0), "{err}");
+                s.elapsed()
+            })
+            .collect();
+        t.sort();
+        best = best.min(t[190]);
+        if best < Duration::from_millis(10) {
+            break;
+        }
+    }
+    assert!(
+        best < Duration::from_millis(10),
+        "guard p95 {best:?} (L19: 10 ms)"
     );
 }
