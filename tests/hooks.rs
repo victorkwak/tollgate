@@ -162,6 +162,52 @@ fn the_repo_hook_runs_first_and_its_failure_aborts_t3_r7() {
     assert_eq!(r.code, Some(0), "{}", r.out);
 }
 
+/// T3 variant (R7): git runs an executable hook with no `#!` line through
+/// /bin/sh; tollgate's chaining must too, with the same args and stdin.
+#[test]
+fn a_repo_hook_without_a_shebang_runs_through_sh_t3_r7() {
+    let sb = Sandbox::new();
+    let (repo, _bare) = trusted_repo(&sb, PASS);
+    for name in ["pre-commit", "post-commit", "commit-msg"] {
+        write_exe(
+            &repo.join(".githooks").join(name),
+            &format!("echo REPO-{name} \"$#\" >&2\n"),
+        );
+    }
+    write_exe(
+        &repo.join(".githooks/pre-push"),
+        "echo REPO-pre-push \"$1\" >&2\nwhile read l; do echo \"STDIN $l\" >&2; done\n",
+    );
+    sb.git(&repo, &["config", "core.hooksPath", ".githooks"]);
+    stage(&sb, &repo, "a.txt", "1\n");
+    let r = sb.hooked(&repo, &["commit", "-m", "a"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    for want in [
+        "REPO-pre-commit 0",
+        "REPO-commit-msg 1",
+        "REPO-post-commit 0",
+        "tollgate: pass pre-commit",
+    ] {
+        assert!(r.out.contains(want), "no {want:?} in:\n{}", r.out);
+    }
+    assert!(!r.out.contains("Exec format error"), "{}", r.out);
+    let r = sb.hooked(&repo, &["push", "-q", "origin", "main"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(r.out.contains("REPO-pre-push origin"), "{}", r.out);
+    assert!(r.out.contains("STDIN refs/heads/main "), "{}", r.out);
+    // Its failure is the hook's failure (R7).
+    write_exe(
+        &repo.join(".githooks/pre-commit"),
+        "echo REPO-NO >&2\nexit 4\n",
+    );
+    stage(&sb, &repo, "b.txt", "1\n");
+    let before = head(&sb, &repo);
+    let r = sb.hooked(&repo, &["commit", "-m", "b"]);
+    assert_ne!(r.code, Some(0), "{}", r.out);
+    assert!(r.out.contains("REPO-NO"), "{}", r.out);
+    assert_eq!(head(&sb, &repo), before);
+}
+
 #[test]
 fn a_failing_tree_is_denied_with_the_report_r15_r91() {
     let sb = Sandbox::new();

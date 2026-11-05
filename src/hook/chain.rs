@@ -168,9 +168,15 @@ pub struct Site<'a> {
     pub exe: &'a Path,
 }
 
+/// The shell git runs a hook file with when the kernel cannot exec it
+/// (git's `SHELL_PATH` default).
+const HOOK_SHELL: &str = "/bin/sh";
+
 /// Runs the repo's own hook `name` (R7) and returns its exit code; 0 when
 /// there is none. The hook runs directly, as git runs an executable hook
-/// file, on macOS and Linux alike.
+/// file, on macOS and Linux alike. A file the kernel cannot exec (no `#!`
+/// line: ENOEXEC) runs as `/bin/sh <hook> <args>`, as git's run-command
+/// does.
 pub fn run(
     name: &str,
     args: &[OsString],
@@ -180,22 +186,33 @@ pub fn run(
     let Some(hook) = repo_hook(name, site.layout, site.env, site.dirs, site.exe)? else {
         return Ok(0);
     };
-    let mut cmd = Command::new(&hook);
-    cmd.args(args).current_dir(site.cwd).env_clear();
-    for (k, v) in site.env.iter() {
-        cmd.env(k, v);
-    }
-    match input {
-        Input::Inherit => {
-            cmd.stdin(Stdio::inherit());
+    let command = |program: &Path, lead: Option<&Path>| {
+        let mut cmd = Command::new(program);
+        if let Some(l) = lead {
+            cmd.arg(l);
         }
-        Input::Replay(_) => {
-            cmd.stdin(Stdio::piped());
+        cmd.args(args).current_dir(site.cwd).env_clear();
+        for (k, v) in site.env.iter() {
+            cmd.env(k, v);
         }
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("cannot run the repo hook {}: {e}", hook.display()))?;
+        match input {
+            Input::Inherit => {
+                cmd.stdin(Stdio::inherit());
+            }
+            Input::Replay(_) => {
+                cmd.stdin(Stdio::piped());
+            }
+        }
+        cmd
+    };
+    let spawned = match command(&hook, None).spawn() {
+        Err(e) if e.raw_os_error() == Some(libc::ENOEXEC) => {
+            command(Path::new(HOOK_SHELL), Some(&hook)).spawn()
+        }
+        other => other,
+    };
+    let mut child =
+        spawned.map_err(|e| format!("cannot run the repo hook {}: {e}", hook.display()))?;
     if let (Input::Replay(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
         // A hook that does not read its stdin closes the pipe early; git
         // ignores that too.
