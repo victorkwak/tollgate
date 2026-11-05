@@ -241,6 +241,8 @@ struct Runner<'a> {
     here: bool,
     /// Take resource slots (R85; `run --here --no-host-locks` turns it off).
     use_locks: bool,
+    /// This binary, for `tollgate __step` (R94).
+    tollgate: PathBuf,
 }
 
 /// The runner entry point (`tollgate __run-job <id>`). Returns the exit
@@ -347,8 +349,21 @@ impl<'a> Runner<'a> {
             maps: BTreeMap::new(),
             here,
             use_locks,
+            tollgate: tollgate_exe(),
         }
     }
+}
+
+/// The running tollgate binary. On Linux a binary replaced while the runner
+/// runs (`tollgate install` after `cargo install`) shows as `<path>
+/// (deleted)`; `/proc/self/exe` still execs it from the forked step.
+fn tollgate_exe() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tollgate"));
+    #[cfg(target_os = "linux")]
+    if exe.to_string_lossy().ends_with(" (deleted)") || !exe.is_file() {
+        return PathBuf::from("/proc/self/exe");
+    }
+    exe
 }
 
 impl Runner<'_> {
@@ -908,6 +923,14 @@ impl Runner<'_> {
                 ));
                 break;
             }
+            let env = match self.step_env(s) {
+                Ok(e) if steps::is_rust(s.kind) => self.target_env(&e, workdir, &root),
+                Ok(e) => e,
+                Err(end) => {
+                    error_end = Some(end);
+                    break;
+                }
+            };
             let mut slug = report::slug(&s.name);
             if !used_logs.insert(slug.clone()) {
                 slug = format!("{slug}-{}", used_logs.len());
@@ -917,6 +940,28 @@ impl Runner<'_> {
             let nextest_cfg = self.job_dir.join(format!("{slug}.nextest.toml"));
             let tool_config = self.job_dir.join(format!("{slug}.nextest-tool.toml"));
             let junit = self.job_dir.join(format!("{slug}.junit.xml"));
+            let findings = self.job_dir.join(format!("{slug}.findings.json"));
+            let root_dir = workdir.join(&root);
+            let lang_ctx = steps::lang::LangCtx {
+                root_dir: &root_dir,
+                top: workdir,
+                path: env.get("PATH"),
+                tollgate: &self.tollgate,
+                baseline: None,
+                findings: &findings,
+            };
+            if (steps::lang::is_ts(s.kind) || steps::lang::is_python(s.kind))
+                && let Some(missing) = steps::lang::missing_tool(s.kind, &lang_ctx)
+            {
+                let mut rep = StepReport::skipped(&s.name, s.kind, &missing);
+                rep.status = StepStatus::Error;
+                self.report.steps.push(rep);
+                error_end = Some(error(
+                    ErrorCause::Setup,
+                    format!("step {:?}: {missing}", s.name),
+                ));
+                break;
+            }
             if s.kind == StepKind::Nextest {
                 // R49: the policy commit's nextest config (empty when it has
                 // none, so the tree's own file is not read); R72: the tool
@@ -951,11 +996,17 @@ impl Runner<'_> {
                     nextest_config: &nextest_cfg,
                     tool_config: &tool_config,
                     map,
+                    lang: Some(lang_ctx),
                 },
             ) {
                 Ok(Some(i)) => i,
                 Ok(None) => {
-                    let mut rep = StepReport::skipped(&s.name, s.kind, "no library target");
+                    let why = if s.kind == StepKind::CargoDoctest {
+                        "no library target"
+                    } else {
+                        "no changed file left to lint"
+                    };
+                    let mut rep = StepReport::skipped(&s.name, s.kind, why);
                     rep.status = StepStatus::Pass;
                     self.report.steps.push(rep);
                     self.step_results.push(StepResult {
@@ -970,14 +1021,6 @@ impl Runner<'_> {
                 }
                 Err(e) => {
                     error_end = Some(error(ErrorCause::Config, e));
-                    break;
-                }
-            };
-            let env = match self.step_env(s) {
-                Ok(e) if steps::is_rust(s.kind) => self.target_env(&e, workdir, &root),
-                Ok(e) => e,
-                Err(end) => {
-                    error_end = Some(end);
                     break;
                 }
             };
@@ -1242,6 +1285,8 @@ impl Runner<'_> {
         None
     }
 
+    /// The step's environment: the job's, the kind's own variables, then
+    /// the step's `env` and `env_file` (R52).
     fn step_env(&self, s: &crate::config::repo::Step) -> Result<JobEnv, End> {
         let file = match &s.env_file {
             Some(p) => {
@@ -1263,7 +1308,8 @@ impl Runner<'_> {
             None => None,
         };
         self.env
-            .for_step(&s.env, file.as_ref())
+            .for_step(&steps::lang::step_env(s.kind), None)
+            .and_then(|e| e.for_step(&s.env, file.as_ref()))
             .map_err(|e| error(ErrorCause::Config, e.to_string()))
     }
 

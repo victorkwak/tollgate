@@ -1,13 +1,13 @@
 //! Step kinds: which steps run in a job, on what, and their command lines
 //! (R54, R58, R61, R63).
 //!
-//! Built kinds: `cargo-fmt`, `cargo-clippy`, `nextest`, `cargo-doctest` and
-//! `command`. The TypeScript and Python kinds (`biome`, `tsc`,
-//! `svelte-check`, `bun-test`, `ruff`, `pyright-baseline`,
-//! `pytest-baseline`) are in the config schema but not built yet: a job
-//! that has to run one ends with verdict `error`, cause `config`.
+//! Kinds: `cargo-fmt`, `cargo-clippy`, `nextest`, `cargo-doctest` (R58),
+//! the TypeScript/Bun kinds `biome`, `tsc`, `svelte-check`, `bun-test`
+//! (R59), the Python kinds `ruff`, `pyright-baseline`, `pytest-baseline`
+//! (R60, R94) ([`lang`]) and `command`.
 
 pub mod junit;
+pub mod lang;
 pub mod nextest;
 
 use std::collections::BTreeSet;
@@ -34,6 +34,12 @@ pub enum Scope {
         /// Marked members: the filterset roots (R58).
         marked: BTreeSet<String>,
     },
+    /// Changed files a `fast` linter checked (`biome`, `ruff`; R59, R60),
+    /// repo-relative.
+    Files {
+        /// The files.
+        files: BTreeSet<String>,
+    },
 }
 
 impl Scope {
@@ -42,7 +48,6 @@ impl Scope {
     pub fn covers(&self, need: &Scope) -> bool {
         match (self, need) {
             (Self::All, _) => true,
-            (Self::Packages { .. }, Self::All) => false,
             (
                 Self::Packages {
                     affected: a,
@@ -53,6 +58,8 @@ impl Scope {
                     marked: n,
                 },
             ) => a.is_superset(b) && m.is_superset(n),
+            (Self::Files { files: a }, Self::Files { files: b }) => a.is_superset(b),
+            (Self::Packages { .. } | Self::Files { .. }, _) => false,
         }
     }
 }
@@ -87,7 +94,7 @@ pub fn is_rust(kind: StepKind) -> bool {
 /// True for kinds this version can run.
 #[must_use]
 pub fn is_built(kind: StepKind) -> bool {
-    is_rust(kind) || kind == StepKind::Command
+    is_rust(kind) || kind == StepKind::Command || lang::is_ts(kind) || kind == StepKind::Ruff
 }
 
 /// The step's dir relative to the repo root.
@@ -158,6 +165,17 @@ fn fast_decision(s: &Step, p: &Picked, broad: GlobOpts) -> Decision {
             Decision::Run(Scope::All)
         } else {
             Decision::Skip("no change matches when".into())
+        };
+    }
+    if lang::is_file_scoped(s.kind) {
+        // R59, R60: lint the changed files only.
+        return match lang::lint_pick(s.kind, &root, &p.code_paths, &p.deleted) {
+            lang::LintPick::Untouched => Decision::Skip("no change under its root".into()),
+            lang::LintPick::Nothing => Decision::Skip(
+                "no changed file to lint (only deletions or other file types)".into(),
+            ),
+            lang::LintPick::Whole => Decision::Run(Scope::All),
+            lang::LintPick::Files(files) => Decision::Run(Scope::Files { files }),
         };
     }
     if s.kind != StepKind::Command && !p.code_paths.iter().any(|c| c.starts_with(&root)) {
@@ -248,6 +266,15 @@ pub fn fast_plan(
                 .filter(|s| matches!(s.decision, Decision::Run(_)))
                 .map(|s| s.step.name.clone())
                 .collect(),
+            files: plan
+                .iter()
+                .filter_map(|s| match &s.decision {
+                    Decision::Run(Scope::Files { files }) => {
+                        Some((s.step.name.clone(), files.clone()))
+                    }
+                    _ => None,
+                })
+                .collect(),
         });
     Ok(FastPlan {
         picked,
@@ -305,6 +332,8 @@ pub struct InvocationCtx<'a> {
     pub tool_config: &'a Path,
     /// The workspace map, when metadata worked.
     pub map: Option<&'a WorkspaceMap>,
+    /// For the TypeScript and Python kinds.
+    pub lang: Option<lang::LangCtx<'a>>,
 }
 
 fn package_args(scope: &Scope, names: Option<&BTreeSet<String>>) -> Vec<OsString> {
@@ -324,9 +353,16 @@ pub fn invocation(
     scope: &Scope,
     ctx: &InvocationCtx<'_>,
 ) -> Result<Option<Invocation>, String> {
+    if lang::is_ts(step.kind) || lang::is_python(step.kind) {
+        let ctx = ctx
+            .lang
+            .as_ref()
+            .ok_or("internal: no context for a TypeScript or Python step")?;
+        return lang::invocation(step.kind, scope, ctx);
+    }
     let affected = match scope {
         Scope::Packages { affected, .. } => Some(affected),
-        Scope::All => None,
+        Scope::All | Scope::Files { .. } => None,
     };
     Ok(Some(match step.kind {
         StepKind::CargoFmt => Invocation::cargo(["fmt", "--all", "--check"]),
@@ -465,6 +501,9 @@ tiers = ["full"]
                         Decision::Run(Scope::Packages { affected, .. }) => {
                             affected.iter().cloned().collect::<Vec<_>>().join(",")
                         }
+                        Decision::Run(Scope::Files { files }) => {
+                            files.iter().cloned().collect::<Vec<_>>().join(",")
+                        }
                         Decision::Skip(_) => "skip".to_owned(),
                     },
                 )
@@ -519,6 +558,7 @@ tiers = ["full"]
             nextest_config: Path::new("/j/nextest.toml"),
             tool_config: Path::new("/j/tool.toml"),
             map: Some(&m),
+            lang: None,
         };
         let scope = Scope::Packages {
             affected: ["a".into(), "b".into()].into(),
@@ -554,7 +594,7 @@ tiers = ["full"]
         assert!(
             invocation(&biome, &Scope::All, &ctx)
                 .unwrap_err()
-                .contains("not built")
+                .contains("no context")
         );
     }
 
@@ -569,8 +609,85 @@ tiers = ["full"]
             nextest_config: Path::new("/n"),
             tool_config: Path::new("/t"),
             map: Some(&m),
+            lang: None,
         };
         assert_eq!(invocation(&c.steps[3], &Scope::All, &ctx).unwrap(), None);
+    }
+
+    #[test]
+    fn fast_ts_and_python_steps_follow_their_root_r59_r60_r80() {
+        let c = config(
+            r#"
+[[step]]
+name = "biome"
+kind = "biome"
+cwd = "web"
+[[step]]
+name = "tsc"
+kind = "tsc"
+cwd = "web"
+[[step]]
+name = "ruff"
+kind = "ruff"
+cwd = "py"
+[[step]]
+name = "pytest"
+kind = "pytest-baseline"
+cwd = "py"
+"#,
+        );
+        let m = map("", &[]);
+        let roots = [PathBuf::from("web"), PathBuf::from("py")];
+        let run = |paths: &[(&str, char)]| {
+            let changes: Vec<ChangedPath> = paths
+                .iter()
+                .map(|(p, st)| ChangedPath {
+                    path: PathBuf::from(p),
+                    status: *st,
+                })
+                .collect();
+            let maps: std::collections::BTreeMap<PathBuf, Option<WorkspaceMap>> =
+                [(PathBuf::new(), Some(m.clone()))].into();
+            fast_plan(
+                &c,
+                &crate::gitx::Oid::parse(&"0".repeat(40)).unwrap(),
+                &changes,
+                &maps,
+                &roots,
+                Platform::Linux,
+            )
+            .unwrap()
+        };
+        let f = run(&[("web/src/a.ts", 'M'), ("web/src/gone.ts", 'D')]);
+        let got: Vec<_> = f.plan.iter().map(|p| p.decision.clone()).collect();
+        assert_eq!(
+            got[0],
+            Decision::Run(Scope::Files {
+                files: ["web/src/a.ts".to_owned()].into()
+            })
+        );
+        assert_eq!(got[1], Decision::Run(Scope::All), "tsc: whole root");
+        assert!(matches!(&got[2], Decision::Skip(w) if w == "no change under its root"));
+        assert!(matches!(&got[3], Decision::Skip(_)));
+        let crate::cache::record::Selection::Subset(sel) = &f.selection else {
+            panic!("fast selection")
+        };
+        assert_eq!(
+            sel.files,
+            [("biome".to_owned(), ["web/src/a.ts".to_owned()].into())].into()
+        );
+        assert_eq!(sel.roots, ["web".to_owned()].into());
+        // A config file lints the whole root; only deletions lint nothing.
+        let f = run(&[("py/pyproject.toml", 'M')]);
+        assert_eq!(f.plan[2].decision, Decision::Run(Scope::All));
+        assert_eq!(f.plan[3].decision, Decision::Run(Scope::All));
+        let f = run(&[("py/old.py", 'D')]);
+        assert!(matches!(&f.plan[2].decision, Decision::Skip(w) if w.contains("only deletions")));
+        assert_eq!(
+            f.plan[3].decision,
+            Decision::Run(Scope::All),
+            "pytest still runs"
+        );
     }
 
     #[test]
@@ -583,5 +700,13 @@ tiers = ["full"]
         assert!(p(&["a", "b"]).covers(&p(&["a"])));
         assert!(!p(&["a"]).covers(&p(&["a", "b"])));
         assert!(!p(&["a"]).covers(&Scope::All));
+        let f = |a: &[&str]| Scope::Files {
+            files: a.iter().map(|s| (*s).to_owned()).collect(),
+        };
+        assert!(Scope::All.covers(&f(&["x.ts"])));
+        assert!(f(&["x.ts", "y.ts"]).covers(&f(&["x.ts"])));
+        assert!(!f(&["x.ts"]).covers(&f(&["x.ts", "y.ts"])));
+        assert!(!f(&["x.ts"]).covers(&Scope::All));
+        assert!(!f(&["a"]).covers(&p(&["a"])));
     }
 }

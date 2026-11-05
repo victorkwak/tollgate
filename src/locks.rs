@@ -583,8 +583,20 @@ mod tests {
         assert!(LockFile::try_acquire(&p).unwrap().is_none());
         assert!(is_held(&p).unwrap());
         drop(first);
-        assert!(!is_held(&p).unwrap());
-        assert!(LockFile::try_acquire(&p).unwrap().is_some());
+        // Another test thread can fork while this one holds the lock (or
+        // while `is_held` takes it for a moment): the child keeps a copy of
+        // the open file, and so the lock, until its exec closes it. Allow
+        // that short window.
+        let free_soon = || {
+            (0..200).any(|_| {
+                if !is_held(&p).unwrap() && LockFile::try_acquire(&p).unwrap().is_some() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+                false
+            })
+        };
+        assert!(free_soon());
         assert!(!is_held(&tmp.path().join("missing")).unwrap());
     }
 

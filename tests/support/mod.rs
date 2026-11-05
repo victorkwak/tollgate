@@ -6,6 +6,8 @@
 // Each test crate uses a different subset of these helpers.
 #![allow(dead_code)]
 
+pub mod tools;
+
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
