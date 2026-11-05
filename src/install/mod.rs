@@ -60,13 +60,23 @@ pub struct InstallRecord {
     /// The settings edit, once it was applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<SettingsRecord>,
+    /// The dirs install used. Hooks of this install take their host
+    /// config, scope roots and state dir from here, never from `HOME` or
+    /// `XDG_*` in git's environment (R8). `None` in records of older
+    /// builds: the guard and doctor then ask for `tollgate install`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirs: Option<Dirs>,
 }
 
 impl InstallRecord {
     /// Reads `install.json`.
     pub fn read(dirs: &Dirs) -> Result<Self, String> {
-        let path = dirs.install_record();
-        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::read_at(&dirs.install_record())
+    }
+
+    /// Reads the record at `path`.
+    pub fn read_at(path: &Path) -> Result<Self, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let rec: Self =
             serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
         if rec.version != RECORD_VERSION {
@@ -77,6 +87,25 @@ impl InstallRecord {
             ));
         }
         Ok(rec)
+    }
+
+    /// Why the recorded dirs do not match `dirs` (the dirs of this
+    /// process), if they do not (R8, R24).
+    #[must_use]
+    pub fn dirs_mismatch(&self, dirs: &Dirs) -> Option<String> {
+        match &self.dirs {
+            None => Some("install.json records no dirs (an older install)".into()),
+            Some(d) if d != dirs => Some(format!(
+                "install.json records config {}, state {}, data {}, but this environment has config {}, state {}, data {}",
+                d.config_dir().display(),
+                d.state_dir().display(),
+                d.data_dir().display(),
+                dirs.config_dir().display(),
+                dirs.state_dir().display(),
+                dirs.data_dir().display()
+            )),
+            Some(_) => None,
+        }
     }
 
     fn write(&self, dirs: &Dirs) -> Result<(), String> {
@@ -447,6 +476,7 @@ pub fn install(ctx: &Ctx, yes: bool) -> u8 {
         hooks: names,
         env: env.clone(),
         settings: previous.as_ref().and_then(|p| p.settings.clone()),
+        dirs: Some(dirs.clone()),
     };
     // (c) the settings edit.
     let path = settings_path(&ctx.env, &dirs);

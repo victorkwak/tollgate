@@ -20,6 +20,7 @@ use crate::dirs::Dirs;
 use crate::env::EnvSnapshot;
 use crate::exit;
 use crate::gitx::{Git, RepoLayout};
+use crate::install::InstallRecord;
 
 /// Hooks that gate (R17, R20). `reference-transaction` is CUT (L1).
 pub const GATE_HOOKS: &[&str] = &["pre-commit", "pre-merge-commit", "pre-push"];
@@ -70,6 +71,49 @@ pub struct HookCtx {
     pub exe: PathBuf,
 }
 
+/// tollgate's dirs for a hook running as `exe` (R8).
+///
+/// The hooks of an install are `<data dir>/hooks/<name>` (and `tollgate
+/// hook` runs `<data dir>/bin/tollgate`), and `<data dir>/install.json`
+/// records the dirs install used. They are taken from there, so no `HOME`
+/// or `XDG_*` value in git's environment decides which host config, scope
+/// roots and records apply. A binary outside an install (a test or dev
+/// build, the PATH binary) has no record beside it and uses the
+/// environment: whoever points `core.hooksPath` at such a binary decides
+/// what runs as a hook anyway, and the guard denies that (R25).
+pub fn hook_dirs(exe: &Path, env: &EnvSnapshot) -> Result<Dirs, String> {
+    let Some(data_dir) = exe.parent().and_then(Path::parent) else {
+        return Dirs::from_env(env).map_err(|e| e.to_string());
+    };
+    let record = data_dir.join("install.json");
+    match std::fs::symlink_metadata(&record) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Dirs::from_env(env).map_err(|e| e.to_string());
+        }
+        Err(e) => return Err(format!("{}: {e}", record.display())),
+        Ok(_) => {}
+    }
+    let rec = InstallRecord::read_at(&record)?;
+    let dirs = rec.dirs.ok_or_else(|| {
+        format!(
+            "{} records no dirs (an older install); run: tollgate install",
+            record.display()
+        )
+    })?;
+    let same = |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    if !same(&dirs.data_dir(), data_dir) {
+        return Err(format!(
+            "{} records the data dir {}, not the dir it is in; run: tollgate install",
+            record.display(),
+            dirs.data_dir().display()
+        ));
+    }
+    Ok(dirs)
+}
+
 /// Hooks whose stdin tollgate reads itself; the repo hook gets it replayed
 /// (R7). Other hooks pass stdin through untouched.
 const READS_STDIN: &[&str] = &["pre-push"];
@@ -99,12 +143,12 @@ pub fn run(name: &'static str, args: &[OsString], ctx: &HookCtx) -> u8 {
         }
         return exit::OK;
     };
-    let dirs = Dirs::from_env(&ctx.env).ok();
+    let dirs = hook_dirs(&ctx.exe, &ctx.env);
     let site = chain::Site {
         layout: &layout,
         cwd: &ctx.cwd,
         env: &ctx.env,
-        dirs: dirs.as_ref(),
+        dirs: dirs.as_ref().ok(),
         exe: &ctx.exe,
     };
     let input = stdin
@@ -122,7 +166,16 @@ pub fn run(name: &'static str, args: &[OsString], ctx: &HookCtx) -> u8 {
         return exit::OK;
     }
     // R31: from here every path is an explicit allow or deny.
-    let gate = match gate::Gate::open(name, &ctx.env, &ctx.exe, layout) {
+    let dirs = match dirs {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("tollgate: DENIED {name}: {e}");
+            return exit::FAIL;
+        }
+    };
+    // R8: git calls and the runner see the install's dirs, not git's env.
+    let env = dirs.env_for(&ctx.env);
+    let gate = match gate::Gate::open(name, &env, &ctx.exe, layout, dirs) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("tollgate: DENIED {name}: {e}");

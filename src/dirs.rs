@@ -45,8 +45,9 @@ pub enum DirsError {
     NoHome,
 }
 
-/// The resolved base dirs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The resolved base dirs. `install.json` records them, and hooks of an
+/// install read them from there (R8).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Dirs {
     home: PathBuf,
     config_home: PathBuf,
@@ -81,6 +82,18 @@ impl Dirs {
     #[must_use]
     pub fn home(&self) -> &Path {
         &self.home
+    }
+
+    /// `env` with `HOME` and the `XDG_*_HOME` variables set to these dirs,
+    /// so git calls and the job runner a hook starts resolve the same
+    /// dirs (R8).
+    #[must_use]
+    pub fn env_for(&self, env: &EnvSnapshot) -> EnvSnapshot {
+        env.clone()
+            .with("HOME", &self.home)
+            .with("XDG_CONFIG_HOME", &self.config_home)
+            .with("XDG_STATE_HOME", &self.state_home)
+            .with("XDG_DATA_HOME", &self.data_home)
     }
 
     /// Expands a leading `~` or `~/` to `$HOME`. Other text is returned as is.

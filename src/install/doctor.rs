@@ -94,6 +94,19 @@ fn check_install(out: &mut Out, ctx: &Ctx, dirs: &Dirs) -> Option<InstallRecord>
             return None;
         }
     };
+    // R8: hooks use the recorded dirs; they must be this environment's.
+    match rec.dirs_mismatch(dirs) {
+        Some(why) => out.line(Level::Fail, "dirs", format!("{why}; run: tollgate install")),
+        None => out.line(
+            Level::Ok,
+            "dirs",
+            format!(
+                "hooks use the recorded state dir {} and host config {}",
+                dirs.state_dir().display(),
+                dirs.host_config_file().display()
+            ),
+        ),
+    }
     // Binaries (R97): the PATH binary against the installed copy.
     let installed = super::inode(&rec.binary);
     match &installed {

@@ -60,6 +60,8 @@ The repo stays local until a GitLab remote is approved (L12).
 
    `install` copies the binary to `$XDG_DATA_HOME/tollgate/bin/tollgate`, links the hooks next to it, writes the host config when it is absent, and shows a diff of `~/.claude/settings.json` before it changes it. It asks for confirmation (L10). Agents never run `tollgate install --yes` on the real settings.
 
+   `install.json` records the config, state and data dirs that `install` used. The installed hooks read their dirs from there, not from `HOME` or `XDG_*` in git's environment, so `HOME=/tmp/x git commit` is gated like any other commit (R8). Run `install` from an environment with the same `HOME` and `XDG_*` values as your Claude sessions: the guard reports the gate as not armed when they differ.
+
 3. Check the result:
 
    ```sh

@@ -256,6 +256,7 @@ fn doctor_reports_links_settings_injection_and_stale_locks_r39_r97() {
     assert_eq!(r.code, Some(0), "{}", r.out);
     for want in [
         "ok   hooks: 14 links",
+        "ok   dirs: hooks use the recorded state dir",
         "ok   settings:",
         "ok   claude: 2.1.317",
         "ok   git: git version",

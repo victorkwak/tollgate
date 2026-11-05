@@ -7,7 +7,7 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use support::{HOOK_NAMES, Sandbox, eventually, job_id, test_hooks_dir, write_exe};
+use support::{Armed, HOOK_NAMES, Sandbox, eventually, job_id, test_hooks_dir, write_exe};
 
 const PASS: &str = "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n";
 
@@ -750,4 +750,105 @@ fn a_chained_hook_runs_no_git_subprocess_on_a_warm_cache_t2_r7_r75() {
     run(true);
     let text = std::fs::read_to_string(&trace).unwrap_or_default();
     assert!(text.contains("GIT_CONFIG_SYSTEM"), "{text}");
+}
+
+/// git through the installed hooks (`tollgate install` in the sandbox) in
+/// `repo`, with `extra` on top of the sandbox env and the injection.
+fn installed_git(a: &Armed, repo: &Path, args: &[&str], extra: &[(&str, &str)]) -> support::Run {
+    let ident = [
+        ("GIT_AUTHOR_NAME", "a"),
+        ("GIT_AUTHOR_EMAIL", "a@example.invalid"),
+        ("GIT_COMMITTER_NAME", "a"),
+        ("GIT_COMMITTER_EMAIL", "a@example.invalid"),
+    ];
+    let mut all: Vec<(&str, &str)> = ident.to_vec();
+    all.extend_from_slice(extra);
+    let out = a
+        .cmd(Path::new("git"), args, &all)
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    support::Run {
+        code: out.status.code(),
+        out: format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    }
+}
+
+/// R8, L4, R5: the installed hooks take their dirs from install.json, so a
+/// HOME or XDG value on the git command line neither turns the gate off
+/// (no host config, `~/Repos` against another home, so out of scope) nor
+/// points it at another state dir.
+#[test]
+fn hook_dirs_come_from_the_install_not_from_git_env_r8_l4() {
+    let a = Armed::new();
+    a.sb.scoped_host("");
+    let repo = repo_with(
+        &a.sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"lint\"\nkind = \"command\"\nrun = \"exit 1\"\n",
+    );
+    stage(&a.sb, &repo, "a.txt", "1\n");
+    let before = head(&a.sb, &repo);
+    let r = installed_git(&a, &repo, &["commit", "-m", "x"], &[]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(r.out.contains("verdict fail"), "{}", r.out);
+    let fake = a.sb.root().join("fakehome");
+    std::fs::create_dir_all(&fake).unwrap();
+    let fake_s = fake.to_str().unwrap();
+    let other_state = a.sb.root().join("other-state");
+    let other_s = other_state.to_str().unwrap();
+    for extra in [
+        vec![
+            ("HOME", fake_s),
+            ("XDG_CONFIG_HOME", ""),
+            ("XDG_STATE_HOME", ""),
+            ("XDG_DATA_HOME", ""),
+        ],
+        vec![("HOME", fake_s)],
+        vec![("XDG_CONFIG_HOME", fake_s)],
+        vec![("XDG_STATE_HOME", other_s)],
+    ] {
+        let r = installed_git(&a, &repo, &["commit", "-m", "x"], &extra);
+        assert_eq!(r.code, Some(1), "{extra:?}: {}", r.out);
+        assert!(
+            r.out.contains("DENIED pre-commit") && r.out.contains("stored fail"),
+            "{extra:?}: {}",
+            r.out
+        );
+        assert_eq!(head(&a.sb, &repo), before, "{extra:?}");
+    }
+    assert!(
+        !other_state.exists(),
+        "the hook used the state dir from git's env"
+    );
+    assert_eq!(a.sb.jobs().len(), 1);
+    // A record without dirs (an older install) fails closed: the gate
+    // denies and the guard is not armed until install runs again.
+    let rec_path = a.data().join("install.json");
+    let mut rec: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&rec_path).unwrap()).unwrap();
+    rec.as_object_mut().unwrap().remove("dirs");
+    std::fs::write(&rec_path, serde_json::to_vec_pretty(&rec).unwrap()).unwrap();
+    let r = installed_git(&a, &repo, &["commit", "-m", "x"], &[]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("records no dirs") && r.out.contains("run: tollgate install"),
+        "{}",
+        r.out
+    );
+    let (code, _, err) = a.bash("ls");
+    assert_eq!(code, Some(2), "{err}");
+    assert!(
+        err.contains("gate not armed (install.json records no dirs"),
+        "{err}"
+    );
+    assert_eq!(a.install().0, Some(0));
+    assert_eq!(a.bash("ls").0, Some(0));
+    let r = installed_git(&a, &repo, &["commit", "-m", "x"], &[]);
+    assert!(r.out.contains("stored fail"), "{}", r.out);
 }

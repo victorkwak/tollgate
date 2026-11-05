@@ -299,6 +299,9 @@ fn self_check(
     record: Result<&InstallRecord, &String>,
 ) -> Result<(), String> {
     let rec = record.map_err(|e| format!("no install record: {e}"))?;
+    if let Some(why) = rec.dirs_mismatch(dirs) {
+        return Err(why);
+    }
     for (k, v) in &rec.env {
         if env.get_str(k) != Some(v.as_str()) {
             return Err(format!(

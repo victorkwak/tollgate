@@ -62,14 +62,15 @@ fn remote_urls(git: &Git) -> Result<Vec<String>, String> {
 }
 
 impl<'a> Gate<'a> {
-    /// Loads dirs, host config, scope and remotes for `layout`.
+    /// Loads host config, scope and remotes for `layout`. `dirs` come
+    /// from [`super::hook_dirs`] (R8).
     pub fn open(
         hook: &'static str,
         env: &'a EnvSnapshot,
         exe: &'a Path,
         layout: RepoLayout,
+        dirs: Dirs,
     ) -> Result<Self, String> {
-        let dirs = Dirs::from_env(env).map_err(|e| e.to_string())?;
         let host = HostConfig::load(&dirs).map_err(|e| e.to_string())?;
         let v = host.config.validate();
         if !v.is_ok() {
