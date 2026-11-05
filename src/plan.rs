@@ -1,0 +1,456 @@
+//! The front end of a check: plan a job, look up its record, start or
+//! attach to the job, wait (R15, R32, R34, R53, R56, R74, R78-R81, R88,
+//! R89, L2, L16).
+//!
+//! Used by `tollgate check` now and by the gate hooks later. It runs only
+//! `git` (R51) and tool version probes that the tool cache usually answers
+//! (R75): no `cargo`, so the selection a `fast` lookup needs is not known
+//! exactly; [`Needed::SameBase`] accepts a record of the same base tree,
+//! and the runner re-checks with the exact selection.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use crate::cache::fingerprint::{self, FingerprintError, FingerprintInputs, Roots};
+use crate::cache::record::{Needed, Selection, Verdict};
+use crate::cache::store::{Lookup, LookupRequest, RecordStore, StoreError};
+use crate::cache::toolcache::ToolCache;
+use crate::cache::{Fingerprint, record_key};
+use crate::config::repo::StepKind;
+use crate::config::{CompiledScope, LoadedHost, Tier};
+use crate::dirs::Dirs;
+use crate::env::EnvSnapshot;
+use crate::gitx::{Git, GitError, Oid, RepoLayout};
+use crate::ids::{JobId, ResourceName};
+use crate::locks::Priority;
+use crate::policy::{self, PolicyError};
+use crate::report::JobReport;
+use crate::runner::env::{BaseInputs, EnvFile, JobEnv};
+use crate::runner::job::{JobSpec, PolicySpec, SPEC_SCHEMA};
+use crate::runner::spawn;
+use crate::sched::{self, Claim, JobMeta, JobState, JobStore, Origin};
+
+/// Error while planning or starting a job.
+#[derive(Debug, thiserror::Error)]
+pub enum PlanError {
+    /// git.
+    #[error(transparent)]
+    Git(#[from] GitError),
+    /// Policy or config (R64).
+    #[error(transparent)]
+    Policy(#[from] PolicyError),
+    /// Config or environment.
+    #[error("{0}")]
+    Config(String),
+    /// Fingerprint (docker errors write no record, R34).
+    #[error(transparent)]
+    Fingerprint(#[from] FingerprintError),
+    /// Record store.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// Job store or files.
+    #[error("{0}")]
+    Io(String),
+}
+
+/// The base of a `fast` selection (R55).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Base {
+    /// Base tree.
+    pub tree: Oid,
+    /// Base commit, for the reachability trust rule (R56).
+    pub commit: Option<Oid>,
+}
+
+/// What to check.
+#[derive(Debug)]
+pub struct PlanRequest<'a> {
+    /// tollgate's environment.
+    pub env: &'a EnvSnapshot,
+    /// Dirs.
+    pub dirs: &'a Dirs,
+    /// Host config.
+    pub host: &'a LoadedHost,
+    /// The repo.
+    pub layout: &'a RepoLayout,
+    /// Scrubbed git in the repo (R52).
+    pub git: &'a Git,
+    /// The tree (R40).
+    pub tree: Oid,
+    /// Tier.
+    pub tier: Tier,
+    /// The new commit `N` whose policy applies (L2); `None` on an unborn
+    /// branch.
+    pub tip: Option<Oid>,
+    /// Selection base; `None` disables selection.
+    pub base: Option<Base>,
+    /// Origin ref (R89).
+    pub refname: String,
+    /// L16 reuse wanted (CI sets false). It applies to `fast` jobs and to
+    /// `full` jobs of non-full refs only.
+    pub allow_reuse: bool,
+    /// Queue rank (R89).
+    pub priority: Priority,
+    /// `check --rerun`.
+    pub rerun: bool,
+}
+
+/// A planned job.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    /// The spec the runner gets.
+    pub spec: JobSpec,
+    /// What a lookup needs (R79).
+    pub needed: Needed,
+}
+
+fn kinds_roots(spec_config: &crate::config::RepoConfig, tier: Tier) -> Roots {
+    let mut r = Roots::default();
+    for s in spec_config.steps.iter().filter(|s| s.runs_in(tier)) {
+        match s.kind {
+            StepKind::CargoFmt
+            | StepKind::CargoClippy
+            | StepKind::Nextest
+            | StepKind::CargoDoctest => {
+                r.rust = true;
+            }
+            StepKind::Biome | StepKind::Tsc | StepKind::SvelteCheck | StepKind::BunTest => {
+                r.typescript = true;
+            }
+            StepKind::Ruff | StepKind::PyrightBaseline | StepKind::PytestBaseline => {
+                r.python = true;
+            }
+            StepKind::Command => {}
+        }
+    }
+    r
+}
+
+/// Remote names whose URL matches `scope.remotes` (R5, R20).
+pub fn trusted_remotes(git: &Git, scope: &CompiledScope) -> Result<Vec<String>, GitError> {
+    let out = git.output(["config", "--get-regexp", r"^remote\..*\.url$"])?;
+    let mut names = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some((key, url)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some(name) = key
+            .strip_prefix("remote.")
+            .and_then(|k| k.strip_suffix(".url"))
+        else {
+            continue;
+        };
+        if scope.remote_trusted(url) && !names.iter().any(|n| n == name) {
+            names.push(name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
+/// R56: a base is trusted when its tree has a pass at `fast` or above, or
+/// its commit is reachable from a trusted remote-tracking ref.
+fn base_trusted(
+    git: &Git,
+    store: &RecordStore,
+    base: &Base,
+    fp: &Fingerprint,
+    trusted: &[String],
+) -> Result<bool, PlanError> {
+    for tier in [Tier::Full, Tier::Fast] {
+        let key = record_key(&base.tree, tier, fp);
+        if store
+            .read(&key)
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.verdict == Verdict::Pass && store_report_exists(store, &r.job_id))
+        {
+            return Ok(true);
+        }
+    }
+    if let Some(c) = &base.commit
+        && !trusted.is_empty()
+    {
+        let mut args = vec![
+            "for-each-ref".to_owned(),
+            "--count=1".to_owned(),
+            format!("--contains={c}"),
+            "--format=%(refname)".to_owned(),
+        ];
+        args.extend(trusted.iter().map(|r| format!("refs/remotes/{r}/")));
+        let out = git.run(&args)?;
+        if !out.trim_ascii().is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn store_report_exists(store: &RecordStore, job: &JobId) -> bool {
+    store.dirs().job_report(job).is_file()
+}
+
+/// Plans a job for `req` (R74, L2, R56).
+pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
+    let host = &req.host.config;
+    let scope = CompiledScope::new(&host.scope, req.dirs).map_err(PlanError::Config)?;
+    let trusted = trusted_remotes(req.git, &scope)?;
+    let entries = req.git.ls_tree(&req.tree)?;
+    let policy = policy::resolve(req.git, &entries, req.tip.as_ref(), &trusted)?;
+    let config = &policy.config;
+    let rules = config.ref_rules().map_err(PlanError::Config)?;
+    // L16: no reuse for full jobs of full refs, or on --rerun.
+    let allow_reuse = req.allow_reuse
+        && !req.rerun
+        && (req.tier == Tier::Fast || rules.tier_for_ref(&req.refname) == Tier::Fast);
+    let budgets = host.budget.with_overrides(&config.budget);
+    let now = jiff::Timestamp::now();
+    let id = JobId::generate(now);
+    let job_env = JobEnv::base(&BaseInputs {
+        env: req.env,
+        dirs: req.dirs,
+        job: &host.job,
+        tmpdir: &req.dirs.job_dir(&id).join("tmp"),
+    })
+    .map_err(|e| PlanError::Config(e.to_string()))?;
+    let mut env_files = Vec::new();
+    let mut images: BTreeMap<ResourceName, String> = BTreeMap::new();
+    for s in config.steps.iter().filter(|s| s.runs_in(req.tier)) {
+        if let Some(p) = &s.env_file {
+            env_files.push(
+                EnvFile::read(&req.dirs.expand_tilde(p))
+                    .map_err(|e| PlanError::Config(e.to_string()))?,
+            );
+        }
+        for r in &s.resources {
+            if let Some(i) = host.resource_image(r) {
+                images.insert(r.clone(), i.to_owned());
+            }
+        }
+    }
+    let probe_dir: PathBuf = req
+        .layout
+        .worktree
+        .clone()
+        .unwrap_or_else(|| req.layout.common_dir.clone());
+    let mut tools = ToolCache::load(&req.dirs.toolcache_file());
+    let mut fp = fingerprint::compute(
+        &FingerprintInputs {
+            roots: kinds_roots(config, req.tier),
+            job_env: &job_env,
+            cwd: &probe_dir,
+            host_config_hash: &req.host.hash,
+            effective_config_hash: &config.effective_hash(),
+            env_files: &env_files,
+            images: &images,
+        },
+        &mut tools,
+    )?;
+    let _ = tools.save();
+    fp.insert("policy-files", policy.files_hash());
+    let key = record_key(&req.tree, req.tier, &fp);
+    let store = RecordStore::new(req.dirs);
+
+    let (select, note, needed) = match (&req.base, req.tier) {
+        (_, Tier::Full) => (false, None, Needed::Exact(Selection::All)),
+        (None, Tier::Fast) => (
+            false,
+            Some("no base".to_owned()),
+            Needed::Exact(Selection::All),
+        ),
+        (Some(b), Tier::Fast) if b.tree == req.tree => {
+            (false, Some("empty diff (R56)".to_owned()), Needed::Any)
+        }
+        (Some(b), Tier::Fast) => {
+            let empty = req.git.object_format()?.empty_tree();
+            if b.tree == empty {
+                (
+                    false,
+                    Some("the base is the empty tree (R56)".to_owned()),
+                    Needed::Exact(Selection::All),
+                )
+            } else if base_trusted(req.git, &store, b, &fp, &trusted)? {
+                (true, None, Needed::SameBase(b.tree.clone()))
+            } else {
+                (
+                    false,
+                    Some("the base has no record and no trusted remote has it (R56)".to_owned()),
+                    Needed::Exact(Selection::All),
+                )
+            }
+        }
+    };
+    let origin = Origin {
+        worktree: probe_dir,
+        refname: req.refname.clone(),
+    };
+    let mut env_pairs = Vec::new();
+    for (k, v) in job_env.iter() {
+        match (k.to_str(), v.to_str()) {
+            (Some(k), Some(v)) => env_pairs.push((k.to_owned(), v.to_owned())),
+            _ => {
+                return Err(PlanError::Config(format!(
+                    "job environment {}: not UTF-8",
+                    k.to_string_lossy()
+                )));
+            }
+        }
+    }
+    let spec = JobSpec {
+        schema: SPEC_SCHEMA,
+        id,
+        key,
+        tree: req.tree.clone(),
+        tier: req.tier,
+        fingerprint: fp,
+        common_dir: req.layout.common_dir.clone(),
+        repo_key: req.layout.repo_key(),
+        origin,
+        base_tree: req.base.as_ref().map(|b| b.tree.clone()),
+        select,
+        select_note: note,
+        policy: PolicySpec::from_policy(&policy),
+        host: host.clone(),
+        budgets,
+        job_env: env_pairs,
+        allow_reuse,
+        rerun: req.rerun,
+        priority: req.priority,
+        created: now,
+    };
+    Ok(Plan { spec, needed })
+}
+
+/// The record lookup of R15 for a plan.
+pub fn lookup(dirs: &Dirs, plan: &Plan) -> Result<Lookup, StoreError> {
+    RecordStore::new(dirs).lookup(&LookupRequest {
+        tree: &plan.spec.tree,
+        tier: plan.spec.tier,
+        fingerprint: &plan.spec.fingerprint,
+        needed: &plan.needed,
+        now: jiff::Timestamp::now(),
+    })
+}
+
+/// What [`start`] did.
+#[derive(Debug)]
+pub enum Started {
+    /// A record answers the request (the race re-check after the claim).
+    Hit(Box<Lookup>),
+    /// This call created the job and started its runner.
+    Created(JobId),
+    /// Another job for the key runs; attach to it (R88).
+    Attached(JobId),
+}
+
+/// Creates the job and starts its runner, or names the job that already
+/// owns the key (R88). `exe` is the tollgate binary.
+pub fn start(
+    dirs: &Dirs,
+    plan: &Plan,
+    exe: &Path,
+    env: &EnvSnapshot,
+) -> Result<Started, PlanError> {
+    let spec = &plan.spec;
+    let io = |e: &dyn std::fmt::Display| PlanError::Io(e.to_string());
+    for _ in 0..50 {
+        match sched::claim_job(dirs, &spec.key, &spec.id).map_err(|e| io(&e))? {
+            Claim::Owner(claim) => {
+                // Re-check after the claim: the previous owner may have
+                // written the record just before releasing the key.
+                if !spec.rerun {
+                    let found = lookup(dirs, plan)?;
+                    if !matches!(found, Lookup::Miss) {
+                        return Ok(Started::Hit(Box::new(found)));
+                    }
+                }
+                spec.write(dirs).map_err(|e| io(&e))?;
+                let meta = JobMeta {
+                    id: spec.id.clone(),
+                    key: spec.key.clone(),
+                    tree: spec.tree.clone(),
+                    tier: spec.tier,
+                    origin: spec.origin.clone(),
+                    priority: spec.priority,
+                    created: spec.created,
+                    state: JobState::Queued,
+                };
+                let store = JobStore::new(dirs);
+                store.create(&meta).map_err(|e| io(&e))?;
+                if let Err(e) = spawn::spawn(exe, dirs, &spec.id, claim.into_file(), env) {
+                    let _ = store.transition(
+                        &spec.id,
+                        &[sched::StateKind::Queued],
+                        JobState::Deferred {
+                            reason: format!("runner did not start: {e}"),
+                        },
+                    );
+                    return Err(io(&format!("cannot start the runner: {e}")));
+                }
+                return Ok(Started::Created(spec.id.clone()));
+            }
+            Claim::Running(Some(id)) => return Ok(Started::Attached(id)),
+            Claim::Running(None) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    Err(PlanError::Io(
+        "another job holds the key but its id cannot be read".into(),
+    ))
+}
+
+/// How waiting for a job ended.
+#[derive(Debug)]
+pub enum WaitEnd {
+    /// The job ended; its report.
+    Done(Box<JobReport>),
+    /// Still queued or running at the deadline.
+    Running,
+    /// The job is gone without a report (its runner died).
+    Lost(String),
+}
+
+/// Waits for job `id` until it ends or `deadline` passes, holding a waiter
+/// lock (R89) meanwhile.
+pub fn wait(dirs: &Dirs, id: &JobId, deadline: Option<Instant>) -> WaitEnd {
+    let store = JobStore::new(dirs);
+    let _waiter = sched::register_waiter(&dirs.job_dir(id));
+    let mut dead_once = false;
+    loop {
+        let meta = match store.read(id) {
+            Ok(m) => m,
+            Err(e) => {
+                // An attached job may not have written job.json yet.
+                if dead_once {
+                    return WaitEnd::Lost(e.to_string());
+                }
+                dead_once = true;
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        };
+        if meta.state.is_terminal() {
+            return match JobReport::read(dirs, id) {
+                Ok(Some(r)) => WaitEnd::Done(Box::new(r)),
+                Ok(None) => WaitEnd::Lost(format!("job {id} ended without a report")),
+                Err(e) => WaitEnd::Lost(e.to_string()),
+            };
+        }
+        let owner = sched::running_job(dirs, &meta.key).ok().flatten();
+        if owner.as_ref() != Some(id) {
+            // Seen twice in a row: the runner died without a final state.
+            if dead_once {
+                return WaitEnd::Lost(format!(
+                    "job {id}: its runner is gone (see {})",
+                    dirs.job_dir(id).join("runner.log").display()
+                ));
+            }
+            dead_once = true;
+        } else {
+            dead_once = false;
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return WaitEnd::Running;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

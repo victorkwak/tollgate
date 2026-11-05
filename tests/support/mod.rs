@@ -248,3 +248,139 @@ impl Sandbox {
         dir
     }
 }
+
+/// The tollgate binary under test.
+pub const BIN: &str = env!("CARGO_BIN_EXE_tollgate");
+
+/// Output of a tollgate run: exit code and stdout + stderr.
+#[derive(Debug)]
+pub struct Run {
+    pub code: Option<i32>,
+    pub out: String,
+}
+
+impl Sandbox {
+    /// Writes the host config (`$XDG_CONFIG_HOME/tollgate/config.toml`).
+    pub fn host_config(&self, text: &str) {
+        let p = self.root().join("config/tollgate/config.toml");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    /// The sandbox state dir (`$XDG_STATE_HOME/tollgate`).
+    pub fn state(&self) -> PathBuf {
+        self.root().join("state/tollgate")
+    }
+
+    /// Runs the tollgate binary in `cwd` with the sandbox env plus `extra`.
+    pub fn tollgate_with(&self, cwd: &Path, args: &[&str], extra: &[(&str, &str)]) -> Run {
+        let mut cmd = Command::new(BIN);
+        cmd.env_clear()
+            .current_dir(cwd)
+            .args(args)
+            .stdin(Stdio::null());
+        for (k, v) in self.env().iter() {
+            cmd.env(k, v);
+        }
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        Run {
+            code: out.status.code(),
+            out: format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        }
+    }
+
+    /// Runs the tollgate binary in `cwd` with the sandbox env.
+    pub fn tollgate(&self, cwd: &Path, args: &[&str]) -> Run {
+        self.tollgate_with(cwd, args, &[])
+    }
+
+    /// Job ids that exist, oldest first.
+    pub fn jobs(&self) -> Vec<String> {
+        let mut ids: Vec<String> = std::fs::read_dir(self.state().join("jobs"))
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+                    .filter(|n| n.len() == 24 && n.as_bytes()[8] == b'-')
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    /// `jobs/<id>/report.json` as JSON.
+    pub fn report(&self, job: &str) -> serde_json::Value {
+        let p = self.state().join("jobs").join(job).join("report.json");
+        serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap()
+    }
+
+    /// Number of record files.
+    pub fn record_count(&self) -> usize {
+        let Ok(rd) = std::fs::read_dir(self.state().join("results")) else {
+            return 0;
+        };
+        rd.flatten()
+            .map(|shard| std::fs::read_dir(shard.path()).map_or(0, |r| r.count()))
+            .sum()
+    }
+}
+
+/// The job id named in tollgate output (`job <id>`).
+pub fn job_id(out: &str) -> String {
+    out.split_whitespace()
+        .skip_while(|w| *w != "job")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no job id in:\n{out}"))
+        .to_owned()
+}
+
+/// Kills runner processes a failed test left behind, with their steps.
+fn kill_runners(jobs: &Path) {
+    let Ok(rd) = std::fs::read_dir(jobs) else {
+        return;
+    };
+    let Ok(table) = tollgate::procs::ProcTable::snapshot() else {
+        return;
+    };
+    for e in rd.flatten() {
+        let Ok(text) = std::fs::read_to_string(e.path().join("runner.pid")) else {
+            continue;
+        };
+        let Ok(pid) = text.trim().parse::<i32>() else {
+            continue;
+        };
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        if !String::from_utf8_lossy(&cmdline).contains("__run-job") {
+            continue;
+        }
+        for p in table.descendants(pid) {
+            let _ = tollgate::procs::signal(p, libc::SIGKILL);
+        }
+        let _ = tollgate::procs::signal(pid, libc::SIGKILL);
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        kill_runners(&self.root().join("state/tollgate/jobs"));
+    }
+}
+
+/// Polls `cond` until it holds or `secs` pass.
+pub fn eventually(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < end {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    cond()
+}

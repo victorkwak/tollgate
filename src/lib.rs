@@ -11,17 +11,20 @@
 compile_error!("tollgate supports Linux and macOS only (L13)");
 
 pub mod cache;
+pub mod cli;
 pub mod config;
 pub mod dirs;
 pub mod env;
 pub mod exit;
 pub mod fsx;
+pub mod gc;
 pub mod gitx;
 pub mod guard;
 pub mod hook;
 pub mod ids;
 pub mod install;
 pub mod locks;
+pub mod plan;
 pub mod policy;
 pub mod procs;
 pub mod report;

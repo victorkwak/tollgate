@@ -3,7 +3,8 @@
 //!
 //! The per-job checks that need `cargo metadata`, the nextest test list and
 //! the policy commit (unknown owners and quarantine tests, the 30-day cap)
-//! run in jobs; this command reports what can be checked locally.
+//! run in jobs; this command reports what can be checked locally. Without
+//! a `tollgate.toml` it reports what detection (R65) gives.
 
 use std::path::Path;
 
@@ -95,10 +96,21 @@ pub fn check(cwd: &Path, env: &EnvSnapshot) -> CheckReport {
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            report.lines.push(format!(
-                "repo config: no {REPO_CONFIG_FILE} in {}; detection (R65) is not built yet",
-                worktree.display()
-            ));
+            let detected = crate::select::detect::roots_from_dir(&worktree)
+                .map(|r| crate::select::detect::detected_config(&r));
+            match detected {
+                Ok((config, notes)) => {
+                    report.lines.push(format!(
+                        "repo config: no {REPO_CONFIG_FILE} in {}; jobs use detection (R65): {} step(s); see tollgate config --effective",
+                        worktree.display(),
+                        config.steps.len()
+                    ));
+                    report
+                        .lines
+                        .extend(notes.into_iter().map(|n| format!("note: {n}")));
+                }
+                Err(e) => fail(&mut report, format!("detection: {e}")),
+            }
             return report;
         }
         Err(e) => {

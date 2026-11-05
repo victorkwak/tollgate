@@ -25,7 +25,7 @@ pub const RECORD_SCHEMA: u32 = 1;
 
 /// R74: bump on every change to step kinds, selection, parsing or verdict
 /// logic, so records made by older logic stop matching.
-pub const CHECKS_SCHEMA: u32 = 1;
+pub const CHECKS_SCHEMA: u32 = 2;
 
 /// The sorted map of outside inputs (R74).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

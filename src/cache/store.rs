@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use super::record::{Record, Selection, Verdict, VerdictClass};
+use super::record::{Needed, Record, Selection, Verdict, VerdictClass};
 use super::{Fingerprint, RECORD_SCHEMA, record_key};
 use crate::config::Tier;
 use crate::dirs::Dirs;
@@ -55,8 +55,8 @@ pub struct LookupRequest<'a> {
     pub tier: Tier,
     /// The current fingerprint.
     pub fingerprint: &'a Fingerprint,
-    /// The selection the current base needs; `All` for `full`.
-    pub needed: &'a Selection,
+    /// The selection the current base needs; `Exact(All)` for `full`.
+    pub needed: &'a Needed,
     /// Now, for TTLs.
     pub now: jiff::Timestamp,
 }
@@ -93,6 +93,12 @@ impl RecordStore {
     #[must_use]
     pub fn new(dirs: &Dirs) -> Self {
         Self { dirs: dirs.clone() }
+    }
+
+    /// The dirs of the store.
+    #[must_use]
+    pub fn dirs(&self) -> &Dirs {
+        &self.dirs
     }
 
     /// Reads the record of `key`.
@@ -207,12 +213,14 @@ impl RecordStore {
         let fast_key = record_key(req.tree, Tier::Fast, req.fingerprint);
         if let Some(r) = self.read_usable(&fast_key)? {
             match r.verdict {
-                Verdict::Pass if r.selection.covers(req.needed) => return Ok(Lookup::Pass(r)),
-                Verdict::Fail if req.needed.covers(&r.selection) => return Ok(Lookup::Fail(r)),
+                Verdict::Pass if req.needed.covered_by(&r.selection) => {
+                    return Ok(Lookup::Pass(r));
+                }
+                Verdict::Fail if req.needed.contains(&r.selection) => return Ok(Lookup::Fail(r)),
                 Verdict::Timeout | Verdict::Error
                     if r.verdict_class == VerdictClass::Environmental
                         && !r.expired(req.now)
-                        && req.needed.covers(&r.selection) =>
+                        && req.needed.contains(&r.selection) =>
                 {
                     return Ok(Lookup::Environmental(r));
                 }

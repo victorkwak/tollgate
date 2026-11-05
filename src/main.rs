@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use tollgate::exit;
+use tollgate::config::Tier;
+use tollgate::{cli, exit};
 
 fn main() -> ExitCode {
     // R23: a panic exits 2, never 101.
@@ -33,6 +34,17 @@ fn run() -> u8 {
             };
         }
     };
+    let ctx = match std::env::current_dir() {
+        Ok(cwd) => cli::Ctx {
+            env: tollgate::env::EnvSnapshot::capture(),
+            cwd,
+            exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tollgate")),
+        },
+        Err(e) => {
+            eprintln!("tollgate: cannot read the current dir: {e}");
+            return exit::BLOCK;
+        }
+    };
     match cli.command {
         Command::Hook { name, args } => match tollgate::hook::hook_name(&name) {
             Some(name) => hook_main(name, &args),
@@ -41,7 +53,47 @@ fn run() -> u8 {
                 exit::BLOCK
             }
         },
-        Command::Config(c) => config_main(&c),
+        Command::Config(c) => config_main(&ctx, &c),
+        Command::Check {
+            tier,
+            tree,
+            rev,
+            wait,
+            detach,
+            rerun,
+        } => cli::check(
+            &ctx,
+            &cli::CheckArgs {
+                tier: tier.map_or(Tier::Fast, TierArg::tier),
+                tree,
+                rev,
+                wait,
+                detach,
+                rerun,
+            },
+        ),
+        Command::Wait { job, timeout } => cli::wait(&ctx, &job, timeout.as_deref()),
+        Command::Cancel { job } => cli::cancel(&ctx, &job),
+        Command::Status { rev, json } => cli::status(&ctx, rev.as_deref(), json),
+        Command::Report { target, json } => cli::report_cmd(&ctx, &target, json),
+        Command::Log { job, step, tail } => cli::log(&ctx, &job, &step, tail),
+        Command::Run {
+            tier,
+            here: _,
+            report,
+            no_host_locks,
+        } => cli::run_here(
+            &ctx,
+            cli::HereArgs {
+                tier: tier.tier(),
+                junit: report.is_some(),
+                no_host_locks,
+            },
+        ),
+        Command::Gc { all } => cli::gc(&ctx, all),
+        Command::Audit { since } => cli::audit(&ctx, since.as_deref()),
+        Command::Flaky { days } => cli::flaky(&ctx, days),
+        Command::RunJob { job, lock_fd } => cli::run_job(&ctx, &job, lock_fd),
         other => not_built(other.name()),
     }
 }
@@ -53,26 +105,24 @@ fn hook_main(name: &str, _args: &[OsString]) -> u8 {
     exit::FAIL
 }
 
-fn config_main(args: &ConfigArgs) -> u8 {
+fn config_main(ctx: &cli::Ctx, args: &ConfigArgs) -> u8 {
     if args.check {
-        let cwd = match std::env::current_dir() {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("tollgate config --check: cannot read the current dir: {e}");
-                return exit::FAIL;
-            }
-        };
-        let report = tollgate::config::check::check(&cwd, &tollgate::env::EnvSnapshot::capture());
+        let report = tollgate::config::check::check(&ctx.cwd, &ctx.env);
         for line in &report.lines {
             println!("{line}");
         }
         return if report.ok { exit::OK } else { exit::FAIL };
     }
-    not_built(if args.effective {
-        "config --effective"
-    } else {
-        "config init"
-    })
+    if args.effective {
+        return cli::config_effective(ctx);
+    }
+    match &args.action {
+        Some(ConfigAction::Init { nextest }) => cli::config_init(ctx, *nextest),
+        None => {
+            eprintln!("tollgate config: use --effective, --check or init");
+            exit::BLOCK
+        }
+    }
 }
 
 fn not_built(what: &str) -> u8 {
@@ -95,6 +145,15 @@ struct Cli {
 enum TierArg {
     Fast,
     Full,
+}
+
+impl TierArg {
+    fn tier(self) -> Tier {
+        match self {
+            Self::Fast => Tier::Fast,
+            Self::Full => Tier::Full,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -216,6 +275,13 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+    /// Internal: the detached job runner (R38).
+    #[command(name = "__run-job", hide = true)]
+    RunJob {
+        job: String,
+        #[arg(long)]
+        lock_fd: Option<i32>,
+    },
 }
 
 impl Command {
@@ -240,6 +306,7 @@ impl Command {
             Self::Gc { .. } => "gc",
             Self::Guard => "guard",
             Self::Hook { .. } => "hook",
+            Self::RunJob { .. } => "__run-job",
         }
     }
 }

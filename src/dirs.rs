@@ -16,6 +16,7 @@
 //!   `waiters/` (R89), `job.json`
 //! - `jobs/by-key/<key>.lock` (R88), `jobs/queue/<origin>/` (R89)
 //! - `locks/<resource>/slot-<i>`, `locks/<resource>/queue/` (R85, R86)
+//! - `steps/<key[..2]>/<key>.json`: stored step passes (L16)
 //! - `flaky.jsonl` (R93)
 //! - `verify/` (default `verify.root`, R41)
 //!
@@ -29,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Tier;
 use crate::env::EnvSnapshot;
-use crate::ids::{JobId, RecordKey, RepoKey, ResourceName, WorktreeKey};
+use crate::ids::{JobId, RecordKey, RepoKey, ResourceName, StepKey, WorktreeKey};
 
 const APP: &str = "tollgate";
 
@@ -149,6 +150,20 @@ impl Dirs {
     #[must_use]
     pub fn record_file(&self, key: &RecordKey) -> PathBuf {
         self.results_dir()
+            .join(key.shard())
+            .join(format!("{key}.json"))
+    }
+
+    /// Root of the step result store (L16).
+    #[must_use]
+    pub fn step_results_dir(&self) -> PathBuf {
+        self.state_dir().join("steps")
+    }
+
+    /// `steps/<key[..2]>/<key>.json`: a stored step pass (L16).
+    #[must_use]
+    pub fn step_result_file(&self, key: &StepKey) -> PathBuf {
+        self.step_results_dir()
             .join(key.shard())
             .join(format!("{key}.json"))
     }

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use support::Sandbox;
 use tollgate::cache::fingerprint::{self, FingerprintError, FingerprintInputs, Roots};
 use tollgate::cache::record::{
-    ErrorCause, Record, Selection, StepResult, StepStatus, SubsetSelection, Verdict,
+    ErrorCause, Needed, Record, Selection, StepResult, StepStatus, SubsetSelection, Verdict,
 };
 use tollgate::cache::store::{Lookup, LookupRequest, RecordStore, StoreError, WriteOutcome};
 use tollgate::cache::toolcache::ToolCache;
@@ -258,7 +258,7 @@ impl Store {
                 tree,
                 tier,
                 fingerprint: &self.fp,
-                needed,
+                needed: &Needed::Exact(needed.clone()),
                 now,
             })
             .unwrap()
@@ -490,7 +490,7 @@ exclude_inputs = ["docs/**"]
     let keys = |entries: &[tollgate::gitx::TreeEntry], fp: &Fingerprint| {
         cfg.steps
             .iter()
-            .map(|s| step_key(s, fp, entries).unwrap())
+            .map(|s| step_key(s, Tier::Fast, fp, entries).unwrap())
             .collect::<Vec<_>>()
     };
     let k0 = keys(&e0, &fp);
@@ -524,7 +524,15 @@ exclude_inputs = ["docs/**"]
     // The step definition and the fingerprint are part of the key.
     let mut changed = cfg.steps[0].clone();
     changed.env.insert("RUST_LOG".into(), "debug".into());
-    assert_ne!(step_key(&changed, &fp, &entries()).unwrap(), k3[0]);
+    assert_ne!(
+        step_key(&changed, Tier::Fast, &fp, &entries()).unwrap(),
+        k3[0]
+    );
+    assert_ne!(
+        step_key(&cfg.steps[0], Tier::Full, &fp, &entries()).unwrap(),
+        k3[0],
+        "the tier is part of the key"
+    );
     let mut fp2 = fp.clone();
     fp2.insert("rustc", "rustc 1.97.0");
     assert_ne!(keys(&entries(), &fp2)[0], k3[0]);

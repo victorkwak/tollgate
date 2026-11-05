@@ -119,6 +119,44 @@ impl Selection {
     }
 }
 
+/// The selection a lookup needs (R79).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Needed {
+    /// Known exactly: the runner after `cargo metadata`, or `All`.
+    Exact(Selection),
+    /// Not known (a hook runs no `cargo`, R51): only a record of the same
+    /// base tree is known to hold the same selection (same tree, base and
+    /// policy; the fingerprint covers the rest), or an `All` record.
+    SameBase(Oid),
+    /// R56: an empty diff (the tree equals its base): any pass of the tree
+    /// covers it; with no pass, the job runs everything.
+    Any,
+}
+
+impl Needed {
+    /// True when a pass on `have` covers what is needed (R79).
+    #[must_use]
+    pub fn covered_by(&self, have: &Selection) -> bool {
+        match (self, have) {
+            (Self::Exact(need), _) => have.covers(need),
+            (Self::SameBase(_) | Self::Any, Selection::All) | (Self::Any, _) => true,
+            (Self::SameBase(base), Selection::Subset(s)) => &s.base == base,
+        }
+    }
+
+    /// True when a fail or live timeout/error on `have` would run again as
+    /// is: what is needed contains it.
+    #[must_use]
+    pub fn contains(&self, have: &Selection) -> bool {
+        match (self, have) {
+            (Self::Exact(need), _) => need.covers(have),
+            (Self::SameBase(base), Selection::Subset(s)) => &s.base == base,
+            (Self::SameBase(_), Selection::All) => false,
+            (Self::Any, _) => true,
+        }
+    }
+}
+
 /// One step's outcome (R76).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepResult {
@@ -249,6 +287,27 @@ mod tests {
             "T35: one-crate record must not hit a two-crate diff"
         );
         assert!(!subset(&["a", "b"], &["tests"]).covers(&a));
+    }
+
+    #[test]
+    fn needed_without_metadata_r79_r56() {
+        let base = Oid::parse(&"0".repeat(40)).unwrap();
+        let other = Oid::parse(&"1".repeat(40)).unwrap();
+        let mut a = subset(&["a"], &["t"]);
+        let same = Needed::SameBase(base.clone());
+        assert!(same.covered_by(&a));
+        assert!(same.covered_by(&Selection::All));
+        assert!(same.contains(&a));
+        assert!(!same.contains(&Selection::All));
+        if let Selection::Subset(s) = &mut a {
+            s.base = other.clone();
+        }
+        assert!(!same.covered_by(&a), "another base may need more");
+        assert!(Needed::Any.covered_by(&a));
+        assert!(Needed::Any.contains(&a));
+        let exact = Needed::Exact(subset(&["a", "b"], &["t"]));
+        assert!(!exact.covered_by(&subset(&["a"], &["t"])));
+        assert!(exact.contains(&subset(&["a"], &["t"])));
     }
 
     #[test]
