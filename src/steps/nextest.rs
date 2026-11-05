@@ -9,6 +9,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::config::Tier;
 use crate::config::host::NextestHost;
@@ -45,12 +46,51 @@ pub fn pg_filter(pg_tests: &[String]) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" | "))
 }
 
+/// Time the runner keeps between nextest's own global timeout and its kill
+/// at the step limit (R36), on top of the step's grace.
+pub const LIMIT_MARGIN: Duration = Duration::from_secs(5);
+
+/// R36: the global timeout of a run whose step may take `step_limit` and
+/// gets `grace` after SIGTERM: the host's value, but always below the
+/// step limit, so nextest ends the run before the runner kills the step.
+/// nextest counts it from the start of the test run, after the build.
+#[must_use]
+pub fn global_timeout(host: Duration, step_limit: Duration, grace: Duration) -> Duration {
+    host.min(step_limit.saturating_sub(grace + LIMIT_MARGIN))
+        .max(Duration::from_secs(1))
+}
+
+/// R36: the slow-timeout period, so that one hung test, terminated after
+/// `period * terminate_after` on each of its `retries + 1` tries, ends
+/// before the global timeout `global`: then nextest records it as failed
+/// and names it in the JUnit report (a test still running when the global
+/// timeout cancels the run is missing from the report when retries are
+/// on).
+#[must_use]
+pub fn slow_period(
+    host: Duration,
+    global: Duration,
+    terminate_after: u32,
+    retries: u32,
+) -> Duration {
+    let tries = u128::from(terminate_after.max(1)) * (u128::from(retries) + 1) + 1;
+    let ms = global.as_millis() / tries;
+    host.min(Duration::from_millis(u64::try_from(ms).unwrap_or(u64::MAX)))
+        .max(Duration::from_millis(100))
+}
+
 /// The generated tool config (R72). The JUnit report goes to `junit`, an
 /// absolute path (nextest joins it to its store dir, which an absolute
 /// path replaces), so its place does not depend on `store.dir` or the
-/// target dir.
+/// target dir. `cap` bounds the global timeouts of both profiles (R36,
+/// [`global_timeout`]).
 #[must_use]
-pub fn tool_config(host: &NextestHost, pg_tests: &[String], junit: &Path) -> String {
+pub fn tool_config(
+    host: &NextestHost,
+    pg_tests: &[String],
+    junit: &Path,
+    cap: Option<(Duration, Duration)>,
+) -> String {
     let junit = toml::Value::String(junit.to_string_lossy().into_owned()).to_string();
     let mut s = String::new();
     let _ = writeln!(
@@ -66,16 +106,29 @@ pub fn tool_config(host: &NextestHost, pg_tests: &[String], junit: &Path) -> Str
     for tier in [Tier::Fast, Tier::Full] {
         let p = profile(tier);
         let global = match tier {
-            Tier::Fast => &host.global_timeout_fast,
-            Tier::Full => &host.global_timeout_full,
+            Tier::Fast => host.global_timeout_fast.get(),
+            Tier::Full => host.global_timeout_full.get(),
+        };
+        let (global, period) = match cap {
+            Some((limit, grace)) => {
+                let g = global_timeout(global, limit, grace);
+                let p = slow_period(
+                    host.slow_timeout.get(),
+                    g,
+                    host.terminate_after,
+                    host.retries,
+                );
+                (g, p)
+            }
+            None => (global, host.slow_timeout.get()),
         };
         let _ = writeln!(
             s,
-            "[profile.{p}]\nretries = {}\nfail-fast = false\nslow-timeout = {{ period = \"{}s\", terminate-after = {} }}\nglobal-timeout = \"{}s\"\n\n[profile.{p}.junit]\npath = {junit}\n",
+            "[profile.{p}]\nretries = {}\nfail-fast = false\nslow-timeout = {{ period = \"{}ms\", terminate-after = {} }}\nglobal-timeout = \"{}s\"\n\n[profile.{p}.junit]\npath = {junit}\n",
             host.retries,
-            host.slow_timeout.get().as_secs().max(1),
+            period.as_millis().max(1),
             host.terminate_after,
-            global.get().as_secs().max(1),
+            global.as_secs().max(1),
         );
         if let Some(f) = &pg {
             let _ = writeln!(
@@ -141,6 +194,7 @@ mod tests {
             &host,
             &["gatehouse-api::*".into(), "core::db_*".into()],
             Path::new("/j/tests \"x\".junit.xml"),
+            None,
         );
         assert!(text.contains("[profile.tollgate-fast]"), "{text}");
         assert!(text.contains("[profile.tollgate-full]"), "{text}");
@@ -154,8 +208,32 @@ mod tests {
         );
         let parsed: toml::Table = toml::from_str(&text).unwrap();
         assert!(parsed.contains_key("profile"));
-        assert!(!tool_config(&host, &[], Path::new("/j/t.xml")).contains(".overrides]]"));
+        assert!(!tool_config(&host, &[], Path::new("/j/t.xml"), None).contains(".overrides]]"));
         let junit = &parsed["profile"]["tollgate-fast"]["junit"]["path"];
         assert_eq!(junit.as_str(), Some("/j/tests \"x\".junit.xml"));
+    }
+
+    #[test]
+    fn global_timeout_stays_below_the_step_limit_r36() {
+        let m = |s| Duration::from_secs(s);
+        // A repo budget of 5 min under a host global timeout of 15 min.
+        assert_eq!(global_timeout(m(900), m(300), m(60)), m(235));
+        assert_eq!(global_timeout(m(900), m(7200), m(60)), m(900));
+        assert_eq!(global_timeout(m(900), m(30), m(60)), m(1));
+        let host = NextestHost::default();
+        let text = tool_config(&host, &[], Path::new("/j/t.xml"), Some((m(300), m(60))));
+        assert_eq!(
+            text.matches("global-timeout = \"235s\"").count(),
+            2,
+            "{text}"
+        );
+        // 120 s period: a hung test takes 2 x 120 s per try, 3 tries: 720 s,
+        // more than 235 s; the period shrinks to fit (235 s / 7).
+        assert_eq!(text.matches("period = \"33571ms\"").count(), 2, "{text}");
+        assert_eq!(
+            slow_period(m(120), m(6000), 2, 2),
+            m(120),
+            "fits: the host value"
+        );
     }
 }

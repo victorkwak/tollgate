@@ -391,3 +391,96 @@ fn quarantine_never_hides_a_test_that_fails_every_try_r93() {
         assert!(!r.out.contains("QUARANTINED"), "{tier}: {}", r.out);
     }
 }
+
+#[test]
+fn a_hung_test_fails_inside_nextest_before_the_step_limit_r36() {
+    let sb = Sandbox::new();
+    host(&sb);
+    let repo = sb.rust_repo("ws", Scratch::default());
+    std::fs::write(
+        repo.join("crates/b/tests/hang.rs"),
+        "#[test]\nfn hangs() {\n    std::thread::sleep(std::time::Duration::from_secs(120));\n}\n",
+    )
+    .unwrap();
+    sb.git(&repo, &["add", "-A"]);
+    sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "hang"]);
+    // The step limit (12 s) is far below the host's global timeout (15 min):
+    // nextest must stop the run itself, so the report names the test.
+    commit_policy(
+        &sb,
+        &repo,
+        "version = 1\n[[step]]\nname = \"tests\"\nkind = \"nextest\"\ntimeout = \"12s\"\ngrace = \"1s\"\n",
+        "policy",
+    );
+    let r = sb.tollgate(&repo, &["check", "--rev", "HEAD", "--wait"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(r.out.contains("FAIL b b::hang hangs"), "{}", r.out);
+    assert!(!r.out.contains("TIMEOUT"), "{}", r.out);
+}
+
+#[test]
+fn above_max_target_stale_packages_go_first_then_cargo_clean_r44() {
+    let sb = Sandbox::new();
+    sb.host_config("[verify]\nmin_free = \"1M\"\nmax_target = \"1M\"\n");
+    let repo = sb.rust_repo("ws", Scratch::default());
+    // cargo fmt builds nothing: the target dir holds only what the test
+    // puts there.
+    commit_policy(
+        &sb,
+        &repo,
+        "version = 1\n[[step]]\nname = \"fmt\"\nkind = \"cargo-fmt\"\n",
+        "policy",
+    );
+    let r = sb.tollgate(&repo, &["check", "--rev", "HEAD", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let fast = std::fs::read_dir(sb.state().join("verify"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("fast");
+    let checkout = std::fs::read_dir(&fast)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .unwrap();
+    let debug = checkout.join("target/debug");
+    let put = |rel: &str, bytes: usize| {
+        let p = debug.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, vec![0u8; bytes]).unwrap();
+    };
+    // A package no longer in the graph (2 MB) and the current member `a`.
+    put(".fingerprint/gone-pkg-0123456789abcdef/lib-gone", 10);
+    put("deps/libgone_pkg-0123456789abcdef.rlib", 2 << 20);
+    put("deps/gone_pkg-0123456789abcdef.d", 10);
+    put("incremental/gone_pkg-0abw3gvoytti4/s", 10);
+    put(".fingerprint/a-0123456789abcdef/lib-a", 10);
+    put("deps/liba-0123456789abcdef.rlib", 10);
+    sb.commit_file(&repo, "crates/a/src/extra.rs", "\n", "one");
+    let r = sb.tollgate(&repo, &["check", "--rev", "HEAD", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        !debug
+            .join("deps/libgone_pkg-0123456789abcdef.rlib")
+            .exists()
+    );
+    assert!(
+        !debug
+            .join(".fingerprint/gone-pkg-0123456789abcdef")
+            .exists()
+    );
+    assert!(!debug.join("incremental/gone_pkg-0abw3gvoytti4").exists());
+    assert!(
+        debug.join("deps/liba-0123456789abcdef.rlib").exists(),
+        "current packages keep their warm build"
+    );
+    // Still above the limit with current packages only: a full cargo clean.
+    put("deps/liba-0123456789abcdef.rlib", 2 << 20);
+    sb.commit_file(&repo, "crates/a/src/extra.rs", "\n\n", "two");
+    let r = sb.tollgate(&repo, &["check", "--rev", "HEAD", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(!checkout.join("target").exists(), "cargo clean");
+}

@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 pub struct PackageInfo {
     /// Manifest dir relative to the repo root (`""` for the repo root).
     pub manifest_dir: PathBuf,
-    /// Has a library or proc-macro target (doctests run, R58).
+    /// Has a target `cargo test --doc` documents (R58): crate type `lib`,
+    /// `rlib` or `proc-macro`.
     pub has_lib: bool,
     /// Members that depend on this one through any edge kind.
     pub dependents: BTreeSet<String>,
@@ -30,6 +31,10 @@ pub struct WorkspaceMap {
     pub packages: BTreeMap<String, PackageInfo>,
     /// Absolute target dir (nextest store, JUnit file).
     pub target_dir: PathBuf,
+    /// Every package in the resolve graph (members and dependencies), for
+    /// the R44 pass that removes build outputs of packages no longer in it.
+    #[serde(default)]
+    pub all_packages: BTreeSet<String>,
 }
 
 fn rel(path: &Path, repo_root: &Path) -> Result<PathBuf, String> {
@@ -42,6 +47,19 @@ fn rel(path: &Path, repo_root: &Path) -> Result<PathBuf, String> {
                 repo_root.display()
             )
         })
+}
+
+/// A target `cargo test --doc` documents: a library whose crate types
+/// include `lib`, `rlib` or `proc-macro` (cargo's own rule; `dylib`,
+/// `cdylib` and `staticlib` alone give "no library targets found").
+fn doctestable(t: &cargo_metadata::Target) -> bool {
+    use cargo_metadata::TargetKind;
+    t.kind.iter().any(|k| {
+        matches!(
+            k,
+            TargetKind::Lib | TargetKind::RLib | TargetKind::ProcMacro
+        )
+    })
 }
 
 impl WorkspaceMap {
@@ -64,7 +82,7 @@ impl WorkspaceMap {
                 name,
                 PackageInfo {
                     manifest_dir: rel(dir.as_std_path(), repo_root)?,
-                    has_lib: p.targets.iter().any(|t| t.is_lib() || t.is_proc_macro()),
+                    has_lib: p.targets.iter().any(doctestable),
                     dependents: BTreeSet::new(),
                 },
             );
@@ -90,6 +108,7 @@ impl WorkspaceMap {
             root: root.to_owned(),
             packages,
             target_dir: meta.target_directory.into_std_path_buf(),
+            all_packages: meta.packages.iter().map(|p| p.name.to_string()).collect(),
         })
     }
 
@@ -261,6 +280,7 @@ pub(crate) mod tests {
         }
         WorkspaceMap {
             root: PathBuf::from(root),
+            all_packages: packages.keys().cloned().collect(),
             packages,
             target_dir: PathBuf::from("/t"),
         }

@@ -1045,3 +1045,51 @@ fn waiting_on_a_dead_runner_reaps_its_steps_r35() {
     let c = sb.tollgate(&repo, &["cancel", &job]);
     assert_eq!(c.code, Some(0), "{}", c.out);
 }
+
+#[test]
+fn an_unchecked_or_empty_base_disables_selection_r56() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = sb.root().join("r");
+    std::fs::create_dir_all(&repo).unwrap();
+    sb.git(&repo, &["init", "-q"]);
+    sb.commit_file(
+        &repo,
+        "tollgate.toml",
+        "version = 1\n[[step]]\nname = \"b-only\"\nkind = \"command\"\nrun = \"true\"\nwhen = [\"b/**\"]\n",
+        "root: policy",
+    );
+    sb.commit_file(&repo, "README", "x\n", "unchecked");
+    let status = |out: &str| {
+        let rep = sb.report(&job_id(out));
+        let s = rep["steps"].as_array().unwrap()[0]["status"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let log =
+            std::fs::read_to_string(sb.state().join("jobs").join(job_id(out)).join("job.log"))
+                .unwrap_or_default();
+        (s, log)
+    };
+    // Root commit: the base is the empty tree; selection off, the step runs.
+    let root = sb.git(&repo, &["rev-list", "--max-parents=0", "HEAD"]);
+    let r = sb.tollgate(&repo, &["check", "--rev", &root, "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let (s, log) = status(&r.out);
+    assert_eq!(s, "pass", "{log}");
+    assert!(log.contains("the base is the empty tree (R56)"), "{log}");
+    // The root commit is checked now; HEAD is not. A change in a/ on top
+    // of the unchecked HEAD runs the step too.
+    sb.commit_file(&repo, "a/x", "1\n", "a on top of an unchecked base");
+    let r = sb.tollgate(&repo, &["check", "--rev", "HEAD", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let (s, log) = status(&r.out);
+    assert_eq!(s, "pass", "{log}");
+    assert!(log.contains("the base has no record"), "{log}");
+    // On a checked base, the same kind of change skips the step.
+    sb.commit_file(&repo, "a/x", "2\n", "a on top of a checked base");
+    let r = sb.tollgate(&repo, &["check", "--rev", "HEAD", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let (s, log) = status(&r.out);
+    assert_eq!(s, "skipped", "{log}");
+}

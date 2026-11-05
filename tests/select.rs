@@ -164,3 +164,31 @@ fn filtersets_select_with_nextest_list_t31() {
         set(&["b tests::fails", "b::it integration"])
     );
 }
+
+#[test]
+fn doctests_cover_every_library_crate_type_cargo_documents_r58() {
+    let sb = Sandbox::new();
+    let repo = sb.root().join("libs");
+    let lib = |name: &str, types: &str| {
+        let dir = repo.join(name);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [{types}]\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    };
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"both\", \"rlib\", \"dy\", \"c\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    lib("both", "\"cdylib\", \"rlib\"");
+    lib("rlib", "\"rlib\"");
+    lib("dy", "\"dylib\"");
+    lib("c", "\"cdylib\"");
+    let map = workspace_map(&sb, &repo);
+    assert_eq!(map.with_lib(&map.all()), set(&["both", "rlib"]));
+}

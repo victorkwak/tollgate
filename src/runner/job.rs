@@ -235,6 +235,8 @@ struct Runner<'a> {
     /// R87), so a step that outlives a dead runner keeps the checkout from
     /// the next job until it is reaped.
     inherit: Vec<std::os::fd::RawFd>,
+    /// Workspace maps of this job's Rust roots (R44 after the job).
+    maps: BTreeMap<PathBuf, Option<WorkspaceMap>>,
     /// `run --here` (R47): no checkout, no record, report in this dir.
     here: bool,
     /// Take resource slots (R85; `run --here --no-host-locks` turns it off).
@@ -342,6 +344,7 @@ impl<'a> Runner<'a> {
             pending_steps: Vec::new(),
             reused: false,
             inherit: Vec::new(),
+            maps: BTreeMap::new(),
             here,
             use_locks,
         }
@@ -546,6 +549,7 @@ impl Runner<'_> {
             .iter()
             .map(|root| (root.clone(), self.metadata(workdir, root, entries)))
             .collect();
+        self.maps.clone_from(&maps);
         let fast = match self.select(config, entries, &maps) {
             Ok(p) => p,
             Err(end) => return end,
@@ -928,6 +932,7 @@ impl Runner<'_> {
                     &self.spec.host.nextest,
                     &config.select.fast.pg_tests,
                     &junit,
+                    Some((self.step_limit(s), s.grace())),
                 );
                 let _ = std::fs::remove_file(&junit);
                 if let Err(e) = std::fs::write(&nextest_cfg, text)
@@ -1031,15 +1036,7 @@ impl Runner<'_> {
                 self.started = Some(Instant::now());
                 self.report.started = Some(jiff::Timestamp::now());
             }
-            let job_left = self
-                .spec
-                .budgets
-                .job_limit(self.spec.tier)
-                .saturating_sub(self.run_time);
-            let step_limit = s
-                .timeout
-                .as_ref()
-                .map_or(job_left, |t| t.get().min(job_left));
+            let step_limit = self.step_limit(s);
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -1221,6 +1218,19 @@ impl Runner<'_> {
         End::Verdict(verdict, None, None)
     }
 
+    /// What is left of the job limit (R33; slot waits do not count), and
+    /// at most the step's own timeout.
+    fn step_limit(&self, s: &crate::config::repo::Step) -> Duration {
+        let job_left = self
+            .spec
+            .budgets
+            .job_limit(self.spec.tier)
+            .saturating_sub(self.run_time);
+        s.timeout
+            .as_ref()
+            .map_or(job_left, |t| t.get().min(job_left))
+    }
+
     fn missing_tool(&self, kind: StepKind) -> Option<&'static str> {
         let absent = |k: &str| self.spec.fingerprint.get(k) == Some("absent");
         if absent("cargo") {
@@ -1345,6 +1355,25 @@ impl Runner<'_> {
             let target = co.path.join(&root).join("target");
             if !target.is_dir() || checkout::dir_size(&target) <= max {
                 continue;
+            }
+            // First the outputs of packages no longer in the workspace's
+            // graph; a full clean only when that is not enough (L15: keep
+            // the warm build).
+            if let Some(Some(map)) = self.maps.get(&root)
+                && !map.all_packages.is_empty()
+            {
+                let gone = checkout::clean_stale(&target, &map.all_packages);
+                if !gone.is_empty() {
+                    self.say(&format!(
+                        "target {} is above verify.max_target: removed outputs of {} package(s) no longer in the workspace: {}",
+                        target.display(),
+                        gone.len(),
+                        gone.iter().cloned().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                if checkout::dir_size(&target) <= max {
+                    continue;
+                }
             }
             self.say(&format!(
                 "target {} is above verify.max_target: cargo clean",

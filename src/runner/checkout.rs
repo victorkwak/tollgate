@@ -553,6 +553,96 @@ pub fn free_bytes(path: &Path) -> io::Result<u64> {
     Ok(bytes)
 }
 
+/// R44, first pass: removes the build outputs in the cargo target dir
+/// `target` of packages that are not in `current` (every package name of
+/// the workspace's resolve graph): a removed member or a dropped
+/// dependency. `cargo clean -p` cannot do it, since it accepts only
+/// packages the current workspace resolves. Profile dirs are found by
+/// their `.fingerprint` dir (`target/debug`, `target/<triple>/release`,
+/// ...); outputs are named `<package>-<hash>` there and in `build/`, and
+/// `<crate>-<hash>` / `lib<crate>-<hash>` in `deps/` and `incremental/`
+/// (crate = package with `-` as `_`). Returns the names removed.
+pub fn clean_stale(
+    target: &Path,
+    current: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let norm = |n: &str| n.replace('-', "_");
+    let keep: std::collections::BTreeSet<String> = current.iter().map(|n| norm(n)).collect();
+    let mut profiles = Vec::new();
+    let mut stack = vec![(target.to_owned(), 0u8)];
+    while let Some((d, depth)) = stack.pop() {
+        if d.join(".fingerprint").is_dir() {
+            profiles.push(d.clone());
+        }
+        if depth < 2 {
+            for e in fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if e.file_type().is_ok_and(|t| t.is_dir())
+                    && !e.file_name().to_string_lossy().starts_with('.')
+                {
+                    stack.push((p, depth + 1));
+                }
+            }
+        }
+    }
+    // `<name>-<hash>` -> name: 16 hex digits, or 13 base-36 characters in
+    // `incremental/`.
+    let split = |file: &str| -> Option<String> {
+        let (name, hash) = file.rsplit_once('-')?;
+        ((13..=16).contains(&hash.len())
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase()))
+        .then(|| name.to_owned())
+    };
+    let mut removed = std::collections::BTreeSet::new();
+    for prof in profiles {
+        let mut stale = std::collections::BTreeSet::new();
+        for e in fs::read_dir(prof.join(".fingerprint"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if let Some(name) = split(&e.file_name().to_string_lossy())
+                && !keep.contains(&norm(&name))
+            {
+                stale.insert(norm(&name));
+            }
+        }
+        if stale.is_empty() {
+            continue;
+        }
+        for sub in [".fingerprint", "build", "deps", "incremental"] {
+            for e in fs::read_dir(prof.join(sub)).into_iter().flatten().flatten() {
+                let file = e.file_name().to_string_lossy().into_owned();
+                let stem = file.split('.').next().unwrap_or("");
+                // `libfoo-<hash>.rlib` is crate foo, but a package may be
+                // named `libfoo` too: stale only when no reading is kept.
+                let names: Vec<String> = [Some(stem), stem.strip_prefix("lib")]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(split)
+                    .map(|n| norm(&n))
+                    .collect();
+                if let Some(name) = names.iter().find(|n| stale.contains(*n)).cloned()
+                    && !names.iter().any(|n| keep.contains(n))
+                {
+                    let p = e.path();
+                    let gone = if p.is_dir() {
+                        fs::remove_dir_all(&p)
+                    } else {
+                        fs::remove_file(&p)
+                    };
+                    if gone.is_ok() {
+                        removed.insert(name);
+                    }
+                }
+            }
+        }
+    }
+    removed
+}
+
 /// Total size of the files under `dir` (symlinks not followed).
 #[must_use]
 pub fn dir_size(dir: &Path) -> u64 {
