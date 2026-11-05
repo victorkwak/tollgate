@@ -236,7 +236,7 @@ fn bun_project_full_then_fast_lints_only_changed_files_r59_r46_t25() {
 }
 
 #[test]
-fn changes_outside_the_root_skip_its_steps_r59() {
+fn changes_outside_the_root_skip_its_steps_and_docs_pass_r59_r61() {
     let Some(p) = project("changes_outside_the_root_skip_its_steps", Some(POLICY)) else {
         return;
     };
@@ -249,6 +249,27 @@ fn changes_outside_the_root_skip_its_steps_r59() {
         assert_eq!(step(&report, s)["status"], "skipped", "{s}: {report}");
         assert_eq!(step(&report, s)["message"], "no change under its root");
     }
+    // R61: a root README is docs-only; one inside the TS root is code.
+    p.sb.git(&p.repo, &["reset", "-q", "--hard"]);
+    p.write("README.md", "# app\n");
+    let (code, out, report) = p.check(&["check", "--wait"]);
+    assert_eq!(code, Some(0), "{out}");
+    for s in ["biome", "tsc", "test"] {
+        assert_eq!(
+            step(&report, s)["message"],
+            "docs-only change (R61)",
+            "{report}"
+        );
+    }
+    p.write("web/NOTES.md", "# notes\n");
+    let (code, out, report) = p.check(&["check", "--wait"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(step(&report, "tsc")["status"], "pass", "{report}");
+    assert_eq!(
+        step(&report, "biome")["scope"]["files"]["files"],
+        serde_json::json!(["web/NOTES.md"]),
+        "{report}"
+    );
 }
 
 #[test]
