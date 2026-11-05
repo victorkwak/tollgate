@@ -10,6 +10,18 @@ use support::{Armed, Sandbox, test_hooks_dir};
 
 const PASS: &str = "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n";
 
+/// A docs-only `pre-commit` (L19 budget 200 ms) waits for a job of a few
+/// ms; item 41: the hook sees its end near its run time, not at the next
+/// 100 ms poll (before: 128 ms p95). Measured p95 on the Arch box: 42 ms
+/// alone, 47-55 ms during the whole parallel suite; the assertion adds a
+/// margin for a busier machine.
+const DOCS_ONLY: Duration = Duration::from_millis(90);
+
+/// [`DOCS_ONLY`] with detected Bun and Python roots (R65 detection runs on
+/// the hook path; before: 151 ms p95). Measured: 69 ms alone, 71-77 ms
+/// during the whole suite.
+const DOCS_ONLY_DETECTED: Duration = Duration::from_millis(120);
+
 fn repo_with(sb: &Sandbox, name: &str, toml: &str) -> PathBuf {
     let repo = sb.repo(name);
     sb.commit_file(&repo, "tollgate.toml", toml, "policy");
@@ -154,7 +166,7 @@ fn hook_latency_budgets_l19() {
         let o = sb.run_hook(&repo, "pre-commit", &[]);
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     });
-    within_budget("pre-commit docs-only", t, Duration::from_millis(200));
+    within_budget("pre-commit docs-only", t, DOCS_ONLY);
 }
 
 #[test]
@@ -232,7 +244,7 @@ fn docs_only_pre_commit_with_detected_roots_stays_in_budget_l19_r61_r65() {
     within_budget(
         "pre-commit docs-only (detected Bun and Python roots)",
         t,
-        Duration::from_millis(200),
+        DOCS_ONLY_DETECTED,
     );
     // Each run was docs-only: no job ran a step.
     let jobs = sb.jobs();

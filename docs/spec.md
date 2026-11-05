@@ -61,7 +61,7 @@ L19. **Performance budgets** (p95 on the Arch box, tested where marked):
 - Guard per call: under 10 ms (test: 200 calls).
 - Chained non-gate hook (for example `post-commit` with no repo hook): under 5 ms (test).
 - `pre-commit` on a cache hit: under 200 ms (test).
-- `pre-commit` on a docs-only tree: under 200 ms (test).
+- `pre-commit` on a docs-only tree: under 200 ms (test). Item 41: a hook waiting for a job looks at it after 1 ms, then at doubling pauses up to 100 ms, so a job of a few ms answers near its run time; the test asserts 90 ms (120 ms with detected Bun and Python roots), the measured p95 plus a margin.
 - Fast job overhead beyond the steps themselves (checkout update, metadata, selection, record write): under 3 s for a myapp-sized workspace (bench).
 - No tollgate code on the path of git commands that run no hooks (`status`, `diff`, `log`, `show`, `fetch`).
 
