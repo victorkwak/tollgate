@@ -875,6 +875,7 @@ pub fn run_here(ctx: &Ctx, a: HereArgs) -> u8 {
             nextest_configs: BTreeMap::new(),
             line: None,
             overlay: BTreeMap::new(),
+            baselines: BTreeMap::new(),
             config: config.clone(),
             source,
             notes,
@@ -906,6 +907,18 @@ pub fn run_here(ctx: &Ctx, a: HereArgs) -> u8 {
         if let Ok(text) = std::fs::read_to_string(workdir.join(&root).join(".config/nextest.toml"))
         {
             spec.policy.nextest_configs.insert(root, text);
+        }
+    }
+    // The baselines in the tree apply in CI (no policy base, R94).
+    for s in &config.steps {
+        let kind = match s.kind {
+            crate::config::repo::StepKind::PyrightBaseline => crate::steps::baseline::Kind::Pyright,
+            crate::config::repo::StepKind::PytestBaseline => crate::steps::baseline::Kind::Pytest,
+            _ => continue,
+        };
+        let rel = crate::steps::step_root(s).join(kind.file());
+        if let Ok(text) = std::fs::read_to_string(workdir.join(&rel)) {
+            spec.policy.baselines.insert(rel, text);
         }
     }
     let use_locks = host.exists && !a.no_host_locks;

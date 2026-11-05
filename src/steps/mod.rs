@@ -6,6 +6,7 @@
 //! (R59), the Python kinds `ruff`, `pyright-baseline`, `pytest-baseline`
 //! (R60, R94) ([`lang`]) and `command`.
 
+pub mod baseline;
 pub mod junit;
 pub mod lang;
 pub mod nextest;
@@ -94,7 +95,7 @@ pub fn is_rust(kind: StepKind) -> bool {
 /// True for kinds this version can run.
 #[must_use]
 pub fn is_built(kind: StepKind) -> bool {
-    is_rust(kind) || kind == StepKind::Command || lang::is_ts(kind) || kind == StepKind::Ruff
+    is_rust(kind) || kind == StepKind::Command || lang::is_ts(kind) || lang::is_python(kind)
 }
 
 /// The step's dir relative to the repo root.

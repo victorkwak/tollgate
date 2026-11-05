@@ -333,6 +333,10 @@ pub struct Policy {
     /// `.config/nextest.toml` contents of the policy commit by Rust root
     /// dir (R49).
     pub nextest_configs: BTreeMap<PathBuf, String>,
+    /// Python baseline files of the policy commit by path (R49, R94):
+    /// `pyright-baseline` and `pytest-baseline` compare with these, never
+    /// with the tree's own.
+    pub baselines: BTreeMap<PathBuf, String>,
     /// Policy files that differ between the tree and the policy commit.
     pub changed: Vec<PathBuf>,
     /// Tool configs (R71) whose tree version differs from the policy
@@ -522,7 +526,15 @@ pub fn resolve(
     changed.sort();
     changed.dedup();
     let mut nextest_configs = BTreeMap::new();
+    let mut baselines = BTreeMap::new();
     for (p, (_, oid)) in &files {
+        let name = p.file_name().and_then(std::ffi::OsStr::to_str);
+        if matches!(
+            name,
+            Some(crate::steps::baseline::PYRIGHT_FILE | crate::steps::baseline::PYTEST_FILE)
+        ) {
+            baselines.insert(p.clone(), read_blob(git, oid)?);
+        }
         if p.ends_with(".config/nextest.toml") {
             let root = p
                 .parent()
@@ -540,6 +552,7 @@ pub fn resolve(
         notes,
         files,
         nextest_configs,
+        baselines,
         changed,
         overlay,
     })

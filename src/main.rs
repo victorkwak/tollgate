@@ -94,6 +94,12 @@ fn run() -> u8 {
         Command::Audit { since } => cli::audit(&ctx, since.as_deref()),
         Command::Flaky { days } => cli::flaky(&ctx, days),
         Command::RunJob { job, lock_fd } => cli::run_job(&ctx, &job, lock_fd),
+        Command::Step {
+            kind,
+            findings,
+            root,
+            baseline,
+        } => tollgate::steps::baseline::step(kind.kind(), baseline.as_deref(), &findings, &root),
         other => not_built(other.name()),
     }
 }
@@ -165,6 +171,21 @@ enum ReportFormat {
 enum BaselineKind {
     Pyright,
     Pytest,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BaselineStep {
+    PyrightBaseline,
+    PytestBaseline,
+}
+
+impl BaselineStep {
+    fn kind(self) -> tollgate::steps::baseline::Kind {
+        match self {
+            Self::PyrightBaseline => tollgate::steps::baseline::Kind::Pyright,
+            Self::PytestBaseline => tollgate::steps::baseline::Kind::Pytest,
+        }
+    }
 }
 
 /// L14: the v1 CLI subset. `pick`, `policy approve` and `waive` are CUT.
@@ -282,6 +303,18 @@ enum Command {
         #[arg(long)]
         lock_fd: Option<i32>,
     },
+    /// Internal: a Python baseline step in a job (R94).
+    #[command(name = "__step", hide = true)]
+    Step {
+        #[arg(value_enum)]
+        kind: BaselineStep,
+        #[arg(long)]
+        findings: PathBuf,
+        #[arg(long, default_value = ".")]
+        root: String,
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+    },
 }
 
 impl Command {
@@ -307,6 +340,7 @@ impl Command {
             Self::Guard => "guard",
             Self::Hook { .. } => "hook",
             Self::RunJob { .. } => "__run-job",
+            Self::Step { .. } => "__step",
         }
     }
 }

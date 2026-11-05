@@ -352,6 +352,8 @@ pub fn invocation(
                 "--findings",
             ]);
             args.push(ctx.findings.into());
+            args.push("--root".into());
+            args.push(show(ctx.root_dir, ctx.top).into());
             if let Some(b) = ctx.baseline {
                 args.push("--baseline".into());
                 args.push(b.into());
@@ -549,7 +551,7 @@ mod tests {
         assert!(ruff.ends_with(" ruff"), "{ruff}");
         assert_eq!(
             line(StepKind::PyrightBaseline, &Scope::All).unwrap(),
-            "/bin/tollgate __step pyright-baseline --findings /j/pyright.findings.json --baseline /j/pyright.baseline.json"
+            "/bin/tollgate __step pyright-baseline --findings /j/pyright.findings.json --root web --baseline /j/pyright.baseline.json"
         );
         let no_base = LangCtx {
             baseline: None,
@@ -560,7 +562,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .display(),
-            "/bin/tollgate __step pytest-baseline --findings /j/pyright.findings.json"
+            "/bin/tollgate __step pytest-baseline --findings /j/pyright.findings.json --root web"
         );
         assert_eq!(step_env(StepKind::Ruff)["PYTHONDONTWRITEBYTECODE"], "1");
         assert!(step_env(StepKind::Tsc).is_empty());

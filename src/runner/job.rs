@@ -80,6 +80,9 @@ pub struct PolicySpec {
     /// version.
     #[serde(default)]
     pub overlay: BTreeMap<PathBuf, crate::policy::OverlayFile>,
+    /// R94: the policy commit's Python baseline files by path.
+    #[serde(default)]
+    pub baselines: BTreeMap<PathBuf, String>,
 }
 
 impl PolicySpec {
@@ -96,6 +99,7 @@ impl PolicySpec {
             nextest_configs: p.nextest_configs.clone(),
             line: p.line(),
             overlay: p.overlay.clone(),
+            baselines: p.baselines.clone(),
         }
     }
 }
@@ -941,13 +945,33 @@ impl Runner<'_> {
             let tool_config = self.job_dir.join(format!("{slug}.nextest-tool.toml"));
             let junit = self.job_dir.join(format!("{slug}.junit.xml"));
             let findings = self.job_dir.join(format!("{slug}.findings.json"));
+            let _ = std::fs::remove_file(&findings);
+            // R49, R94: the baseline of the policy commit, never the tree's.
+            let baseline_kind = match s.kind {
+                StepKind::PyrightBaseline => Some(steps::baseline::Kind::Pyright),
+                StepKind::PytestBaseline => Some(steps::baseline::Kind::Pytest),
+                _ => None,
+            };
+            let baseline_file = self.job_dir.join(format!("{slug}.baseline.json"));
+            let baseline = match baseline_kind
+                .and_then(|k| self.spec.policy.baselines.get(&root.join(k.file())))
+            {
+                Some(text) => match std::fs::write(&baseline_file, text) {
+                    Ok(()) => Some(baseline_file.as_path()),
+                    Err(e) => {
+                        error_end = Some(error(ErrorCause::Internal, e.to_string()));
+                        break;
+                    }
+                },
+                None => None,
+            };
             let root_dir = workdir.join(&root);
             let lang_ctx = steps::lang::LangCtx {
                 root_dir: &root_dir,
                 top: workdir,
                 path: env.get("PATH"),
                 tollgate: &self.tollgate,
-                baseline: None,
+                baseline,
                 findings: &findings,
             };
             if (steps::lang::is_ts(s.kind) || steps::lang::is_python(s.kind))
@@ -1129,6 +1153,7 @@ impl Runner<'_> {
                 reused_from: None,
                 message: None,
                 failing: Vec::new(),
+                items: Vec::new(),
                 rerun: Vec::new(),
                 tail: Vec::new(),
             };
@@ -1158,7 +1183,9 @@ impl Runner<'_> {
                     stop = true;
                 }
                 ExecEnd::Exited(status) => {
-                    if s.kind == StepKind::Nextest {
+                    if baseline_kind.is_some() {
+                        Self::baseline_result(&mut rep, status.success(), &findings, &log);
+                    } else if s.kind == StepKind::Nextest {
                         self.nextest_result(
                             &mut rep,
                             status.code(),
@@ -1230,6 +1257,7 @@ impl Runner<'_> {
                     .failing
                     .iter()
                     .map(|f| format!("{} {} {}", f.package, f.binary_id, f.name))
+                    .chain(rep.items.iter().cloned())
                     .collect(),
             });
             self.report.steps.push(rep);
@@ -1365,6 +1393,32 @@ impl Runner<'_> {
                 &self.job_dir.join(format!("{slug}.log")),
                 report::TAIL_LINES,
             );
+        }
+    }
+
+    /// The report of a baseline step (R91, R94): what `tollgate __step`
+    /// wrote to `findings`, else the log tail.
+    fn baseline_result(rep: &mut StepReport, passed: bool, findings: &Path, log: &Path) {
+        let found: Option<steps::baseline::Findings> = std::fs::read(findings)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        if passed {
+            if let Some(f) = found.filter(|f| !f.notes.is_empty()) {
+                rep.message = Some(f.notes.join(" "));
+            }
+            return;
+        }
+        rep.status = StepStatus::Fail;
+        match found {
+            Some(f) => {
+                rep.message = f.summary;
+                rep.items = f.items;
+                rep.rerun = f.rerun;
+                if rep.items.is_empty() {
+                    rep.tail = report::tail(log, report::TAIL_LINES);
+                }
+            }
+            None => rep.tail = report::tail(log, report::TAIL_LINES),
         }
     }
 
