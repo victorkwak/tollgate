@@ -168,10 +168,13 @@ fn docs_only_pre_commit_with_detected_roots_stays_in_budget_l19_r61_r65() {
     }
     sb.git(&repo, &["add", "-A"]);
     sb.git(&repo, &["commit", "-q", "-m", "roots"]);
-    // A trusted remote has the base, so selection is on (R56).
+    // A trusted remote has the base, so selection is on (R56); the server
+    // confirms the fetched value once, then the record of its answer does.
     let url = sb.root().join("remotes/trusted.git");
+    sb.git(&sb.root(), &["init", "-q", "--bare", url.to_str().unwrap()]);
     sb.git(&repo, &["remote", "add", "origin", url.to_str().unwrap()]);
-    sb.git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    sb.git(&repo, &["push", "-q", "origin", "main"]);
+    sb.git(&repo, &["fetch", "-q", "origin"]);
     let effective = sb.tollgate(&repo, &["config", "--effective"]);
     for step in ["web bun test", "py pytest"] {
         assert!(effective.out.contains(step), "{step:?}: {}", effective.out);

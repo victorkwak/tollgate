@@ -157,6 +157,12 @@ impl Dirs {
         self.state_dir().join("probe")
     }
 
+    /// What trusted servers reported for their branches (L2, R56).
+    #[must_use]
+    pub fn remote_refs_file(&self) -> PathBuf {
+        self.state_dir().join("remote-refs.json")
+    }
+
     /// Tool version cache (R75).
     #[must_use]
     pub fn toolcache_file(&self) -> PathBuf {

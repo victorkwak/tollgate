@@ -942,7 +942,10 @@ pub fn config_effective(ctx: &Ctx) -> u8 {
         Ok(s) => s,
         Err(e) => return fail(e),
     };
-    let trusted = plan::trusted_remotes(&repo.git, &scope).unwrap_or_default();
+    let remotes = match plan::remote_trust(&repo.git, &scope) {
+        Ok(t) => plan::remote_refs(&repo.dirs, &ctx.env, &t),
+        Err(e) => return fail(e),
+    };
     let (tip, tree) = match repo.git.rev_parse_verify("HEAD^{commit}") {
         Ok(Some(c)) => {
             let t = repo.git.tree_of(c.as_str()).ok().flatten();
@@ -958,7 +961,7 @@ pub fn config_effective(ctx: &Ctx) -> u8 {
         Err(e) => return fail(e),
     };
     let own = head_ref(&repo.git);
-    let p = match policy::resolve(&repo.git, &entries, tip.as_ref(), &trusted, Some(&own)) {
+    let p = match policy::resolve(&repo.git, &entries, tip.as_ref(), &remotes, Some(&own)) {
         Ok(p) => p,
         Err(e) => return fail(e),
     };

@@ -8,6 +8,12 @@
 //! The job's own ref is never an anchor, and a local anchor that already
 //! contains `N` is skipped. Trusted remotes with none of their anchor refs
 //! fetched deny (no local fallback). With no usable anchor, `N` itself.
+//!
+//! A remote-tracking anchor is a local file anyone can move (`fetch .`,
+//! `update-ref`), so its commit is the newest value the trusted server
+//! reported for the branch ([`crate::remote_refs`]); when the server
+//! confirms none that the repo has, the anchor is unusable, and with no
+//! usable remote anchor left the policy denies.
 //! Policy files (R71) come from that commit, so a branch cannot weaken the
 //! checks that judge it: its own policy changes take effect after it merges
 //! to a full ref. The approval flow and union rule are CUT (L2).
@@ -24,6 +30,7 @@ use globset::GlobSet;
 use crate::config::glob::{self, GlobOpts};
 use crate::config::repo::RepoConfig;
 use crate::gitx::{Git, GitError, Oid, TreeEntry};
+use crate::remote_refs::RemoteRefs;
 use crate::select::detect;
 
 /// The repo config file (R63).
@@ -184,12 +191,13 @@ fn existing_refs(git: &Git, wanted: &[String]) -> Result<Vec<(String, Oid)>, Git
 /// anchor branches (`refs/remotes/<r>/main`, then `.../master`), or, only
 /// when no trusted remote is configured, the local anchor branches. The
 /// job's own ref is never an anchor. Errors when trusted remotes are
-/// configured but none of their anchor refs exists locally: falling back
-/// to local refs would let an agent pick its own policy by deleting the
+/// configured but none of their anchor refs exists locally, or the
+/// trusted server confirms none of them: falling back to local refs would
+/// let an agent pick its own policy by deleting or forging the
 /// remote-tracking refs.
 fn anchors(
     git: &Git,
-    trusted: &[String],
+    remotes: &RemoteRefs,
     names: &[String],
     own_ref: Option<&str>,
 ) -> Result<Vec<Anchor>, PolicyError> {
@@ -197,27 +205,47 @@ fn anchors(
         .iter()
         .filter(|n| crate::config::repo::valid_anchor(n))
         .collect();
-    if !trusted.is_empty() {
-        let wanted: Vec<String> = trusted
+    if !remotes.is_empty() {
+        let pairs: Vec<(&crate::remote_refs::TrustedRemote, &String)> = remotes
+            .remotes()
             .iter()
-            .flat_map(|r| names.iter().map(move |n| format!("refs/remotes/{r}/{n}")))
+            .flat_map(|r| names.iter().map(move |n| (r, *n)))
             .collect();
-        let found = existing_refs(git, &wanted)?;
+        let wanted: Vec<String> = pairs
+            .iter()
+            .map(|(r, n)| format!("refs/remotes/{}/{n}", r.name))
+            .collect();
+        let found: BTreeMap<String, Oid> = existing_refs(git, &wanted)?.into_iter().collect();
         if found.is_empty() {
             return Err(PolicyError::NoAnchor(format!(
                 "no policy anchor (L2): none of {} exists locally; fetch the trusted remote (git fetch {}), or push its first branch from your own terminal",
                 wanted.join(", "),
-                trusted[0]
+                remotes.remotes()[0].name
             )));
         }
-        return Ok(found
-            .into_iter()
-            .map(|(refname, tip)| Anchor {
-                refname,
-                tip,
-                local: false,
-            })
-            .collect());
+        let mut out = Vec::new();
+        let mut unconfirmed = Vec::new();
+        for ((remote, name), refname) in pairs.iter().zip(&wanted) {
+            let Some(local) = found.get(refname) else {
+                continue;
+            };
+            match remotes.anchor_tip(git, remote, name, local)? {
+                Ok(tip) => out.push(Anchor {
+                    refname: refname.clone(),
+                    tip,
+                    local: false,
+                }),
+                Err(why) => unconfirmed.push(format!("{refname} ({why})")),
+            }
+        }
+        if out.is_empty() {
+            return Err(PolicyError::NoAnchor(format!(
+                "no policy anchor (L2): the trusted server confirms no value of {}; fetch it again (git fetch {}) and check that its server answers",
+                unconfirmed.join(", "),
+                remotes.remotes()[0].name
+            )));
+        }
+        return Ok(out);
     }
     let wanted: Vec<String> = names.iter().map(|n| format!("refs/heads/{n}")).collect();
     Ok(existing_refs(git, &wanted)?
@@ -260,7 +288,7 @@ fn is_ancestor(git: &Git, ancestor: &Oid, descendant: &Oid) -> Result<bool, GitE
 pub fn policy_base(
     git: &Git,
     tip: Option<&Oid>,
-    trusted: &[String],
+    remotes: &RemoteRefs,
     anchor_names: &[String],
     own_ref: Option<&str>,
 ) -> Result<PolicyBase, PolicyError> {
@@ -272,7 +300,7 @@ pub fn policy_base(
         });
     };
     let mut chosen = None;
-    for a in anchors(git, trusted, anchor_names, own_ref)? {
+    for a in anchors(git, remotes, anchor_names, own_ref)? {
         if a.local && is_ancestor(git, tip, &a.tip)? {
             continue;
         }
@@ -481,11 +509,11 @@ pub fn resolve(
     git: &Git,
     tree_entries: &[TreeEntry],
     tip: Option<&Oid>,
-    trusted: &[String],
+    remotes: &RemoteRefs,
     own_ref: Option<&str>,
 ) -> Result<Policy, PolicyError> {
     let default_anchors = RepoConfig::default().policy.anchors;
-    let mut base = policy_base(git, tip, trusted, &default_anchors, own_ref)?;
+    let mut base = policy_base(git, tip, remotes, &default_anchors, own_ref)?;
     let mut base_entries = match &base.commit {
         Some(c) => git.ls_tree(c)?,
         None => tree_entries.to_vec(),
@@ -499,7 +527,7 @@ pub fn resolve(
         && let Some((_, c)) = &found
         && c.policy.anchors != default_anchors
     {
-        let again = policy_base(git, tip, trusted, &c.policy.anchors, own_ref)?;
+        let again = policy_base(git, tip, remotes, &c.policy.anchors, own_ref)?;
         if again.anchor.is_some() && again.commit != base.commit {
             base = again;
             base_entries = match &base.commit {

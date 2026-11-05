@@ -23,6 +23,7 @@ use crate::ids::JobId;
 use crate::locks::Priority;
 use crate::plan::{self, Base, Plan, PlanRequest, Settled, Started};
 use crate::policy;
+use crate::remote_refs::RemoteRefs;
 use crate::report::{self, JobReport};
 
 /// What a gate hook needs, loaded once.
@@ -50,6 +51,9 @@ pub struct Gate<'a> {
     pub trusted: Vec<String>,
     /// Remotes a push to which is a push to a trusted remote (R5, R20).
     pub push_trusted: Vec<String>,
+    /// The trusted remotes' URLs and what their server reported (L2,
+    /// R14(2)).
+    pub remote_refs: RemoteRefs,
 }
 
 impl<'a> Gate<'a> {
@@ -75,6 +79,7 @@ impl<'a> Gate<'a> {
         let git = Git::scrubbed(env, layout.hooks_cwd());
         let scope = CompiledScope::new(&host.config.scope, &dirs)?;
         let trust = plan::remote_trust(&git, &scope).map_err(|e| e.to_string())?;
+        let remote_refs = plan::remote_refs(&dirs, env, &trust);
         Ok(Self {
             hook,
             env,
@@ -87,6 +92,7 @@ impl<'a> Gate<'a> {
             remote_urls: trust.urls,
             trusted: trust.trusted,
             push_trusted: trust.push_trusted,
+            remote_refs,
         })
     }
 
@@ -106,7 +112,7 @@ impl<'a> Gate<'a> {
         own_ref: &str,
     ) -> Result<RefRules, String> {
         let entries = self.git.ls_tree(tree).map_err(|e| e.to_string())?;
-        let p = policy::resolve(&self.git, &entries, tip, &self.trusted, Some(own_ref))
+        let p = policy::resolve(&self.git, &entries, tip, &self.remote_refs, Some(own_ref))
             .map_err(|e| e.to_string())?;
         p.config.ref_rules()
     }
@@ -188,43 +194,13 @@ pub struct Check {
     pub rerun_hint: String,
 }
 
-/// How long R14(2) waits for one `git ls-remote` (an unreachable remote
-/// must not hold the hook until the Bash timeout).
-const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// `git ls-remote -- <remote> <refname>` with a time limit; its stdout on
-/// success.
-fn ls_remote(git: &crate::gitx::Git, remote: &str, refname: &str) -> Option<Vec<u8>> {
-    use std::io::Read as _;
-    let mut child = git
-        .command(["ls-remote", "--", remote, refname])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let end = Instant::now() + LS_REMOTE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut out = Vec::new();
-                child.stdout.take()?.read_to_end(&mut out).ok()?;
-                return status.success().then_some(out);
-            }
-            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-}
-
-/// R14 outcome 2: `git ls-remote <remote> refs/heads/<branch>` on each of
-/// `remotes` (trusted remotes) at hook time. The remote-tracking ref is
-/// only a hint: a remote whose fetched tip does not match is not asked
-/// (no network wait for a merge or push that cannot match); a match is
-/// confirmed by `ls-remote`, which the agent cannot forge locally.
+/// R14 outcome 2: the current `refs/heads/<branch>` of each of `remotes`
+/// (trusted remotes), from `git ls-remote` against its trusted URL at
+/// hook time, run outside the repo so the repo's own config (an
+/// `uploadpack` or `sshCommand`) cannot change who answers
+/// ([`RemoteRefs::server_heads`]). The remote-tracking ref is only a hint:
+/// a remote whose fetched tip does not match is not asked (no network wait
+/// for a merge or push that cannot match).
 fn remote_verified(gate: &Gate<'_>, check: &Check, remotes: &[String]) -> Option<String> {
     let rv = check.remote_verify.as_ref()?;
     let branch = match rv {
@@ -241,6 +217,9 @@ fn remote_verified(gate: &Gate<'_>, check: &Check, remotes: &[String]) -> Option
             .is_some_and(|t| t == check.tree),
     };
     for remote in remotes {
+        let Some(trusted) = gate.remote_refs.get(remote) else {
+            continue;
+        };
         let tracking = format!("refs/remotes/{remote}/{branch}");
         if !gate
             .git
@@ -251,17 +230,10 @@ fn remote_verified(gate: &Gate<'_>, check: &Check, remotes: &[String]) -> Option
         {
             continue;
         }
-        let Some(out) = ls_remote(&gate.git, remote, &refname) else {
+        let Ok(heads) = gate.remote_refs.server_heads(trusted) else {
             continue;
         };
-        let text = String::from_utf8_lossy(&out);
-        let Some(oid) = text.lines().find_map(|l| {
-            let (oid, name) = l.split_once('\t')?;
-            (name == refname).then(|| Oid::parse(oid).ok())?
-        }) else {
-            continue;
-        };
-        if matches(&oid) {
+        if let Some(oid) = heads.get(&refname).filter(|o| matches(o)) {
             return Some(format!("{remote} {refname} at {}", oid.short(12)));
         }
     }

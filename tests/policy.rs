@@ -9,6 +9,7 @@ use support::Sandbox;
 use tollgate::config::RepoConfig;
 use tollgate::gitx::Git;
 use tollgate::policy::{self, ConfigSource};
+use tollgate::remote_refs::{RemoteRefs, TrustedRemote};
 
 const MAIN_POLICY: &str =
     "version = 1\n[[step]]\nname = \"tests\"\nkind = \"command\"\nrun = \"true\"\n";
@@ -16,6 +17,28 @@ const WEAK_POLICY: &str = "version = 1\n";
 
 fn rev(sb: &Sandbox, repo: &Path, r: &str) -> tollgate::gitx::Oid {
     tollgate::gitx::Oid::parse(&sb.git(repo, &["rev-parse", r])).unwrap()
+}
+
+/// `origin` at `url` as the one trusted remote.
+fn trusted(sb: &Sandbox, url: &Path) -> RemoteRefs {
+    let env = sb.env();
+    RemoteRefs::new(
+        &tollgate::dirs::Dirs::from_env(&env).unwrap(),
+        &env,
+        vec![TrustedRemote {
+            name: "origin".into(),
+            url: url.to_str().unwrap().to_owned(),
+        }],
+    )
+}
+
+/// A bare repo at `<root>/<name>` as `origin` of `repo`.
+fn bare_origin(sb: &Sandbox, repo: &Path, name: &str) -> PathBuf {
+    let bare = sb.root().join(name);
+    std::fs::create_dir_all(&bare).unwrap();
+    sb.git(&bare, &["init", "-q", "--bare"]);
+    sb.git(repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    bare
 }
 
 #[test]
@@ -38,7 +61,14 @@ fn branch_policy_changes_wait_for_the_merge_l2() {
     let git = Git::scrubbed(&sb.env(), &repo);
     let tree = git.tree_of("HEAD").unwrap().unwrap();
     let entries = git.ls_tree(&tree).unwrap();
-    let p = policy::resolve(&git, &entries, Some(&tip), &[], Some("refs/heads/feat")).unwrap();
+    let p = policy::resolve(
+        &git,
+        &entries,
+        Some(&tip),
+        &RemoteRefs::none(),
+        Some("refs/heads/feat"),
+    )
+    .unwrap();
     assert_eq!(
         p.base.commit.as_ref(),
         Some(&main_tip),
@@ -65,7 +95,14 @@ fn branch_policy_changes_wait_for_the_merge_l2() {
     sb.git(&repo, &["checkout", "-q", "main"]);
     sb.git(&repo, &["merge", "-q", "--no-verify", "--ff-only", "feat"]);
     let tip = rev(&sb, &repo, "HEAD");
-    let p = policy::resolve(&git, &entries, Some(&tip), &[], Some("refs/heads/main")).unwrap();
+    let p = policy::resolve(
+        &git,
+        &entries,
+        Some(&tip),
+        &RemoteRefs::none(),
+        Some("refs/heads/main"),
+    )
+    .unwrap();
     assert_eq!(p.base.commit.as_ref(), Some(&tip));
     assert!(p.config.steps.is_empty());
     assert!(p.line().is_none());
@@ -97,7 +134,7 @@ fn trusted_remote_full_refs_anchor_first_l2() {
         &git,
         &entries,
         Some(&tip),
-        &["origin".to_owned()],
+        &trusted(&sb, &remote),
         Some("refs/heads/main"),
     )
     .unwrap();
@@ -119,7 +156,7 @@ fn trusted_remote_full_refs_anchor_first_l2() {
         &git,
         &entries,
         Some(&tip),
-        &["origin".to_owned()],
+        &trusted(&sb, &remote),
         Some("refs/heads/main"),
     )
     .unwrap();
@@ -137,7 +174,14 @@ fn no_anchor_uses_the_tip_and_unborn_uses_the_tree_l2_r65() {
     let git = Git::scrubbed(&sb.env(), &repo);
     let tree = git.write_tree().unwrap();
     let entries = git.ls_tree(&tree).unwrap();
-    let p = policy::resolve(&git, &entries, None, &[], Some("refs/heads/feat")).unwrap();
+    let p = policy::resolve(
+        &git,
+        &entries,
+        None,
+        &RemoteRefs::none(),
+        Some("refs/heads/feat"),
+    )
+    .unwrap();
     assert_eq!(p.base.commit, None);
     assert_eq!(p.source, ConfigSource::Detected);
     assert_eq!(p.config.steps.len(), 4, "detected Rust steps");
@@ -149,7 +193,14 @@ fn no_anchor_uses_the_tip_and_unborn_uses_the_tree_l2_r65() {
     );
     sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "c"]);
     let tip = rev(&sb, &repo, "HEAD");
-    let p = policy::resolve(&git, &entries, Some(&tip), &[], Some("refs/heads/feat")).unwrap();
+    let p = policy::resolve(
+        &git,
+        &entries,
+        Some(&tip),
+        &RemoteRefs::none(),
+        Some("refs/heads/feat"),
+    )
+    .unwrap();
     assert_eq!(p.base.commit.as_ref(), Some(&tip), "no anchor: N itself");
     let _ = RepoConfig::default();
 }
@@ -170,14 +221,14 @@ fn resolve_at(
     sb: &Sandbox,
     repo: &Path,
     tip: &tollgate::gitx::Oid,
-    trusted: &[String],
+    remotes: &RemoteRefs,
     own: &str,
 ) -> Result<policy::Policy, policy::PolicyError> {
     let git = Git::scrubbed(&sb.env(), repo);
     let entries = git
         .ls_tree(&git.tree_of(tip.as_str()).unwrap().unwrap())
         .unwrap();
-    policy::resolve(&git, &entries, Some(tip), trusted, Some(own))
+    policy::resolve(&git, &entries, Some(tip), remotes, Some(own))
 }
 
 #[test]
@@ -188,7 +239,7 @@ fn a_branch_made_at_the_own_tip_does_not_anchor_l2() {
     // is not main.
     sb.git(&repo, &["branch", "integration/x", "HEAD"]);
     sb.git(&repo, &["branch", "Main", "HEAD"]);
-    let p = resolve_at(&sb, &repo, &tip, &[], "refs/heads/feat").unwrap();
+    let p = resolve_at(&sb, &repo, &tip, &RemoteRefs::none(), "refs/heads/feat").unwrap();
     assert_eq!(p.base.commit.as_ref(), Some(&main_tip));
     assert_eq!(p.base.anchor.as_deref(), Some("refs/heads/main"));
     assert_eq!(p.config.steps.len(), 1, "main's policy applies");
@@ -196,7 +247,7 @@ fn a_branch_made_at_the_own_tip_does_not_anchor_l2() {
     // `master` created at the own tip: main has priority, and one
     // merge-base per anchor (not one across all anchors).
     sb.git(&repo, &["branch", "master", "HEAD"]);
-    let p = resolve_at(&sb, &repo, &tip, &[], "refs/heads/feat").unwrap();
+    let p = resolve_at(&sb, &repo, &tip, &RemoteRefs::none(), "refs/heads/feat").unwrap();
     assert_eq!(p.base.commit.as_ref(), Some(&main_tip));
 }
 
@@ -207,14 +258,21 @@ fn a_local_anchor_that_contains_the_tip_is_skipped_l2() {
     // The repo's anchor is `master`; the agent creates `main` at its tip.
     sb.git(&repo, &["branch", "-m", "main", "master"]);
     sb.git(&repo, &["branch", "main", "HEAD"]);
-    let p = resolve_at(&sb, &repo, &tip, &[], "refs/heads/feat").unwrap();
+    let p = resolve_at(&sb, &repo, &tip, &RemoteRefs::none(), "refs/heads/feat").unwrap();
     assert_eq!(p.base.commit.as_ref(), Some(&main_tip));
     assert_eq!(p.base.anchor.as_deref(), Some("refs/heads/master"));
     assert_eq!(p.config.steps.len(), 1);
 
     // The job's own ref is never its anchor: on `master` itself with no
     // other anchor, N itself.
-    let p = resolve_at(&sb, &repo, &main_tip, &[], "refs/heads/master").unwrap();
+    let p = resolve_at(
+        &sb,
+        &repo,
+        &main_tip,
+        &RemoteRefs::none(),
+        "refs/heads/master",
+    )
+    .unwrap();
     assert_eq!(p.base.commit.as_ref(), Some(&main_tip));
 }
 
@@ -222,17 +280,10 @@ fn a_local_anchor_that_contains_the_tip_is_skipped_l2() {
 fn trusted_remotes_without_fetched_anchors_deny_l2() {
     let sb = Sandbox::new();
     let (repo, _, tip) = weakened_branch(&sb);
-    sb.git(
-        &repo,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://gitlab.com/victorkwak/r.git",
-        ],
-    );
+    let bare = bare_origin(&sb, &repo, "remotes/trusted.git");
+    let origin = trusted(&sb, &bare);
     // Local main exists, but trusted remotes never fall back to local refs.
-    let err = resolve_at(&sb, &repo, &tip, &["origin".to_owned()], "refs/heads/feat")
+    let err = resolve_at(&sb, &repo, &tip, &origin, "refs/heads/feat")
         .expect_err("no fetched anchor must deny");
     assert!(
         matches!(err, policy::PolicyError::NoAnchor(_))
@@ -241,21 +292,99 @@ fn trusted_remotes_without_fetched_anchors_deny_l2() {
     );
     // origin/master alone is enough; origin/main ranks first when both
     // exist.
-    let first = rev(&sb, &repo, "main");
-    sb.git(
-        &repo,
-        &["update-ref", "refs/remotes/origin/master", first.as_str()],
-    );
-    let p = resolve_at(&sb, &repo, &tip, &["origin".to_owned()], "refs/heads/feat").unwrap();
+    sb.git(&repo, &["push", "-q", "origin", "main:master"]);
+    sb.git(&repo, &["fetch", "-q", "origin"]);
+    let p = resolve_at(&sb, &repo, &tip, &origin, "refs/heads/feat").unwrap();
     assert_eq!(p.base.anchor.as_deref(), Some("refs/remotes/origin/master"));
     let root = rev(&sb, &repo, "main~1");
-    sb.git(
-        &repo,
-        &["update-ref", "refs/remotes/origin/main", root.as_str()],
-    );
-    let p = resolve_at(&sb, &repo, &tip, &["origin".to_owned()], "refs/heads/feat").unwrap();
+    sb.git(&repo, &["push", "-q", "origin", "main~1:refs/heads/main"]);
+    sb.git(&repo, &["fetch", "-q", "origin"]);
+    // A new process (each hook is one) asks the server again.
+    let origin = trusted(&sb, &bare);
+    let p = resolve_at(&sb, &repo, &tip, &origin, "refs/heads/feat").unwrap();
     assert_eq!(p.base.anchor.as_deref(), Some("refs/remotes/origin/main"));
     assert_eq!(p.base.commit.as_ref(), Some(&root));
+}
+
+/// L2, X1: forged remote-tracking anchors. `git fetch .`, `git fetch
+/// <path>` and `git update-ref` write `refs/remotes/origin/*` (with any
+/// reflog message); only the newest value the trusted server reported
+/// counts, and a server that confirms nothing denies.
+#[test]
+fn forged_remote_tracking_anchors_are_not_trusted_l2() {
+    let sb = Sandbox::new();
+    let (repo, main_tip, tip) = weakened_branch(&sb);
+    let bare = bare_origin(&sb, &repo, "remotes/trusted.git");
+    sb.git(&repo, &["push", "-q", "origin", "main"]);
+    sb.git(&repo, &["fetch", "-q", "origin"]);
+    let origin = trusted(&sb, &bare);
+    let check = |what: &str| {
+        let p = resolve_at(&sb, &repo, &tip, &origin, "refs/heads/feat").unwrap();
+        assert_eq!(p.base.commit.as_ref(), Some(&main_tip), "{what}");
+        assert_eq!(p.config.steps.len(), 1, "{what}: main's policy applies");
+    };
+    check("fetched");
+    sb.git(
+        &repo,
+        &["fetch", "-q", ".", "+feat:refs/remotes/origin/main"],
+    );
+    assert_eq!(rev(&sb, &repo, "origin/main"), tip);
+    check("fetch .");
+    sb.git(
+        &repo,
+        &[
+            "update-ref",
+            "-m",
+            "fetch origin: fast-forward",
+            "refs/remotes/origin/main",
+            tip.as_str(),
+        ],
+    );
+    check("update-ref");
+    // A forged origin/master, which the server does not have, is no
+    // anchor either: origin/main (confirmed) ranks first anyway, and with
+    // origin/main gone origin/master alone is unconfirmed: deny.
+    sb.git(
+        &repo,
+        &["update-ref", "refs/remotes/origin/master", tip.as_str()],
+    );
+    check("forged master");
+    sb.git(&repo, &["update-ref", "-d", "refs/remotes/origin/main"]);
+    let err = resolve_at(&sb, &repo, &tip, &origin, "refs/heads/feat")
+        .expect_err("an unconfirmed anchor only");
+    assert!(
+        matches!(err, policy::PolicyError::NoAnchor(_))
+            && err.to_string().contains("confirms no value")
+            && err.to_string().contains("no branch master"),
+        "{err}"
+    );
+    // A repo that has the server's value through another fetch: a forged
+    // tracking ref is ignored, the confirmed value decides.
+    sb.git(&repo, &["update-ref", "-d", "refs/remotes/origin/master"]);
+    sb.git(
+        &repo,
+        &[
+            "fetch",
+            "-q",
+            bare.to_str().unwrap(),
+            "+main:refs/remotes/origin/main",
+        ],
+    );
+    check("refetched");
+    // An unreachable server and no value it reported before: deny.
+    let sb2 = Sandbox::new();
+    let (repo2, _, tip2) = weakened_branch(&sb2);
+    let gone = sb2.root().join("remotes/gone.git");
+    sb2.git(&repo2, &["update-ref", "refs/remotes/origin/main", "main"]);
+    let err = resolve_at(
+        &sb2,
+        &repo2,
+        &tip2,
+        &trusted(&sb2, &gone),
+        "refs/heads/feat",
+    )
+    .expect_err("no server");
+    assert!(err.to_string().contains("ls-remote"), "{err}");
 }
 
 #[test]
@@ -276,13 +405,13 @@ fn the_anchor_commits_config_names_the_anchors_l2() {
     // No default anchor exists: N itself first, whose config names no
     // other anchor (WEAK_POLICY), so the branch's own policy applies until
     // a default anchor exists.
-    let p = resolve_at(&sb, &repo, &tip, &[], "refs/heads/feat").unwrap();
+    let p = resolve_at(&sb, &repo, &tip, &RemoteRefs::none(), "refs/heads/feat").unwrap();
     assert_eq!(p.base.commit.as_ref(), Some(&tip));
     // With `main` at trunk's tip, main's config names `trunk`.
     sb.git(&repo, &["branch", "main", trunk.as_str()]);
     sb.commit_file(&repo, "x.txt", "x", "more");
     let tip = rev(&sb, &repo, "HEAD");
-    let p = resolve_at(&sb, &repo, &tip, &[], "refs/heads/feat").unwrap();
+    let p = resolve_at(&sb, &repo, &tip, &RemoteRefs::none(), "refs/heads/feat").unwrap();
     assert_eq!(p.base.commit.as_ref(), Some(&trunk));
     assert_eq!(p.config.steps.len(), 1);
 }
@@ -304,7 +433,7 @@ fn anchors_named_by_the_policy_that_do_not_exist_keep_the_first_pass_l2() {
     let tip = rev(&sb, &repo, "HEAD");
     // The second pass finds no anchor: the first pass (main) still
     // decides, never the branch's own tip.
-    let p = resolve_at(&sb, &repo, &tip, &[], "refs/heads/feat").unwrap();
+    let p = resolve_at(&sb, &repo, &tip, &RemoteRefs::none(), "refs/heads/feat").unwrap();
     assert_eq!(p.base.commit.as_ref(), Some(&main_tip));
     assert_eq!(p.base.anchor.as_deref(), Some("refs/heads/main"));
     assert_eq!(p.config.steps.len(), 1, "main's policy applies");
@@ -338,7 +467,7 @@ fn tool_configs_come_from_the_policy_commit_r71() {
     );
     sb.commit_file(&repo, "src/fine.rs", "\n", "code");
     let tip = rev(&sb, &repo, "HEAD");
-    let p = resolve_at(&sb, &repo, &tip, &[], "refs/heads/feat").unwrap();
+    let p = resolve_at(&sb, &repo, &tip, &RemoteRefs::none(), "refs/heads/feat").unwrap();
     assert_eq!(p.base.commit.as_ref(), Some(&main_tip));
     assert_eq!(
         p.changed,
@@ -374,6 +503,13 @@ fn tool_configs_come_from_the_policy_commit_r71() {
         ]
     );
     // On the anchor itself nothing differs.
-    let p = resolve_at(&sb, &repo, &main_tip, &[], "refs/heads/feat").unwrap();
+    let p = resolve_at(
+        &sb,
+        &repo,
+        &main_tip,
+        &RemoteRefs::none(),
+        "refs/heads/feat",
+    )
+    .unwrap();
     assert!(p.overlay.is_empty() && p.changed.is_empty());
 }

@@ -28,6 +28,7 @@ use crate::gitx::{Git, GitError, Oid, RepoLayout};
 use crate::ids::{JobId, ResourceName};
 use crate::locks::Priority;
 use crate::policy::{self, PolicyError};
+use crate::remote_refs::{RemoteRefs, TrustedRemote};
 use crate::report::JobReport;
 use crate::runner::env::{BaseInputs, EnvFile, JobEnv};
 use crate::runner::job::{JobSpec, PolicySpec, SPEC_SCHEMA};
@@ -364,8 +365,11 @@ pub fn remote_urls(git: &Git) -> Result<Vec<RemoteUrls>, PlanError> {
 pub struct RemoteTrust {
     /// Remotes whose fetch URL, as git uses it, is trusted: their
     /// remote-tracking refs (L2 anchors, R56) and `ls-remote` answers
-    /// (R14(2)) come from the trusted server.
+    /// (R14(2)) come from the trusted server, once it confirms them
+    /// ([`RemoteRefs`]).
     pub trusted: Vec<String>,
+    /// The same remotes with that fetch URL.
+    pub trusted_urls: Vec<TrustedRemote>,
     /// Remotes with any trusted URL, configured or as git uses it: a push
     /// to one is a push to a trusted remote (R5, R20), wherever a
     /// `pushInsteadOf` sends it.
@@ -399,8 +403,12 @@ pub fn remote_trust(git: &Git, scope: &CompiledScope) -> Result<RemoteTrust, Pla
                 r.fetch.first().map_or("nowhere", String::as_str)
             )));
         }
-        if fetch {
+        if let (true, Some(url)) = (fetch, r.fetch.first()) {
             t.trusted.push(r.name.clone());
+            t.trusted_urls.push(TrustedRemote {
+                name: r.name.clone(),
+                url: url.clone(),
+            });
         }
         if fetch || configured.is_some() || r.push.iter().any(|u| scope.remote_trusted(u)) {
             t.push_trusted.push(r.name.clone());
@@ -420,14 +428,22 @@ pub fn trusted_remotes(git: &Git, scope: &CompiledScope) -> Result<Vec<String>, 
     remote_trust(git, scope).map(|t| t.trusted)
 }
 
+/// The trusted remotes of `trust` with the record of what their server
+/// reported (L2, R56).
+#[must_use]
+pub fn remote_refs(dirs: &Dirs, env: &EnvSnapshot, trust: &RemoteTrust) -> RemoteRefs {
+    RemoteRefs::new(dirs, env, trust.trusted_urls.clone())
+}
+
 /// R56: a base is trusted when its tree has a pass at `fast` or above, or
-/// its commit is reachable from a trusted remote-tracking ref.
+/// its commit is reachable from a trusted remote-tracking ref whose value
+/// the trusted server reported (a forged tracking ref does not count).
 fn base_trusted(
     git: &Git,
     store: &RecordStore,
     base: &Base,
     fp: &Fingerprint,
-    trusted: &[String],
+    remotes: &RemoteRefs,
 ) -> Result<bool, PlanError> {
     for tier in [Tier::Full, Tier::Fast] {
         let key = record_key(&base.tree, tier, fp);
@@ -441,18 +457,32 @@ fn base_trusted(
         }
     }
     if let Some(c) = &base.commit
-        && !trusted.is_empty()
+        && !remotes.is_empty()
     {
         let mut args = vec![
             "for-each-ref".to_owned(),
-            "--count=1".to_owned(),
             format!("--contains={c}"),
-            "--format=%(refname)".to_owned(),
+            "--format=%(objectname) %(refname)".to_owned(),
         ];
-        args.extend(trusted.iter().map(|r| format!("refs/remotes/{r}/")));
+        args.extend(
+            remotes
+                .remotes()
+                .iter()
+                .map(|r| format!("refs/remotes/{}/", r.name)),
+        );
         let out = git.run(&args)?;
-        if !out.trim_ascii().is_empty() {
-            return Ok(true);
+        for line in String::from_utf8_lossy(&out).lines() {
+            let Some((oid, refname)) = line.split_once(' ') else {
+                continue;
+            };
+            let (Ok(oid), Some((remote, branch))) =
+                (Oid::parse(oid), remotes.split_tracking(refname))
+            else {
+                continue;
+            };
+            if remotes.is_reported(remote, branch, &oid) {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -492,13 +522,13 @@ fn exact_selection(
 pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
     let host = &req.host.config;
     let scope = CompiledScope::new(&host.scope, req.dirs).map_err(PlanError::Config)?;
-    let trusted = trusted_remotes(req.git, &scope)?;
+    let remotes = remote_refs(req.dirs, req.env, &remote_trust(req.git, &scope)?);
     let entries = req.git.ls_tree(&req.tree)?;
     let policy = policy::resolve(
         req.git,
         &entries,
         req.tip.as_ref(),
-        &trusted,
+        &remotes,
         Some(&req.refname),
     )?;
     let config = &policy.config;
@@ -581,7 +611,7 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
                     Some("the base is the empty tree (R56)".to_owned()),
                     Needed::Exact(Selection::All),
                 )
-            } else if base_trusted(req.git, &store, b, &fp, &trusted)? {
+            } else if base_trusted(req.git, &store, b, &fp, &remotes)? {
                 let needed = exact_selection(req, config, &entries, &b.tree, &fp)
                     .map_or_else(|| Needed::SameBase(b.tree.clone()), Needed::Exact);
                 (true, None, needed)

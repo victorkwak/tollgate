@@ -653,7 +653,7 @@ fn an_attached_check_with_another_selection_runs_its_own_job_r79_r88() {
     host(
         &sb,
         &format!(
-            "[scope]\nremotes = [\"*example.invalid*\"]\n[job.env]\nGO = \"{}\"\n",
+            "[scope]\nremotes = [\"*/remotes/trusted*\"]\n[job.env]\nGO = \"{}\"\n",
             go.display()
         ),
     );
@@ -680,18 +680,32 @@ when = ["b/**"]
     sb.commit_file(&repo, "a/x", "a1\n", "a");
     sb.commit_file(&repo, "b/y", "b1\n", "R0");
     let r0 = sb.git(&repo, &["rev-parse", "HEAD"]);
-    sb.git(
-        &repo,
-        &["remote", "add", "origin", "https://example.invalid/r.git"],
-    );
-    sb.git(&repo, &["update-ref", "refs/remotes/origin/main", &r0]);
-    // X: b broken; W: a changed. Both are reachable from a trusted remote
-    // ref, so each is a trusted base (R56).
+    let bare = trusted_bare(&sb, &repo);
+    // X: b broken; W: a changed. Both are on the trusted remote, so each
+    // is a trusted base (R56).
     let x = sb.commit_file(&repo, "b/y", "bad\n", "X");
     sb.git(&repo, &["checkout", "-q", &r0]);
     let w = sb.commit_file(&repo, "a/x", "a2\n", "W");
-    sb.git(&repo, &["update-ref", "refs/remotes/origin/x", &x]);
-    sb.git(&repo, &["update-ref", "refs/remotes/origin/w", &w]);
+    for (oid, branch) in [(&r0, "main"), (&x, "x"), (&w, "w")] {
+        sb.git(
+            &repo,
+            &[
+                "push",
+                "-q",
+                "origin",
+                &format!("{oid}:refs/heads/{branch}"),
+            ],
+        );
+    }
+    sb.git(
+        &repo,
+        &[
+            "fetch",
+            "-q",
+            bare.to_str().unwrap(),
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
     // wt1: HEAD X, index T (only a/ changed: stepA). wt2: HEAD W, index T
     // (only b/ changed: stepB, which fails on T).
     sb.git(&repo, &["checkout", "-q", &x]);
@@ -746,19 +760,88 @@ when = ["b/**"]
     assert_eq!(w1.code, Some(0), "wt1 needs only stepA: {}", w1.out);
 }
 
+/// A bare repo at `<root>/remotes/trusted.git` (it matches the
+/// `*/remotes/trusted*` scope glob) as `origin` of `repo`.
+fn trusted_bare(sb: &Sandbox, repo: &Path) -> std::path::PathBuf {
+    let bare = sb.root().join("remotes/trusted.git");
+    sb.git(
+        &sb.root(),
+        &["init", "-q", "--bare", bare.to_str().unwrap()],
+    );
+    sb.git(repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    bare
+}
+
 /// A repo whose `main` is also `origin/main` of a trusted remote, so every
 /// commit on it is a trusted base (R56) without a record.
 fn trusted_repo(sb: &Sandbox, policy: &str) -> std::path::PathBuf {
-    host(sb, "[scope]\nremotes = [\"*example.invalid*\"]\n");
+    host(sb, "[scope]\nremotes = [\"*/remotes/trusted*\"]\n");
     let repo = repo_with(sb, "r", policy);
-    sb.git(
-        &repo,
-        &["remote", "add", "origin", "https://example.invalid/r.git"],
-    );
-    let head = sb.git(&repo, &["rev-parse", "HEAD"]);
-    sb.git(&repo, &["update-ref", "refs/remotes/origin/main", &head]);
+    trusted_bare(sb, &repo);
+    sb.git(&repo, &["push", "-q", "origin", "main"]);
+    sb.git(&repo, &["fetch", "-q", "origin"]);
     repo
 }
+
+/// R56, X1: a base counts as trusted through a remote-tracking ref only
+/// when the trusted server reported that ref's value; `update-ref` or
+/// `fetch .` into `refs/remotes/origin/*` does not turn selection on.
+#[test]
+fn a_forged_tracking_ref_does_not_trust_a_base_r56() {
+    use tollgate::plan::{Base, PlanRequest};
+
+    let sb = Sandbox::new();
+    let repo = trusted_repo(&sb, PASS_POLICY);
+    let main = sb.git(&repo, &["rev-parse", "HEAD"]);
+    sb.commit_file(&repo, "x.txt", "1\n", "X, never pushed");
+    let x = sb.git(&repo, &["rev-parse", "HEAD"]);
+    sb.git(&repo, &["update-ref", "refs/remotes/origin/x", &x]);
+    sb.git(&repo, &["fetch", "-q", ".", "+HEAD:refs/remotes/origin/y"]);
+    sb.commit_file(&repo, "y.txt", "1\n", "Y");
+    let env = sb.env();
+    let dirs = tollgate::dirs::Dirs::from_env(&env).unwrap();
+    let host = tollgate::config::HostConfig::load(&dirs).unwrap();
+    let git = tollgate::gitx::Git::scrubbed(&env, &repo);
+    let layout = tollgate::gitx::RepoLayout::discover(&git).unwrap();
+    let oid = |r: &str| tollgate::gitx::Oid::parse(&sb.git(&repo, &["rev-parse", r])).unwrap();
+    let plan_on = |base: &str| {
+        tollgate::plan::plan(&PlanRequest {
+            env: &env,
+            dirs: &dirs,
+            host: &host,
+            layout: &layout,
+            git: &git,
+            tree: oid("HEAD^{tree}"),
+            tier: tollgate::config::Tier::Fast,
+            tip: Some(oid("HEAD")),
+            base: Some(Base {
+                tree: oid(&format!("{base}^{{tree}}")),
+                commit: Some(oid(base)),
+            }),
+            refname: "refs/heads/main".into(),
+            allow_reuse: true,
+            priority: tollgate::locks::Priority::Hook,
+            rerun: false,
+        })
+        .unwrap()
+    };
+    let forged = plan_on(&x);
+    assert!(!forged.spec.select, "{:?}", forged.spec.select_note);
+    assert!(
+        forged
+            .spec
+            .select_note
+            .as_deref()
+            .is_some_and(|n| n.contains("R56")),
+        "{:?}",
+        forged.spec.select_note
+    );
+    // The fetched main is on the server: selection on.
+    assert!(plan_on(&main).spec.select);
+}
+
+const PASS_POLICY: &str =
+    "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n";
 
 #[test]
 fn a_docs_only_change_still_needs_a_valid_policy_r64_r61() {
