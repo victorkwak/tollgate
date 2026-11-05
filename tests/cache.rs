@@ -199,6 +199,7 @@ fn subset(packages: &[&str]) -> Selection {
     Selection::Subset(SubsetSelection {
         base: tree(9),
         packages: packages.iter().map(|s| (*s).to_owned()).collect(),
+        marked: packages.iter().map(|s| (*s).to_owned()).collect(),
         roots: BTreeSet::new(),
         steps: ["clippy".to_owned(), "tests".to_owned()].into(),
     })
@@ -239,6 +240,7 @@ impl Store {
             }],
             flaky: vec![],
             quarantine_hits: vec![],
+            reused: false,
         }
     }
 
@@ -260,9 +262,52 @@ impl Store {
                 fingerprint: &self.fp,
                 needed: &Needed::Exact(needed.clone()),
                 now,
+                fresh_only: false,
             })
             .unwrap()
     }
+
+    fn lookup_fresh(&self, tree: &Oid) -> Lookup {
+        self.store
+            .lookup(&LookupRequest {
+                tree,
+                tier: Tier::Full,
+                fingerprint: &self.fp,
+                needed: &Needed::Exact(Selection::All),
+                now: jiff::Timestamp::now(),
+                fresh_only: true,
+            })
+            .unwrap()
+    }
+}
+
+#[test]
+fn a_full_pass_with_reused_steps_does_not_answer_a_full_ref_l16() {
+    let sb = Sandbox::new();
+    let s = store(&sb);
+    let t = tree(1);
+    let mut reused = s.record(&t, Tier::Full, Verdict::Pass, Selection::All);
+    reused.reused = true;
+    assert_eq!(s.store.write(&reused).unwrap(), WriteOutcome::Written);
+    // A feature branch's full check and any fast check accept it.
+    assert!(matches!(
+        s.lookup(&t, Tier::Full, &Selection::All),
+        Lookup::Pass(_)
+    ));
+    assert!(matches!(
+        s.lookup(&t, Tier::Fast, &subset(&["a"])),
+        Lookup::Pass(_)
+    ));
+    // A full ref (merge, push to main) needs every step fresh.
+    assert_eq!(s.lookup_fresh(&t), Lookup::Miss);
+    let fresh = s.record(&t, Tier::Full, Verdict::Pass, Selection::All);
+    assert_eq!(s.store.write(&fresh).unwrap(), WriteOutcome::Written);
+    assert_eq!(s.lookup_fresh(&t), Lookup::Pass(fresh.clone()));
+    // A later reused pass never replaces the fresh one.
+    let mut again = s.record(&t, Tier::Full, Verdict::Pass, Selection::All);
+    again.reused = true;
+    assert_eq!(s.store.write(&again).unwrap(), WriteOutcome::KeptBroader);
+    assert_eq!(s.lookup_fresh(&t), Lookup::Pass(fresh));
 }
 
 #[test]

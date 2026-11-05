@@ -739,6 +739,9 @@ impl Runner<'_> {
                 fingerprint: &self.spec.fingerprint,
                 needed: &Needed::Exact(self.record_selection.clone()),
                 now: jiff::Timestamp::now(),
+                // L16: a full job that may not reuse accepts only a fresh
+                // full pass.
+                fresh_only: self.spec.tier == Tier::Full && !self.spec.allow_reuse,
             })
             .ok()?;
         match found {
@@ -1367,6 +1370,7 @@ impl Runner<'_> {
                 .iter()
                 .map(|q: &QuarantineHit| q.test.clone())
                 .collect(),
+            reused: self.reused,
         };
         match RecordStore::new(self.dirs).write(&record) {
             Ok(_) => {

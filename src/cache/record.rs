@@ -92,8 +92,13 @@ pub enum Selection {
 pub struct SubsetSelection {
     /// Base tree of the diff (R55).
     pub base: Oid,
-    /// Selected Rust packages.
+    /// Selected Rust packages: the reverse-dependency closure that was
+    /// built and tested (R57e).
     pub packages: BTreeSet<String>,
+    /// Marked Rust packages (R57): the filterset roots, which decide which
+    /// integration tests ran in `rdeps-unit+changed-integration` (R58).
+    #[serde(default)]
+    pub marked: BTreeSet<String>,
     /// Selected TS and Python roots.
     pub roots: BTreeSet<String>,
     /// Steps that ran.
@@ -112,6 +117,7 @@ impl Selection {
             (Self::Subset(_), Self::All) => false,
             (Self::Subset(have), Self::Subset(need)) => {
                 have.packages.is_superset(&need.packages)
+                    && have.marked.is_superset(&need.marked)
                     && have.roots.is_superset(&need.roots)
                     && have.steps.is_superset(&need.steps)
             }
@@ -244,6 +250,11 @@ pub struct Record {
     /// Quarantined tests that failed (R93).
     #[serde(default)]
     pub quarantine_hits: Vec<String>,
+    /// L16: at least one step result was reused from another job. A `full`
+    /// lookup for a full ref (merge, push to `main`) accepts only a record
+    /// whose steps all ran fresh.
+    #[serde(default)]
+    pub reused: bool,
 }
 
 impl Record {
@@ -269,6 +280,7 @@ mod tests {
         Selection::Subset(SubsetSelection {
             base: Oid::parse(&"0".repeat(40)).unwrap(),
             packages: packages.iter().map(|s| (*s).to_owned()).collect(),
+            marked: packages.iter().map(|s| (*s).to_owned()).collect(),
             roots: BTreeSet::new(),
             steps: steps.iter().map(|s| (*s).to_owned()).collect(),
         })
@@ -287,6 +299,22 @@ mod tests {
             "T35: one-crate record must not hit a two-crate diff"
         );
         assert!(!subset(&["a", "b"], &["tests"]).covers(&a));
+    }
+
+    #[test]
+    fn covers_compares_the_marked_set_r79_r80() {
+        // api depends on core. Marked {core}: affected {core, api}, but
+        // only core's integration tests ran (rdeps-unit+changed-integration).
+        let with = |marked: &[&str]| {
+            let Selection::Subset(mut s) = subset(&["api", "core"], &["tests"]) else {
+                unreachable!()
+            };
+            s.marked = marked.iter().map(|m| (*m).to_owned()).collect();
+            Selection::Subset(s)
+        };
+        assert!(!with(&["core"]).covers(&with(&["api", "core"])));
+        assert!(!with(&["core"]).covers(&with(&["api"])));
+        assert!(with(&["api", "core"]).covers(&with(&["core"])));
     }
 
     #[test]

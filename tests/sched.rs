@@ -344,3 +344,38 @@ fn cancel_ends_queued_jobs_and_flags_running_ones_r89_t39() {
         .collect();
     assert!(names.is_empty(), "{names:?}");
 }
+
+#[test]
+fn a_held_key_of_an_ended_job_is_not_a_running_job_r88() {
+    let sb = Sandbox::new();
+    let state = sb.root().join("state");
+    let dirs = dirs_at(&state);
+    let store = JobStore::new(&dirs);
+    let k = key(3);
+    let ended = job_id(30);
+    let origin = Origin {
+        worktree: "/r/wt".into(),
+        refname: "refs/heads/feat".into(),
+    };
+    let mut m = meta(ended.clone(), k.clone(), 3, Tier::Fast, &origin, 0);
+    m.state = JobState::Finished {
+        verdict: Verdict::Pass,
+    };
+    store.create(&m).unwrap();
+    // The ended job's id is still in the key file, and someone holds the
+    // lock for a moment (a waiter probing it, or the runner on its way
+    // out): the claim waits for it instead of attaching to the old job.
+    let Claim::Owner(c) = sched::claim_job(&dirs, &k, &ended).unwrap() else {
+        panic!("free key");
+    };
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        drop(c);
+    });
+    let got = sched::claim_job(&dirs, &k, &job_id(31)).unwrap();
+    holder.join().unwrap();
+    match got {
+        Claim::Owner(c) => assert_eq!(c.job(), &job_id(31)),
+        other => panic!("attached to an ended job: {other:?}"),
+    }
+}

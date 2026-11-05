@@ -604,3 +604,144 @@ fn steps_must_leave_the_checkout_as_read_and_are_not_reused_r42_l16() {
         );
     }
 }
+
+#[test]
+fn a_full_ref_never_takes_a_full_pass_with_reused_steps_l16() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"t\"\nkind = \"command\"\nrun = \"test ! -e b/bad\"\ninputs = [\"a/**\"]\n",
+    );
+    sb.commit_file(&repo, "a/x", "1\n", "a");
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(&repo, "a/x", "2\n", "c1");
+    let r = sb.tollgate(
+        &repo,
+        &["check", "--tier", "full", "--rev", "HEAD", "--wait"],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    // c2 changes nothing under the step's inputs (a wrong inputs list): a
+    // feature branch's full job may reuse the pass (L16).
+    sb.commit_file(&repo, "b/bad", "x\n", "c2 adds b/bad");
+    let r = sb.tollgate(
+        &repo,
+        &["check", "--tier", "full", "--rev", "HEAD", "--wait"],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(r.out.contains("REUSED t"), "{}", r.out);
+    let reused_job = job_id(&r.out);
+    // On main the same tree needs every step fresh: no hit, no attach to
+    // the reused record; the step runs and fails.
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    sb.git(&repo, &["merge", "-q", "--no-verify", "--ff-only", "feat"]);
+    let r = sb.tollgate(
+        &repo,
+        &["check", "--tier", "full", "--rev", "main", "--wait"],
+    );
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(!r.out.contains("REUSED"), "{}", r.out);
+    assert!(!r.out.contains(&reused_job), "{}", r.out);
+    assert!(r.out.contains("step t: fail"), "{}", r.out);
+}
+
+#[test]
+fn an_attached_check_with_another_selection_runs_its_own_job_r79_r88() {
+    let sb = Sandbox::new();
+    let go = sb.root().join("go");
+    host(
+        &sb,
+        &format!(
+            "[scope]\nremotes = [\"*example.invalid*\"]\n[job.env]\nGO = \"{}\"\n",
+            go.display()
+        ),
+    );
+    let repo = sb.root().join("r");
+    std::fs::create_dir_all(&repo).unwrap();
+    sb.git(&repo, &["init", "-q"]);
+    sb.commit_file(
+        &repo,
+        "tollgate.toml",
+        r#"version = 1
+[[step]]
+name = "stepA"
+kind = "command"
+run = "touch $TMPDIR/../a-started; while [ ! -e $GO ]; do sleep 0.05; done"
+when = ["a/**"]
+[[step]]
+name = "stepB"
+kind = "command"
+run = "! grep -q bad b/y"
+when = ["b/**"]
+"#,
+        "policy",
+    );
+    sb.commit_file(&repo, "a/x", "a1\n", "a");
+    sb.commit_file(&repo, "b/y", "b1\n", "R0");
+    let r0 = sb.git(&repo, &["rev-parse", "HEAD"]);
+    sb.git(
+        &repo,
+        &["remote", "add", "origin", "https://example.invalid/r.git"],
+    );
+    sb.git(&repo, &["update-ref", "refs/remotes/origin/main", &r0]);
+    // X: b broken; W: a changed. Both are reachable from a trusted remote
+    // ref, so each is a trusted base (R56).
+    let x = sb.commit_file(&repo, "b/y", "bad\n", "X");
+    sb.git(&repo, &["checkout", "-q", &r0]);
+    let w = sb.commit_file(&repo, "a/x", "a2\n", "W");
+    sb.git(&repo, &["update-ref", "refs/remotes/origin/x", &x]);
+    sb.git(&repo, &["update-ref", "refs/remotes/origin/w", &w]);
+    // wt1: HEAD X, index T (only a/ changed: stepA). wt2: HEAD W, index T
+    // (only b/ changed: stepB, which fails on T).
+    sb.git(&repo, &["checkout", "-q", &x]);
+    std::fs::write(repo.join("a/x"), "a2\n").unwrap();
+    sb.git(&repo, &["add", "-A"]);
+    let wt2 = sb.root().join("wt2");
+    sb.git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            wt2.to_str().unwrap(),
+            &w,
+        ],
+    );
+    std::fs::write(wt2.join("b/y"), "bad\n").unwrap();
+    sb.git(&wt2, &["add", "-A"]);
+    assert_eq!(
+        sb.git(&repo, &["write-tree"]),
+        sb.git(&wt2, &["write-tree"])
+    );
+
+    let first = sb.tollgate(&repo, &["check", "--detach"]);
+    assert_eq!(first.code, Some(0), "{}", first.out);
+    let job1 = job_id(&first.out);
+    let job_dir = sb.state().join("jobs").join(&job1);
+    assert!(eventually(20, || job_dir.join("a-started").exists()));
+    std::thread::scope(|s| {
+        let second = s.spawn(|| sb.tollgate(&wt2, &["check", "--wait"]));
+        let waiting = || {
+            std::fs::read_dir(job_dir.join("waiters"))
+                .map(|rd| {
+                    rd.flatten()
+                        .any(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                })
+                .unwrap_or(false)
+        };
+        assert!(eventually(20, waiting), "wt2 never attached");
+        std::fs::write(&go, "").unwrap();
+        let r = second.join().unwrap();
+        assert!(
+            r.out.contains(&format!("attached to running job {job1}")),
+            "{}",
+            r.out
+        );
+        assert_eq!(r.code, Some(1), "wt2 needs stepB, which fails: {}", r.out);
+        assert!(r.out.contains("step stepB: fail"), "{}", r.out);
+    });
+    let w1 = sb.tollgate(&repo, &["wait", &job1, "--timeout", "30s"]);
+    assert_eq!(w1.code, Some(0), "wt1 needs only stepA: {}", w1.out);
+}

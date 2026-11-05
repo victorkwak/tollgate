@@ -25,7 +25,7 @@ use crate::exit;
 use crate::gitx::{Git, Oid, RepoLayout};
 use crate::ids::JobId;
 use crate::locks::Priority;
-use crate::plan::{self, Base, PlanRequest, Started, WaitEnd};
+use crate::plan::{self, Base, PlanRequest, Settled, Started, WaitEnd};
 use crate::policy::{self, ConfigSource};
 use crate::report::{self, JobReport};
 use crate::runner::env::{BaseInputs, JobEnv};
@@ -297,25 +297,28 @@ pub fn check(ctx: &Ctx, a: &CheckArgs) -> u8 {
             Err(e) => return fail(e),
         }
     }
-    let id = match plan::start(&repo.dirs, &plan, &ctx.exe, &ctx.env) {
-        Ok(Started::Hit(found)) => return print_lookup(&repo.dirs, &found),
-        Ok(Started::Created(id)) => {
-            println!(
-                "tollgate: job {id} started: tier {} tree {}",
-                plan.spec.tier,
-                plan.spec.tree.short(12)
-            );
-            id
-        }
-        Ok(Started::Attached(id)) => {
-            println!("tollgate: attached to running job {id}");
-            id
-        }
+    let started = match plan::start(&repo.dirs, &plan, &ctx.exe, &ctx.env) {
+        Ok(s) => s,
         Err(e) => return fail(e),
     };
+    let mut say = |s: &Started| match s {
+        Started::Hit(_) => {}
+        Started::Created(id) => println!(
+            "tollgate: job {id} started: tier {} tree {}",
+            plan.spec.tier,
+            plan.spec.tree.short(12)
+        ),
+        Started::Attached(id) => println!("tollgate: attached to running job {id}"),
+    };
+    say(&started);
     if a.detach {
-        println!("tollgate: wait with: tollgate wait {id}");
-        return exit::OK;
+        return match &started {
+            Started::Hit(found) => print_lookup(&repo.dirs, found),
+            Started::Created(id) | Started::Attached(id) => {
+                println!("tollgate: wait with: tollgate wait {id}");
+                exit::OK
+            }
+        };
     }
     let deadline = if a.wait {
         inline_cap(&ctx.env).map(|d| Instant::now() + d)
@@ -328,7 +331,24 @@ pub fn check(ctx: &Ctx, a: &CheckArgs) -> u8 {
                     .inline_for_hook(ctx.env.get_str("TOLLGATE_INLINE_CAP"), a.tier),
         )
     };
-    wait_and_print(&repo.dirs, &id, deadline)
+    match plan::settle(
+        &repo.dirs, &plan, &ctx.exe, &ctx.env, started, deadline, &mut say,
+    ) {
+        Ok(Settled::Record(found)) => print_lookup(&repo.dirs, &found),
+        Ok(Settled::Report(r)) => {
+            print_report(&r);
+            report_exit(&r)
+        }
+        Ok(Settled::Running(id)) => {
+            println!("tollgate: job {id} is still running; wait with: tollgate wait {id}");
+            exit::RUNNING
+        }
+        Ok(Settled::Lost(m)) => {
+            eprintln!("tollgate: {m}");
+            exit::FAIL
+        }
+        Err(e) => fail(e),
+    }
 }
 
 fn print_lookup(dirs: &Dirs, found: &Lookup) -> u8 {

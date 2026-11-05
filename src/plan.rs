@@ -105,6 +105,9 @@ pub struct Plan {
     pub spec: JobSpec,
     /// What a lookup needs (R79).
     pub needed: Needed,
+    /// L16: a `full` check of a full ref (or with reuse turned off) accepts
+    /// only a `full` pass whose steps all ran fresh.
+    pub fresh_only: bool,
 }
 
 fn kinds_roots(spec_config: &crate::config::RepoConfig, tier: Tier) -> Roots {
@@ -234,10 +237,11 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
     )?;
     let config = &policy.config;
     let rules = config.ref_rules().map_err(PlanError::Config)?;
-    // L16: no reuse for full jobs of full refs, or on --rerun.
-    let allow_reuse = req.allow_reuse
-        && !req.rerun
-        && (req.tier == Tier::Fast || rules.tier_for_ref(&req.refname) == Tier::Fast);
+    // L16: no reuse for full jobs of full refs, or on --rerun; their
+    // lookups accept only a full pass that ran every step fresh.
+    let full_ref = rules.tier_for_ref(&req.refname) == Tier::Full;
+    let allow_reuse = req.allow_reuse && !req.rerun && (req.tier == Tier::Fast || !full_ref);
+    let fresh_only = req.tier == Tier::Full && (full_ref || !req.allow_reuse);
     let budgets = host.budget.with_overrides(&config.budget);
     let now = jiff::Timestamp::now();
     let id = JobId::generate(now);
@@ -355,7 +359,11 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
         priority: req.priority,
         created: now,
     };
-    Ok(Plan { spec, needed })
+    Ok(Plan {
+        spec,
+        needed,
+        fresh_only,
+    })
 }
 
 /// The record lookup of R15 for a plan.
@@ -366,6 +374,7 @@ pub fn lookup(dirs: &Dirs, plan: &Plan) -> Result<Lookup, StoreError> {
         fingerprint: &plan.spec.fingerprint,
         needed: &plan.needed,
         now: jiff::Timestamp::now(),
+        fresh_only: plan.fresh_only,
     })
 }
 
@@ -433,6 +442,88 @@ pub fn start(
     Err(PlanError::Io(
         "another job holds the key but its id cannot be read".into(),
     ))
+}
+
+/// How a check ended ([`settle`]).
+#[derive(Debug)]
+pub enum Settled {
+    /// A record answers this plan's own lookup (R15, R79).
+    Record(Box<Lookup>),
+    /// This plan's job ended, or an attached job that checked exactly what
+    /// this plan needs: its report.
+    Report(Box<JobReport>),
+    /// Still queued or running at the deadline.
+    Running(JobId),
+    /// The job is gone without a report (its runner died).
+    Lost(String),
+}
+
+/// True when job `id` checks exactly what `plan` needs: same key (tree,
+/// tier, fingerprint), same selection base and selection switch, and no
+/// step reuse when `plan` needs every step fresh (L16).
+fn same_check(dirs: &Dirs, id: &JobId, plan: &Plan) -> bool {
+    let Ok(other) = JobSpec::read(dirs, id) else {
+        return false;
+    };
+    let mine = &plan.spec;
+    other.key == mine.key
+        && other.tree == mine.tree
+        && other.tier == mine.tier
+        && other.base_tree == mine.base_tree
+        && other.select == mine.select
+        && (!plan.fresh_only || !other.allow_reuse)
+}
+
+/// Follows `started` to an answer for `plan` (R15, R32, R79, R88).
+///
+/// A job this plan created answers with its report. A job it attached to
+/// (another check of the same key) may have checked another selection or
+/// reused steps, so its report answers only when [`same_check`] holds;
+/// otherwise, once it ends, this plan's own lookup decides, and on a miss
+/// this plan starts its own job. `on_start` sees every job started or
+/// attached on the way (for messages). The hooks use this, never the
+/// attached job's verdict alone.
+pub fn settle(
+    dirs: &Dirs,
+    plan: &Plan,
+    exe: &Path,
+    env: &EnvSnapshot,
+    started: Started,
+    deadline: Option<Instant>,
+    on_start: &mut dyn FnMut(&Started),
+) -> Result<Settled, PlanError> {
+    let mut current = started;
+    for _ in 0..8 {
+        match current {
+            Started::Hit(found) => return Ok(Settled::Record(found)),
+            Started::Created(id) => {
+                return Ok(match wait(dirs, &id, deadline) {
+                    WaitEnd::Done(r) => Settled::Report(r),
+                    WaitEnd::Running => Settled::Running(id),
+                    WaitEnd::Lost(m) => Settled::Lost(m),
+                });
+            }
+            Started::Attached(id) => {
+                let same = same_check(dirs, &id, plan);
+                match wait(dirs, &id, deadline) {
+                    WaitEnd::Running => return Ok(Settled::Running(id)),
+                    WaitEnd::Lost(m) => return Ok(Settled::Lost(m)),
+                    WaitEnd::Done(r) if same => return Ok(Settled::Report(r)),
+                    WaitEnd::Done(_) => {}
+                }
+                match lookup(dirs, plan)? {
+                    Lookup::Miss => {}
+                    found => return Ok(Settled::Record(Box::new(found))),
+                }
+                current = start(dirs, plan, exe, env)?;
+                on_start(&current);
+            }
+        }
+    }
+    Err(PlanError::Io(format!(
+        "key {}: other jobs kept taking it; run the check again",
+        plan.spec.key
+    )))
 }
 
 /// How waiting for a job ended.

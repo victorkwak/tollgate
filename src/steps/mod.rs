@@ -191,6 +191,16 @@ pub struct FastPlan {
     pub selection: crate::cache::record::Selection,
 }
 
+/// A package name as a selection records it: `<root>:<name>` outside the
+/// repo root (R80).
+fn root_name(root: &Path, name: &str) -> String {
+    if root.as_os_str().is_empty() {
+        name.to_owned()
+    } else {
+        format!("{}:{name}", root.display())
+    }
+}
+
 /// Plans a fast job relative to `base` (R55-R58, R61, R80).
 pub fn fast_plan(
     config: &RepoConfig,
@@ -216,14 +226,16 @@ pub fn fast_plan(
             packages: picked
                 .rust
                 .iter()
+                .flat_map(|rp| rp.affected.iter().map(move |n| root_name(&rp.root, n)))
+                .collect(),
+            // A whole workspace runs without a filterset: every member is a
+            // filterset root (R58).
+            marked: picked
+                .rust
+                .iter()
                 .flat_map(|rp| {
-                    rp.affected.iter().map(move |n| {
-                        if rp.root.as_os_str().is_empty() {
-                            n.clone()
-                        } else {
-                            format!("{}:{n}", rp.root.display())
-                        }
-                    })
+                    let marked = if rp.whole { &rp.affected } else { &rp.marked };
+                    marked.iter().map(move |n| root_name(&rp.root, n))
                 })
                 .collect(),
             roots: picked

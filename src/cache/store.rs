@@ -57,6 +57,9 @@ pub struct LookupRequest<'a> {
     pub fingerprint: &'a Fingerprint,
     /// The selection the current base needs; `Exact(All)` for `full`.
     pub needed: &'a Needed,
+    /// L16: a `full` lookup for a full ref (merge, push to a full ref, CI)
+    /// accepts only a `full` pass whose steps all ran fresh.
+    pub fresh_only: bool,
     /// Now, for TTLs.
     pub now: jiff::Timestamp,
 }
@@ -157,9 +160,19 @@ impl RecordStore {
 
     /// Writes `r` by atomic rename (R76). Refuses records that break R34,
     /// R54 or R81. A `fast` pass never replaces a `fast` pass that already
-    /// covers its selection.
+    /// covers its selection, and a `full` pass with reused steps never
+    /// replaces a fresh one (L16).
     pub fn write(&self, r: &Record) -> Result<WriteOutcome, StoreError> {
         self.check(r).map_err(StoreError::Invalid)?;
+        if r.tier == Tier::Full
+            && r.verdict == Verdict::Pass
+            && r.reused
+            && let Some(old) = self.read_usable(&r.key)?
+            && old.verdict == Verdict::Pass
+            && !old.reused
+        {
+            return Ok(WriteOutcome::KeptBroader);
+        }
         if r.tier == Tier::Fast
             && r.verdict == Verdict::Pass
             && let Some(old) = self.read_usable(&r.key)?
@@ -197,6 +210,7 @@ impl RecordStore {
         let full_key = record_key(req.tree, Tier::Full, req.fingerprint);
         if let Some(r) = self.read_usable(&full_key)? {
             match r.verdict {
+                Verdict::Pass if r.reused && req.fresh_only && req.tier == Tier::Full => {}
                 Verdict::Pass => return Ok(Lookup::Pass(r)),
                 Verdict::Fail if req.tier == Tier::Full => return Ok(Lookup::Fail(r)),
                 Verdict::Timeout | Verdict::Error

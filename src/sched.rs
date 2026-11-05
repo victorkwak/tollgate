@@ -91,28 +91,43 @@ impl JobClaim {
 }
 
 /// Claims `key` for `job`, or names the job that holds it (R88).
+///
+/// A held lock whose file names a job that already ended is not a running
+/// job: its runner is on its way out, or another process (a waiter's
+/// [`running_job`] probe, gc) holds the lock for a moment. The claim tries
+/// again for up to a second before it names that job.
 pub fn claim_job(dirs: &Dirs, key: &RecordKey, job: &JobId) -> Result<Claim, SchedError> {
     let path = dirs.job_dedupe_lock(key);
-    if let Some(lock) = LockFile::try_acquire(&path).map_err(io_at(&path))? {
-        let f = lock.file();
-        f.set_len(0).map_err(io_at(&path))?;
-        f.write_all_at(job.as_str().as_bytes(), 0)
-            .map_err(io_at(&path))?;
-        f.sync_data().map_err(io_at(&path))?;
-        return Ok(Claim::Owner(JobClaim {
-            lock,
-            job: job.clone(),
-        }));
-    }
-    // The owner writes its id right after it takes the lock.
-    for _ in 0..40 {
-        let text = fs::read_to_string(&path).map_err(io_at(&path))?;
+    let store = JobStore::new(dirs);
+    let mut last = None;
+    for _ in 0..200 {
+        if let Some(lock) = LockFile::try_acquire(&path).map_err(io_at(&path))? {
+            let f = lock.file();
+            f.set_len(0).map_err(io_at(&path))?;
+            f.write_all_at(job.as_str().as_bytes(), 0)
+                .map_err(io_at(&path))?;
+            f.sync_data().map_err(io_at(&path))?;
+            return Ok(Claim::Owner(JobClaim {
+                lock,
+                job: job.clone(),
+            }));
+        }
+        // The owner writes its id right after it takes the lock, and its
+        // job.json right after that.
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(io_at(&path)(e)),
+        };
         if let Ok(id) = JobId::parse(text.trim()) {
-            return Ok(Claim::Running(Some(id)));
+            match store.read(&id) {
+                Ok(meta) if meta.state.is_terminal() => last = Some(id),
+                _ => return Ok(Claim::Running(Some(id))),
+            }
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    Ok(Claim::Running(None))
+    Ok(Claim::Running(last))
 }
 
 /// The job that holds `key` now, if any.

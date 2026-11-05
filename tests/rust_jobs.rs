@@ -310,3 +310,59 @@ fn a_branch_cargo_config_does_not_reach_the_steps_r71() {
         r.out
     );
 }
+
+#[test]
+fn a_record_covers_only_the_integration_tests_it_ran_r79_r80() {
+    let sb = Sandbox::new();
+    host(&sb);
+    let repo = sb.rust_repo("ws", Scratch::default());
+    // `a` dev-depends on `b` (like an api crate on its core crate).
+    let four = |n: u32| {
+        std::fs::write(
+            repo.join("crates/b/src/four.rs"),
+            format!("/// Four.\npub fn four() -> u32 {{\n    {n}\n}}\n"),
+        )
+        .unwrap();
+    };
+    let lib = std::fs::read_to_string(repo.join("crates/b/src/lib.rs")).unwrap();
+    std::fs::write(
+        repo.join("crates/b/src/lib.rs"),
+        format!("mod four;\npub use four::four;\n{lib}"),
+    )
+    .unwrap();
+    four(4);
+    sb.git(&repo, &["add", "-A"]);
+    sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "four"]);
+    commit_policy(
+        &sb,
+        &repo,
+        "version = 1\n[select.fast]\ntests = \"rdeps-unit+changed-integration\"\n[[step]]\nname = \"tests\"\nkind = \"nextest\"\n",
+        "policy",
+    );
+    let c0 = sb.git(&repo, &["rev-parse", "HEAD"]);
+    let ok = |r: &support::Run| assert_eq!(r.code, Some(0), "{}", r.out);
+    ok(&sb.tollgate(&repo, &["check", "--rev", "HEAD", "--wait"]));
+    // Commit 1 changes `a` (its integration test runs and passes).
+    sb.commit_file(
+        &repo,
+        "crates/a/tests/ait.rs",
+        "#[test]\nfn four_is_four() {\n    assert_eq!(b::four(), 4);\n}\n",
+        "a: integration test",
+    );
+    ok(&sb.tollgate(&repo, &["check", "--rev", "HEAD", "--wait"]));
+    // Commit 2 changes only `b`: marked {b}, affected {a, b}; `a`'s
+    // integration test does not run, and it would fail.
+    four(5);
+    sb.git(&repo, &["add", "-A"]);
+    sb.git(
+        &repo,
+        &["commit", "-q", "--no-verify", "-m", "b: four is five"],
+    );
+    ok(&sb.tollgate(&repo, &["check", "--rev", "HEAD", "--wait"]));
+    // Squashed onto c0, the same tree marks {a, b}: the record of the
+    // narrower run must not answer; `a`'s integration test fails.
+    sb.git(&repo, &["reset", "-q", "--soft", &c0]);
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(r.out.contains("FAIL a a::ait four_is_four"), "{}", r.out);
+}
