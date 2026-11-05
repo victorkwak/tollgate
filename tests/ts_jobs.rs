@@ -111,7 +111,7 @@ fn project(test: &str, policy: Option<&str>) -> Option<Project> {
     sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "web"]);
     sb.host_config(&format!(
         "[verify]\nmin_free = \"1M\"\n{}",
-        tools::job_config(&[&bun])
+        tools::job_config(&sb.root(), &[&bun])
     ));
     Some(Project { sb, repo, biome })
 }

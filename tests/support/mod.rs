@@ -51,6 +51,11 @@ impl Sandbox {
             ("XDG_CONFIG_HOME", root.join("config").into_os_string()),
             ("GIT_CONFIG_NOSYSTEM", "1".into()),
             ("LANG", "C".into()),
+            // The sandbox can sit under the real HOME (a job's TMPDIR is in
+            // its state dir). Tools that search parent dirs for config must
+            // stop here: mise reads the real `~/.config/mise/config.toml` as
+            // an untrusted project config, and its `node` shim then fails.
+            ("MISE_CEILING_PATHS", root.into_os_string()),
         ])
     }
 
