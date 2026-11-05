@@ -249,24 +249,13 @@ impl Lexer<'_> {
                     any = true;
                 }
                 '$' if self.peek_at(1) == Some('\'') => {
-                    // ANSI-C quoting: escapes are kept as text (best effort).
                     self.pos += 2;
-                    while let Some(c) = self.peek() {
-                        self.pos += 1;
-                        if c == '\\' {
-                            if let Some(n) = self.peek() {
-                                w.push(n);
-                                self.pos += 1;
-                            }
-                            continue;
-                        }
-                        if c == '\'' {
-                            break;
-                        }
-                        w.push(c);
-                    }
+                    self.read_ansi_c(&mut w);
                     any = true;
                 }
+                // `$"..."` (a locale-translated string) is a double-quoted
+                // string: the next pass reads it.
+                '$' if self.peek_at(1) == Some('"') => self.pos += 1,
                 _ => {
                     w.push(c);
                     self.pos += 1;
@@ -275,6 +264,83 @@ impl Lexer<'_> {
             }
         }
         any.then_some(w)
+    }
+
+    /// Reads up to `max` digits of `radix`; `None` when there is none.
+    fn take_digits(&mut self, radix: u32, max: usize) -> Option<u32> {
+        let mut value: Option<u32> = None;
+        for _ in 0..max {
+            let Some(d) = self.peek().and_then(|c| c.to_digit(radix)) else {
+                break;
+            };
+            value = Some(value.unwrap_or(0).saturating_mul(radix).saturating_add(d));
+            self.pos += 1;
+        }
+        value
+    }
+
+    /// Reads the rest of an ANSI-C quoted string (`$'...'`, after the
+    /// opening quote) into `w`, decoding escapes as bash does: `\a \b \e
+    /// \E \f \n \r \t \v \\ \' \" \?`, octal `\nnn` (1-3 digits) and hex
+    /// `\xHH` (1-2 digits) bytes, `\uHHHH` and `\UHHHHHHHH` code points,
+    /// and `\cx` control characters. An unknown escape keeps its
+    /// backslash. A NUL ends the string (bash builds a C string); the rest
+    /// of the quote is read and dropped. A byte above 0x7f becomes the
+    /// code point of the same value: only ASCII matters to the rules.
+    fn read_ansi_c(&mut self, w: &mut String) {
+        let mut ended = false;
+        while let Some(c) = self.peek() {
+            self.pos += 1;
+            let decoded: Option<char> = match c {
+                '\'' => return,
+                '\\' => {
+                    let Some(e) = self.peek() else {
+                        if !ended {
+                            w.push('\\');
+                        }
+                        return;
+                    };
+                    self.pos += 1;
+                    let code = |v: u32| char::from_u32(v).unwrap_or(char::REPLACEMENT_CHARACTER);
+                    match e {
+                        'a' => Some('\x07'),
+                        'b' => Some('\x08'),
+                        'e' | 'E' => Some('\x1b'),
+                        'f' => Some('\x0c'),
+                        'n' => Some('\n'),
+                        'r' => Some('\r'),
+                        't' => Some('\t'),
+                        'v' => Some('\x0b'),
+                        '\\' | '\'' | '"' | '?' => Some(e),
+                        '0'..='7' => {
+                            self.pos -= 1;
+                            self.take_digits(8, 3).map(|v| code(v & 0xff))
+                        }
+                        'x' => self.take_digits(16, 2).map(code),
+                        'u' => self.take_digits(16, 4).map(code),
+                        'U' => self.take_digits(16, 8).map(code),
+                        'c' => self.peek().map(|x| {
+                            self.pos += 1;
+                            code(u32::from(x) & 0x1f)
+                        }),
+                        _ => None,
+                    }
+                    .or_else(|| {
+                        // Unknown, or no digits: the text stays.
+                        if !ended {
+                            w.push('\\');
+                        }
+                        Some(e)
+                    })
+                }
+                other => Some(other),
+            };
+            match decoded {
+                Some('\0') => ended = true,
+                Some(ch) if !ended => w.push(ch),
+                _ => {}
+            }
+        }
     }
 
     fn skip_blanks(&mut self) {
@@ -486,5 +552,38 @@ mod tests {
         assert!(words("").is_empty());
         assert!(is_assignment("X_1=2") && !is_assignment("1X=2") && !is_assignment("--a=b"));
         assert!(is_assignment("P+=x") && !is_assignment("+=x"));
+    }
+
+    /// ANSI-C quoting (`$'...'`) decodes as bash does, so a word spelled
+    /// with escapes is the word the command gets (S1, S2).
+    #[test]
+    fn ansi_c_quotes_decode_as_bash_does() {
+        for (src, want) in [
+            (r"$'\x2d-no-verify'", "--no-verify"),
+            (r"$'\055-no-verify'", "--no-verify"),
+            (r"$'\x2dn'", "-n"),
+            (r"$'-\U0000002dno-v'", "--no-v"),
+            (r"$'\x47IT_CONFIG_COUNT=0'", "GIT_CONFIG_COUNT=0"),
+            (r#"$'a\tb\nc\\d\'e\"f\?'"#, "a\tb\nc\\d'e\"f?"),
+            (r"$'\a\b\e\E\f\r\v'", "\x07\x08\x1b\x1b\x0c\r\x0b"),
+            (r"$'\cA\c['", "\x01\x1b"),
+            // Unknown escapes and escapes without digits keep the
+            // backslash.
+            (r"$'\z\x\u'", r"\z\x\u"),
+            // Octal takes at most three digits, hex at most two.
+            (r"$'\1011\x414'", "A1A4"),
+            // A NUL ends the string; the rest of the quote is dropped.
+            (r"$'ab\x00cd'x", "abx"),
+            // Glued to other quoting.
+            (r"e$'\x6e'v", "env"),
+            // `$"..."` is a double-quoted string.
+            (r#"$"--no-verify""#, "--no-verify"),
+        ] {
+            assert_eq!(
+                words(&format!("git {src}")),
+                vec![vec!["git", want]],
+                "{src}"
+            );
+        }
     }
 }

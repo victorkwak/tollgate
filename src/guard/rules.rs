@@ -141,6 +141,16 @@ fn no_verify_abbrev(norm: &str) -> bool {
     })
 }
 
+/// The R25 substring and `--no-verify` abbreviation rules on normalized
+/// text.
+fn text_ruling(norm: &str) -> Option<Ruling> {
+    if let Some((_, why)) = DENY_SUBSTRINGS.iter().find(|(n, _)| norm.contains(n)) {
+        return Some(Ruling::Deny(format!("{why} (R25)")));
+    }
+    no_verify_abbrev(norm)
+        .then(|| Ruling::Deny("an abbreviation of --no-verify skips the gate hooks (R25)".into()))
+}
+
 /// Wrapper commands whose arguments are another command, with the options
 /// that take a separate value.
 const WRAPPERS: &[(&str, &[&str])] = &[
@@ -435,6 +445,9 @@ struct Run {
     assigns: Vec<String>,
     /// See [`Unwrapped::env_loss`].
     env_loss: Option<String>,
+    /// The simple command it came from, wrappers and their arguments
+    /// included, as bash passes the words (quotes and escapes decoded).
+    source: Vec<String>,
 }
 
 /// The commands a simple command runs: itself after wrappers, plus the
@@ -445,6 +458,7 @@ fn expand(cmd: &SimpleCommand, inherited: &[String], depth: usize, out: &mut Vec
     assigns.extend(cmd.assignments.iter().cloned());
     assigns.extend(un.assigns);
     let words = un.words;
+    let source: Vec<String> = cmd.assignments.iter().chain(&cmd.words).cloned().collect();
     if words.is_empty() {
         // An assignment statement, a lone redirection, or a wrapper with
         // no command: kept for the env and redirection rules.
@@ -452,6 +466,7 @@ fn expand(cmd: &SimpleCommand, inherited: &[String], depth: usize, out: &mut Vec
             words,
             assigns,
             env_loss: un.env_loss,
+            source,
         });
         return;
     }
@@ -476,6 +491,7 @@ fn expand(cmd: &SimpleCommand, inherited: &[String], depth: usize, out: &mut Vec
         words,
         assigns,
         env_loss: un.env_loss,
+        source,
     });
 }
 
@@ -1010,14 +1026,8 @@ fn runs_git_or_tollgate(ctx: &Context, words: &[String]) -> bool {
 /// R25/R26 for a Bash command.
 #[must_use]
 pub fn bash_ruling(ctx: &Context, command: &str) -> Ruling {
-    let norm = normalize(command);
-    for (needle, why) in DENY_SUBSTRINGS {
-        if norm.contains(needle) {
-            return Ruling::Deny(format!("{why} (R25)"));
-        }
-    }
-    if no_verify_abbrev(&norm) {
-        return Ruling::Deny("an abbreviation of --no-verify skips the gate hooks (R25)".into());
+    if let Some(deny) = text_ruling(&normalize(command)) {
+        return deny;
     }
     let cmds = shell::parse(command);
     let runs: Vec<Vec<Run>> = cmds
@@ -1028,6 +1038,17 @@ pub fn bash_ruling(ctx: &Context, command: &str) -> Ruling {
             runs
         })
         .collect();
+    // The same rules on the words as bash passes them: quoting hides a
+    // name from the text (`$'\x2d-no-verify'`, `$'\x47IT_CONFIG_COUNT'`).
+    // One command per segment, so words of separate commands never join.
+    let decoded: Vec<String> = runs
+        .iter()
+        .flatten()
+        .map(|r| normalize(&r.source.join(" ")))
+        .collect();
+    if let Some(deny) = text_ruling(&decoded.join(" ; ")) {
+        return deny;
+    }
     // R8: HOME or XDG set for the rest of the shell counts for every git
     // and tollgate in the command (best effort: order is not followed).
     let shell_sets = runs.iter().flatten().find_map(shell_dir_var);
@@ -1274,6 +1295,33 @@ mod tests {
         ] {
             assert!(deny(cmd), "{cmd}");
         }
+    }
+
+    /// S1, S2: ANSI-C quoting (`$'\x2d-no-verify'`) hides a flag or a
+    /// variable name from the text match; the R25 rules also see the words
+    /// as bash passes them.
+    #[test]
+    fn ansi_c_quoted_words_deny_r25() {
+        for cmd in [
+            r"git commit $'\x2d-no-verify' -m x",
+            r"git commit $'\055-no-verify' -m x",
+            r"git commit $'\x2dn' -m x",
+            r"git commit $'--no-verif' -m x",
+            r"env -u $'\x47IT_CONFIG_COUNT' git commit -m x",
+            r"unset $'\x47IT_CONFIG_COUNT'; git commit -m x",
+            r"export $'\x47IT_CONFIG_COUNT=0'; git commit -m x",
+            r"bash -c $'git commit \x2dn -m x'",
+            r"git -c $'core.hooks\x50ath=/dev/null' commit -m x",
+            r"e$'\x6e'v -i git commit -m x",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+        // Words in separate commands do not join into a match.
+        assert_eq!(bash_ruling(&ctx(), "echo env; echo -u git"), Ruling::Allow);
+        assert_eq!(
+            bash_ruling(&ctx(), r"git commit -m $'two\nlines'"),
+            Ruling::Allow
+        );
     }
 
     /// git's option parser takes any unambiguous prefix of a long option:
