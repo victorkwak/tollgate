@@ -73,8 +73,9 @@ pub fn run(gate: &Gate<'_>, args: &[OsString], stdin: &[u8]) -> u8 {
         .unwrap_or_else(|| remote.clone());
     // R5, R20: git gives the URL it pushes to (after rewrites); a push to
     // a remote with a trusted URL counts too, wherever pushInsteadOf sends
-    // it.
-    let push_trusted = gate.scope.remote_trusted(&url) || gate.push_trusted.contains(&remote);
+    // it. Gating takes the loose match too (item 34: a look-alike URL
+    // needs full, it is never trusted for anything that grants).
+    let push_trusted = gate.scope.remote_in_scope(&url) || gate.push_trusted.contains(&remote);
     let in_scope = gate.in_scope()
         || gate
             .scope

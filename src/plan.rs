@@ -552,7 +552,9 @@ pub fn remote_trust(git: &Git, scope: &CompiledScope) -> Result<RemoteTrust, Pla
                 url: url.clone(),
             });
         }
-        if fetch || configured.is_some() || r.push.iter().any(|u| scope.remote_trusted(u)) {
+        // R5, R20: pushes are gated on the loose match too (item 34: a
+        // look-alike URL gates more, it never trusts).
+        if fetch || configured.is_some() || r.all().any(|u| scope.remote_in_scope(u)) {
             t.push_trusted.push(r.name.clone());
         }
         t.urls.extend(r.configured);

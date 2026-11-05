@@ -47,9 +47,15 @@ pub struct ScopeConfig {
     /// Dirs whose direct children are in scope.
     #[serde(default = "default_roots")]
     pub roots: Vec<String>,
-    /// Remote URL globs of trusted remotes (R5, R20).
+    /// Remote URL globs of trusted remotes (R5, R20). Scope and push
+    /// gating match them loosely; trust parses them (item 34,
+    /// [`crate::config::trust`]).
     #[serde(default)]
     pub remotes: Vec<String>,
+    /// Exact canonical absolute paths of local repos trusted as remotes
+    /// (mirrors, tests); a pattern never trusts a local path (item 34).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_paths: Vec<String>,
     /// Basename globs allowed (rollout).
     #[serde(default = "default_include")]
     pub include: Vec<String>,
@@ -71,6 +77,7 @@ impl Default for ScopeConfig {
         Self {
             roots: default_roots(),
             remotes: Vec::new(),
+            trusted_paths: Vec::new(),
             include: default_include(),
             exclude: Vec::new(),
         }
@@ -478,6 +485,14 @@ impl HostConfig {
                 v.error(field, format!("{h:?} must be absolute or start with ~/"));
             }
         }
+        for p in &self.scope.trusted_paths {
+            if !p.starts_with('/') {
+                v.error(
+                    "scope.trusted_paths",
+                    format!("{p:?} must be an absolute path (item 34)"),
+                );
+            }
+        }
         for r in &self.scope.roots {
             if !(r.starts_with('/') || r == "~" || r.starts_with("~/")) {
                 v.error(
@@ -603,6 +618,8 @@ SQLX_OFFLINE = "true"
 pub struct CompiledScope {
     roots: Vec<PathBuf>,
     remotes: GlobSet,
+    trust: Vec<super::trust::TrustPattern>,
+    trusted_paths: Vec<PathBuf>,
     include: GlobSet,
     exclude: GlobSet,
 }
@@ -629,15 +646,41 @@ impl CompiledScope {
         Ok(Self {
             roots,
             remotes: glob::compile(&scope.remotes, loose_ci)?,
+            trust: scope
+                .remotes
+                .iter()
+                .filter_map(|p| super::trust::TrustPattern::parse(p))
+                .collect(),
+            // A trusted path that does not exist trusts nothing.
+            trusted_paths: scope
+                .trusted_paths
+                .iter()
+                .filter(|p| p.starts_with('/'))
+                .filter_map(|p| std::fs::canonicalize(p).ok())
+                .collect(),
             include: glob::compile(&scope.include, names)?,
             exclude: glob::compile(&scope.exclude, names)?,
         })
     }
 
-    /// True when `url` matches `scope.remotes` (R5, R20).
+    /// Item 34: `url` is a trusted remote: a parsed https or ssh URL that a
+    /// `scope.remotes` pattern names exactly (host, port, path by segment),
+    /// or a local path or `file://` URL that is one of
+    /// `scope.trusted_paths` (R14(2), R56, L2 anchors).
     #[must_use]
     pub fn remote_trusted(&self, url: &str) -> bool {
-        self.remotes.is_match(url)
+        if let Some(u) = super::trust::parse_url(url) {
+            return self.trust.iter().any(|p| p.matches(&u));
+        }
+        super::trust::local_path(url).is_some_and(|p| self.trusted_paths.contains(&p))
+    }
+
+    /// `url` puts a repo in scope and gates pushes to it (L4, R5, R20):
+    /// the loose `scope.remotes` match (case-insensitive, `*` crosses
+    /// `/`: look-alikes are gated too) or [`Self::remote_trusted`].
+    #[must_use]
+    pub fn remote_in_scope(&self, url: &str) -> bool {
+        self.remotes.is_match(url) || self.remote_trusted(url)
     }
 
     /// True when `include`/`exclude` allow the repo name `name`.
@@ -656,7 +699,7 @@ impl CompiledScope {
     pub fn contains(&self, repo_dir: &Path, remote_urls: &[String]) -> bool {
         let base = repo_dir.file_name().and_then(|n| n.to_str());
         let by_project = remote_urls.iter().any(|u| {
-            self.remote_trusted(u) && remote_project_name(u).is_some_and(|n| self.name_allowed(n))
+            self.remote_in_scope(u) && remote_project_name(u).is_some_and(|n| self.name_allowed(n))
         });
         if by_project {
             return true;
@@ -667,7 +710,7 @@ impl CompiledScope {
         if !self.name_allowed(base) {
             return false;
         }
-        remote_urls.iter().any(|u| self.remote_trusted(u))
+        remote_urls.iter().any(|u| self.remote_in_scope(u))
             || repo_dir
                 .parent()
                 .is_some_and(|p| self.roots.iter().any(|r| r == p))
@@ -865,6 +908,78 @@ SQLX_OFFLINE = "true"
         assert!(err.contains("config.toml"), "{err}");
     }
 
+    /// Item 34 (X5): trust parses the URL: allowed schemes (https, ssh,
+    /// scp-like), the exact host, the path per segment (`*` never crosses
+    /// `/`). Local paths and `file://` never match a pattern; only
+    /// `scope.trusted_paths` names them. Scope stays loose (more gating).
+    #[test]
+    fn trust_parses_urls_scope_stays_loose_item34() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let mirror = home.join("mirror/r.git");
+        std::fs::create_dir_all(&mirror).unwrap();
+        let dirs = Dirs::from_env(&EnvSnapshot::from_pairs([("HOME", home.as_os_str())])).unwrap();
+        let scope = ScopeConfig {
+            remotes: vec![
+                "*gitlab.com:victorkwak/*".into(),
+                "*gitlab.com/victorkwak/*".into(),
+            ],
+            trusted_paths: vec![mirror.to_str().unwrap().to_owned()],
+            ..ScopeConfig::default()
+        };
+        let s = CompiledScope::new(&scope, &dirs).unwrap();
+        for url in [
+            "git@gitlab.com:victorkwak/baton.git",
+            "gitlab.com:victorkwak/baton",
+            "ssh://git@gitlab.com/victorkwak/baton.git",
+            "git+ssh://git@gitlab.com/victorkwak/baton.git",
+            "https://gitlab.com/victorkwak/baton.git",
+            "https://oauth2:token@GitLab.COM/victorkwak/baton",
+            "https://gitlab.com/victorkwak/baton.git/",
+        ] {
+            assert!(s.remote_trusted(url), "{url} not trusted");
+            assert!(s.remote_in_scope(url), "{url} not in scope");
+        }
+        for url in [
+            // Local paths and file URLs that spell the host in a dir name.
+            "/tmp/x/gitlab.com/victorkwak/r.git",
+            "file:///tmp/x/gitlab.com/victorkwak/r.git",
+            "../gitlab.com/victorkwak/r.git",
+            // Another host with the trusted one in its path or name.
+            "https://evil.example/gitlab.com/victorkwak/r",
+            "https://gitlab.com.evil.example/victorkwak/r",
+            "https://evilgitlab.com/victorkwak/r",
+            "git@evil.example:gitlab.com/victorkwak/r",
+            // Schemes without server authentication, a port, deeper paths.
+            "http://gitlab.com/victorkwak/r.git",
+            "git://gitlab.com/victorkwak/r.git",
+            "ssh://git@gitlab.com:2222/victorkwak/r.git",
+            "https://gitlab.com/victorkwak/group/r.git",
+            "https://gitlab.com/victorkwak/../evil/r.git",
+            "https://gitlab.com/victorkwak/%2e%2e",
+            "https://gitlab.com//victorkwak/r.git",
+            "https://gitlab.com/VictorKwak/r.git",
+        ] {
+            assert!(!s.remote_trusted(url), "{url} trusted");
+        }
+        // Loose matching still puts the look-alikes in scope.
+        assert!(s.remote_in_scope("/tmp/x/gitlab.com/victorkwak/r.git"));
+        assert!(s.remote_in_scope("https://evil.example/gitlab.com/victorkwak/r"));
+        // trusted_paths: the exact canonical path, as a path or file URL.
+        assert!(s.remote_trusted(mirror.to_str().unwrap()));
+        assert!(s.remote_trusted(&format!("file://{}", mirror.display())));
+        assert!(s.remote_trusted(&format!("{}/", mirror.display())));
+        assert!(s.remote_in_scope(mirror.to_str().unwrap()));
+        assert!(!s.remote_trusted(home.join("mirror").to_str().unwrap()));
+        assert!(!s.remote_trusted(home.join("mirror/r.git/sub").to_str().unwrap()));
+        let linked = home.join("link.git");
+        std::os::unix::fs::symlink(&mirror, &linked).unwrap();
+        assert!(s.remote_trusted(linked.to_str().unwrap()), "canonical");
+        // A relative trusted path is a config error.
+        let bad = HostConfig::from_toml("[scope]\ntrusted_paths = [\"x/r.git\"]\n").unwrap();
+        assert!(!bad.validate().is_ok());
+    }
+
     #[test]
     fn scope_l4_depth_one_remotes_include_exclude() {
         let tmp = tempfile::tempdir().unwrap();
@@ -876,6 +991,7 @@ SQLX_OFFLINE = "true"
         let scope = ScopeConfig {
             roots: vec!["~/Repos".into(), "~/missing".into()],
             remotes: vec!["*gitlab.com:victorkwak/*".into()],
+            trusted_paths: Vec::new(),
             include: vec!["*".into()],
             exclude: vec!["agent_v".into()],
         };
@@ -889,8 +1005,13 @@ SQLX_OFFLINE = "true"
         // A trusted remote puts a clone anywhere in scope (R5).
         let remote = ["git@GitLab.com:victorkwak/baton.git".to_owned()];
         assert!(s.contains(&home.join("elsewhere/clone"), &remote));
-        assert!(s.remote_trusted("git@gitlab.com:victorkwak/a/b.git"));
-        assert!(!s.remote_trusted("git@github.com:victorkwak/baton.git"));
+        assert!(s.remote_in_scope("git@gitlab.com:victorkwak/a/b.git"));
+        assert!(
+            !s.remote_trusted("git@gitlab.com:victorkwak/a/b.git"),
+            "item 34"
+        );
+        assert!(s.remote_trusted("git@gitlab.com:victorkwak/b.git"));
+        assert!(!s.remote_in_scope("git@github.com:victorkwak/baton.git"));
         // include/exclude still apply to remote matches: by the local name
         // or the project name; an excluded project in an excluded dir is
         // out, a clone of an allowed project is in whatever its dir name.

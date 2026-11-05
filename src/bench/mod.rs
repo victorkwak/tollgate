@@ -638,6 +638,7 @@ fn execute(
                 .to_owned(),
         ],
         remotes: Vec::new(),
+        trusted_paths: Vec::new(),
         include: vec!["*".into()],
         exclude: Vec::new(),
     };

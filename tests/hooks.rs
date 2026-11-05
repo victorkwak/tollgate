@@ -323,7 +323,10 @@ fn scope_by_path_depth_and_by_push_url_t4_r4_r5_l4() {
 /// A repo `r` whose origin is a trusted bare remote holding `main` (pushed
 /// without hooks, as Victor's first push would be) and fetched (L2 anchor).
 fn trusted_repo(sb: &Sandbox, toml: &str) -> (PathBuf, PathBuf) {
-    sb.scoped_host("remotes = [\"*/remotes/trusted*\"]");
+    sb.scoped_host(&format!(
+        "trusted_paths = [\"{}\"]",
+        sb.root().join("remotes/trusted.git").display()
+    ));
     let repo = repo_with(sb, "r", toml);
     let bare = sb.root().join("remotes/trusted.git");
     std::fs::create_dir_all(&bare).unwrap();
@@ -550,9 +553,12 @@ fn remote_urls_with_control_characters_or_two_fetch_urls_deny_r14_l2() {
     sb.git(&repo, &["config", "remote.origin.url", &injected]);
     let git = tollgate::gitx::Git::scrubbed(&sb.env(), &repo);
     let scope = tollgate::config::CompiledScope::new(
-        &tollgate::config::HostConfig::from_toml("[scope]\nremotes = [\"*/remotes/trusted*\"]\n")
-            .unwrap()
-            .scope,
+        &tollgate::config::HostConfig::from_toml(&format!(
+            "[scope]\ntrusted_paths = [\"{}\"]\n",
+            bare.display()
+        ))
+        .unwrap()
+        .scope,
         &tollgate::dirs::Dirs::from_env(&sb.env()).unwrap(),
     )
     .unwrap();

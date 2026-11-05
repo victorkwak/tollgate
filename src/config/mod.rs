@@ -7,6 +7,7 @@ pub mod check;
 pub mod glob;
 pub mod host;
 pub mod repo;
+pub mod trust;
 pub mod units;
 
 use std::fmt;
