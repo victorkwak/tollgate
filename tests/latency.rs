@@ -21,6 +21,20 @@ fn stage(sb: &Sandbox, repo: &Path, path: &str, content: &str) {
     sb.git(repo, &["add", path]);
 }
 
+/// Prints the measured p95 next to its L19 budget, then asserts it. The
+/// line goes to the process's stderr, past the test harness's capture, so
+/// every `cargo test` run shows the numbers.
+fn within_budget(what: &str, p95: Duration, budget: Duration) {
+    use std::io::Write as _;
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "L19 {what}: p95 {:.2} ms (budget {} ms)",
+        p95.as_secs_f64() * 1000.0,
+        budget.as_millis()
+    );
+    assert!(p95 < budget, "{what} p95 {p95:?} (L19: {budget:?})");
+}
+
 /// p95 of `runs` timings of `f`; the best of three rounds, so a busy
 /// moment of the parallel test run does not fail the budget.
 fn p95(rounds: usize, runs: usize, mut f: impl FnMut()) -> Duration {
@@ -83,10 +97,7 @@ fn hook_latency_budgets_l19() {
     };
     chained();
     let t = p95(3, 40, chained);
-    assert!(
-        t < Duration::from_millis(5),
-        "chained hook p95 {t:?} (L19: 5 ms)"
-    );
+    within_budget("chained hook (post-checkout)", t, Duration::from_millis(5));
     // post-commit after a gate hook of the same git process allowed the
     // commit (item 17): it takes the marker, no subprocess, same budget.
     // The test process stands in for that git process.
@@ -111,9 +122,10 @@ fn hook_latency_budgets_l19() {
         t.sort();
         best = best.min(t[38]);
     }
-    assert!(
-        best < Duration::from_millis(5),
-        "post-commit with a gate marker p95 {best:?} (L19: 5 ms)"
+    within_budget(
+        "chained hook (post-commit, gate marker)",
+        best,
+        Duration::from_millis(5),
     );
 
     // pre-commit on a cache hit: under 200 ms.
@@ -130,10 +142,7 @@ fn hook_latency_budgets_l19() {
         let o = sb.run_hook(&repo, "pre-commit", &[]);
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     });
-    assert!(
-        t < Duration::from_millis(200),
-        "pre-commit cache hit p95 {t:?} (L19: 200 ms)"
-    );
+    within_budget("pre-commit cache hit", t, Duration::from_millis(200));
 
     // pre-commit on a docs-only tree: under 200 ms, a new tree each time.
     assert_eq!(sb.hooked(&repo, &["commit", "-m", "b"]).code, Some(0));
@@ -145,10 +154,7 @@ fn hook_latency_budgets_l19() {
         let o = sb.run_hook(&repo, "pre-commit", &[]);
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     });
-    assert!(
-        t < Duration::from_millis(200),
-        "docs-only pre-commit p95 {t:?} (L19: 200 ms)"
-    );
+    within_budget("pre-commit docs-only", t, Duration::from_millis(200));
 }
 
 #[test]
@@ -176,10 +182,7 @@ fn the_guard_answers_in_under_10_ms_l19() {
             break;
         }
     }
-    assert!(
-        best < Duration::from_millis(10),
-        "guard p95 {best:?} (L19: 10 ms)"
-    );
+    within_budget("guard", best, Duration::from_millis(10));
 }
 
 /// Detection runs on the `pre-commit` path when the policy commit has no
@@ -226,9 +229,10 @@ fn docs_only_pre_commit_with_detected_roots_stays_in_budget_l19_r61_r65() {
         assert!(o.status.success(), "{err}");
         assert!(err.contains("tollgate: pass pre-commit"), "{err}");
     });
-    assert!(
-        t < Duration::from_millis(200),
-        "docs-only pre-commit with detected roots p95 {t:?} (L19: 200 ms)"
+    within_budget(
+        "pre-commit docs-only (detected Bun and Python roots)",
+        t,
+        Duration::from_millis(200),
     );
     // Each run was docs-only: no job ran a step.
     let jobs = sb.jobs();
