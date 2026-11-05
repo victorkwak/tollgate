@@ -155,6 +155,11 @@ fn install_adds_tagged_entries_and_uninstall_removes_exactly_them_t43_r95_r96() 
         .collect();
     assert_eq!(backups.len(), 1);
     assert_eq!(std::fs::read_to_string(backups[0].path()).unwrap(), FIXTURE);
+    // Item 10: the settings env may hold secrets.
+    assert_eq!(
+        std::fs::metadata(backups[0].path()).unwrap().mode() & 0o777,
+        0o600
+    );
     let rec: serde_json::Value =
         serde_json::from_slice(&std::fs::read(e.data().join("install.json")).unwrap()).unwrap();
     assert_eq!(rec["hooks"].as_array().unwrap().len(), 14);

@@ -394,6 +394,35 @@ fn write_settings(path: &Path, text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Writes the backup of the original settings (R95), unless a backup of an
+/// earlier install is there (a regular file: kept as it is). The settings
+/// may hold secrets in `env`, so the file is new (`O_EXCL`, which never
+/// follows a symlink) with mode 0600; any other file at the path (a
+/// symlink, a dir) is refused.
+fn write_backup(path: &Path, text: &str) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let err = |e: &dyn std::fmt::Display| format!("backup {}: {e}", path.display());
+    match path.symlink_metadata() {
+        Ok(m) if m.file_type().is_file() => return Ok(()),
+        Ok(_) => {
+            return Err(err(
+                &"something other than a regular file is there; remove it and run install again",
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(err(&e)),
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| err(&e))?;
+    f.write_all(text.as_bytes())
+        .and_then(|()| f.sync_all())
+        .map_err(|e| err(&e))
+}
+
 /// How an edit of the settings went.
 enum Edit {
     Unchanged,
@@ -432,10 +461,8 @@ fn edit_settings(
             "the settings need this change and there is no terminal to confirm it (L10); run tollgate install in your own terminal".into()
         }));
     }
-    if let Some((b, text)) = backup
-        && !b.exists()
-    {
-        std::fs::write(b, text).map_err(|e| format!("backup {}: {e}", b.display()))?;
+    if let Some((b, text)) = backup {
+        write_backup(b, text)?;
     }
     write_settings(path, new)?;
     Ok(Edit::Applied)
@@ -745,6 +772,36 @@ mod tests {
         );
         // No passwd home: refused.
         assert!(yes_without_tty(&sandbox.join("settings.json"), None).is_err());
+    }
+
+    /// R95, item 10: the backup may hold secrets (settings `env`): mode
+    /// 0600, never written through a symlink, and an earlier install's
+    /// backup is kept as it is.
+    #[test]
+    fn the_settings_backup_is_private_and_follows_no_link_r95() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = tmp.path().join("settings.json.tollgate-bak-1");
+        write_backup(&b, "{\"env\":{\"TOKEN\":\"x\"}}").unwrap();
+        assert_eq!(
+            std::fs::metadata(&b).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(std::fs::read_to_string(&b).unwrap().contains("TOKEN"));
+        // Kept on the next install.
+        write_backup(&b, "other").unwrap();
+        assert!(std::fs::read_to_string(&b).unwrap().contains("TOKEN"));
+        // A dangling link and a link to a file: refused, nothing written
+        // where they point.
+        let target = tmp.path().join("elsewhere");
+        let dangling = tmp.path().join("bak-2");
+        std::os::unix::fs::symlink(&target, &dangling).unwrap();
+        assert!(write_backup(&dangling, "secret").is_err());
+        assert!(!target.exists());
+        std::fs::write(&target, "mine").unwrap();
+        let linked = tmp.path().join("bak-3");
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+        assert!(write_backup(&linked, "secret").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "mine");
     }
 
     #[test]
