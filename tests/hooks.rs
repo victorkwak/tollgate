@@ -718,3 +718,36 @@ fn tollgate_merge_checks_full_then_commits_or_aborts_r99() {
     assert_eq!(head(&sb, &repo), before);
     assert!(!repo.join(".git/MERGE_HEAD").exists());
 }
+
+#[test]
+fn a_chained_hook_runs_no_git_subprocess_on_a_warm_cache_t2_r7_r75() {
+    let sb = Sandbox::new();
+    sb.scoped_host("");
+    let repo = repo_with(&sb, "r", PASS);
+    // As on a real machine: git's system config counts, so its compiled-in
+    // path is needed once (`git var`), then comes from the tool cache.
+    let trace = sb.root().join("trace");
+    let trace_s = trace.to_str().unwrap().to_owned();
+    let run = |traced: bool| {
+        let mut cmd = std::process::Command::new(test_hooks_dir().join("post-commit"));
+        cmd.env_clear().current_dir(&repo);
+        for (k, v) in sb.env().iter() {
+            if k != "GIT_CONFIG_NOSYSTEM" {
+                cmd.env(k, v);
+            }
+        }
+        if traced {
+            cmd.env("GIT_TRACE", &trace_s);
+        }
+        assert!(cmd.status().unwrap().success());
+    };
+    run(false);
+    run(true);
+    let text = std::fs::read_to_string(&trace).unwrap_or_default();
+    assert!(text.is_empty(), "a git subprocess ran:\n{text}");
+    // A cold cache asks git once (the trace sees it).
+    std::fs::remove_file(sb.state().join("toolcache.json")).unwrap();
+    run(true);
+    let text = std::fs::read_to_string(&trace).unwrap_or_default();
+    assert!(text.contains("GIT_CONFIG_SYSTEM"), "{text}");
+}
