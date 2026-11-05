@@ -40,8 +40,6 @@ const RUNNER_ENV: &[&str] = &[
     "XDG_CONFIG_HOME",
     "XDG_STATE_HOME",
     "XDG_DATA_HOME",
-    "CARGO_HOME",
-    "RUSTUP_HOME",
     "DOCKER_HOST",
     "SSH_AUTH_SOCK",
     "GIT_CONFIG_GLOBAL",

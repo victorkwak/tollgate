@@ -1628,3 +1628,69 @@ fn s20_a_fake_ssh_or_a_global_rewrite_never_answers_for_the_trusted_server() {
     assert_eq!(lab.refs_in(&mac), "");
     assert_not_kept(&bad_main, "R14(2)");
 }
+
+/// S32 (item 38): `CARGO_HOME` (and `RUSTUP_HOME`) set for one git command
+/// outside the guard (a script file) does not reach the job: its `bin`
+/// would come first on the job PATH, and a fake cargo there could add a
+/// runner that never runs the test binaries. The job takes both from the
+/// host config or the install's home, so the failing test still fails and
+/// the fake never runs.
+#[test]
+fn s32_cargo_home_from_the_hook_environment_never_reaches_the_job() {
+    let lab = Lab::new(RUST_POLICY);
+    let root = lab.root();
+    let fake_home = root.join("fake-cargo-home");
+    let mark = root.join("fake-cargo-ran");
+    // The cargo the job would find without the fake (never the fake
+    // itself: that would exec itself forever).
+    let real_cargo = ["/usr/local/bin/cargo", "/usr/bin/cargo"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+        .or_else(|| support::tools::which("cargo"))
+        .expect("cargo");
+    write_exe(
+        &fake_home.join("bin/cargo"),
+        &format!(
+            "#!/bin/sh\ntouch '{}'\nexec '{}' --config \"target.'cfg(all())'.runner = 'true'\" \"$@\"\n",
+            mark.display(),
+            real_cargo.display()
+        ),
+    );
+    let fake_rustup = root.join("fake-rustup-home");
+    std::fs::create_dir_all(&fake_rustup).unwrap();
+    lab.stage_failing_test();
+    let before = lab.refs();
+    let r = lab.direct_with(
+        &["commit", "-m", "fake cargo"],
+        &[
+            ("CARGO_HOME", fake_home.to_str().unwrap()),
+            ("RUSTUP_HOME", fake_rustup.to_str().unwrap()),
+        ],
+    );
+    assert_ne!(r.code, Some(0), "{}", r.out);
+    assert!(
+        r.out.contains("DENIED pre-commit") && r.out.contains("FAIL b b tests::fails"),
+        "{}",
+        r.out
+    );
+    assert_eq!(lab.refs(), before);
+    assert!(!mark.exists(), "the job ran the fake cargo");
+    let spec: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            lab.sb()
+                .state()
+                .join("jobs")
+                .join(job_id(&r.out))
+                .join("spec.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let text = spec.to_string();
+    assert!(
+        !text.contains("fake-cargo-home") && !text.contains("fake-rustup-home"),
+        "{spec:#}"
+    );
+    lab.assert_no_bad_pass();
+}

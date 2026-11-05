@@ -351,6 +351,13 @@ pub struct JobConfig {
     /// Extra job environment.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// `CARGO_HOME` of jobs (`~` expands); default `<home>/.cargo`. Never
+    /// taken from the environment that started the job (item 38).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_home: Option<String>,
+    /// `RUSTUP_HOME` of jobs (`~` expands); default `<home>/.rustup`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rustup_home: Option<String>,
 }
 
 /// Error when the host config cannot be read or parsed.
@@ -459,6 +466,16 @@ impl HostConfig {
                 if let Err(e) = glob::check(p) {
                     v.error(field, e);
                 }
+            }
+        }
+        for (field, home) in [
+            ("job.cargo_home", &self.job.cargo_home),
+            ("job.rustup_home", &self.job.rustup_home),
+        ] {
+            if let Some(h) = home
+                && !(h.starts_with('/') || h == "~" || h.starts_with("~/"))
+            {
+                v.error(field, format!("{h:?} must be absolute or start with ~/"));
             }
         }
         for r in &self.scope.roots {
@@ -572,6 +589,8 @@ full = "2h"
 [job]
 {path_prepend}
 allow_ssh_agent = false
+# cargo_home = "~/.cargo"     # item 38: jobs never take these from the hook's env
+# rustup_home = "~/.rustup"
 [job.env]
 SQLX_OFFLINE = "true"
 "#

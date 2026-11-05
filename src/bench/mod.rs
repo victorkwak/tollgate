@@ -642,6 +642,19 @@ fn execute(
         include: vec!["*".into()],
         exclude: Vec::new(),
     };
+    // Item 38: jobs take CARGO_HOME and RUSTUP_HOME from the host config
+    // only; the bench's caller's values stand in for a host config entry.
+    for (key, slot) in [
+        ("CARGO_HOME", &mut host.job.cargo_home),
+        ("RUSTUP_HOME", &mut host.job.rustup_home),
+    ] {
+        if slot.is_none()
+            && let Some(v) = ctx.env.get_nonempty(key).and_then(|v| v.to_str())
+            && v.starts_with('/')
+        {
+            *slot = Some(v.to_owned());
+        }
+    }
     host.verify.root = Some(
         layout
             .root

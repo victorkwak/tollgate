@@ -6,8 +6,13 @@
 //! - `PATH`: `job.path_prepend`, then `$CARGO_HOME/bin` (default
 //!   `~/.cargo/bin`), `~/.local/bin`, `~/.bun/bin`, `/usr/local/bin`,
 //!   `/usr/bin`, `/bin`
-//! - `HOME`, and `USER`, `LOGNAME`, `SHELL`, `CARGO_HOME`, `RUSTUP_HOME`,
-//!   `DOCKER_HOST` when tollgate has them
+//! - `HOME`, and `USER`, `LOGNAME`, `SHELL`, `DOCKER_HOST` when tollgate
+//!   has them
+//! - `CARGO_HOME` and `RUSTUP_HOME` from host `[job]` (`cargo_home`,
+//!   `rustup_home`), else `<home>/.cargo` and `<home>/.rustup`, where home
+//!   is the install's (`install.json` for hooks): never from the
+//!   environment that started the job, so `CARGO_HOME=/tmp/x git commit`
+//!   cannot put a fake cargo first on the job PATH (item 38)
 //! - `LANG`/`LC_ALL` (`C.UTF-8`; `en_US.UTF-8` on macOS), `TERM=dumb`, `CI=1`
 //! - `SSH_AUTH_SOCK` only with `job.allow_ssh_agent = true`
 //! - host `[job.env]`, then the step's `env`, then its `env_file`
@@ -30,14 +35,7 @@ use crate::dirs::Dirs;
 use crate::env::EnvSnapshot;
 
 /// Variables copied from tollgate's own environment when present.
-const PASS_THROUGH: &[&str] = &[
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "CARGO_HOME",
-    "RUSTUP_HOME",
-    "DOCKER_HOST",
-];
+const PASS_THROUGH: &[&str] = &["USER", "LOGNAME", "SHELL", "DOCKER_HOST"];
 
 #[cfg(target_os = "macos")]
 const LOCALE: &str = "en_US.UTF-8";
@@ -157,10 +155,12 @@ impl JobEnv {
             tmpdir,
         } = *inputs;
         let home = dirs.home();
-        let cargo_bin = env
-            .get_nonempty("CARGO_HOME")
-            .map_or_else(|| home.join(".cargo"), PathBuf::from)
-            .join("bin");
+        let tool_home = |configured: Option<&String>, default: &str| {
+            configured.map_or_else(|| home.join(default), |p| dirs.expand_tilde(p))
+        };
+        let cargo_home = tool_home(job.cargo_home.as_ref(), ".cargo");
+        let rustup_home = tool_home(job.rustup_home.as_ref(), ".rustup");
+        let cargo_bin = cargo_home.join("bin");
         let mut path_dirs: Vec<PathBuf> = job
             .path_prepend
             .iter()
@@ -187,6 +187,8 @@ impl JobEnv {
                 vars.insert((*key).into(), v.to_owned());
             }
         }
+        vars.insert("CARGO_HOME".into(), cargo_home.into_os_string());
+        vars.insert("RUSTUP_HOME".into(), rustup_home.into_os_string());
         if job.allow_ssh_agent
             && let Some(v) = env.get_nonempty("SSH_AUTH_SOCK")
         {
@@ -356,6 +358,7 @@ mod tests {
         assert_eq!(
             keys(&e),
             [
+                "CARGO_HOME",
                 "CI",
                 "HOME",
                 "LANG",
@@ -369,6 +372,8 @@ mod tests {
                 "USER"
             ]
         );
+        assert_eq!(e.get("CARGO_HOME"), Some(OsStr::new("/home/u/.cargo")));
+        assert_eq!(e.get("RUSTUP_HOME"), Some(OsStr::new("/home/u/.rustup")));
         assert_eq!(e.get("TOLLGATE"), Some(OsStr::new("1")));
         assert_eq!(e.get("TMPDIR"), Some(OsStr::new("/s/jobs/j/tmp")));
         assert_eq!(
@@ -379,10 +384,28 @@ mod tests {
         );
     }
 
+    /// Item 38: `CARGO_HOME` and `RUSTUP_HOME` come from the host config or
+    /// the install's home, never from the environment that started the
+    /// job.
+    #[test]
+    fn cargo_and_rustup_homes_never_come_from_the_hook_env_item38() {
+        let mut f = fixture();
+        f.env.set("CARGO_HOME", "/tmp/fake-cargo");
+        f.env.set("RUSTUP_HOME", "/tmp/fake-rustup");
+        let e = base(&f, "/t");
+        assert_eq!(e.get("CARGO_HOME"), Some(OsStr::new("/home/u/.cargo")));
+        assert_eq!(e.get("RUSTUP_HOME"), Some(OsStr::new("/home/u/.rustup")));
+        let path = e.get("PATH").unwrap().to_str().unwrap();
+        assert!(!path.contains("fake"), "{path}");
+        f.job.rustup_home = Some("~/rs".into());
+        let e = base(&f, "/t");
+        assert_eq!(e.get("RUSTUP_HOME"), Some(OsStr::new("/home/u/rs")));
+    }
+
     #[test]
     fn path_prepend_cargo_home_and_ssh_agent() {
         let mut f = fixture();
-        f.env.set("CARGO_HOME", "/opt/cargo");
+        f.job.cargo_home = Some("/opt/cargo".into());
         f.job.path_prepend = vec!["~/tools".into(), "/opt/x".into()];
         f.job.allow_ssh_agent = true;
         let e = base(&f, "/t");
