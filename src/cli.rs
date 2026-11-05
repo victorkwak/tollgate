@@ -624,15 +624,15 @@ pub fn status(ctx: &Ctx, rev: Option<&str>, json: bool) -> u8 {
     }
     match &unchecked.newest_checked {
         Some(c) if unchecked.above == 0 => {
-            println!("unchecked: none ({} has a record)", c.short(12));
+            println!("unchecked: none ({} has a pass record)", c.short(12));
         }
         Some(c) => println!(
-            "unchecked: {} commit(s) above {} (newest commit with a record)",
+            "unchecked: {} commit(s) above {} (the newest commit with a pass record)",
             unchecked.above,
             c.short(12)
         ),
         None => println!(
-            "unchecked: no record in the last {} commit(s)",
+            "unchecked: no pass record in the last {} commit(s)",
             unchecked.scanned
         ),
     }
