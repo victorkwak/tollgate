@@ -501,8 +501,28 @@ impl Runner<'_> {
         if let Err(e) = co.update(&self.env, &self.spec.tree, &cache_dirs) {
             return error(ErrorCause::Checkout, e.to_string());
         }
-        // R71: the policy commit's tool configs, never the branch's own.
+        // R71: the policy commit's tool configs, never the branch's own,
+        // and none reached through a symlink.
         if let Err(e) = co.apply_overlay(&self.spec.policy.overlay) {
+            return error(ErrorCause::Checkout, e.to_string());
+        }
+        let entries = match self.repo_git.ls_tree(&self.spec.tree) {
+            Ok(e) => e,
+            Err(e) => return error(ErrorCause::Internal, e.to_string()),
+        };
+        let links = entries
+            .iter()
+            .filter(|e| e.mode == "120000")
+            .map(|e| e.path.as_path())
+            .chain(
+                self.spec
+                    .policy
+                    .overlay
+                    .iter()
+                    .filter(|(_, f)| matches!(f, crate::policy::OverlayFile::Symlink { .. }))
+                    .map(|(p, _)| p.as_path()),
+            );
+        if let Err(e) = co.check_links(links, &cache_dirs) {
             return error(ErrorCause::Checkout, e.to_string());
         }
         self.say(&format!(
@@ -510,10 +530,6 @@ impl Runner<'_> {
             co.path.display(),
             self.spec.tree
         ));
-        let entries = match self.repo_git.ls_tree(&self.spec.tree) {
-            Ok(e) => e,
-            Err(e) => return error(ErrorCause::Internal, e.to_string()),
-        };
         if let Some(end) = self.setup(co, &config, &entries) {
             return end;
         }

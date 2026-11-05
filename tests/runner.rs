@@ -236,6 +236,91 @@ mkdir -p target && touch target/marker junk.txt
     );
 }
 
+/// R71, item 3: after the checkout, a tool config reached through a
+/// symlink is refused (even one the policy commit has: its target can
+/// change on any branch), and so is a symlink to a dir outside the
+/// checkout (its files are not in the tree).
+#[test]
+fn tool_configs_reached_through_symlinks_are_refused_r71() {
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(outside.path().join("deep/er")).unwrap();
+    std::fs::write(outside.path().join("deep/er/rustfmt.toml"), "\n").unwrap();
+    for (name, link, target, extra) in [
+        (
+            ".cargo dir",
+            ".cargo",
+            "cfg",
+            Some(("cfg/config.toml", "[alias]\nx = \"y\"\n")),
+        ),
+        (
+            "clippy.toml file",
+            "clippy.toml",
+            "shared.toml",
+            Some(("shared.toml", "\n")),
+        ),
+        (
+            "dir outside with a tool config",
+            "ext",
+            outside.path().to_str().unwrap(),
+            None,
+        ),
+    ] {
+        let sb = Sandbox::new();
+        host(&sb, "");
+        let repo = repo_with(&sb, "r", PASS_POLICY);
+        if let Some((p, text)) = extra {
+            sb.commit_file(&repo, p, text, "target");
+        }
+        std::os::unix::fs::symlink(target, repo.join(link)).unwrap();
+        sb.git(&repo, &["add", link]);
+        sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "link"]);
+        let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+        assert_eq!(r.code, Some(1), "{name}: {}", r.out);
+        assert!(
+            r.out.contains("cause checkout") && r.out.contains(&format!("{link} ")),
+            "{name}: {}",
+            r.out
+        );
+    }
+    // A link into a kept dir (`target/` survives `git clean`): an earlier
+    // job's step wrote a tool config there.
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"w\"\nkind = \"command\"\nrun = \"mkdir -p target/x && touch target/x/clippy.toml\"\n",
+    );
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    std::os::unix::fs::symlink("target/x", repo.join("lint")).unwrap();
+    sb.git(&repo, &["add", "lint"]);
+    sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "link"]);
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("cause checkout") && r.out.contains("lint links to"),
+        "{}",
+        r.out
+    );
+    // A symlink to a file or dir inside the checkout is fine, and so is
+    // one to an outside dir without tool configs (a local wheel index).
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(&sb, "r", PASS_POLICY);
+    sb.commit_file(&repo, "docs/a.md", "a\n", "docs");
+    sb.commit_file(&repo, "docs/clippy.toml", "\n", "tree config");
+    let wheels = tempfile::tempdir().unwrap();
+    std::fs::write(wheels.path().join("x.whl"), "w").unwrap();
+    std::os::unix::fs::symlink("docs", repo.join("doc")).unwrap();
+    std::os::unix::fs::symlink("docs/a.md", repo.join("a.md")).unwrap();
+    std::os::unix::fs::symlink(wheels.path(), repo.join("wheels")).unwrap();
+    sb.git(&repo, &["add", "doc", "a.md", "wheels"]);
+    sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "links"]);
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+}
+
 #[test]
 fn unborn_repo_and_lru_eviction_r41_l15() {
     let sb = Sandbox::new();

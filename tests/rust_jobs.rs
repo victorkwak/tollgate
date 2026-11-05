@@ -311,6 +311,40 @@ fn a_branch_cargo_config_does_not_reach_the_steps_r71() {
     );
 }
 
+/// R71, item 3: TOOL_CONFIGS match git paths, so a `.cargo` that is a
+/// symlink to a dir holding `config.toml` hid a target runner of `true`
+/// from the overlay. The branch's `.cargo` entry (any mode) is policy.
+#[test]
+fn a_symlinked_cargo_dir_does_not_reach_the_steps_r71() {
+    let sb = Sandbox::new();
+    host(&sb);
+    let repo = sb.rust_repo("ws", Scratch { failing: true });
+    commit_policy(
+        &sb,
+        &repo,
+        "version = 1\n[[step]]\nname = \"tests\"\nkind = \"nextest\"\n",
+        "policy",
+    );
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(
+        &repo,
+        "tools/cfg/config.toml",
+        "[target.'cfg(all())']\nrunner = \"true\"\n",
+        "runner",
+    );
+    std::os::unix::fs::symlink("tools/cfg", repo.join(".cargo")).unwrap();
+    sb.git(&repo, &["add", ".cargo"]);
+    sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "link"]);
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(r.out.contains("FAIL b b tests::fails"), "{}", r.out);
+    assert!(
+        r.out.contains("POLICY: this branch changes .cargo"),
+        "{}",
+        r.out
+    );
+}
+
 #[test]
 fn a_record_covers_only_the_integration_tests_it_ran_r79_r80() {
     let sb = Sandbox::new();

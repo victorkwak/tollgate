@@ -46,6 +46,7 @@ const BUILTIN: &[&str] = &[
     "**/.pytest-baseline.json",
     "**/.cargo/config.toml",
     "**/.cargo/config",
+    "**/.cargo",
     "**/clippy.toml",
     "**/.clippy.toml",
     "**/rustfmt.toml",
@@ -58,14 +59,39 @@ const BUILTIN: &[&str] = &[
 /// replaces each in the verify checkout with the policy commit's version
 /// ([`Policy::overlay`]); cargo reads config from the step's dir and its
 /// parents, clippy and rustfmt from package and source dirs, so any depth.
+/// A tree entry named `.cargo` (a symlink to a dir holding `config.toml`,
+/// or a file) is one too: its path matches no config name, but cargo
+/// reads through it.
 const TOOL_CONFIGS: &[&str] = &[
     "**/.cargo/config.toml",
     "**/.cargo/config",
+    "**/.cargo",
     "**/clippy.toml",
     "**/.clippy.toml",
     "**/rustfmt.toml",
     "**/.rustfmt.toml",
 ];
+
+fn tool_globs() -> &'static GlobSet {
+    static SET: std::sync::OnceLock<GlobSet> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        glob::compile(
+            TOOL_CONFIGS,
+            GlobOpts {
+                case_insensitive: false,
+                literal_separator: true,
+            },
+        )
+        .expect("built-in tool config globs compile")
+    })
+}
+
+/// True when `path` (repo-relative) is a tool config of R71, or a
+/// `.cargo` entry.
+#[must_use]
+pub fn is_tool_config(path: &Path) -> bool {
+    tool_globs().is_match(path)
+}
 
 /// What the verify checkout must hold at one tool-config path (R71): the
 /// policy commit's version, or nothing.
@@ -440,20 +466,12 @@ fn overlay(
     base: &[TreeEntry],
     tree: &[TreeEntry],
 ) -> Result<BTreeMap<PathBuf, OverlayFile>, PolicyError> {
-    let tools = glob::compile(
-        TOOL_CONFIGS,
-        GlobOpts {
-            case_insensitive: false,
-            literal_separator: true,
-        },
-    )
-    .map_err(PolicyError::Config)?;
     // Gitlinks and trees cannot be tool configs; a tree entry of another
     // kind at the same path still has to go.
     let pick = |entries: &[TreeEntry]| -> BTreeMap<PathBuf, (String, Oid)> {
         entries
             .iter()
-            .filter(|e| tools.is_match(&e.path))
+            .filter(|e| is_tool_config(&e.path))
             .map(|e| (e.path.clone(), (e.mode.clone(), e.oid.clone())))
             .collect()
     };
