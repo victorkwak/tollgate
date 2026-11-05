@@ -95,6 +95,12 @@ fn run() -> u8 {
         Command::Flaky { days } => cli::flaky(&ctx, days),
         Command::RunJob { job, lock_fd } => cli::run_job(&ctx, &job, lock_fd),
         Command::Merge { branch } => tollgate::merge::merge(&ctx, &branch),
+        Command::Install { yes } => tollgate::install::install(&ctx, yes),
+        Command::Uninstall { yes } => tollgate::install::uninstall(&ctx, yes),
+        Command::Doctor { repo, injection } => tollgate::install::doctor::doctor(
+            &ctx,
+            &tollgate::install::doctor::Options { repo, injection },
+        ),
         other => not_built(other.name()),
     }
 }
@@ -191,7 +197,10 @@ enum Command {
         yes: bool,
     },
     /// Remove exactly what install added (R96).
-    Uninstall,
+    Uninstall {
+        #[arg(long)]
+        yes: bool,
+    },
     /// Check the installation, injection, tools, disk and locks (R97).
     Doctor {
         #[arg(long)]
@@ -303,7 +312,7 @@ impl Command {
     fn name(&self) -> &'static str {
         match self {
             Self::Install { .. } => "install",
-            Self::Uninstall => "uninstall",
+            Self::Uninstall { .. } => "uninstall",
             Self::Doctor { .. } => "doctor",
             Self::Check { .. } => "check",
             Self::Wait { .. } => "wait",
