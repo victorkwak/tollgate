@@ -975,7 +975,7 @@ pub fn config_effective(ctx: &Ctx) -> u8 {
         Err(e) => return fail(e),
     };
     let remotes = match plan::remote_trust(&repo.git, &scope) {
-        Ok(t) => plan::remote_refs(&repo.dirs, &ctx.env, &t),
+        Ok(t) => plan::remote_refs(&repo.dirs, &ctx.env, &repo.host.config.job, &t),
         Err(e) => return fail(e),
     };
     let (tip, tree) = match repo.git.rev_parse_verify("HEAD^{commit}") {

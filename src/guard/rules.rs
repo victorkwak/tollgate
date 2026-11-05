@@ -435,6 +435,28 @@ pub fn strip_wrappers(words: &[String]) -> Unwrapped {
     out
 }
 
+/// Where a command's stdin comes from, besides the shell's own (item 31).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Feed {
+    /// A pipe.
+    piped: bool,
+    /// A heredoc or a here-string.
+    inline_doc: bool,
+    /// Another input redirection (`<`, `<&`, `<>`).
+    input: bool,
+}
+
+impl Feed {
+    fn of(cmd: &SimpleCommand) -> Self {
+        let op = |ops: &[&str]| cmd.redirects.iter().any(|r| ops.contains(&r.op.as_str()));
+        Self {
+            piped: cmd.piped,
+            inline_doc: op(&["<<", "<<<"]),
+            input: op(&["<", "<&", "<>"]),
+        }
+    }
+}
+
 /// One command a Bash command runs.
 #[derive(Debug, Clone, Default)]
 struct Run {
@@ -448,6 +470,8 @@ struct Run {
     /// The simple command it came from, wrappers and their arguments
     /// included, as bash passes the words (quotes and escapes decoded).
     source: Vec<String>,
+    /// Where its stdin comes from.
+    feed: Feed,
 }
 
 /// The commands a simple command runs: itself after wrappers, plus the
@@ -459,6 +483,7 @@ fn expand(cmd: &SimpleCommand, inherited: &[String], depth: usize, out: &mut Vec
     assigns.extend(un.assigns);
     let words = un.words;
     let source: Vec<String> = cmd.assignments.iter().chain(&cmd.words).cloned().collect();
+    let feed = Feed::of(cmd);
     if words.is_empty() {
         // An assignment statement, a lone redirection, or a wrapper with
         // no command: kept for the env and redirection rules.
@@ -467,6 +492,7 @@ fn expand(cmd: &SimpleCommand, inherited: &[String], depth: usize, out: &mut Vec
             assigns,
             env_loss: un.env_loss,
             source,
+            feed,
         });
         return;
     }
@@ -492,6 +518,7 @@ fn expand(cmd: &SimpleCommand, inherited: &[String], depth: usize, out: &mut Vec
         assigns,
         env_loss: un.env_loss,
         source,
+        feed,
     });
 }
 
@@ -653,18 +680,23 @@ fn dangerous_config_key(value: &str) -> bool {
 
 /// R26: `git config` writes of these keys ask. `url.*` rewrites
 /// (`insteadOf`, `pushInsteadOf`) change which server a remote reaches,
-/// which decides remote trust (R5, R14).
+/// which decides remote trust (R5, R14); `core.sshCommand`,
+/// `core.gitProxy` and `ssh.*` change the program that reaches it (X1).
 fn config_key_asks(key: &str) -> bool {
     let key = key.to_lowercase();
     key.starts_with("core.hooks")
         || key == "core"
+        || key == "core.sshcommand"
+        || key == "core.gitproxy"
+        || key == "ssh"
+        || key.starts_with("ssh.")
         || key.starts_with("include")
         || key.starts_with("alias")
         || key == "url"
         || key.starts_with("url.")
 }
 
-/// R26: a `git config` call that writes a hook, include or alias key.
+/// R26: a `git config` call that writes a key [`config_key_asks`] names.
 fn git_config_write(args: &[String]) -> Option<String> {
     const WRITE_SUBS: &[&str] = &["set", "unset", "rename-section", "remove-section", "edit"];
     const WRITE_FLAGS: &[&str] = &[
@@ -980,37 +1012,57 @@ fn command_ruling(ctx: &Context, words: &[String], redirects: &[shell::Redirect]
     ruling
 }
 
-/// Variables that decide where tollgate finds its host config, install
-/// record and records, and which config files git reads (R8). Hooks take
-/// their dirs from `install.json`, not from these; the guard still denies
-/// setting them for git or tollgate, so a CLI check cannot run against a
-/// planted state dir either.
-const DIR_VARS: &[&str] = &[
-    "HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_STATE_HOME",
-    "XDG_DATA_HOME",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_CONFIG_NOSYSTEM",
+/// Why a dir variable is denied (R8).
+const DIR_WHY: &str = "changes which config and records tollgate uses (R8, R25)";
+
+/// Why a transport variable is denied (X1).
+const TRANSPORT_WHY: &str = "picks the program git reaches a server with, which could answer for the trusted remote (X1, R25)";
+
+/// Variables the guard denies for git and tollgate, with why:
+///
+/// - where tollgate finds its host config, install record and records,
+///   and which config files git reads (R8). Hooks take their dirs from
+///   `install.json`, not from these; the guard still denies them, so a CLI
+///   check cannot run against a planted state dir either;
+/// - the program git reaches a server with (`GIT_SSH*`,
+///   `GIT_PROXY_COMMAND`) and the dir git runs its own programs from,
+///   which git also puts first on the hooks' PATH (`GIT_EXEC_PATH`). The
+///   trusted-server query (L2, R14(2), R56) runs in its own environment
+///   anyway; the guard keeps them away from every git (X1).
+const GUARDED_VARS: &[(&str, &str)] = &[
+    ("HOME", DIR_WHY),
+    ("XDG_CONFIG_HOME", DIR_WHY),
+    ("XDG_STATE_HOME", DIR_WHY),
+    ("XDG_DATA_HOME", DIR_WHY),
+    ("GIT_CONFIG_GLOBAL", DIR_WHY),
+    ("GIT_CONFIG_SYSTEM", DIR_WHY),
+    ("GIT_CONFIG_NOSYSTEM", DIR_WHY),
+    ("GIT_SSH", TRANSPORT_WHY),
+    ("GIT_SSH_COMMAND", TRANSPORT_WHY),
+    ("GIT_SSH_VARIANT", TRANSPORT_WHY),
+    ("GIT_PROXY_COMMAND", TRANSPORT_WHY),
+    (
+        "GIT_EXEC_PATH",
+        "changes which git programs git and the gate hooks run (X1, R25)",
+    ),
 ];
 
-/// The [`DIR_VARS`] name that assignment word `a` (`NAME=v`, `NAME+=v`)
-/// sets.
-fn sets_dir_var(a: &str) -> Option<&'static str> {
+/// The [`GUARDED_VARS`] entry that assignment word `a` (`NAME=v`,
+/// `NAME+=v`) sets.
+fn sets_guarded_var(a: &str) -> Option<(&'static str, &'static str)> {
     let (name, _) = a.split_once('=')?;
     let name = name.strip_suffix('+').unwrap_or(name);
-    DIR_VARS.iter().find(|v| **v == name).copied()
+    GUARDED_VARS.iter().find(|(v, _)| *v == name).copied()
 }
 
-/// A [`DIR_VARS`] name that run `r` sets for the rest of the shell: an
-/// assignment statement (`HOME=/x;`) or `export`/`declare -x`/... with an
-/// assignment.
-fn shell_dir_var(r: &Run) -> Option<&'static str> {
+/// A [`GUARDED_VARS`] entry that run `r` sets for the rest of the shell:
+/// an assignment statement (`HOME=/x;`) or `export`/`declare -x`/... with
+/// an assignment.
+fn shell_guarded_var(r: &Run) -> Option<(&'static str, &'static str)> {
     match r.words.first().map(|w| basename(w)) {
-        None => r.assigns.iter().find_map(|a| sets_dir_var(a)),
+        None => r.assigns.iter().find_map(|a| sets_guarded_var(a)),
         Some("export" | "declare" | "typeset" | "readonly" | "local") => {
-            r.words[1..].iter().find_map(|a| sets_dir_var(a))
+            r.words[1..].iter().find_map(|a| sets_guarded_var(a))
         }
         Some(_) => None,
     }
@@ -1021,6 +1073,110 @@ fn runs_git_or_tollgate(ctx: &Context, words: &[String]) -> bool {
     words
         .first()
         .is_some_and(|w| git_call(words).is_some() || is_tollgate(ctx, w))
+}
+
+/// True when the command text names git or tollgate anywhere: in the raw
+/// text or the normalized text (quotes and backslashes inside the name do
+/// not hide it), heredoc bodies and messages included.
+fn mentions_git_or_tollgate(command: &str) -> bool {
+    let raw = command.to_lowercase();
+    let norm = normalize(command);
+    ["git", "tollgate"]
+        .iter()
+        .any(|n| raw.contains(n) || norm.contains(n))
+}
+
+/// Shells, and the builtins that run a file as shell code, whose stdin
+/// can be a script.
+const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish", "busybox", "source", ".",
+];
+
+/// True when python or perl takes its program from stdin: no inline
+/// program (`-c`/`-m` for python, `-e`/`-E` in perl's option clusters) and
+/// no script operand other than `-`.
+fn program_from_stdin(name: &str, args: &[String]) -> bool {
+    let python = name.starts_with("python");
+    // Option letters that give the program inline, and those whose value
+    // is the rest of the cluster (or, for python, the next word).
+    let (inline, valued) = if python {
+        ("cm", "WXQ")
+    } else {
+        ("eE", "IMmxilCd0D")
+    };
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        i += 1;
+        match a.as_str() {
+            "-" => return true,
+            "--" => return args.get(i).is_none_or(|s| s == "-"),
+            _ => {}
+        }
+        let Some(cluster) = a.strip_prefix('-') else {
+            // A script file.
+            return false;
+        };
+        if cluster.starts_with('-') {
+            continue;
+        }
+        for (k, c) in cluster.char_indices() {
+            if inline.contains(c) {
+                return false;
+            }
+            if valued.contains(c) {
+                if python && k + c.len_utf8() == cluster.len() {
+                    i += 1;
+                }
+                break;
+            }
+        }
+    }
+    true
+}
+
+/// Item 31 (21c): in a command that mentions git or tollgate, text the
+/// guard does not check is denied instead of decoded: ANSI-C quoting, a
+/// `\c` escape, and text fed to a shell (or to python or perl) through a
+/// pipe, a heredoc, a here-string or an input redirection, at any depth
+/// (`bash -c '... | sh'` included).
+fn hidden_text(command: &str, runs: &[Vec<Run>]) -> Option<Ruling> {
+    if !mentions_git_or_tollgate(command) {
+        return None;
+    }
+    if command.contains("$'") {
+        return Some(Ruling::Deny(
+            "ANSI-C quoting ($'...') in a command that runs git or tollgate is not checked: write the words plainly, and give a multi-line commit message with -F <file> or a quoted heredoc (item 31, R25)".into(),
+        ));
+    }
+    if command.contains("\\c") {
+        return Some(Ruling::Deny(
+            "a \\c escape in a command that runs git or tollgate is not checked; write the text without it (item 31, R25)".into(),
+        ));
+    }
+    for run in runs.iter().flatten() {
+        let Some(first) = run.words.first() else {
+            continue;
+        };
+        let name = basename(first);
+        let Feed {
+            piped,
+            inline_doc,
+            input,
+        } = run.feed;
+        let fed = if SHELLS.contains(&name) {
+            piped || inline_doc || input
+        } else if name.starts_with("python") || name == "perl" {
+            inline_doc || (piped && program_from_stdin(name, &run.words[1..]))
+        } else {
+            false
+        };
+        if fed {
+            return Some(Ruling::Deny(format!(
+                "{name} reads text from a pipe, heredoc or redirection in a command that runs git or tollgate; the guard cannot check that text, so run the commands directly (item 31, R25)"
+            )));
+        }
+    }
+    None
 }
 
 /// R25/R26 for a Bash command.
@@ -1038,6 +1194,9 @@ pub fn bash_ruling(ctx: &Context, command: &str) -> Ruling {
             runs
         })
         .collect();
+    if let Some(deny) = hidden_text(command, &runs) {
+        return deny;
+    }
     // The same rules on the words as bash passes them: quoting hides a
     // name from the text (`$'\x2d-no-verify'`, `$'\x47IT_CONFIG_COUNT'`).
     // One command per segment, so words of separate commands never join.
@@ -1049,9 +1208,10 @@ pub fn bash_ruling(ctx: &Context, command: &str) -> Ruling {
     if let Some(deny) = text_ruling(&decoded.join(" ; ")) {
         return deny;
     }
-    // R8: HOME or XDG set for the rest of the shell counts for every git
-    // and tollgate in the command (best effort: order is not followed).
-    let shell_sets = runs.iter().flatten().find_map(shell_dir_var);
+    // R8, X1: a guarded variable set for the rest of the shell counts for
+    // every git and tollgate in the command (best effort: order is not
+    // followed).
+    let shell_sets = runs.iter().flatten().find_map(shell_guarded_var);
     let mut ruling = Ruling::Allow;
     // `cd <dir>` changes where later relative paths point (best effort).
     let mut here = ctx.clone();
@@ -1067,15 +1227,13 @@ pub fn bash_ruling(ctx: &Context, command: &str) -> Ruling {
                 return Ruling::Deny(format!("{why} (R25)"));
             }
             if runs_git_or_tollgate(ctx, &run.words)
-                && let Some(var) = run
+                && let Some((var, why)) = run
                     .assigns
                     .iter()
-                    .find_map(|a| sets_dir_var(a))
+                    .find_map(|a| sets_guarded_var(a))
                     .or(shell_sets)
             {
-                return Ruling::Deny(format!(
-                    "{var} set for git or tollgate changes which config and records tollgate uses (R8, R25)"
-                ));
+                return Ruling::Deny(format!("{var} set for git or tollgate {why}"));
             }
             // Redirections belong to the outer command only.
             let redirects: &[shell::Redirect] = if k + 1 == runs.len() {
@@ -1318,10 +1476,94 @@ mod tests {
         }
         // Words in separate commands do not join into a match.
         assert_eq!(bash_ruling(&ctx(), "echo env; echo -u git"), Ruling::Allow);
-        assert_eq!(
-            bash_ruling(&ctx(), r"git commit -m $'two\nlines'"),
-            Ruling::Allow
-        );
+    }
+
+    /// Item 31 (21c): in a command that mentions git or tollgate, ANSI-C
+    /// quoting, a `\c` escape and text fed to an interpreter's stdin
+    /// deny; the guard does not chase bash's decoding there.
+    #[test]
+    fn hidden_text_in_git_commands_denies_r25() {
+        for cmd in [
+            r"echo $'\c\\' ; git commit -n -m x",
+            r"echo $'\c\\' ; git commit $'\x2dn' -m x",
+            r"git commit $'\c\\' -n -m x",
+            r"git commit $'\c-\c-no-verify' -m x",
+            r"git commit -m $'two\nlines'",
+            r"git commit -m 'path C:\code'",
+            r"tollgate check $'\x2d-tier' full",
+            "bash <<< 'git commit -n -m x'",
+            "sh <<'EOF'\ngit commit -n -m x\nEOF",
+            "cat <<EOF | bash\ngit commit -n -m x\nEOF",
+            "echo 'git commit -n -m x' | sh",
+            "printf 'git push -n origin x' | env bash -s",
+            "echo 'git push -n' |& zsh",
+            "echo 'git am -n x' | (bash)",
+            "bash -c \"echo 'git commit -n -m x' | sh\"",
+            "sh -c 'sh <<< \"git push -n origin x\"'",
+            "bash < /dev/stdin <<< 'git commit -n -m x'",
+            ". /dev/stdin <<< 'git commit -n -m x'",
+            "python3 - <<'EOF'\nimport os; os.system('git commit -n -m x')\nEOF",
+            "python3 <<< 'import os; os.system(\"git commit -n\")'",
+            "perl <<< 'system(\"git commit -n -m x\")'",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+        for cmd in [
+            "git commit -F - <<'EOF'\nsubject\n\nbody\nEOF",
+            "git commit -m \"$(cat <<'EOF'\nsubject\nEOF\n)\"",
+            "cat <<'EOF' > notes.md\ngit is nice\nEOF",
+            "git show HEAD:a.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+            "git log --format=%s | perl -ne 'print if /fix/'",
+            "git diff | wc -l",
+            "git status || echo no",
+        ] {
+            assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
+    }
+
+    /// A command that does not mention git or tollgate keeps the ANSI-C
+    /// decoder, which reads `$'...'` as bash does (`\c\\` is one
+    /// character), so the words it hides are checked (R25).
+    #[test]
+    fn decoded_words_without_a_git_mention_deny_r25() {
+        for cmd in [
+            r"echo $'\c\\' ; $'\x67it' commit -n -m x",
+            r"$'\x67it' commit $'\c\\' -n -m x",
+            r"$'\x67it' commit $'\c\\\\' $'\x2dn' -m x",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+        assert_eq!(bash_ruling(&ctx(), r"printf %s $'\c\\x'"), Ruling::Allow);
+    }
+
+    /// Variables that choose the program git reaches a server with
+    /// (`GIT_SSH*`, `GIT_PROXY_COMMAND`) or the dir git and the hooks run
+    /// git's programs from (`GIT_EXEC_PATH`) are denied for git and
+    /// tollgate (R25, X1).
+    #[test]
+    fn transport_variables_in_front_of_git_deny_r25() {
+        for cmd in [
+            "GIT_SSH_COMMAND=/tmp/f git commit -m x",
+            "GIT_SSH=/tmp/f git commit -m x",
+            "GIT_SSH_VARIANT=simple git push origin feat",
+            "GIT_PROXY_COMMAND=/tmp/p git fetch origin",
+            "GIT_EXEC_PATH=/tmp/x git commit -m x",
+            "env GIT_SSH_COMMAND=/tmp/f git commit -m x",
+            "export GIT_SSH_COMMAND=/tmp/f; git commit -m x",
+            "GIT_SSH_COMMAND=/tmp/f; git commit -m x",
+            "declare -x GIT_EXEC_PATH=/tmp/x && git push",
+            "GIT_SSH_COMMAND=/tmp/f tollgate check",
+            "bash -c 'GIT_SSH=/tmp/f git push origin feat'",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+        for cmd in [
+            "GIT_SSH_COMMAND=/tmp/f cargo test",
+            "echo $GIT_SSH_COMMAND",
+            "git config --get core.sshCommand",
+        ] {
+            assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
     }
 
     /// git's option parser takes any unambiguous prefix of a long option:
@@ -1487,6 +1729,11 @@ mod tests {
             "git config set url.x.insteadOf y",
             "git -c url./tmp/f.git.insteadOf=git@h:r.git fetch origin",
             "git --config-env=url.x.insteadOf=V fetch",
+            "git config --global core.sshCommand /tmp/f",
+            "git config set --global core.sshcommand /tmp/f",
+            "git config core.gitProxy /tmp/p",
+            "git config ssh.variant simple",
+            "git config --remove-section ssh",
         ] {
             assert!(ask(cmd), "{cmd}");
         }

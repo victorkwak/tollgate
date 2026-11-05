@@ -6,9 +6,12 @@
 //! reflog tells where its value came from. tollgate trusts a value only
 //! when the trusted server reported it for that branch: `git ls-remote
 //! --heads` against the remote's fetch URL as git uses it (after
-//! `insteadOf` rewrites, checked against `scope.remotes`), run outside the
-//! repo, so no repo config (`remote.<name>.uploadpack`, `core.sshCommand`,
-//! `url.*`) changes where it goes.
+//! `insteadOf` rewrites, checked against `scope.remotes`). The query runs
+//! in its own environment, with no repo and no global or system config,
+//! so neither the repo's or the user's config (`remote.<name>.uploadpack`,
+//! `core.sshCommand`, `url.*`) nor what the agent's shell sets for one
+//! command (`GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_EXEC_PATH`, `PATH`)
+//! changes who answers (X1).
 //!
 //! Each answer is kept in `<state>/remote-refs.json` per URL (the newest
 //! values of each branch, newest first). A value the server reported once
@@ -20,8 +23,10 @@
 //! counts, never an older one the tracking ref was moved back to.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::Read as _;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -96,15 +101,147 @@ impl Store {
     }
 }
 
+/// The dirs after `job.path_prepend` on the server query's PATH.
+const SYSTEM_PATH: [&str; 3] = ["/usr/local/bin", "/usr/bin", "/bin"];
+
+/// Variables the server query keeps from tollgate's environment. None
+/// changes who answers (ssh checks the host key, TLS the certificate):
+/// they only reach credentials (an ssh agent, a keyring, a credential
+/// helper's files).
+const QUERY_PASS_THROUGH: &[&str] = &[
+    "USER",
+    "LOGNAME",
+    "SSH_AUTH_SOCK",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+];
+
+/// The ssh of the server query, found on its PATH. `BatchMode` fails at
+/// once where ssh would ask on the terminal (unknown host key, a
+/// passphrase without an agent).
+const QUERY_SSH: &str = "core.sshCommand=ssh -o BatchMode=yes";
+
 /// Where the store lives and how `ls-remote` runs.
 #[derive(Debug, Clone)]
 struct Site {
     file: PathBuf,
-    /// An empty dir under the state dir: `ls-remote` runs there, with
-    /// `GIT_CEILING_DIRECTORIES` at its parent, so it finds no repo.
+    /// A dir under the state dir that `ls-remote` runs in. git reads no
+    /// repo there whatever it holds (`GIT_DIR=/dev/null`).
     neutral: PathBuf,
-    env: EnvSnapshot,
+    /// The query's environment ([`query_env`]).
+    env: BTreeMap<OsString, OsString>,
     timeout: Duration,
+}
+
+/// The server query's environment (L2, X1). Nothing in it comes from what
+/// the shell that started the hook can set for one command: PATH is
+/// `job.path_prepend` and then the system dirs, HOME is tollgate's home,
+/// no `GIT_*` variable and no proxy variable comes through, and git reads
+/// no repo (`GIT_DIR=/dev/null`), no global and no system config. So
+/// `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_EXEC_PATH`, a fake `ssh` first on the
+/// agent's PATH, and a global `core.sshCommand` or `url.<x>.insteadOf`
+/// cannot pick who answers for the trusted server.
+fn query_env(
+    env: &EnvSnapshot,
+    dirs: &Dirs,
+    path_prepend: &[String],
+) -> BTreeMap<OsString, OsString> {
+    let path: Vec<PathBuf> = path_prepend
+        .iter()
+        .map(|p| dirs.expand_tilde(p))
+        .chain(SYSTEM_PATH.iter().map(PathBuf::from))
+        .collect();
+    // The host config refuses a `:` in path_prepend (the only error).
+    let path = std::env::join_paths(&path).unwrap_or_else(|_| SYSTEM_PATH.join(":").into());
+    let mut vars: BTreeMap<OsString, OsString> = BTreeMap::new();
+    vars.insert("PATH".into(), path);
+    vars.insert("HOME".into(), dirs.home().as_os_str().to_owned());
+    for key in QUERY_PASS_THROUGH {
+        if let Some(v) = env.get_nonempty(key) {
+            vars.insert((*key).into(), v.to_owned());
+        }
+    }
+    for (k, v) in [
+        ("LC_ALL", "C"),
+        ("GIT_DIR", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+    ] {
+        vars.insert(k.into(), v.into());
+    }
+    vars
+}
+
+/// The `global` and `system` entries of `git config -z --show-scope`
+/// output (`scope\0key\nvalue\0`; a key with no value, `key\0`, is a
+/// boolean true), in order.
+fn user_entries(out: &[u8]) -> Vec<(String, String)> {
+    let mut fields = out.split(|b| *b == 0);
+    let mut entries = Vec::new();
+    while let (Some(scope), Some(entry)) = (fields.next(), fields.next()) {
+        if !matches!(scope, b"global" | b"system") {
+            continue;
+        }
+        let entry = String::from_utf8_lossy(entry);
+        let (key, value) = entry.split_once('\n').unwrap_or((&entry, "true"));
+        entries.push((key.to_owned(), value.to_owned()));
+    }
+    entries
+}
+
+impl Site {
+    /// The user's `credential.*` settings from the global and system
+    /// config, in order. A credential helper only supplies credentials; it
+    /// cannot change which server answers, so the query keeps them (an
+    /// https remote with a helper keeps working).
+    fn user_credentials(&self) -> Vec<(String, String)> {
+        let out = Command::new("git")
+            .env_clear()
+            .envs(self.env.iter().filter(|(k, _)| {
+                !matches!(
+                    k.to_str(),
+                    Some("GIT_CONFIG_NOSYSTEM" | "GIT_CONFIG_GLOBAL")
+                )
+            }))
+            .arg("-C")
+            .arg(&self.neutral)
+            .args([
+                "config",
+                "-z",
+                "--show-scope",
+                "--get-regexp",
+                r"^credential\.",
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        out.map(|o| user_entries(&o.stdout)).unwrap_or_default()
+    }
+
+    /// `git <args>` as the server query runs it: in the neutral dir, with
+    /// [`query_env`], the user's credential settings and [`QUERY_SSH`].
+    fn query_command(&self, args: &[&str]) -> Result<Command, String> {
+        fsx::ensure_dir(&self.neutral).map_err(|e| format!("{}: {e}", self.neutral.display()))?;
+        let mut cmd = Command::new("git");
+        cmd.env_clear().envs(&self.env);
+        let creds = self.user_credentials();
+        if !creds.is_empty() {
+            cmd.env("GIT_CONFIG_COUNT", creds.len().to_string());
+            for (i, (k, v)) in creds.iter().enumerate() {
+                cmd.env(format!("GIT_CONFIG_KEY_{i}"), k)
+                    .env(format!("GIT_CONFIG_VALUE_{i}"), v);
+            }
+        }
+        cmd.arg("-C")
+            .arg(&self.neutral)
+            .args(["-c", QUERY_SSH])
+            .args(args)
+            .stdin(Stdio::null());
+        Ok(cmd)
+    }
 }
 
 /// The trusted remotes of a repo and what their server reported.
@@ -130,16 +267,24 @@ impl RemoteRefs {
         }
     }
 
-    /// `remotes`, with the store in `dirs` and `ls-remote` in `env`.
+    /// `remotes`, with the store in `dirs`. `ls-remote` runs in its own
+    /// environment ([`query_env`]): from `env` it takes only what reaches
+    /// credentials, and it finds git and ssh on `path_prepend` (the host's
+    /// `job.path_prepend`) and then the system dirs.
     #[must_use]
-    pub fn new(dirs: &Dirs, env: &EnvSnapshot, remotes: Vec<TrustedRemote>) -> Self {
+    pub fn new(
+        dirs: &Dirs,
+        env: &EnvSnapshot,
+        path_prepend: &[String],
+        remotes: Vec<TrustedRemote>,
+    ) -> Self {
         let state = dirs.state_dir();
         Self {
             remotes,
             site: Some(Site {
                 file: dirs.remote_refs_file(),
                 neutral: state.join("neutral"),
-                env: env.clone(),
+                env: query_env(env, dirs, path_prepend),
                 timeout: LS_REMOTE_TIMEOUT,
             }),
             store: Mutex::new(None),
@@ -298,17 +443,13 @@ impl RemoteRefs {
     }
 }
 
-/// `git ls-remote --heads -- <url>` in the neutral dir with a time limit.
+/// `git ls-remote --heads -- <url>` as the server query runs it
+/// ([`Site::query_command`]), with a time limit.
 fn ls_remote_heads(site: &Site, url: &str) -> Result<Heads, String> {
-    fsx::ensure_dir(&site.neutral).map_err(|e| format!("{}: {e}", site.neutral.display()))?;
-    let git = Git::scrubbed(&site.env, &site.neutral);
-    let mut cmd = git.command(["ls-remote", "--heads", "--", url]);
-    if let Some(parent) = site.neutral.parent() {
-        cmd.env("GIT_CEILING_DIRECTORIES", parent);
-    }
+    let mut cmd = site.query_command(&["ls-remote", "--heads", "--", url])?;
     let mut child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot run git: {e}"))?;
     let (mut out, mut err) = (child.stdout.take(), child.stderr.take());
@@ -391,6 +532,127 @@ mod tests {
         }
         assert_eq!(s.urls["u"].refs["refs/heads/main"].len(), KEEP_PER_REF);
         assert_eq!(s.urls["u"].refs["refs/heads/main"][0], oid('f'));
+    }
+
+    /// X1: the server query gets nothing from the shell that started the
+    /// hook that can change who answers (`GIT_SSH*`, `GIT_PROXY_COMMAND`,
+    /// `GIT_EXEC_PATH`, `GIT_CONFIG_*`, proxies, the agent's PATH), reads
+    /// no repo, global or system config, and keeps only the user's
+    /// `credential.*` settings, which cannot change the server.
+    #[test]
+    fn the_server_query_ignores_the_shell_and_the_user_git_config_x1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[core]\n\tsshCommand = /tmp/forger\n\tgitProxy = /tmp/proxy\n[ssh]\n\tvariant = simple\n[url \"/fake\"]\n\tinsteadOf = /trusted\n[http]\n\tproxy = http://proxy.invalid\n[credential]\n\thelper =\n\thelper = store\n[credential \"https://h.invalid/a=b\"]\n\tusername = me\n\tuseHttpPath\n",
+        )
+        .unwrap();
+        let env = EnvSnapshot::from_pairs([
+            ("PATH", OsString::from("/agent/bin:/usr/bin")),
+            ("HOME", home.clone().into_os_string()),
+            ("XDG_STATE_HOME", root.join("state").into_os_string()),
+            ("XDG_CONFIG_HOME", root.join("config").into_os_string()),
+            ("GIT_SSH_COMMAND", "/tmp/forger".into()),
+            ("GIT_SSH", "/tmp/forger".into()),
+            ("GIT_SSH_VARIANT", "simple".into()),
+            ("GIT_PROXY_COMMAND", "/tmp/proxy".into()),
+            ("GIT_EXEC_PATH", "/tmp/exec".into()),
+            ("GIT_ASKPASS", "/tmp/askpass".into()),
+            (
+                "GIT_CONFIG_PARAMETERS",
+                "'url./fake2.insteadof'='/trusted'".into(),
+            ),
+            ("GIT_CONFIG_COUNT", "1".into()),
+            ("GIT_CONFIG_KEY_0", "core.sshCommand".into()),
+            ("GIT_CONFIG_VALUE_0", "/tmp/forger".into()),
+            ("https_proxy", "http://proxy.invalid".into()),
+            ("SSH_AUTH_SOCK", "/run/agent.sock".into()),
+        ]);
+        let dirs = Dirs::from_env(&env).unwrap();
+        let refs = RemoteRefs::new(&dirs, &env, &["~/tools".to_owned()], Vec::new());
+        let site = refs.site.as_ref().unwrap();
+        // A repo planted at the dir the query runs in.
+        std::fs::create_dir_all(&site.neutral).unwrap();
+        let plant = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .env_clear()
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .arg("-C")
+                .arg(&site.neutral)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(st.success(), "{args:?}");
+        };
+        plant(&["init", "-q"]);
+        plant(&["config", "url./fake3.insteadOf", "/trusted"]);
+        plant(&["config", "core.sshCommand", "/tmp/forger"]);
+
+        let out = site
+            .query_command(&["config", "--list", "--show-scope"])
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            [
+                "command\tcredential.helper=",
+                "command\tcredential.helper=store",
+                "command\tcredential.https://h.invalid/a=b.username=me",
+                "command\tcredential.https://h.invalid/a=b.usehttppath=true",
+                "command\tcore.sshcommand=ssh -o BatchMode=yes",
+            ],
+            "{text}"
+        );
+
+        // What a program git starts (ssh, a credential helper) sees.
+        let out = site
+            .query_command(&["-c", "alias.show-env=!env", "show-env"])
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        let var = |k: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{k}=")))
+                .map(str::to_owned)
+        };
+        for gone in [
+            "GIT_SSH_COMMAND",
+            "GIT_SSH",
+            "GIT_SSH_VARIANT",
+            "GIT_PROXY_COMMAND",
+            "GIT_ASKPASS",
+            "https_proxy",
+        ] {
+            assert_eq!(var(gone), None, "{gone}: {text}");
+        }
+        // git sets GIT_EXEC_PATH for its children: its own, never ours.
+        for planted in ["fake2", "/tmp/forger", "/tmp/exec", "/tmp/proxy"] {
+            assert!(!text.contains(planted), "{planted}: {text}");
+        }
+        let path = var("PATH").unwrap();
+        assert!(
+            !path.contains("/agent/bin")
+                && path.ends_with(&format!(
+                    "{}:/usr/local/bin:/usr/bin:/bin",
+                    home.join("tools").display()
+                )),
+            "{path}"
+        );
+        assert_eq!(var("HOME"), Some(home.display().to_string()));
+        assert_eq!(var("SSH_AUTH_SOCK").as_deref(), Some("/run/agent.sock"));
+        assert_eq!(var("GIT_CONFIG_GLOBAL").as_deref(), Some("/dev/null"));
+        assert_eq!(var("GIT_CONFIG_NOSYSTEM").as_deref(), Some("1"));
+        assert_eq!(var("GIT_TERMINAL_PROMPT").as_deref(), Some("0"));
     }
 
     #[test]

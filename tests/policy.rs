@@ -25,6 +25,7 @@ fn trusted(sb: &Sandbox, url: &Path) -> RemoteRefs {
     RemoteRefs::new(
         &tollgate::dirs::Dirs::from_env(&env).unwrap(),
         &env,
+        &[],
         vec![TrustedRemote {
             name: "origin".into(),
             url: url.to_str().unwrap().to_owned(),

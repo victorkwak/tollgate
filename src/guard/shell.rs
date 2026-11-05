@@ -4,9 +4,11 @@
 //! removed), leading assignments and redirections. Command substitutions
 //! (`$(...)`, backticks), process substitutions (`<(...)`, `>(...)`) and
 //! subshells are parsed as commands too. Heredoc bodies are data: they are
-//! skipped here and seen only by the guard's substring rules. Best effort:
-//! the guard is a backstop behind the git hooks, so a construct this lexer
-//! does not model errs toward more matches, not fewer.
+//! skipped here and seen only by the guard's substring rules (a heredoc,
+//! here-string or pipe into a shell is denied in commands that name git,
+//! item 31). Best effort: the guard is a backstop behind the git hooks, so
+//! a construct this lexer does not model errs toward more matches, not
+//! fewer.
 
 /// One redirection of a simple command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +46,8 @@ pub struct SimpleCommand {
     pub words: Vec<String>,
     /// Redirections.
     pub redirects: Vec<Redirect>,
+    /// Its stdin is a pipe (after `|` or `|&`, or in a piped subshell).
+    pub piped: bool,
 }
 
 struct Lexer<'a> {
@@ -266,81 +270,22 @@ impl Lexer<'_> {
         any.then_some(w)
     }
 
-    /// Reads up to `max` digits of `radix`; `None` when there is none.
-    fn take_digits(&mut self, radix: u32, max: usize) -> Option<u32> {
-        let mut value: Option<u32> = None;
-        for _ in 0..max {
-            let Some(d) = self.peek().and_then(|c| c.to_digit(radix)) else {
-                break;
-            };
-            value = Some(value.unwrap_or(0).saturating_mul(radix).saturating_add(d));
-            self.pos += 1;
-        }
-        value
-    }
-
     /// Reads the rest of an ANSI-C quoted string (`$'...'`, after the
-    /// opening quote) into `w`, decoding escapes as bash does: `\a \b \e
-    /// \E \f \n \r \t \v \\ \' \" \?`, octal `\nnn` (1-3 digits) and hex
-    /// `\xHH` (1-2 digits) bytes, `\uHHHH` and `\UHHHHHHHH` code points,
-    /// and `\cx` control characters. An unknown escape keeps its
-    /// backslash. A NUL ends the string (bash builds a C string); the rest
-    /// of the quote is read and dropped. A byte above 0x7f becomes the
-    /// code point of the same value: only ASCII matters to the rules.
+    /// opening quote) into `w`. As bash does, the end is found first (a
+    /// backslash escapes the next character, the first other `'` ends the
+    /// string) and then the text is decoded ([`decode_ansi_c`]), so no
+    /// escape can move the end.
     fn read_ansi_c(&mut self, w: &mut String) {
-        let mut ended = false;
+        let start = self.pos;
         while let Some(c) = self.peek() {
-            self.pos += 1;
-            let decoded: Option<char> = match c {
-                '\'' => return,
-                '\\' => {
-                    let Some(e) = self.peek() else {
-                        if !ended {
-                            w.push('\\');
-                        }
-                        return;
-                    };
-                    self.pos += 1;
-                    let code = |v: u32| char::from_u32(v).unwrap_or(char::REPLACEMENT_CHARACTER);
-                    match e {
-                        'a' => Some('\x07'),
-                        'b' => Some('\x08'),
-                        'e' | 'E' => Some('\x1b'),
-                        'f' => Some('\x0c'),
-                        'n' => Some('\n'),
-                        'r' => Some('\r'),
-                        't' => Some('\t'),
-                        'v' => Some('\x0b'),
-                        '\\' | '\'' | '"' | '?' => Some(e),
-                        '0'..='7' => {
-                            self.pos -= 1;
-                            self.take_digits(8, 3).map(|v| code(v & 0xff))
-                        }
-                        'x' => self.take_digits(16, 2).map(code),
-                        'u' => self.take_digits(16, 4).map(code),
-                        'U' => self.take_digits(16, 8).map(code),
-                        'c' => self.peek().map(|x| {
-                            self.pos += 1;
-                            code(u32::from(x) & 0x1f)
-                        }),
-                        _ => None,
-                    }
-                    .or_else(|| {
-                        // Unknown, or no digits: the text stays.
-                        if !ended {
-                            w.push('\\');
-                        }
-                        Some(e)
-                    })
-                }
-                other => Some(other),
-            };
-            match decoded {
-                Some('\0') => ended = true,
-                Some(ch) if !ended => w.push(ch),
-                _ => {}
+            if c == '\'' {
+                break;
             }
+            self.pos += if c == '\\' { 2 } else { 1 };
         }
+        let end = self.pos.min(self.chars.len());
+        decode_ansi_c(&self.chars[start..end], w);
+        self.pos = (end + 1).min(self.chars.len());
     }
 
     fn skip_blanks(&mut self) {
@@ -399,9 +344,27 @@ impl Lexer<'_> {
                     flush(&mut cur, self.out);
                     self.skip_heredocs(&mut heredocs);
                 }
-                ';' | '|' | ')' => {
+                ';' | ')' => {
                     self.pos += 1;
                     flush(&mut cur, self.out);
+                }
+                '|' => {
+                    self.pos += 1;
+                    flush(&mut cur, self.out);
+                    match self.peek() {
+                        // `||`: the next command runs after this one, not
+                        // on its output.
+                        Some('|') => {
+                            self.pos += 1;
+                            cur.piped = false;
+                        }
+                        // `|&` pipes stderr too.
+                        Some('&') => {
+                            self.pos += 1;
+                            cur.piped = true;
+                        }
+                        _ => cur.piped = true,
+                    }
                 }
                 '&' if self.peek_at(1) == Some('>') => {
                     let op = self.read_redirect_op();
@@ -415,9 +378,18 @@ impl Lexer<'_> {
                 }
                 '(' => {
                     self.pos += 1;
+                    let piped = cur.piped;
                     flush(&mut cur, self.out);
+                    cur.piped = false;
                     let inner = self.read_balanced_paren();
+                    let first = self.out.len();
                     self.nested(&inner);
+                    // Every command of a piped subshell may read the pipe.
+                    if piped {
+                        for c in &mut self.out[first..] {
+                            c.piped = true;
+                        }
+                    }
                 }
                 '#' => {
                     while self.peek().is_some_and(|c| c != '\n') {
@@ -460,6 +432,89 @@ impl Lexer<'_> {
             }
         }
         flush(&mut cur, self.out);
+    }
+}
+
+/// bash's `\cx`: toupper(x) & 0x1f, and 0x7f for `?`.
+fn control(x: char) -> char {
+    if x == '?' {
+        return '\x7f';
+    }
+    let v = u32::from(x.to_ascii_uppercase()) & 0x1f;
+    char::from_u32(v).unwrap_or(char::REPLACEMENT_CHARACTER)
+}
+
+/// Decodes the text of an ANSI-C quoted string (`$'...'` without its
+/// quotes) into `w` as bash 5 does: `\a \b \e \E \f \n \r \t \v \\ \' \"
+/// \?`, octal `\nnn` (1-3 digits) and hex `\xHH` (1-2 digits) bytes,
+/// `\uHHHH` and `\UHHHHHHHH` code points, and `\cx` control characters
+/// ([`control`]; in `\c\\` the pair of backslashes is the `x`, and a
+/// `\c` at the end stays as text). An unknown escape keeps its backslash.
+/// A NUL ends the string (bash builds a C string); the rest is dropped. A
+/// byte above 0x7f becomes the code point of the same value: only ASCII
+/// matters to the rules.
+fn decode_ansi_c(text: &[char], w: &mut String) {
+    let code = |v: u32| char::from_u32(v).unwrap_or(char::REPLACEMENT_CHARACTER);
+    // Up to `max` digits of `radix` at `text[*i..]`; `None` when none.
+    let digits = |i: &mut usize, radix: u32, max: usize| -> Option<u32> {
+        let mut value: Option<u32> = None;
+        for _ in 0..max {
+            let Some(d) = text.get(*i).and_then(|c| c.to_digit(radix)) else {
+                break;
+            };
+            value = Some(value.unwrap_or(0).saturating_mul(radix).saturating_add(d));
+            *i += 1;
+        }
+        value
+    };
+    let mut i = 0;
+    while let Some(&c) = text.get(i) {
+        i += 1;
+        let decoded = if c == '\\' {
+            let Some(&e) = text.get(i) else {
+                w.push('\\');
+                return;
+            };
+            i += 1;
+            let known = match e {
+                'a' => Some('\x07'),
+                'b' => Some('\x08'),
+                'e' | 'E' => Some('\x1b'),
+                'f' => Some('\x0c'),
+                'n' => Some('\n'),
+                'r' => Some('\r'),
+                't' => Some('\t'),
+                'v' => Some('\x0b'),
+                '\\' | '\'' | '"' | '?' => Some(e),
+                '0'..='7' => {
+                    i -= 1;
+                    digits(&mut i, 8, 3).map(|v| code(v & 0xff))
+                }
+                'x' => digits(&mut i, 16, 2).map(code),
+                'u' => digits(&mut i, 16, 4).map(code),
+                'U' => digits(&mut i, 16, 8).map(code),
+                'c' => text.get(i).copied().map(|x| {
+                    i += 1;
+                    if x == '\\' && text.get(i) == Some(&'\\') {
+                        i += 1;
+                    }
+                    control(x)
+                }),
+                _ => None,
+            };
+            known.unwrap_or_else(|| {
+                // Unknown, without digits, or `\c` at the end: the text
+                // stays.
+                w.push('\\');
+                e
+            })
+        } else {
+            c
+        };
+        if decoded == '\0' {
+            return;
+        }
+        w.push(decoded);
     }
 }
 
@@ -585,5 +640,45 @@ mod tests {
                 "{src}"
             );
         }
+    }
+
+    /// `\c` reads as bash 5 reads it: bash finds the end of `$'...'`
+    /// first (a backslash escapes the next character), so `\c\\` is one
+    /// control character and the quote after it closes the string; `\cx`
+    /// is toupper(x) & 0x1f, `\c?` is 0x7f, and a `\c` at the end stays.
+    #[test]
+    fn ansi_c_control_escapes_match_bash() {
+        assert_eq!(
+            words(r"echo $'\c\\' ; echo next"),
+            vec![vec!["echo", "\x1c"], vec!["echo", "next"]]
+        );
+        for (src, want) in [
+            (r"$'\c\\x'", "\x1cx"),
+            (r"$'\c\x'", "\x1cx"),
+            (r"$'\c\'a'", "\x1c'a"),
+            (r"$'\c\\\\'", "\x1c\\"),
+            (r"$'\c'", r"\c"),
+            (r"$'\ca\cA\c?\c[\c-'", "\x01\x01\x7f\x1b\r"),
+            (r"$'a\cb'", "a\x02"),
+        ] {
+            assert_eq!(
+                words(&format!("git {src}")),
+                vec![vec!["git", want]],
+                "{src}"
+            );
+        }
+    }
+
+    /// A command after `|` or `|&` reads a pipe; after `||` it does not.
+    /// Every command of a piped subshell reads the pipe.
+    #[test]
+    fn piped_commands_are_marked() {
+        let piped: Vec<bool> = parse("a | b || c |& d ; e")
+            .iter()
+            .map(|c| c.piped)
+            .collect();
+        assert_eq!(piped, vec![false, true, false, true, false]);
+        let piped: Vec<bool> = parse("a | (b; c) && d").iter().map(|c| c.piped).collect();
+        assert_eq!(piped, vec![false, true, true, false]);
     }
 }

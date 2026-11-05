@@ -20,6 +20,7 @@ use crate::cache::record::{Needed, Selection, Verdict};
 use crate::cache::store::{Lookup, LookupRequest, RecordStore, StoreError};
 use crate::cache::toolcache::ToolCache;
 use crate::cache::{Fingerprint, record_key};
+use crate::config::host::JobConfig;
 use crate::config::repo::StepKind;
 use crate::config::{CompiledScope, LoadedHost, Platform, Tier};
 use crate::dirs::Dirs;
@@ -512,10 +513,16 @@ pub fn trusted_remotes(git: &Git, scope: &CompiledScope) -> Result<Vec<String>, 
 }
 
 /// The trusted remotes of `trust` with the record of what their server
-/// reported (L2, R56).
+/// reported (L2, R56). The server query finds git and ssh on the host's
+/// `job.path_prepend` and then the system dirs (X1).
 #[must_use]
-pub fn remote_refs(dirs: &Dirs, env: &EnvSnapshot, trust: &RemoteTrust) -> RemoteRefs {
-    RemoteRefs::new(dirs, env, trust.trusted_urls.clone())
+pub fn remote_refs(
+    dirs: &Dirs,
+    env: &EnvSnapshot,
+    job: &JobConfig,
+    trust: &RemoteTrust,
+) -> RemoteRefs {
+    RemoteRefs::new(dirs, env, &job.path_prepend, trust.trusted_urls.clone())
 }
 
 /// R56: a base is trusted when its tree has a pass at `fast` or above, or
@@ -601,7 +608,12 @@ fn exact_selection(
 pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
     let host = &req.host.config;
     let scope = CompiledScope::new(&host.scope, req.dirs).map_err(PlanError::Config)?;
-    let remotes = remote_refs(req.dirs, req.env, &remote_trust(req.git, &scope)?);
+    let remotes = remote_refs(
+        req.dirs,
+        req.env,
+        &host.job,
+        &remote_trust(req.git, &scope)?,
+    );
     let entries = req.git.ls_tree(&req.tree)?;
     let policy = policy::resolve(
         req.git,

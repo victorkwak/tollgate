@@ -1,4 +1,4 @@
-//! Security regression suite (S1-S19): one test per bypass, each run the
+//! Security regression suite (S1-S20): one test per bypass, each run the
 //! way a Claude Code session runs git.
 //!
 //! The lab: the binary from this build installed by `tollgate install
@@ -246,7 +246,16 @@ impl Lab {
     /// git with the session environment but not through the guard (a
     /// script file the agent wrote and ran).
     fn direct(&self, args: &[&str]) -> Run {
-        let out = self.cmd("git", &self.repo).args(args).output().unwrap();
+        self.direct_with(args, &[])
+    }
+
+    /// [`Self::direct`] with `extra` variables set for git.
+    fn direct_with(&self, args: &[&str], extra: &[(&str, &str)]) -> Run {
+        let mut cmd = self.cmd("git", &self.repo);
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        let out = cmd.args(args).output().unwrap();
         Run {
             code: out.status.code(),
             out: format!(
@@ -472,6 +481,13 @@ fn s1_no_verify_and_every_abbreviation_through_the_guard() {
             "sh -c \"git commit -n -m x\"",
             "cd . && git commit --no-veri -m x",
             "git merge --no-verify --no-edit main",
+            // `\c\\` is one character in bash; a decoder that took one
+            // backslash read the rest as part of the quote (item 31).
+            "echo $'\\c\\\\' ; git commit -n -m x",
+            "git commit $'\\c\\\\' -n -m x",
+            // Text a shell reads from stdin (item 31).
+            "sh <<'EOF'\ngit commit -n -m x\nEOF",
+            "echo 'git commit -n -m x' | bash",
         ]
         .map(str::to_owned),
     );
@@ -1442,4 +1458,173 @@ fn s19_a_no_verify_commit_outside_the_guard_is_marked_unverified() {
         "{s:?}"
     );
     lab.assert_remote_is(&remote);
+}
+
+/// S20's trusted server over ssh: an ssh that runs the requested command
+/// on this machine, as the server's sshd would.
+const HONEST_SSH: &str = "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    -o|-p|-l|-i|-F|-J) shift 2 ;;\n    -*) shift ;;\n    *) break ;;\n  esac\ndone\nshift\nexec sh -c \"$*\"\n";
+
+/// A policy that lets every tree pass.
+const WEAK_POLICY: &str =
+    "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n";
+
+/// S20: what the trusted server reports (L2 anchors, R56 bases, R14(2))
+/// comes from the trusted server only. A fake ssh (named by
+/// `GIT_SSH_COMMAND`, `GIT_SSH`, a global `core.sshCommand` or a dir first
+/// on the agent's PATH) and a global `url.<x>.insteadOf` never answer for
+/// it: the guard denies the variables and asks before the config writes,
+/// and when they reach git anyway (a script file), tollgate asks the real
+/// server and keeps no forged value.
+#[test]
+fn s20_a_fake_ssh_or_a_global_rewrite_never_answers_for_the_trusted_server() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    let root = lab.root();
+    let bin = root.join("bin");
+    let honest = bin.join("ssh");
+    write_exe(&honest, HONEST_SSH);
+    // tollgate finds ssh on the job PATH (`job.path_prepend`, then the
+    // system dirs), never on the agent's PATH.
+    lab.sb().host_config(&format!(
+        "[scope]\nremotes = [\"*/remotes/trusted*\"]\n[job]\npath_prepend = [\"{}\"]\n[verify]\nmin_free = \"1M\"\n",
+        bin.display()
+    ));
+    let url = format!("ssh://localhost{}", lab.bare.display());
+    let honest_ssh = format!("core.sshCommand={}", honest.display());
+    lab.plain(&["remote", "set-url", "origin", &url]);
+    lab.plain(&["-c", &honest_ssh, "fetch", "-q", "origin"]);
+    // The fake server's main: a branch that weakens the policy.
+    lab.plain(&["checkout", "-q", "-b", "feat"]);
+    std::fs::write(lab.repo.join("tollgate.toml"), WEAK_POLICY).unwrap();
+    lab.plain(&["commit", "-q", "--no-verify", "-am", "weaken"]);
+    let fake = root.join("fake.git");
+    let fake_s = fake.to_str().unwrap().to_owned();
+    lab.plain_in(&root, &["init", "-q", "--bare", &fake_s]);
+    lab.plain(&["push", "-q", &fake_s, "feat:main"]);
+    let forged = lab.plain(&["rev-parse", "feat"]);
+    let forger_dir = root.join("forger");
+    let forger = forger_dir.join("ssh");
+    let forger_s = forger.to_str().unwrap().to_owned();
+    write_exe(
+        &forger,
+        &format!("#!/bin/sh\nexec git-upload-pack '{fake_s}'\n"),
+    );
+    let store = lab.sb().state().join("remote-refs.json");
+    let assert_not_kept = |oid: &str, how: &str| {
+        let text = std::fs::read_to_string(&store).unwrap_or_default();
+        assert!(
+            !text.contains(oid),
+            "{how}: remote-refs.json keeps the forged {oid}:\n{text}"
+        );
+    };
+    // Main's policy decides, from what the real server reports.
+    let main_policy_denies = |code: Option<i32>, out: &str, how: &str| {
+        assert!(
+            code != Some(0)
+                && out.contains("DENIED pre-commit refs/heads/feat")
+                && !out.contains("no policy anchor"),
+            "{how}: {out}"
+        );
+        assert_not_kept(&forged, how);
+    };
+
+    // Control: the real server answers through the honest ssh, so a good
+    // commit on feat runs main's policy and passes.
+    std::fs::write(lab.repo.join("ok.txt"), "1\n").unwrap();
+    lab.plain(&["add", "ok.txt"]);
+    let s = lab.session("git commit -q -m ok");
+    assert_eq!(s.code(), Some(0), "{s:?}");
+
+    // origin/main forged to feat, as a fetch through the fake ssh would.
+    lab.plain(&["update-ref", "refs/remotes/origin/main", "feat"]);
+    for var in ["GIT_SSH_COMMAND", "GIT_SSH"] {
+        lab.stage_bad_file(var);
+        let before = lab.refs();
+        let r = lab.direct_with(&["commit", "-m", "bad"], &[(var, &forger_s)]);
+        main_policy_denies(r.code, &r.out, var);
+        assert_eq!(lab.refs(), before, "{var}: a ref moved");
+        let cmd = format!("{var}={forger_s} git commit -m bad");
+        assert!(lab.refused(&cmd).denied(), "{cmd}");
+        let cmd = format!("export {var}={forger_s}; git commit -m bad");
+        assert!(lab.refused(&cmd).denied(), "{cmd}");
+    }
+    lab.stage_bad_file("PATH");
+    let cmd = format!("PATH={}:$PATH git commit -m bad", forger_dir.display());
+    let s = lab.refused(&cmd);
+    main_policy_denies(s.code(), s.out(), &cmd);
+
+    // A global core.sshCommand: the guard asks; set anyway, tollgate does
+    // not read it.
+    let cmd = format!("git config --global core.sshCommand {forger_s}");
+    assert!(
+        matches!(lab.guard(&cmd), Guarded::Asked(ref why) if why.contains("core.sshCommand")),
+        "{cmd}"
+    );
+    lab.plain(&["config", "--global", "core.sshCommand", &forger_s]);
+    lab.stage_bad_file("core.sshCommand");
+    let s = lab.refused("git commit -m bad");
+    main_policy_denies(s.code(), s.out(), "global core.sshCommand");
+    lab.plain(&["config", "--global", "--unset", "core.sshCommand"]);
+
+    // A global rewrite of the trusted URL to the fake repo, with origin
+    // set to an alias that another rewrite turns into the trusted URL:
+    // the repo's remote is trusted, and only the server query would follow
+    // the second rewrite.
+    lab.plain(&[
+        "config",
+        "--global",
+        &format!("url.{url}.insteadOf"),
+        "tg-alias:",
+    ]);
+    lab.plain(&[
+        "config",
+        "--global",
+        &format!("url.{fake_s}.insteadOf"),
+        &url,
+    ]);
+    lab.plain(&["remote", "set-url", "origin", "tg-alias:"]);
+    assert_eq!(lab.plain(&["remote", "get-url", "origin"]), url);
+    lab.stage_bad_file("insteadOf");
+    let s = lab.refused("git commit -m bad");
+    main_policy_denies(s.code(), s.out(), "global insteadOf");
+    lab.plain(&["remote", "set-url", "origin", &url]);
+    lab.plain(&[
+        "config",
+        "--global",
+        "--remove-section",
+        &format!("url.{url}"),
+    ]);
+    lab.plain(&[
+        "config",
+        "--global",
+        "--remove-section",
+        &format!("url.{fake_s}"),
+    ]);
+
+    // Nothing forged was kept: a later commit with no fake ssh is still
+    // checked under main's policy.
+    lab.stage_bad_file("later");
+    let s = lab.refused("git commit -m bad");
+    main_policy_denies(s.code(), s.out(), "later");
+
+    // R14(2): a failing main that the fake ssh reports as the server's
+    // main is not remote-verified for a push elsewhere.
+    lab.plain(&["checkout", "-q", "-f", "main"]);
+    lab.stage_bad_file("main");
+    lab.plain(&["commit", "-q", "--no-verify", "-m", "bad main"]);
+    let bad_main = lab.head();
+    lab.plain(&["push", "-q", "-f", &fake_s, "main:main"]);
+    lab.plain(&["update-ref", "refs/remotes/origin/main", "main"]);
+    let mac = root.join("mac.git");
+    lab.plain_in(&root, &["init", "-q", "--bare", mac.to_str().unwrap()]);
+    lab.plain(&["remote", "add", "mac", mac.to_str().unwrap()]);
+    let r = lab.direct_with(&["push", "mac", "main"], &[("GIT_SSH_COMMAND", &forger_s)]);
+    assert!(
+        r.code != Some(0)
+            && r.out.contains("DENIED pre-push refs/heads/main")
+            && !r.out.contains("remote-verified"),
+        "{}",
+        r.out
+    );
+    assert_eq!(lab.refs_in(&mac), "");
+    assert_not_kept(&bad_main, "R14(2)");
 }
