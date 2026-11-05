@@ -510,7 +510,7 @@ pub fn resolve(
     let (config, source, notes) = match found {
         Some((blob, c)) => (c, ConfigSource::File { blob }, Vec::new()),
         None => {
-            let (c, notes) = detect::detected_config(&detect::roots_from_tree(tree_entries));
+            let (c, notes) = detect::detect_tree(git, tree_entries);
             (c, ConfigSource::Detected, notes)
         }
     };

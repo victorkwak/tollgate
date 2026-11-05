@@ -143,11 +143,9 @@ fn no_anchor_uses_the_tip_and_unborn_uses_the_tree_l2_r65() {
     assert_eq!(p.config.steps.len(), 4, "detected Rust steps");
     assert_eq!(
         p.config.effective_hash(),
-        tollgate::select::detect::detected_config(&tollgate::select::detect::roots_from_tree(
-            &entries
-        ))
-        .0
-        .effective_hash()
+        tollgate::select::detect::detect_tree(&git, &entries)
+            .0
+            .effective_hash()
     );
     sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "c"]);
     let tip = rev(&sb, &repo, "HEAD");

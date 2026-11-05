@@ -51,7 +51,7 @@ fn step<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value 
 
 /// A repo with a Bun project in `web/` (biome, typescript, `bun test`),
 /// its `bun.lock`, and `policy` as `tollgate.toml`, committed on `main`.
-fn project(test: &str, policy: &str) -> Option<Project> {
+fn project(test: &str, policy: Option<&str>) -> Option<Project> {
     let Some(bun) = tools::which("bun") else {
         tools::skip(test, "bun is not on PATH");
         return None;
@@ -69,9 +69,11 @@ fn project(test: &str, policy: &str) -> Option<Project> {
     std::fs::create_dir_all(web.join("vendor")).unwrap();
     std::os::unix::fs::symlink(&biome_pkg, web.join("vendor/biome")).unwrap();
     std::os::unix::fs::symlink(&ts_pkg, web.join("vendor/typescript")).unwrap();
+    if let Some(policy) = policy {
+        std::fs::write(repo.join("tollgate.toml"), policy).unwrap();
+    }
     let files: &[(&str, &str)] = &[
         (".gitignore", "node_modules/\n"),
-        ("tollgate.toml", policy),
         (
             "web/package.json",
             r#"{"name":"web","private":true,"scripts":{"test":"bun test"},"devDependencies":{"@biomejs/biome":"file:./vendor/biome","typescript":"file:./vendor/typescript"}}"#,
@@ -138,7 +140,7 @@ fn command(report: &serde_json::Value, name: &str) -> String {
 
 #[test]
 fn bun_project_full_then_fast_lints_only_changed_files_r59_r46_t25() {
-    let Some(p) = project("bun_project_full_then_fast", POLICY) else {
+    let Some(p) = project("bun_project_full_then_fast", Some(POLICY)) else {
         return;
     };
     // Full: setup installs node_modules in the checkout (R45), every step
@@ -235,7 +237,7 @@ fn bun_project_full_then_fast_lints_only_changed_files_r59_r46_t25() {
 
 #[test]
 fn changes_outside_the_root_skip_its_steps_r59() {
-    let Some(p) = project("changes_outside_the_root_skip_its_steps", POLICY) else {
+    let Some(p) = project("changes_outside_the_root_skip_its_steps", Some(POLICY)) else {
         return;
     };
     let (code, out, _) = p.check(&["check", "--tier", "full", "--wait"]);
@@ -275,4 +277,48 @@ fn a_missing_project_tool_is_a_setup_error_r46() {
         r.out
     );
     assert_eq!(step(&report, "lint")["status"], "error");
+}
+
+#[test]
+fn detection_installs_and_checks_a_bun_root_t25_r65_r45_r47() {
+    let Some(p) = project("detection_installs_and_checks_a_bun_root", None) else {
+        return;
+    };
+    // No tollgate.toml: detection names the setup and the steps (R65).
+    let eff = p.sb.tollgate(&p.repo, &["config", "--effective"]);
+    assert_eq!(eff.code, Some(0), "{}", eff.out);
+    for needle in [
+        "# source: detection (R65)",
+        "name = \"web bun install\"",
+        "run = \"bun install --frozen-lockfile\"",
+        "kind = \"biome\"",
+        "kind = \"tsc\"",
+        "kind = \"bun-test\"",
+    ] {
+        assert!(eff.out.contains(needle), "{needle:?} in\n{}", eff.out);
+    }
+    let (code, out, report) = p.check(&["check", "--tier", "full", "--wait"]);
+    assert_eq!(code, Some(0), "{out}\n{report}");
+    for s in ["web biome", "web tsc", "web bun test"] {
+        assert_eq!(step(&report, s)["status"], "pass", "{s}: {report}");
+    }
+    let job = report["job_id"].as_str().unwrap();
+    let log = std::fs::read_to_string(p.sb.state().join("jobs").join(job).join("job.log")).unwrap();
+    assert!(log.contains("setup \"web bun install\": ran"), "T25: {log}");
+
+    // CI mode in a fresh clone: the setup runs there too (R45, R47).
+    let ci = p.sb.root().join("ci");
+    p.sb.git(&p.sb.root(), &["clone", "-q", "app", "ci"]);
+    assert!(!ci.join("web/node_modules").exists());
+    let r = p.sb.tollgate_with(
+        &ci,
+        &["run", "--tier", "full", "--here", "--report", "junit"],
+        &[],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(ci.join("web/node_modules/.bin/biome").is_file());
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ci.join("tollgate-report/report.json")).unwrap())
+            .unwrap();
+    assert_eq!(report["verdict"], "pass", "{report}");
 }

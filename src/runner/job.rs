@@ -287,6 +287,7 @@ pub fn run_here(
     let end = match fsx::ensure_dir(&out.join("tmp")) {
         Ok(()) => r
             .validate(&config)
+            .or_else(|| r.setup_here(workdir, &config))
             .unwrap_or_else(|| r.check_tree(workdir, None, &config, &[])),
         Err(e) => error(ErrorCause::Internal, e.to_string()),
     };
@@ -645,7 +646,44 @@ impl Runner<'_> {
                         m.setup.insert(name, hash);
                     });
                 }
-                SetupResult::Failed(m) => return Some(error(ErrorCause::Setup, m)),
+                SetupResult::Failed(m) => {
+                    return Some(error(
+                        ErrorCause::Setup,
+                        format!(
+                            "{m}; tollgate log {} setup-{}",
+                            self.spec.id,
+                            report::slug(&s.name)
+                        ),
+                    ));
+                }
+                SetupResult::Aborted(_) => return Some(End::Cancelled),
+            }
+        }
+        None
+    }
+
+    /// `run --here` (R45, R47): every `[[setup]]` step runs in the work
+    /// dir (a CI clone has no `node_modules` or `.venv`; there is no
+    /// checkout meta to say what is up to date).
+    fn setup_here(&mut self, workdir: &Path, config: &RepoConfig) -> Option<End> {
+        for s in &config.setup {
+            let log = self
+                .job_dir
+                .join(format!("setup-{}.log", report::slug(&s.name)));
+            let mut never = || None;
+            match setup::run(s, "", None, workdir, &self.env, &log, None, &mut never, &[]) {
+                SetupResult::Ran(d) => self.say(&format!(
+                    "setup {:?}: ran in {:.1}s",
+                    s.name,
+                    d.as_secs_f64()
+                )),
+                SetupResult::UpToDate => {}
+                SetupResult::Failed(m) => {
+                    return Some(error(
+                        ErrorCause::Setup,
+                        format!("{m}; log: {}", log.display()),
+                    ));
+                }
                 SetupResult::Aborted(_) => return Some(End::Cancelled),
             }
         }

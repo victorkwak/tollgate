@@ -59,7 +59,7 @@ fn step<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value 
 
 /// A repo with a uv project in `py/` whose only package index is a
 /// `wheels` symlink to wheels rebuilt from uv's cache.
-fn project(test: &str, policy: &str) -> Option<Project> {
+fn project(test: &str, policy: Option<&str>, clean: bool) -> Option<Project> {
     let Some(uv) = tools::which("uv") else {
         tools::skip(test, "uv is not on PATH");
         return None;
@@ -83,12 +83,24 @@ fn project(test: &str, policy: &str) -> Option<Project> {
     let py = repo.join("py");
     std::fs::create_dir_all(py.join("tests")).unwrap();
     std::os::unix::fs::symlink(&wheels, py.join("wheels")).unwrap();
+    if let Some(policy) = policy {
+        std::fs::write(repo.join("tollgate.toml"), policy).unwrap();
+    }
     let files: &[(&str, &str)] = &[
         (".gitignore", ".venv/\n__pycache__/\n"),
-        ("tollgate.toml", policy),
         ("py/app.py", APP),
-        ("py/legacy.py", LEGACY),
-        ("py/tests/test_app.py", TESTS),
+        (
+            "py/legacy.py",
+            if clean { "count: int = 1\n" } else { LEGACY },
+        ),
+        (
+            "py/tests/test_app.py",
+            if clean {
+                "from app import add\n\n\ndef test_add():\n    assert add(1, 2) == 3\n"
+            } else {
+                TESTS
+            },
+        ),
     ];
     for (p, text) in files {
         std::fs::write(repo.join(p), text).unwrap();
@@ -181,7 +193,7 @@ impl Project {
 
 #[test]
 fn baselines_from_the_policy_commit_gate_only_new_problems_r94_r49_t42() {
-    let Some(p) = project("baselines_gate_only_new_problems", POLICY) else {
+    let Some(p) = project("baselines_gate_only_new_problems", Some(POLICY), false) else {
         return;
     };
     // Without baselines: the pre-existing error and failure both fail full.
@@ -353,4 +365,31 @@ fn a_python_tool_missing_from_the_venv_is_a_setup_error_r46() {
         "{}",
         r.out
     );
+}
+
+#[test]
+fn detection_syncs_and_checks_a_python_root_t25_r65_r45() {
+    let Some(p) = project("detection_syncs_and_checks_a_python_root", None, true) else {
+        return;
+    };
+    p.commit("python project");
+    let eff = p.sb.tollgate(&p.repo, &["config", "--effective"]);
+    assert_eq!(eff.code, Some(0), "{}", eff.out);
+    for needle in [
+        "name = \"py uv sync\"",
+        "run = \"uv sync --frozen\"",
+        "kind = \"ruff\"",
+        "kind = \"pyright-baseline\"",
+        "kind = \"pytest-baseline\"",
+    ] {
+        assert!(eff.out.contains(needle), "{needle:?} in\n{}", eff.out);
+    }
+    let (code, out, report) = p.check(&["check", "--tier", "full", "--wait"]);
+    assert_eq!(code, Some(0), "{out}\n{report}");
+    for s in ["py ruff", "py pyright", "py pytest"] {
+        assert_eq!(step(&report, s)["status"], "pass", "{s}: {report}");
+    }
+    let job = report["job_id"].as_str().unwrap();
+    let log = std::fs::read_to_string(p.sb.state().join("jobs").join(job).join("job.log")).unwrap();
+    assert!(log.contains("setup \"py uv sync\": ran"), "T25: {log}");
 }

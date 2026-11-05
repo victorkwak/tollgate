@@ -780,8 +780,7 @@ fn worktree_config(root: &Path) -> Result<(RepoConfig, ConfigSource, Vec<String>
             Ok((c, ConfigSource::File { blob }, Vec::new()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let roots = detect::roots_from_dir(root).map_err(|e| e.to_string())?;
-            let (c, notes) = detect::detected_config(&roots);
+            let (c, notes) = detect::detect_dir(root).map_err(|e| e.to_string())?;
             Ok((c, ConfigSource::Detected, notes))
         }
         Err(e) => Err(format!("{}: {e}", path.display())),
@@ -1015,11 +1014,10 @@ pub fn config_init(ctx: &Ctx, nextest: bool) -> u8 {
     if path.exists() {
         return fail(format!("{} exists; not overwritten", path.display()));
     }
-    let roots = match detect::roots_from_dir(&root) {
-        Ok(r) => r,
+    let (config, notes) = match detect::detect_dir(&root) {
+        Ok(d) => d,
         Err(e) => return fail(e),
     };
-    let (config, notes) = detect::detected_config(&roots);
     let mut text = String::from(
         "# tollgate repo config (R63), written by `tollgate config init` from detection (R65).\n# Review it, then commit it; it applies after it merges to a full ref (L2).\n",
     );

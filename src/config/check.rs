@@ -96,8 +96,7 @@ pub fn check(cwd: &Path, env: &EnvSnapshot) -> CheckReport {
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let detected = crate::select::detect::roots_from_dir(&worktree)
-                .map(|r| crate::select::detect::detected_config(&r));
+            let detected = crate::select::detect::detect_dir(&worktree);
             match detected {
                 Ok((config, notes)) => {
                     report.lines.push(format!(
