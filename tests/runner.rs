@@ -410,3 +410,84 @@ fn a_queued_job_without_waiters_is_superseded_r89_t39() {
     }
     assert_eq!(sb.record_count(), 0);
 }
+
+#[test]
+fn setup_runs_when_its_inputs_change_r45_r46() {
+    let sb = Sandbox::new();
+    let count = sb.root().join("setup-runs");
+    host(
+        &sb,
+        &format!("[job.env]\nCOUNT = \"{}\"\n", count.display()),
+    );
+    let repo = repo_with(
+        &sb,
+        "r",
+        r#"version = 1
+[[setup]]
+name = "deps"
+run = "echo ran >> \"$COUNT\" && test -f deps.txt"
+when = ["deps.txt"]
+[[step]]
+name = "ok"
+kind = "command"
+run = "true"
+"#,
+    );
+    sb.commit_file(&repo, "deps.txt", "1\n", "deps");
+    let runs = || {
+        std::fs::read_to_string(&count)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(runs(), 1);
+    sb.commit_file(&repo, "other.sh", "x\n", "other");
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(runs(), 1, "deps.txt unchanged: setup is up to date");
+    sb.commit_file(&repo, "deps.txt", "2\n", "deps2");
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(runs(), 2);
+
+    // A failing setup is verdict error, cause setup.
+    sb.commit_file(
+        &repo,
+        "tollgate.toml",
+        "version = 1\n[[setup]]\nname = \"broken\"\nrun = \"exit 3\"\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n",
+        "broken setup",
+    );
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("cause setup") && r.out.contains("broken"),
+        "{}",
+        r.out
+    );
+}
+
+#[test]
+fn quarantine_beyond_30_days_of_the_policy_commit_is_a_config_error_r69_t34() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let until = jiff::Zoned::now()
+        .date()
+        .checked_add(jiff::Span::new().days(31))
+        .unwrap();
+    let repo = repo_with(
+        &sb,
+        "r",
+        &format!(
+            "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n[[quarantine]]\ntest = \"a tests::x\"\nuntil = \"{until}\"\nissue = \"i\"\n"
+        ),
+    );
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("cause config") && r.out.contains("more than 30 days"),
+        "{}",
+        r.out
+    );
+}

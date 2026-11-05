@@ -607,11 +607,12 @@ impl Runner<'_> {
         let id = self.spec.id.clone();
         let mut abort = || running_abort(&store, &id);
         let cwd = workdir.join(root);
+        let env = self.target_env(&self.env, workdir, root);
         let out = exec::run(ExecSpec {
             program: "cargo".into(),
             args: vec!["metadata".into(), "--format-version".into(), "1".into()],
             cwd: &cwd,
-            env: &self.env,
+            env: &env,
             log: &self.job_dir.join("metadata.log"),
             stdout: Some(&out_file),
             deadline: Some(Instant::now() + Duration::from_secs(600)),
@@ -708,13 +709,6 @@ impl Runner<'_> {
         maps: &BTreeMap<PathBuf, Option<WorkspaceMap>>,
         entries: &[TreeEntry],
     ) -> End {
-        let tool_config = self.job_dir.join("nextest-tool.toml");
-        if let Err(e) = std::fs::write(
-            &tool_config,
-            nextest::tool_config(&self.spec.host.nextest, &config.select.fast.pg_tests),
-        ) {
-            return error(ErrorCause::Internal, e.to_string());
-        }
         let today = jiff::Zoned::now().date();
         let mut used_logs: BTreeSet<String> = BTreeSet::new();
         let mut verdict = Verdict::Pass;
@@ -780,7 +774,12 @@ impl Runner<'_> {
             }
             let log = self.job_dir.join(format!("{slug}.log"));
             let nextest_cfg = self.job_dir.join(format!("{slug}.nextest.toml"));
+            let tool_config = self.job_dir.join(format!("{slug}.nextest-tool.toml"));
+            let junit = self.job_dir.join(format!("{slug}.junit.xml"));
             if s.kind == StepKind::Nextest {
+                // R49: the policy commit's nextest config (empty when it has
+                // none, so the tree's own file is not read); R72: the tool
+                // config with this step's JUnit path.
                 let text = self
                     .spec
                     .policy
@@ -788,7 +787,15 @@ impl Runner<'_> {
                     .get(&root)
                     .cloned()
                     .unwrap_or_default();
-                if let Err(e) = std::fs::write(&nextest_cfg, text) {
+                let tool = nextest::tool_config(
+                    &self.spec.host.nextest,
+                    &config.select.fast.pg_tests,
+                    &junit,
+                );
+                let _ = std::fs::remove_file(&junit);
+                if let Err(e) = std::fs::write(&nextest_cfg, text)
+                    .and_then(|()| std::fs::write(&tool_config, tool))
+                {
                     error_end = Some(error(ErrorCause::Internal, e.to_string()));
                     break;
                 }
@@ -825,6 +832,7 @@ impl Runner<'_> {
                 }
             };
             let env = match self.step_env(s) {
+                Ok(e) if steps::is_rust(s.kind) => self.target_env(&e, workdir, &root),
                 Ok(e) => e,
                 Err(end) => {
                     error_end = Some(end);
@@ -883,17 +891,6 @@ impl Runner<'_> {
                 .timeout
                 .as_ref()
                 .map_or(job_left, |t| t.get().min(job_left));
-            let junit_src = map
-                .map_or_else(
-                    || workdir.join(&root).join("target"),
-                    |m| m.target_dir.clone(),
-                )
-                .join("nextest")
-                .join(nextest::profile(self.spec.tier))
-                .join(nextest::JUNIT_FILE);
-            if s.kind == StepKind::Nextest {
-                let _ = std::fs::remove_file(&junit_src);
-            }
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -963,7 +960,7 @@ impl Runner<'_> {
                         self.nextest_result(
                             &mut rep,
                             status.code(),
-                            &junit_src,
+                            &junit,
                             &slug,
                             &scope,
                             config,
@@ -1093,10 +1090,9 @@ impl Runner<'_> {
         config: &RepoConfig,
         today: jiff::civil::Date,
     ) {
-        let parsed = std::fs::read_to_string(junit_src).ok().map(|xml| {
-            let _ = std::fs::write(self.job_dir.join(format!("{slug}.junit.xml")), &xml);
-            junit::parse(&xml)
-        });
+        let parsed = std::fs::read_to_string(junit_src)
+            .ok()
+            .map(|xml| junit::parse(&xml));
         let summary = match parsed {
             Some(Ok(cases)) => Some(junit::summarize(&cases, &config.quarantine, today)),
             Some(Err(e)) => {
@@ -1133,6 +1129,23 @@ impl Runner<'_> {
         }
     }
 
+    /// R43: in a verify checkout, cargo builds into the checkout's own
+    /// `target/`, whatever a cargo config says, so it never shares a target
+    /// dir with an agent checkout or the other tier. `run --here` keeps the
+    /// CI's own setting.
+    fn target_env(&self, env: &JobEnv, workdir: &Path, root: &Path) -> JobEnv {
+        if self.here {
+            return env.clone();
+        }
+        let target = workdir.join(root).join("target");
+        let extra: BTreeMap<String, String> = [(
+            "CARGO_TARGET_DIR".to_owned(),
+            target.to_string_lossy().into_owned(),
+        )]
+        .into();
+        env.for_step(&extra, None).unwrap_or_else(|_| env.clone())
+    }
+
     /// R44: a target dir above `verify.max_target` is cleaned after the job.
     fn max_target(&self, co: &Checkout) {
         let max = self.spec.host.verify.max_target.bytes();
@@ -1155,11 +1168,12 @@ impl Runner<'_> {
                 target.display()
             ));
             let mut never = || None;
+            let env = self.target_env(&self.env, &co.path, &root);
             let _ = exec::run(ExecSpec {
                 program: "cargo".into(),
                 args: vec!["clean".into()],
                 cwd: &co.path.join(&root),
-                env: &self.env,
+                env: &env,
                 log: &self.log,
                 stdout: None,
                 deadline: Some(Instant::now() + Duration::from_secs(600)),

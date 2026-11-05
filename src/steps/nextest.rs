@@ -8,6 +8,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::path::Path;
 
 use crate::config::Tier;
 use crate::config::host::NextestHost;
@@ -22,9 +23,6 @@ pub fn profile(tier: Tier) -> String {
 /// The test group of the `pg` resource. Tool groups must carry the tool
 /// prefix (nextest refuses others).
 pub const PG_GROUP: &str = "@tool:tollgate:pg";
-
-/// The JUnit file name inside `<target>/nextest/<profile>/`.
-pub const JUNIT_FILE: &str = "junit.xml";
 
 fn is_plain(s: &str) -> bool {
     !s.is_empty()
@@ -47,9 +45,13 @@ pub fn pg_filter(pg_tests: &[String]) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" | "))
 }
 
-/// The generated tool config (R72).
+/// The generated tool config (R72). The JUnit report goes to `junit`, an
+/// absolute path (nextest joins it to its store dir, which an absolute
+/// path replaces), so its place does not depend on `store.dir` or the
+/// target dir.
 #[must_use]
-pub fn tool_config(host: &NextestHost, pg_tests: &[String]) -> String {
+pub fn tool_config(host: &NextestHost, pg_tests: &[String], junit: &Path) -> String {
+    let junit = toml::Value::String(junit.to_string_lossy().into_owned()).to_string();
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -69,7 +71,7 @@ pub fn tool_config(host: &NextestHost, pg_tests: &[String]) -> String {
         };
         let _ = writeln!(
             s,
-            "[profile.{p}]\nretries = {}\nfail-fast = false\nslow-timeout = {{ period = \"{}s\", terminate-after = {} }}\nglobal-timeout = \"{}s\"\n\n[profile.{p}.junit]\npath = \"{JUNIT_FILE}\"\n",
+            "[profile.{p}]\nretries = {}\nfail-fast = false\nslow-timeout = {{ period = \"{}s\", terminate-after = {} }}\nglobal-timeout = \"{}s\"\n\n[profile.{p}.junit]\npath = {junit}\n",
             host.retries,
             host.slow_timeout.get().as_secs().max(1),
             host.terminate_after,
@@ -135,7 +137,11 @@ mod tests {
     #[test]
     fn tool_config_has_both_profiles_and_the_pg_group_r72() {
         let host = NextestHost::default();
-        let text = tool_config(&host, &["gatehouse-api::*".into(), "core::db_*".into()]);
+        let text = tool_config(
+            &host,
+            &["gatehouse-api::*".into(), "core::db_*".into()],
+            Path::new("/j/tests \"x\".junit.xml"),
+        );
         assert!(text.contains("[profile.tollgate-fast]"), "{text}");
         assert!(text.contains("[profile.tollgate-full]"), "{text}");
         assert!(text.contains("retries = 2"), "{text}");
@@ -148,6 +154,8 @@ mod tests {
         );
         let parsed: toml::Table = toml::from_str(&text).unwrap();
         assert!(parsed.contains_key("profile"));
-        assert!(!tool_config(&host, &[]).contains(".overrides]]"));
+        assert!(!tool_config(&host, &[], Path::new("/j/t.xml")).contains(".overrides]]"));
+        let junit = &parsed["profile"]["tollgate-fast"]["junit"]["path"];
+        assert_eq!(junit.as_str(), Some("/j/tests \"x\".junit.xml"));
     }
 }

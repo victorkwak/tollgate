@@ -32,6 +32,15 @@ fn failing_test_report_log_wait_and_flaky_t40_t41_r91_r92() {
     let sb = Sandbox::new();
     host(&sb);
     let repo = sb.rust_repo("ws", Scratch { failing: true });
+    // A cargo config that points every build at one shared target dir must
+    // not reach the verify checkout (R43).
+    let shared = sb.root().join("shared-target");
+    sb.commit_file(
+        &repo,
+        ".cargo/config.toml",
+        &format!("[build]\ntarget-dir = \"{}\"\n", shared.display()),
+        "shared target",
+    );
     let r = sb.tollgate(&repo, &["check", "--wait"]);
     assert_eq!(r.code, Some(1), "{}", r.out);
     let job = job_id(&r.out);
@@ -63,6 +72,10 @@ fn failing_test_report_log_wait_and_flaky_t40_t41_r91_r92() {
             .join("tests.junit.xml")
             .is_file(),
         "R82 JUnit kept"
+    );
+    assert!(
+        !shared.exists(),
+        "R43: the checkout builds in its own target/"
     );
 
     let log = sb.tollgate(&repo, &["log", &job, "tests"]);
@@ -222,6 +235,22 @@ fn full_tier_flaky_quarantine_and_fast_selection_t41_t30_l2() {
     assert_eq!(r.code, Some(1), "{}", r.out);
     assert!(!r.out.contains("QUARANTINED"), "{}", r.out);
     assert!(r.out.contains("FAIL a a tests::flaky"), "{}", r.out);
+
+    // R64: a quarantine entry must name a listed test.
+    let bogus =
+        format!("[[quarantine]]\ntest = \"a tests::nope\"\nuntil = \"{valid}\"\nissue = \"i\"\n");
+    commit_policy(&sb, &repo, &policy(&bogus), "bogus quarantine");
+    let r = sb.tollgate(
+        &repo,
+        &["check", "--tier", "full", "--rev", "HEAD", "--wait"],
+    );
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("cause config") && r.out.contains("a tests::nope"),
+        "{}",
+        r.out
+    );
+    commit_policy(&sb, &repo, &policy(&quarantine(expired)), "expired again");
 
     // A branch that weakens the policy still gets main's (L2).
     sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
