@@ -43,6 +43,8 @@ pub struct ExecSpec<'a> {
     pub env: &'a JobEnv,
     /// Log file; output is appended.
     pub log: &'a Path,
+    /// When set, stdout goes to this file (truncated) instead of the log.
+    pub stdout: Option<&'a Path>,
     /// Kill the step at this time (R33).
     pub deadline: Option<Instant>,
     /// SIGTERM-to-SIGKILL wait (R35).
@@ -182,7 +184,11 @@ pub fn run(spec: ExecSpec<'_>) -> ExecOutcome {
         Ok(f) => f,
         Err(e) => return failed(e),
     };
-    let stderr = match log.try_clone() {
+    let stdout = match spec.stdout {
+        Some(p) => std::fs::File::create(p),
+        None => log.try_clone(),
+    };
+    let stdout = match stdout {
         Ok(f) => f,
         Err(e) => return failed(e),
     };
@@ -192,8 +198,8 @@ pub fn run(spec: ExecSpec<'_>) -> ExecOutcome {
         .args(&spec.args)
         .current_dir(spec.cwd)
         .stdin(Stdio::null())
-        .stdout(log)
-        .stderr(stderr)
+        .stdout(stdout)
+        .stderr(log)
         .process_group(0);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -286,6 +292,7 @@ mod tests {
             cwd: tmp.path(),
             env: &env,
             log: &log,
+            stdout: None,
             deadline: None,
             grace: Duration::from_secs(1),
             abort: &mut never,
@@ -314,6 +321,7 @@ mod tests {
             cwd: tmp.path(),
             env: &env,
             log: &log,
+            stdout: None,
             deadline: Some(Instant::now() + Duration::from_millis(400)),
             grace: Duration::from_millis(300),
             abort: &mut never,
@@ -344,6 +352,7 @@ mod tests {
             cwd: tmp.path(),
             env: &env,
             log: &log,
+            stdout: None,
             deadline: None,
             grace: Duration::from_secs(5),
             abort: &mut abort,
@@ -372,6 +381,7 @@ mod tests {
             cwd: tmp.path(),
             env: &env,
             log: &log,
+            stdout: None,
             deadline: None,
             grace: Duration::from_secs(1),
             abort: &mut never,
@@ -397,6 +407,7 @@ mod tests {
             cwd: tmp.path(),
             env: &env,
             log: &tmp.path().join("l"),
+            stdout: None,
             deadline: None,
             grace: Duration::from_secs(1),
             abort: &mut never,
