@@ -226,7 +226,10 @@ fn the_guard_answers_in_under_10_ms_l19() {
 #[test]
 fn docs_only_pre_commit_with_detected_roots_stays_in_budget_l19_r61_r65() {
     let sb = Sandbox::new();
-    sb.scoped_host("remotes = [\"*/remotes/trusted*\"]");
+    sb.scoped_host(&format!(
+        "trusted_paths = [\"{}\"]",
+        sb.root().join("remotes/trusted.git").display()
+    ));
     let repo = sb.repo("r");
     for (path, text) in [
         (

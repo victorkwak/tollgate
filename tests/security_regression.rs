@@ -104,9 +104,11 @@ impl Lab {
     fn new(policy: &str) -> Self {
         let a = Armed::new();
         let sb = &a.sb;
-        sb.host_config(
-            "[scope]\nremotes = [\"*/remotes/trusted*\"]\n[verify]\nmin_free = \"1M\"\n",
-        );
+        // Item 34: a local bare repo is trusted by its exact path only.
+        sb.host_config(&format!(
+            "[scope]\ntrusted_paths = [\"{}\"]\n[verify]\nmin_free = \"1M\"\n",
+            sb.root().join("remotes/trusted.git").display()
+        ));
         // `tollgate` on the session PATH is the installed copy.
         std::os::unix::fs::symlink(a.bin(), sb.root().join("bin/tollgate")).unwrap();
         let settings: serde_json::Value =
@@ -1485,7 +1487,8 @@ fn s20_a_fake_ssh_or_a_global_rewrite_never_answers_for_the_trusted_server() {
     // tollgate finds ssh on the job PATH (`job.path_prepend`, then the
     // system dirs), never on the agent's PATH.
     lab.sb().host_config(&format!(
-        "[scope]\nremotes = [\"*/remotes/trusted*\"]\n[job]\npath_prepend = [\"{}\"]\n[verify]\nmin_free = \"1M\"\n",
+        "[scope]\nremotes = [\"ssh://localhost{}\"]\n[job]\npath_prepend = [\"{}\"]\n[verify]\nmin_free = \"1M\"\n",
+        lab.bare.display(),
         bin.display()
     ));
     let url = format!("ssh://localhost{}", lab.bare.display());
@@ -1761,4 +1764,50 @@ fn s33_git_exec_path_never_picks_the_git_tollgate_runs() {
         text.contains("ok   git: ") && text.contains(git.to_str().unwrap()),
         "{text}"
     );
+}
+
+/// S30 (item 34, X5): a `scope.remotes` pattern trusts only the server it
+/// names. A local bare repo whose path spells `gitlab.com/victorkwak/...`
+/// matches the loose glob (the repo stays in scope and its pushes are
+/// gated) but is never trusted: its `main`, which drops the checks, does
+/// not become the policy anchor, so a bad commit is still refused.
+#[test]
+fn s30_a_look_alike_remote_path_is_never_trusted() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    let sb = lab.sb();
+    let root = lab.root();
+    sb.host_config(
+        "[scope]\nremotes = [\"*gitlab.com:victorkwak/*\", \"*gitlab.com/victorkwak/*\"]\n[verify]\nmin_free = \"1M\"\n",
+    );
+    // The look-alike "server": its main has a policy with no checks.
+    let evil = root.join("evil/gitlab.com/victorkwak/ws.git");
+    std::fs::create_dir_all(&evil).unwrap();
+    lab.plain_in(&evil, &["init", "-q", "--bare"]);
+    lab.plain(&["checkout", "-q", "-b", "weak"]);
+    std::fs::write(lab.repo.join("tollgate.toml"), WEAK_POLICY).unwrap();
+    lab.plain(&["commit", "-q", "--no-verify", "-am", "weaken"]);
+    lab.plain(&["push", "-q", evil.to_str().unwrap(), "weak:main"]);
+    lab.plain(&["checkout", "-q", "main"]);
+    lab.plain(&["branch", "-q", "-D", "weak"]);
+    // origin now names it (a script file, outside the guard's ask).
+    lab.plain(&["remote", "set-url", "origin", evil.to_str().unwrap()]);
+    lab.plain(&["fetch", "-q", "origin"]);
+    // A branch on the look-alike's main: if it were trusted, that main
+    // would be the policy commit (the merge-base).
+    lab.plain(&["checkout", "-q", "-b", "feat", "origin/main"]);
+    lab.stage_bad_file("look-alike");
+    let s = lab.refused("git commit -m bad");
+    assert!(
+        s.out().contains("DENIED pre-commit") && s.out().contains("step lint: fail"),
+        "{s:?}"
+    );
+    // Still in scope by the loose match: its push is gated at full.
+    lab.plain(&["commit", "-q", "--no-verify", "-m", "bad"]);
+    let s = lab.session("git push origin feat");
+    assert!(
+        s.out().contains("DENIED pre-push") && s.out().contains("tier full"),
+        "{s:?}"
+    );
+    assert!(lab.refs_in(&evil).contains("refs/heads/main"));
+    assert!(!lab.refs_in(&evil).contains("refs/heads/feat"));
 }

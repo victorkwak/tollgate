@@ -809,7 +809,8 @@ fn an_attached_check_with_another_selection_runs_its_own_job_r79_r88() {
     host(
         &sb,
         &format!(
-            "[scope]\nremotes = [\"*/remotes/trusted*\"]\n[job.env]\nGO = \"{}\"\n",
+            "[scope]\ntrusted_paths = [\"{}\"]\n[job.env]\nGO = \"{}\"\n",
+            sb.root().join("remotes/trusted.git").display(),
             go.display()
         ),
     );
@@ -916,8 +917,8 @@ when = ["b/**"]
     assert_eq!(w1.code, Some(0), "wt1 needs only stepA: {}", w1.out);
 }
 
-/// A bare repo at `<root>/remotes/trusted.git` (it matches the
-/// `*/remotes/trusted*` scope glob) as `origin` of `repo`.
+/// A bare repo at `<root>/remotes/trusted.git` (named in
+/// `scope.trusted_paths`, item 34) as `origin` of `repo`.
 fn trusted_bare(sb: &Sandbox, repo: &Path) -> std::path::PathBuf {
     let bare = sb.root().join("remotes/trusted.git");
     sb.git(
@@ -931,7 +932,13 @@ fn trusted_bare(sb: &Sandbox, repo: &Path) -> std::path::PathBuf {
 /// A repo whose `main` is also `origin/main` of a trusted remote, so every
 /// commit on it is a trusted base (R56) without a record.
 fn trusted_repo(sb: &Sandbox, policy: &str) -> std::path::PathBuf {
-    host(sb, "[scope]\nremotes = [\"*/remotes/trusted*\"]\n");
+    host(
+        sb,
+        &format!(
+            "[scope]\ntrusted_paths = [\"{}\"]\n",
+            sb.root().join("remotes/trusted.git").display()
+        ),
+    );
     let repo = repo_with(sb, "r", policy);
     trusted_bare(sb, &repo);
     sb.git(&repo, &["push", "-q", "origin", "main"]);
