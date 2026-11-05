@@ -12,6 +12,7 @@ use std::time::Duration;
 use super::{InstallRecord, MIN_CLAUDE, bad_links, claude_version, settings, settings_path};
 use crate::cache::toolcache::which;
 use crate::cli::Ctx;
+use crate::config::host::JobConfig;
 use crate::config::{CompiledScope, HostConfig, Tier};
 use crate::dirs::{self, Dirs};
 use crate::env::EnvSnapshot;
@@ -19,6 +20,7 @@ use crate::exit;
 use crate::gitx::lockfiles::{git_running_in, old_locks};
 use crate::gitx::{Git, RepoLayout};
 use crate::ids::ResourceName;
+use crate::runner::env::{BaseInputs, JobEnv};
 
 /// Options.
 #[derive(Debug, Clone, Default)]
@@ -253,27 +255,50 @@ fn check_injection(out: &mut Out, ctx: &Ctx, rec: Option<&InstallRecord>) {
     }
 }
 
-fn check_tools(out: &mut Out, ctx: &Ctx) {
+/// `git` on this process's `PATH` (hooks and verify checkouts run it with
+/// tollgate's own environment); the step tools on the job `PATH` (R52),
+/// which is what steps get. A tool only this process can find is a warning
+/// that names the `[job] path_prepend` fix (R46, R97).
+fn check_tools(out: &mut Out, ctx: &Ctx, dirs: &Dirs, job: &JobConfig) {
     let path = ctx.env.get("PATH");
-    for (name, program, args) in [
-        ("git", "git", &["--version"][..]),
-        (
-            "cargo-nextest",
-            "cargo-nextest",
-            &["nextest", "--version"][..],
-        ),
-        ("bun", "bun", &["--version"][..]),
-        ("uv", "uv", &["--version"][..]),
+    let found = |p: &Path, args: &[&str]| {
+        let v = version_of(p, args, &ctx.env).unwrap_or_else(|| "no version".into());
+        format!("{v} ({})", p.display())
+    };
+    match which("git", path) {
+        Some(p) => out.line(Level::Ok, "git", found(&p, &["--version"])),
+        None => out.line(Level::Fail, "git", "not on PATH"),
+    }
+    let job_env = JobEnv::base(&BaseInputs {
+        env: &ctx.env,
+        dirs,
+        job,
+        tmpdir: &dirs.jobs_dir(),
+    });
+    let job_path = match &job_env {
+        Ok(e) => e.get("PATH"),
+        Err(e) => {
+            out.line(Level::Fail, "job PATH", e);
+            return;
+        }
+    };
+    for (name, args) in [
+        ("cargo-nextest", &["nextest", "--version"][..]),
+        ("bun", &["--version"][..]),
+        ("uv", &["--version"][..]),
     ] {
-        match which(program, path) {
-            Some(p) => out.line(
-                Level::Ok,
+        match (which(name, job_path), which(name, path)) {
+            (Some(p), _) => out.line(Level::Ok, name, found(&p, args)),
+            (None, Some(p)) => out.line(
+                Level::Warn,
                 name,
-                version_of(&p, args, &ctx.env)
-                    .unwrap_or_else(|| format!("{} (no version)", p.display())),
+                format!(
+                    "{} is on this PATH but not on the job PATH (R52); add {} to [job] path_prepend",
+                    p.display(),
+                    p.parent().unwrap_or(&p).display()
+                ),
             ),
-            None if name == "git" => out.line(Level::Fail, name, "not on PATH"),
-            None => out.line(Level::Warn, name, "not on PATH"),
+            (None, None) => out.line(Level::Warn, name, "not on the job PATH"),
         }
     }
 }
@@ -585,8 +610,9 @@ pub fn doctor(ctx: &Ctx, opts: &Options) -> u8 {
     if opts.injection {
         check_injection(&mut out, ctx, rec.as_ref());
     }
-    check_tools(&mut out, ctx);
     let host = check_host(&mut out, ctx, &dirs);
+    let job = host.as_ref().map(|h| h.job.clone()).unwrap_or_default();
+    check_tools(&mut out, ctx, &dirs, &job);
     if let Some(repo) = &opts.repo {
         let repo = if repo.is_absolute() {
             repo.clone()

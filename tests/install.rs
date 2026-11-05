@@ -262,6 +262,35 @@ fn doctor_reports_links_settings_injection_and_stale_locks_r39_r97() {
     ] {
         assert!(r.out.contains(want), "no {want:?} in:\n{}", r.out);
     }
+    // R52, R97: step tools are looked up on the job PATH, which steps get,
+    // not on this process's PATH. A uv that only this PATH has is no help.
+    let fake_uv = e.bin_dir.join("uv");
+    write_exe(&fake_uv, "#!/bin/sh\necho 'uv 9.9.9-fake'\n");
+    let uv_line = |out: &str| {
+        out.lines()
+            .find(|l| l.contains(" uv: "))
+            .unwrap_or_else(|| panic!("no uv line in:\n{out}"))
+            .to_owned()
+    };
+    let line = uv_line(&e.run(&bin, &["doctor"], &[]).out);
+    assert!(
+        !(line.starts_with("ok") && line.contains(fake_uv.to_str().unwrap())),
+        "{line}"
+    );
+    if line.starts_with("warn") {
+        let fix = format!("add {} to [job] path_prepend", e.bin_dir.display());
+        assert!(line.contains(&fix), "{line}");
+    }
+    e.sb.host_config(&format!(
+        "[verify]\nmin_free = \"1M\"\n[job]\npath_prepend = [{:?}]\n",
+        e.bin_dir.display().to_string()
+    ));
+    let r = e.run(&bin, &["doctor"], &[]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(
+        uv_line(&r.out),
+        format!("ok   uv: uv 9.9.9-fake ({})", fake_uv.display())
+    );
     // --injection, as a Claude Bash call sees it, never names the key.
     let hooks = e.data().join("hooks");
     let inj = [
