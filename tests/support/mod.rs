@@ -7,8 +7,9 @@
 #![allow(dead_code)]
 
 use std::ffi::OsStr;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use tollgate::env::EnvSnapshot;
 
@@ -119,4 +120,27 @@ pub fn norm(p: &Path) -> PathBuf {
         out.push(part);
     }
     out
+}
+
+/// Writes an executable file through a child process. A file the test
+/// process writes itself can stay open for writing in a child that another
+/// test thread forks at that moment, and exec then fails with ETXTBSY
+/// ("Text file busy"); a file written by `sh` has no such writer.
+pub fn write_exe(path: &Path, content: &str) {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let mut child = Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(content.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success(), "write {}", path.display());
 }

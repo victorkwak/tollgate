@@ -5,7 +5,6 @@
 mod support;
 
 use std::ffi::OsStr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use support::{Sandbox, norm};
@@ -139,9 +138,7 @@ fn hook_view(sb: &Sandbox, dir: &Path, hooks: &Path) -> (PathBuf, EnvSnapshot) {
         "#!/bin/sh\npwd > '{d}.cwd'\nenv -0 > '{d}.env'\n",
         d = dump.display()
     );
-    let hook = hooks.join("pre-commit");
-    std::fs::write(&hook, script).unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    support::write_exe(&hooks.join("pre-commit"), &script);
     std::fs::write(
         dir.join("touched.txt"),
         format!("{:?}\n", std::time::SystemTime::now()),
@@ -230,8 +227,7 @@ fn hook_ran(sb: &Sandbox, dir: &Path, hooks: &Path, extra: &[(&str, &OsStr)]) ->
     let marker = sb.root().join("ran");
     let _ = std::fs::remove_file(&marker);
     let hook = hooks.join("pre-commit");
-    std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    support::write_exe(&hook, &format!("#!/bin/sh\ntouch '{}'\n", marker.display()));
     std::fs::write(
         dir.join("touched.txt"),
         format!("{:?}\n", std::time::SystemTime::now()),
