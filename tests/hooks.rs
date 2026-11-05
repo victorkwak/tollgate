@@ -992,6 +992,61 @@ fn commits_made_without_the_gate_are_recorded_as_unverified_item17() {
     assert_eq!(v["unverified"][0]["commit"], merge, "{v}");
 }
 
+/// Item 30: the unverified record keeps the git subcommand and a fixed
+/// list of flag names only: never `-c` values (a credential header), URLs
+/// (a token in `user:token@`) or message text. Neither the state file nor
+/// the warning, `status` or a later deny shows them.
+#[test]
+fn unverified_records_keep_no_values_of_the_git_command_item30() {
+    let sb = Sandbox::new();
+    sb.scoped_host("");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"lint\"\nkind = \"command\"\nrun = \"test ! -f bad\"\n",
+    );
+    stage(&sb, &repo, "b.txt", "1\n");
+    let r = sb.hooked(
+        &repo,
+        &[
+            "-c",
+            "http.extraHeader=Authorization: Bearer SECRET-HEADER",
+            "-c",
+            "remote.mirror.url=https://user:SECRET-TOKEN@example.invalid/r.git",
+            "commit",
+            "-a",
+            "--no-verify",
+            "-m",
+            "SECRET-MESSAGE",
+        ],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let stored: String = std::fs::read_dir(sb.state().join("unverified"))
+        .unwrap()
+        .flatten()
+        .map(|e| std::fs::read_to_string(e.path()).unwrap())
+        .collect();
+    assert!(stored.contains("commit"), "{stored}");
+    // git itself prints the message ("[main <c>] ..."); tollgate's lines
+    // must not.
+    let warning: String = r.out.lines().filter(|l| l.contains("tollgate")).collect();
+    assert!(warning.contains("WARNING"), "{}", r.out);
+    let shown = format!("{warning}{stored}{}", sb.tollgate(&repo, &["status"]).out);
+    stage(&sb, &repo, "bad", "x\n");
+    let deny = sb.hooked(&repo, &["commit", "-m", "bad"]);
+    assert_eq!(deny.code, Some(1), "{}", deny.out);
+    assert!(deny.out.contains("made without the gate"), "{}", deny.out);
+    for secret in ["SECRET-HEADER", "SECRET-TOKEN", "SECRET-MESSAGE", "Bearer"] {
+        assert!(
+            !shown.contains(secret) && !deny.out.contains(secret),
+            "{secret} kept:\n{shown}\n{}",
+            deny.out
+        );
+    }
+    // What is kept: git, the subcommand, the allowlisted flags.
+    assert!(stored.contains("git commit -a --no-verify"), "{stored}");
+}
+
 #[test]
 fn merges_into_a_full_ref_need_full_r17_r99() {
     let sb = Sandbox::new();

@@ -44,8 +44,15 @@ pub struct UnverifiedCommit {
     pub refname: String,
     /// `post-commit` or `post-merge`.
     pub hook: String,
-    /// The git command, when it could be read.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The git command as `git <subcommand> [flags]`, when it could be
+    /// read: only [`KEPT_FLAGS`], never a value (item 30). Records of older
+    /// builds stored the whole command line under `command`; that key is
+    /// not read, and [`recorded`] rewrites such a file without it.
+    #[serde(
+        default,
+        rename = "git_command",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub command: Option<String>,
     /// When it was seen.
     pub at: jiff::Timestamp,
@@ -89,14 +96,22 @@ fn file(dirs: &Dirs, layout: &RepoLayout) -> PathBuf {
         .join(format!("{}.json", layout.repo_key().as_str()))
 }
 
-/// Every commit recorded for the repo, oldest first.
+/// Every commit recorded for the repo, oldest first. A file of an older
+/// build that kept whole command lines (item 30: they can hold `-c`
+/// secrets and URLs with tokens) is rewritten without them.
 #[must_use]
 pub fn recorded(dirs: &Dirs, layout: &RepoLayout) -> Vec<UnverifiedCommit> {
-    fsx::read_optional(&file(dirs, layout))
-        .ok()
-        .flatten()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    let path = file(dirs, layout);
+    let Some(bytes) = fsx::read_optional(&path).ok().flatten() else {
+        return Vec::new();
+    };
+    let all: Vec<UnverifiedCommit> = serde_json::from_slice(&bytes).unwrap_or_default();
+    let old_key = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes)
+        .is_ok_and(|v| v.iter().any(|e| e.get("command").is_some()));
+    if old_key && let Ok(json) = serde_json::to_vec_pretty(&all) {
+        let _ = fsx::write_atomic(&path, &json);
+    }
+    all
 }
 
 /// The recorded commits whose tree has not passed since (`passed` adds a
@@ -179,6 +194,70 @@ fn subcommand(args: &[std::ffi::OsString]) -> Option<String> {
     None
 }
 
+/// Flag names an unverified record keeps (item 30): what says how the
+/// commit skipped the gate. Everything else of the command line (`-c` and
+/// `--config-env` contents, URLs, messages, paths, branch names) can hold
+/// secrets or private text and is dropped.
+const KEPT_FLAGS: &[&str] = &["--no-verify", "-n", "--amend", "--no-ff", "-a"];
+
+/// Short options that take no value, in a cluster such as `-an`: the
+/// letters after the first one that is not here may be a glued value
+/// (`-am<message>`), so they are not read.
+const FLAG_LETTERS: &[u8] = b"anqvesiopz";
+
+/// `git <subcommand> [kept flags]` from git's argv (item 30): the
+/// subcommand after the global options, then each of [`KEPT_FLAGS`] the
+/// command used, in order (a unique abbreviation of `--no-verify` counts
+/// as it). No value of any option is kept.
+fn redacted_command(args: &[std::ffi::OsString]) -> Option<String> {
+    let sub = subcommand(args)?;
+    let mut it = args.iter().map(|a| a.to_string_lossy());
+    for a in it.by_ref() {
+        if a == sub {
+            break;
+        }
+    }
+    let mut flags: Vec<&'static str> = Vec::new();
+    let mut keep = |f: &'static str| {
+        if !flags.contains(&f) {
+            flags.push(f);
+        }
+    };
+    for a in it {
+        if a == "--" {
+            break;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            let name = long.split_once('=').map_or(long, |(n, _)| n);
+            if name.len() >= 4 && "no-verify".starts_with(name) {
+                keep("--no-verify");
+            } else if let Some(f) = KEPT_FLAGS
+                .iter()
+                .find(|f| f.strip_prefix("--") == Some(name))
+            {
+                keep(f);
+            }
+        } else if let Some(cluster) = a.strip_prefix('-') {
+            for b in cluster.bytes() {
+                if !FLAG_LETTERS.contains(&b) {
+                    break;
+                }
+                match b {
+                    b'a' => keep("-a"),
+                    b'n' => keep("-n"),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut out = format!("git {}", super::argv::shell_quote(&sub));
+    for f in flags {
+        out.push(' ');
+        out.push_str(f);
+    }
+    Some(out)
+}
+
 /// What a post hook needs.
 #[derive(Debug)]
 pub struct PostHook<'a> {
@@ -238,7 +317,7 @@ pub fn detect(hook: &PostHook<'_>, dirs: &Dirs) {
         hook.layout,
         UnverifiedCommit {
             hook: hook.name.to_owned(),
-            command: parent.map(|a| super::argv::git_command_text(&a)),
+            command: parent.as_deref().and_then(redacted_command),
             ..entry
         },
     );
@@ -321,6 +400,44 @@ mod tests {
             Some("commit")
         );
         assert_eq!(subcommand(&a(&[])), None);
+    }
+
+    /// Item 30: only the subcommand and the flag names of [`KEPT_FLAGS`].
+    #[test]
+    fn commands_keep_no_values_item30() {
+        let a = |v: &[&str]| -> Vec<std::ffi::OsString> { v.iter().map(Into::into).collect() };
+        let r = |v: &[&str]| redacted_command(&a(v));
+        assert_eq!(
+            r(&[
+                "-c",
+                "http.extraHeader=Authorization: Bearer x",
+                "--config-env=core.sshCommand=SECRET",
+                "commit",
+                "-am",
+                "token: x",
+                "--no-verif",
+                "--amend",
+                "--author=me <a@b>",
+                "--",
+                "-n",
+            ])
+            .as_deref(),
+            Some("git commit -a --no-verify --amend")
+        );
+        assert_eq!(
+            r(&[
+                "merge",
+                "--no-ff",
+                "-n",
+                "--no-edit",
+                "https://u:tok@h/r",
+                "side"
+            ])
+            .as_deref(),
+            Some("git merge --no-ff -n")
+        );
+        assert_eq!(r(&["commit", "-mn"]).as_deref(), Some("git commit"));
+        assert_eq!(r(&["-c", "a=b"]), None);
     }
 
     #[test]
