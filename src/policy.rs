@@ -226,7 +226,7 @@ fn anchors(
     remotes: &RemoteRefs,
     names: &[String],
     own_ref: Option<&str>,
-) -> Result<Vec<Anchor>, PolicyError> {
+) -> Result<Anchors, PolicyError> {
     let names: Vec<&String> = names
         .iter()
         .filter(|n| crate::config::repo::valid_anchor(n))
@@ -243,7 +243,7 @@ fn anchors(
             .collect();
         let found: BTreeMap<String, Oid> = existing_refs(git, &wanted)?.into_iter().collect();
         if found.is_empty() {
-            return Err(PolicyError::NoAnchor(format!(
+            return Ok(Anchors::NoneExist(format!(
                 "no policy anchor (L2): none of {} exists locally; fetch the trusted remote (git fetch {}), or push its first branch from your own terminal",
                 wanted.join(", "),
                 remotes.remotes()[0].name
@@ -271,18 +271,31 @@ fn anchors(
                 remotes.remotes()[0].name
             )));
         }
-        return Ok(out);
+        return Ok(Anchors::Found(out));
     }
     let wanted: Vec<String> = names.iter().map(|n| format!("refs/heads/{n}")).collect();
-    Ok(existing_refs(git, &wanted)?
-        .into_iter()
-        .filter(|(r, _)| Some(r.as_str()) != own_ref)
-        .map(|(refname, tip)| Anchor {
-            refname,
-            tip,
-            local: true,
-        })
-        .collect())
+    Ok(Anchors::Found(
+        existing_refs(git, &wanted)?
+            .into_iter()
+            .filter(|(r, _)| Some(r.as_str()) != own_ref)
+            .map(|(refname, tip)| Anchor {
+                refname,
+                tip,
+                local: true,
+            })
+            .collect(),
+    ))
+}
+
+/// What [`anchors`] found.
+#[derive(Debug)]
+enum Anchors {
+    /// The usable anchors, in priority order (may be empty without a
+    /// trusted remote).
+    Found(Vec<Anchor>),
+    /// Trusted remotes are configured but none of the named anchor refs
+    /// exists locally; the message says how to fetch them.
+    NoneExist(String),
 }
 
 /// True when `ancestor` is reachable from `descendant`.
@@ -318,15 +331,35 @@ pub fn policy_base(
     anchor_names: &[String],
     own_ref: Option<&str>,
 ) -> Result<PolicyBase, PolicyError> {
+    match policy_base_of(git, tip, remotes, anchor_names, own_ref)? {
+        Ok(base) => Ok(base),
+        Err(why) => Err(PolicyError::NoAnchor(why)),
+    }
+}
+
+/// [`policy_base`], with "trusted remotes are configured but none of the
+/// named anchor refs exists" as the inner `Err` (its message), apart from
+/// the errors that always deny (item 32).
+fn policy_base_of(
+    git: &Git,
+    tip: Option<&Oid>,
+    remotes: &RemoteRefs,
+    anchor_names: &[String],
+    own_ref: Option<&str>,
+) -> Result<Result<PolicyBase, String>, PolicyError> {
     let Some(tip) = tip else {
-        return Ok(PolicyBase {
+        return Ok(Ok(PolicyBase {
             commit: None,
             anchor: None,
             committer_date: None,
-        });
+        }));
+    };
+    let found = match anchors(git, remotes, anchor_names, own_ref)? {
+        Anchors::Found(found) => found,
+        Anchors::NoneExist(why) => return Ok(Err(why)),
     };
     let mut chosen = None;
-    for a in anchors(git, remotes, anchor_names, own_ref)? {
+    for a in found {
         if a.local && is_ancestor(git, tip, &a.tip)? {
             continue;
         }
@@ -351,11 +384,11 @@ pub fn policy_base(
         None => (tip.clone(), None),
     };
     let date = git.run_line(["log", "-1", "--format=%cs", commit.as_str()])?;
-    Ok(PolicyBase {
+    Ok(Ok(PolicyBase {
         committer_date: date.parse().ok(),
         commit: Some(commit),
         anchor,
-    })
+    }))
 }
 
 /// Where the effective config came from.
@@ -541,19 +574,22 @@ pub fn resolve(
     // protected ref, so its list can be trusted. The second pass counts
     // only when it found one of them: with none, `policy_base` falls back
     // to the tip itself, the branch's own policy, so the first pass stays.
+    // The same with trusted remotes when none of the named refs exists
+    // (item 32); named refs that exist but that the server does not
+    // confirm still deny.
     if base.anchor.is_some()
         && let Some((_, c)) = &found
         && c.policy.anchors != default_anchors
+        && let Ok(again) = policy_base_of(git, tip, remotes, &c.policy.anchors, own_ref)?
+        && again.anchor.is_some()
+        && again.commit != base.commit
     {
-        let again = policy_base(git, tip, remotes, &c.policy.anchors, own_ref)?;
-        if again.anchor.is_some() && again.commit != base.commit {
-            base = again;
-            base_entries = match &base.commit {
-                Some(c) => git.ls_tree(c)?,
-                None => tree_entries.to_vec(),
-            };
-            found = config_at(git, &base_entries)?;
-        }
+        base = again;
+        base_entries = match &base.commit {
+            Some(c) => git.ls_tree(c)?,
+            None => tree_entries.to_vec(),
+        };
+        found = config_at(git, &base_entries)?;
     }
     let (config, source, notes) = match found {
         Some((blob, c)) => (c, ConfigSource::File { blob }, Vec::new()),

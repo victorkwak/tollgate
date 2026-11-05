@@ -441,6 +441,42 @@ fn anchors_named_by_the_policy_that_do_not_exist_keep_the_first_pass_l2() {
     assert_eq!(p.changed, [PathBuf::from("tollgate.toml")]);
 }
 
+/// Item 32 (R3): with a trusted remote, a second pass whose
+/// `policy.anchors` names refs that do not exist keeps the first pass, as
+/// without one. Refs that exist but that the server does not confirm
+/// still deny.
+#[test]
+fn trusted_anchors_named_by_the_policy_that_do_not_exist_keep_the_first_pass_item32() {
+    let sb = Sandbox::new();
+    let repo = sb.repo("r");
+    sb.commit_file(
+        &repo,
+        "tollgate.toml",
+        &format!("{MAIN_POLICY}[policy]\nanchors = [\"trunk\"]\n"),
+        "policy",
+    );
+    let bare = bare_origin(&sb, &repo, "origin.git");
+    sb.git(&repo, &["push", "-q", "--no-verify", "origin", "main"]);
+    sb.git(&repo, &["fetch", "-q", "origin"]);
+    let main_tip = rev(&sb, &repo, "origin/main");
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(&repo, "tollgate.toml", WEAK_POLICY, "weaken");
+    let tip = rev(&sb, &repo, "HEAD");
+    let remotes = trusted(&sb, &bare);
+    let p = resolve_at(&sb, &repo, &tip, &remotes, "refs/heads/feat").unwrap();
+    assert_eq!(p.base.commit.as_ref(), Some(&main_tip));
+    assert_eq!(p.base.anchor.as_deref(), Some("refs/remotes/origin/main"));
+    assert_eq!(p.config.steps.len(), 1, "main's policy applies");
+    // `trunk` fetched, then moved by hand to a value the server never
+    // reported: it exists but is not confirmed, so the policy denies.
+    sb.git(
+        &repo,
+        &["update-ref", "refs/remotes/origin/trunk", tip.as_str()],
+    );
+    let err = resolve_at(&sb, &repo, &tip, &remotes, "refs/heads/feat").unwrap_err();
+    assert!(matches!(err, policy::PolicyError::NoAnchor(_)), "{err}");
+}
+
 #[test]
 fn tool_configs_come_from_the_policy_commit_r71() {
     let sb = Sandbox::new();
