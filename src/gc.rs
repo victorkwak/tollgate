@@ -7,8 +7,8 @@
 //!   the record (R82);
 //! - stored step passes (L16) older than 90 days or whose job is gone;
 //! - verify checkouts whose repo is gone (L15);
-//! - lock tickets, waiter files, queue markers and dedupe locks older than
-//!   1 day that no live process holds.
+//! - lock tickets, waiter files, queue markers, dedupe locks and gate-run
+//!   markers (item 17) older than 1 day that no live process holds.
 //!
 //! `--all` removes every record, job, step pass, verify checkout and cache
 //! that is not in use (a running job is kept).
@@ -242,6 +242,8 @@ pub fn gc(dirs: &Dirs, host: &HostConfig, env: &EnvSnapshot, all: bool) -> GcRep
             }
         }
     }
+    // Gate-run markers of git commands that made no commit (item 17).
+    rep.tickets += crate::hook::unverified::gc_gate_runs(dirs, ticket_age);
     if all {
         let _ = fs::remove_file(dirs.toolcache_file());
         let _ = fs::remove_file(dirs.flaky_log());

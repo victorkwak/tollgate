@@ -157,6 +157,26 @@ impl Dirs {
         self.state_dir().join("probe")
     }
 
+    /// Gate-hook runs that allowed a commit, one marker per git process
+    /// (item 17).
+    #[must_use]
+    pub fn gate_runs_dir(&self) -> PathBuf {
+        self.state_dir().join("gate-runs")
+    }
+
+    /// Trees that passed a job or that a gate hook allowed, one empty file
+    /// per tree (item 17).
+    #[must_use]
+    pub fn passed_trees_dir(&self) -> PathBuf {
+        self.state_dir().join("trees")
+    }
+
+    /// Commits made without the gate, per repo (item 17).
+    #[must_use]
+    pub fn unverified_dir(&self) -> PathBuf {
+        self.state_dir().join("unverified")
+    }
+
     /// What trusted servers reported for their branches (L2, R56).
     #[must_use]
     pub fn remote_refs_file(&self) -> PathBuf {

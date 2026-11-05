@@ -484,6 +484,8 @@ struct StatusJson {
     jobs: Vec<JobLine>,
     unchecked: Unchecked,
     policy_line: Option<String>,
+    /// Item 17: commits on the branch made without the gate.
+    unverified: Vec<crate::hook::unverified::UnverifiedCommit>,
 }
 
 const UNCHECKED_SCAN: usize = 200;
@@ -609,6 +611,16 @@ pub fn status(ctx: &Ctx, rev: Option<&str>, json: bool) -> u8 {
             unchecked.above += 1;
         }
     }
+    // Item 17: commits made without the gate that are on this branch and
+    // whose tree has not passed since.
+    let unverified: Vec<_> =
+        crate::hook::unverified::pending(&repo.dirs, &repo.layout, |t| pass_of(&store, t, &fps))
+            .into_iter()
+            .filter(|u| {
+                git.output(["merge-base", "--is-ancestor", u.commit.as_str(), rev_label])
+                    .is_ok_and(|o| o.status.success())
+            })
+            .collect();
     let jobs = active_jobs(&repo.dirs, &repo.layout.common_dir);
     if json {
         let s = StatusJson {
@@ -618,6 +630,7 @@ pub fn status(ctx: &Ctx, rev: Option<&str>, json: bool) -> u8 {
             jobs,
             unchecked,
             policy_line,
+            unverified,
         };
         println!(
             "{}",
@@ -663,6 +676,27 @@ pub fn status(ctx: &Ctx, rev: Option<&str>, json: bool) -> u8 {
             "unchecked: no pass record in the last {} commit(s)",
             unchecked.scanned
         ),
+    }
+    if unverified.is_empty() {
+        println!("unverified: none (no commit here was made without the gate)");
+    } else {
+        println!(
+            "unverified: {} commit(s) made without the gate (--no-verify?); check each with tollgate check --rev <commit>:",
+            unverified.len()
+        );
+        for u in &unverified {
+            println!(
+                "  {} {} ({}, {}){}",
+                u.commit.short(12),
+                u.refname,
+                u.hook,
+                u.at.strftime("%Y-%m-%d %H:%M"),
+                u.command
+                    .as_deref()
+                    .map(|c| format!(": {c}"))
+                    .unwrap_or_default()
+            );
+        }
     }
     for j in &jobs {
         println!(

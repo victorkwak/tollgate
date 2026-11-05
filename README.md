@@ -83,7 +83,7 @@ An agent works as before. The gates run by themselves.
 | `git commit ...` | Runs `pre-commit` (`fast`). On a deny, the report says what failed. |
 | `tollgate check [--tier full] [--wait \| --detach]` | Checks the index tree (or `--rev R`, `--tree T`) ahead of a commit or push. |
 | `tollgate wait <job>` | Waits for a job: exit 0 pass, 1 fail, 3 still running (L17). |
-| `tollgate status [--rev R] [--json]` | Records and running jobs for `HEAD` and the index, and the commits on the branch that have no record (L1). |
+| `tollgate status [--rev R] [--json]` | Records and running jobs for `HEAD` and the index, the commits on the branch that have no record (L1), and those made without the gate (unverified). |
 | `tollgate report <job\|tree>`, `tollgate log <job> <step> [--tail N]` | The full report and a step log (R92). |
 | `tollgate cancel <job>` | Stops a queued or running job (R89). |
 | `tollgate merge <branch>` | Merges into a full ref with a `full` check before the commit (R99). |
@@ -114,6 +114,8 @@ A branch can still change its own code, tests, `package.json` scripts, `tsconfig
 ### Known gap: commits without a `fast` check (L1)
 
 v1 installs no `reference-transaction` hook. Commits that `cherry-pick`, `revert`, `am` and `rebase` make, and fast-forward merges, get no `fast` check when they are made. They are checked at push (`full`), at `tollgate merge` (`full`), and by `tollgate check`. `tollgate status` shows, for the current branch, the newest commit whose tree has a record and how many commits above it have none.
+
+`git commit --no-verify` and `git merge --no-verify` skip the gate hooks; the guard denies them, and `post-commit` and `post-merge` still detect them. Such a commit stays (nothing is undone), git prints a `tollgate: WARNING`, and `tollgate status` and every later deny list it as unverified until its tree passes a check (`tollgate check --rev <commit>`).
 
 ### Other limits
 

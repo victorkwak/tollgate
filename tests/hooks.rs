@@ -896,6 +896,102 @@ fn a_killed_hook_leaves_no_commit_and_no_record_t18_r31_r37() {
     }
 }
 
+/// Item 17 (detection only): `--no-verify` skips `pre-commit` and
+/// `pre-merge-commit`, but `post-commit` and `post-merge` still run. A
+/// commit no gate hook of the same git process allowed, whose tree has no
+/// pass and that no trusted remote has, is recorded as unverified with a
+/// loud warning; `tollgate status` and later denies show it. Cherry-picks
+/// and reverts are the known L1 gap, not flagged. Nothing is undone.
+#[test]
+fn commits_made_without_the_gate_are_recorded_as_unverified_item17() {
+    let sb = Sandbox::new();
+    sb.scoped_host("");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"lint\"\nkind = \"command\"\nrun = \"test ! -f bad\"\n",
+    );
+    // A gated commit: no warning, nothing unverified.
+    stage(&sb, &repo, "a.txt", "1\n");
+    let r = sb.hooked(&repo, &["commit", "-m", "a"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(!r.out.contains("unverified"), "{}", r.out);
+    let st = sb.tollgate(&repo, &["status"]);
+    assert!(st.out.contains("unverified: none"), "{}", st.out);
+    // --no-verify: the commit stays (no undo), with a warning.
+    stage(&sb, &repo, "b.txt", "1\n");
+    let r = sb.hooked(&repo, &["commit", "--no-verify", "-m", "b"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let skipped = head(&sb, &repo);
+    assert!(
+        r.out.contains("WARNING") && r.out.contains(&skipped[..12]) && r.out.contains("unverified"),
+        "{}",
+        r.out
+    );
+    let st = sb.tollgate(&repo, &["status"]);
+    assert!(
+        st.out
+            .contains("unverified: 1 commit(s) made without the gate")
+            && st.out.contains(&skipped[..12]),
+        "{}",
+        st.out
+    );
+    // A later deny names it too.
+    stage(&sb, &repo, "bad", "x\n");
+    let r = sb.hooked(&repo, &["commit", "-m", "bad"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("made without the gate") && r.out.contains(&skipped[..12]),
+        "{}",
+        r.out
+    );
+    sb.git(&repo, &["rm", "-q", "--cached", "bad"]);
+    std::fs::remove_file(repo.join("bad")).unwrap();
+    // A merge with --no-verify: post-merge records it.
+    sb.git(&repo, &["checkout", "-q", "-b", "side", "HEAD~1"]);
+    sb.commit_file(&repo, "s.txt", "1\n", "side");
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    let r = sb.hooked(
+        &repo,
+        &["merge", "--no-ff", "--no-verify", "--no-edit", "side"],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let merge = head(&sb, &repo);
+    assert!(r.out.contains(&merge[..12]), "{}", r.out);
+    // A cherry-pick and a revert (L1 gap): no warning.
+    sb.git(&repo, &["checkout", "-q", "-b", "pick", "HEAD~1"]);
+    sb.commit_file(&repo, "p.txt", "1\n", "pick me");
+    let pick = head(&sb, &repo);
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    let r = sb.hooked(&repo, &["cherry-pick", &pick]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(!r.out.contains("WARNING"), "{}", r.out);
+    let r = sb.hooked(&repo, &["revert", "--no-edit", "HEAD"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(!r.out.contains("WARNING"), "{}", r.out);
+    let st = sb.tollgate(&repo, &["status"]);
+    assert!(
+        st.out
+            .contains("unverified: 2 commit(s) made without the gate"),
+        "{}",
+        st.out
+    );
+    // Once the tree passes a check, the commit no longer counts.
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", &skipped]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let st = sb.tollgate(&repo, &["status"]);
+    assert!(
+        st.out.contains("unverified: 1 commit(s)")
+            && st.out.contains(&format!("  {} ", &merge[..12]))
+            && !st.out.contains(&format!("  {} ", &skipped[..12])),
+        "{}",
+        st.out
+    );
+    let json = sb.tollgate(&repo, &["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json.out).unwrap();
+    assert_eq!(v["unverified"][0]["commit"], merge, "{v}");
+}
+
 #[test]
 fn merges_into_a_full_ref_need_full_r17_r99() {
     let sb = Sandbox::new();
@@ -1028,8 +1124,8 @@ fn a_chained_hook_runs_no_git_subprocess_on_a_warm_cache_t2_r7_r75() {
     // path is needed once (`git var`), then comes from the tool cache.
     let trace = sb.root().join("trace");
     let trace_s = trace.to_str().unwrap().to_owned();
-    let run = |traced: bool| {
-        let mut cmd = std::process::Command::new(test_hooks_dir().join("post-commit"));
+    let run_hook = |name: &str, traced: bool| {
+        let mut cmd = std::process::Command::new(test_hooks_dir().join(name));
         cmd.env_clear().current_dir(&repo);
         for (k, v) in sb.env().iter() {
             if k != "GIT_CONFIG_NOSYSTEM" {
@@ -1041,8 +1137,17 @@ fn a_chained_hook_runs_no_git_subprocess_on_a_warm_cache_t2_r7_r75() {
         }
         assert!(cmd.status().unwrap().success());
     };
+    let run = |traced: bool| run_hook("post-checkout", traced);
     run(false);
     run(true);
+    let text = std::fs::read_to_string(&trace).unwrap_or_default();
+    assert!(text.is_empty(), "a git subprocess ran:\n{text}");
+    // post-commit after a gate hook of the same git process allowed the
+    // commit (item 17; the test process stands in for that git): none
+    // either.
+    let dirs = tollgate::dirs::Dirs::from_env(&sb.env()).unwrap();
+    tollgate::hook::unverified::mark_gate_run_of(&dirs, i32::try_from(std::process::id()).unwrap());
+    run_hook("post-commit", true);
     let text = std::fs::read_to_string(&trace).unwrap_or_default();
     assert!(text.is_empty(), "a git subprocess ran:\n{text}");
     // A cold cache asks git once (the trace sees it).

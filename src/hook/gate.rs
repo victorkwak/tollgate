@@ -476,10 +476,20 @@ pub fn decide(gate: &Gate<'_>, checks: &[Check], retry: &str, ask_remotes: &[Str
             waits.join(" && ")
         );
     }
+    // Item 17: trees a gate allowed count as checked, for the post hooks.
+    let store = crate::cache::store::RecordStore::new(&gate.dirs);
+    for (o, c) in outcomes.iter().zip(checks) {
+        if matches!(o, Outcome::Allowed) {
+            store.mark_passed_tree(&c.tree);
+        }
+    }
     if outcomes.iter().all(|o| matches!(o, Outcome::Allowed)) {
         crate::exit::OK
     } else {
         stale_lock_hint(gate);
+        for l in super::unverified::deny_note(&gate.dirs, &gate.layout) {
+            eprintln!("{l}");
+        }
         crate::exit::FAIL
     }
 }

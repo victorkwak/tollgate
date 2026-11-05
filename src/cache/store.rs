@@ -185,7 +185,36 @@ impl RecordStore {
         let json = serde_json::to_vec_pretty(r)
             .map_err(|e| StoreError::Invalid(format!("serialize: {e}")))?;
         fsx::write_atomic(&path, &json).map_err(io_err(&path))?;
+        if r.verdict == Verdict::Pass {
+            self.mark_passed_tree(&r.tree);
+        }
         Ok(WriteOutcome::Written)
+    }
+
+    fn passed_tree_file(&self, tree: &Oid) -> PathBuf {
+        self.dirs
+            .passed_trees_dir()
+            .join(tree.short(2))
+            .join(tree.as_str())
+    }
+
+    /// Marks that `tree` passed a job, or that a gate hook allowed it,
+    /// under any tier and fingerprint: the index of item 17, which only
+    /// tells whether a tree was ever checked (never what a lookup needs).
+    pub fn mark_passed_tree(&self, tree: &Oid) {
+        let f = self.passed_tree_file(tree);
+        if f.exists() {
+            return;
+        }
+        if let Some(d) = f.parent() {
+            let _ = fsx::ensure_dir(d).and_then(|()| fs::write(&f, b""));
+        }
+    }
+
+    /// True when [`RecordStore::mark_passed_tree`] marked `tree`.
+    #[must_use]
+    pub fn tree_passed(&self, tree: &Oid) -> bool {
+        self.passed_tree_file(tree).exists()
     }
 
     /// Removes the record of `key` (`check --rerun`, R34).
