@@ -38,7 +38,7 @@ fn branch_policy_changes_wait_for_the_merge_l2() {
     let git = Git::scrubbed(&sb.env(), &repo);
     let tree = git.tree_of("HEAD").unwrap().unwrap();
     let entries = git.ls_tree(&tree).unwrap();
-    let p = policy::resolve(&git, &entries, Some(&tip), &[]).unwrap();
+    let p = policy::resolve(&git, &entries, Some(&tip), &[], Some("refs/heads/feat")).unwrap();
     assert_eq!(
         p.base.commit.as_ref(),
         Some(&main_tip),
@@ -65,7 +65,7 @@ fn branch_policy_changes_wait_for_the_merge_l2() {
     sb.git(&repo, &["checkout", "-q", "main"]);
     sb.git(&repo, &["merge", "-q", "--no-verify", "--ff-only", "feat"]);
     let tip = rev(&sb, &repo, "HEAD");
-    let p = policy::resolve(&git, &entries, Some(&tip), &[]).unwrap();
+    let p = policy::resolve(&git, &entries, Some(&tip), &[], Some("refs/heads/main")).unwrap();
     assert_eq!(p.base.commit.as_ref(), Some(&tip));
     assert!(p.config.steps.is_empty());
     assert!(p.line().is_none());
@@ -93,7 +93,14 @@ fn trusted_remote_full_refs_anchor_first_l2() {
     let tip = rev(&sb, &repo, "HEAD");
     let git = Git::scrubbed(&sb.env(), &repo);
     let entries = git.ls_tree(&git.tree_of("HEAD").unwrap().unwrap()).unwrap();
-    let p = policy::resolve(&git, &entries, Some(&tip), &["origin".to_owned()]).unwrap();
+    let p = policy::resolve(
+        &git,
+        &entries,
+        Some(&tip),
+        &["origin".to_owned()],
+        Some("refs/heads/main"),
+    )
+    .unwrap();
     assert_eq!(p.base.commit.as_ref(), Some(&remote_main));
     assert_eq!(p.base.anchor.as_deref(), Some("refs/remotes/origin/main"));
     assert_eq!(p.config.steps.len(), 1);
@@ -108,7 +115,14 @@ fn trusted_remote_full_refs_anchor_first_l2() {
     sb.git(&repo, &["rm", "-q", "-rf", "."]);
     sb.commit_file(&repo, "tollgate.toml", WEAK_POLICY, "orphan");
     let tip = rev(&sb, &repo, "HEAD");
-    let p = policy::resolve(&git, &entries, Some(&tip), &["origin".to_owned()]).unwrap();
+    let p = policy::resolve(
+        &git,
+        &entries,
+        Some(&tip),
+        &["origin".to_owned()],
+        Some("refs/heads/main"),
+    )
+    .unwrap();
     assert_eq!(p.base.commit.as_ref(), Some(&remote_main));
 }
 
@@ -123,7 +137,7 @@ fn no_anchor_uses_the_tip_and_unborn_uses_the_tree_l2_r65() {
     let git = Git::scrubbed(&sb.env(), &repo);
     let tree = git.write_tree().unwrap();
     let entries = git.ls_tree(&tree).unwrap();
-    let p = policy::resolve(&git, &entries, None, &[]).unwrap();
+    let p = policy::resolve(&git, &entries, None, &[], Some("refs/heads/feat")).unwrap();
     assert_eq!(p.base.commit, None);
     assert_eq!(p.source, ConfigSource::Detected);
     assert_eq!(p.config.steps.len(), 4, "detected Rust steps");
@@ -137,7 +151,140 @@ fn no_anchor_uses_the_tip_and_unborn_uses_the_tree_l2_r65() {
     );
     sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "c"]);
     let tip = rev(&sb, &repo, "HEAD");
-    let p = policy::resolve(&git, &entries, Some(&tip), &[]).unwrap();
-    assert_eq!(p.base.commit.as_ref(), Some(&tip), "no full ref: N itself");
+    let p = policy::resolve(&git, &entries, Some(&tip), &[], Some("refs/heads/feat")).unwrap();
+    assert_eq!(p.base.commit.as_ref(), Some(&tip), "no anchor: N itself");
     let _ = RepoConfig::default();
+}
+
+/// A local repo with `main` holding the strong policy and a branch `feat`
+/// that weakens it; returns (repo, main tip, feat tip).
+fn weakened_branch(sb: &Sandbox) -> (PathBuf, tollgate::gitx::Oid, tollgate::gitx::Oid) {
+    let repo = sb.repo("r");
+    sb.commit_file(&repo, "tollgate.toml", MAIN_POLICY, "policy");
+    let main_tip = rev(sb, &repo, "HEAD");
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(&repo, "tollgate.toml", WEAK_POLICY, "weaken");
+    let tip = rev(sb, &repo, "HEAD");
+    (repo, main_tip, tip)
+}
+
+fn resolve_at(
+    sb: &Sandbox,
+    repo: &Path,
+    tip: &tollgate::gitx::Oid,
+    trusted: &[String],
+    own: &str,
+) -> Result<policy::Policy, policy::PolicyError> {
+    let git = Git::scrubbed(&sb.env(), repo);
+    let entries = git
+        .ls_tree(&git.tree_of(tip.as_str()).unwrap().unwrap())
+        .unwrap();
+    policy::resolve(&git, &entries, Some(tip), trusted, Some(own))
+}
+
+#[test]
+fn a_branch_made_at_the_own_tip_does_not_anchor_l2() {
+    let sb = Sandbox::new();
+    let (repo, main_tip, tip) = weakened_branch(&sb);
+    // integration/* is a full ref but not an anchor; a case variant of main
+    // is not main.
+    sb.git(&repo, &["branch", "integration/x", "HEAD"]);
+    sb.git(&repo, &["branch", "Main", "HEAD"]);
+    let p = resolve_at(&sb, &repo, &tip, &[], "refs/heads/feat").unwrap();
+    assert_eq!(p.base.commit.as_ref(), Some(&main_tip));
+    assert_eq!(p.base.anchor.as_deref(), Some("refs/heads/main"));
+    assert_eq!(p.config.steps.len(), 1, "main's policy applies");
+
+    // `master` created at the own tip: main has priority, and one
+    // merge-base per anchor (not one across all anchors).
+    sb.git(&repo, &["branch", "master", "HEAD"]);
+    let p = resolve_at(&sb, &repo, &tip, &[], "refs/heads/feat").unwrap();
+    assert_eq!(p.base.commit.as_ref(), Some(&main_tip));
+}
+
+#[test]
+fn a_local_anchor_that_contains_the_tip_is_skipped_l2() {
+    let sb = Sandbox::new();
+    let (repo, main_tip, tip) = weakened_branch(&sb);
+    // The repo's anchor is `master`; the agent creates `main` at its tip.
+    sb.git(&repo, &["branch", "-m", "main", "master"]);
+    sb.git(&repo, &["branch", "main", "HEAD"]);
+    let p = resolve_at(&sb, &repo, &tip, &[], "refs/heads/feat").unwrap();
+    assert_eq!(p.base.commit.as_ref(), Some(&main_tip));
+    assert_eq!(p.base.anchor.as_deref(), Some("refs/heads/master"));
+    assert_eq!(p.config.steps.len(), 1);
+
+    // The job's own ref is never its anchor: on `master` itself with no
+    // other anchor, N itself.
+    let p = resolve_at(&sb, &repo, &main_tip, &[], "refs/heads/master").unwrap();
+    assert_eq!(p.base.commit.as_ref(), Some(&main_tip));
+}
+
+#[test]
+fn trusted_remotes_without_fetched_anchors_deny_l2() {
+    let sb = Sandbox::new();
+    let (repo, _, tip) = weakened_branch(&sb);
+    sb.git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://gitlab.com/victorkwak/r.git",
+        ],
+    );
+    // Local main exists, but trusted remotes never fall back to local refs.
+    let err = resolve_at(&sb, &repo, &tip, &["origin".to_owned()], "refs/heads/feat")
+        .expect_err("no fetched anchor must deny");
+    assert!(
+        matches!(err, policy::PolicyError::NoAnchor(_))
+            && err.to_string().contains("git fetch origin"),
+        "{err}"
+    );
+    // origin/master alone is enough; origin/main ranks first when both
+    // exist.
+    let first = rev(&sb, &repo, "main");
+    sb.git(
+        &repo,
+        &["update-ref", "refs/remotes/origin/master", first.as_str()],
+    );
+    let p = resolve_at(&sb, &repo, &tip, &["origin".to_owned()], "refs/heads/feat").unwrap();
+    assert_eq!(p.base.anchor.as_deref(), Some("refs/remotes/origin/master"));
+    let root = rev(&sb, &repo, "main~1");
+    sb.git(
+        &repo,
+        &["update-ref", "refs/remotes/origin/main", root.as_str()],
+    );
+    let p = resolve_at(&sb, &repo, &tip, &["origin".to_owned()], "refs/heads/feat").unwrap();
+    assert_eq!(p.base.anchor.as_deref(), Some("refs/remotes/origin/main"));
+    assert_eq!(p.base.commit.as_ref(), Some(&root));
+}
+
+#[test]
+fn the_anchor_commits_config_names_the_anchors_l2() {
+    let sb = Sandbox::new();
+    let repo = sb.repo("r");
+    sb.git(&repo, &["branch", "-m", "main", "trunk"]);
+    sb.commit_file(
+        &repo,
+        "tollgate.toml",
+        &format!("{MAIN_POLICY}[policy]\nanchors = [\"trunk\"]\n"),
+        "policy",
+    );
+    let trunk = rev(&sb, &repo, "HEAD");
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(&repo, "tollgate.toml", WEAK_POLICY, "weaken");
+    let tip = rev(&sb, &repo, "HEAD");
+    // No default anchor exists: N itself first, whose config names no
+    // other anchor (WEAK_POLICY), so the branch's own policy applies until
+    // a default anchor exists.
+    let p = resolve_at(&sb, &repo, &tip, &[], "refs/heads/feat").unwrap();
+    assert_eq!(p.base.commit.as_ref(), Some(&tip));
+    // With `main` at trunk's tip, main's config names `trunk`.
+    sb.git(&repo, &["branch", "main", trunk.as_str()]);
+    sb.commit_file(&repo, "x.txt", "x", "more");
+    let tip = rev(&sb, &repo, "HEAD");
+    let p = resolve_at(&sb, &repo, &tip, &[], "refs/heads/feat").unwrap();
+    assert_eq!(p.base.commit.as_ref(), Some(&trunk));
+    assert_eq!(p.config.steps.len(), 1);
 }

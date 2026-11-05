@@ -914,7 +914,8 @@ pub fn config_effective(ctx: &Ctx) -> u8 {
         Ok(e) => e,
         Err(e) => return fail(e),
     };
-    let p = match policy::resolve(&repo.git, &entries, tip.as_ref(), &trusted) {
+    let own = head_ref(&repo.git);
+    let p = match policy::resolve(&repo.git, &entries, tip.as_ref(), &trusted, Some(&own)) {
         Ok(p) => p,
         Err(e) => return fail(e),
     };

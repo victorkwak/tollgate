@@ -1,15 +1,20 @@
 //! Policy files and the policy commit (R49, R64, R69-R71, L2).
 //!
-//! L2: the policy commit is `git merge-base N <anchors>`. Anchors are the
-//! trusted remotes' full refs (`refs/remotes/<trusted>/main`, ...); when
-//! there are none, the local full refs; with no anchor at all, `N` itself.
+//! L2: the policy commit is `git merge-base N <anchor>` for the first
+//! usable anchor in priority order. Anchors are exact, case-sensitive
+//! branch names (`policy.anchors`, default `main`, `master`; never
+//! `integration/*`): the trusted remotes' `refs/remotes/<r>/<name>` first;
+//! only when no trusted remote is configured, the local `refs/heads/<name>`.
+//! The job's own ref is never an anchor, and a local anchor that already
+//! contains `N` is skipped. Trusted remotes with none of their anchor refs
+//! fetched deny (no local fallback). With no usable anchor, `N` itself.
 //! Policy files (R71) come from that commit, so a branch cannot weaken the
 //! checks that judge it: its own policy changes take effect after it merges
 //! to a full ref. The approval flow and union rule are CUT (L2).
 //!
-//! Full refs for anchor discovery come from the built-in defaults first,
-//! then from the `tollgate.toml` of the commit found that way (it sits on a
-//! protected ref, so its `full_refs` can be trusted).
+//! Anchor names come from the built-in defaults first, then from the
+//! `tollgate.toml` of the commit found that way (it sits on a protected
+//! ref, so its `policy.anchors` can be trusted).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,7 +22,7 @@ use std::path::{Path, PathBuf};
 use globset::GlobSet;
 
 use crate::config::glob::{self, GlobOpts};
-use crate::config::repo::{RefRules, RepoConfig};
+use crate::config::repo::RepoConfig;
 use crate::gitx::{Git, GitError, Oid, TreeEntry};
 use crate::select::detect;
 
@@ -43,6 +48,10 @@ pub enum PolicyError {
     /// The policy commit's `tollgate.toml` is unusable (R64).
     #[error("{0}")]
     Config(String),
+    /// Trusted remotes are configured but none of their anchor refs exists
+    /// locally (L2): deny until they are fetched.
+    #[error("{0}")]
+    NoAnchor(String),
 }
 
 /// Matches policy files (R71).
@@ -92,38 +101,127 @@ pub struct PolicyBase {
     pub committer_date: Option<jiff::civil::Date>,
 }
 
-/// The refs that anchor the policy (L2): full refs of trusted remotes, else
-/// local full refs.
-pub fn anchors(git: &Git, trusted: &[String], rules: &RefRules) -> Result<Vec<String>, GitError> {
-    let full = |text: &[u8]| -> Vec<String> {
-        String::from_utf8_lossy(text)
-            .lines()
-            .filter(|r| rules.tier_for_ref(r) == crate::config::Tier::Full)
-            .map(str::to_owned)
-            .collect()
-    };
-    if !trusted.is_empty() {
-        let mut args = vec!["for-each-ref".to_owned(), "--format=%(refname)".to_owned()];
-        args.extend(trusted.iter().map(|r| format!("refs/remotes/{r}/")));
-        let remote = full(&git.run(&args)?);
-        if !remote.is_empty() {
-            return Ok(remote);
-        }
-    }
-    Ok(full(&git.run([
-        "for-each-ref",
-        "--format=%(refname)",
-        "refs/heads/",
-    ])?))
+/// One candidate anchor ref and its tip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Anchor {
+    refname: String,
+    tip: Oid,
+    /// A local branch: the agent can move it, so it must not contain the
+    /// job's tip.
+    local: bool,
 }
 
-/// The policy commit for new commit `tip` (L2).
+/// Existing refs among `wanted`, in `wanted` order, matched exactly and
+/// case-sensitively (`for-each-ref` patterns also match prefixes, and a
+/// case-insensitive file system can fold loose ref names).
+fn existing_refs(git: &Git, wanted: &[String]) -> Result<Vec<(String, Oid)>, GitError> {
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec![
+        "for-each-ref".to_owned(),
+        "--format=%(objectname) %(refname)".to_owned(),
+    ];
+    args.extend(wanted.iter().cloned());
+    let text = git.run(&args)?;
+    let mut found: BTreeMap<String, Oid> = BTreeMap::new();
+    for line in String::from_utf8_lossy(&text).lines() {
+        if let Some((oid, name)) = line.split_once(' ')
+            && let Ok(oid) = Oid::parse(oid)
+        {
+            found.insert(name.to_owned(), oid);
+        }
+    }
+    Ok(wanted
+        .iter()
+        .filter_map(|w| found.get(w).map(|o| (w.clone(), o.clone())))
+        .collect())
+}
+
+/// The anchor candidates of L2 in priority order: each trusted remote's
+/// anchor branches (`refs/remotes/<r>/main`, then `.../master`), or, only
+/// when no trusted remote is configured, the local anchor branches. The
+/// job's own ref is never an anchor. Errors when trusted remotes are
+/// configured but none of their anchor refs exists locally: falling back
+/// to local refs would let an agent pick its own policy by deleting the
+/// remote-tracking refs.
+fn anchors(
+    git: &Git,
+    trusted: &[String],
+    names: &[String],
+    own_ref: Option<&str>,
+) -> Result<Vec<Anchor>, PolicyError> {
+    let names: Vec<&String> = names
+        .iter()
+        .filter(|n| crate::config::repo::valid_anchor(n))
+        .collect();
+    if !trusted.is_empty() {
+        let wanted: Vec<String> = trusted
+            .iter()
+            .flat_map(|r| names.iter().map(move |n| format!("refs/remotes/{r}/{n}")))
+            .collect();
+        let found = existing_refs(git, &wanted)?;
+        if found.is_empty() {
+            return Err(PolicyError::NoAnchor(format!(
+                "no policy anchor (L2): none of {} exists locally; fetch the trusted remote (git fetch {}), or push its first branch from your own terminal",
+                wanted.join(", "),
+                trusted[0]
+            )));
+        }
+        return Ok(found
+            .into_iter()
+            .map(|(refname, tip)| Anchor {
+                refname,
+                tip,
+                local: false,
+            })
+            .collect());
+    }
+    let wanted: Vec<String> = names.iter().map(|n| format!("refs/heads/{n}")).collect();
+    Ok(existing_refs(git, &wanted)?
+        .into_iter()
+        .filter(|(r, _)| Some(r.as_str()) != own_ref)
+        .map(|(refname, tip)| Anchor {
+            refname,
+            tip,
+            local: true,
+        })
+        .collect())
+}
+
+/// True when `ancestor` is reachable from `descendant`.
+fn is_ancestor(git: &Git, ancestor: &Oid, descendant: &Oid) -> Result<bool, GitError> {
+    let out = git.output([
+        "merge-base",
+        "--is-ancestor",
+        ancestor.as_str(),
+        descendant.as_str(),
+    ])?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(GitError::Output {
+            args: "merge-base --is-ancestor".into(),
+            detail: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        }),
+    }
+}
+
+/// The policy commit for new commit `tip` on `own_ref` (L2).
+///
+/// The first usable anchor in priority order decides: its merge-base with
+/// `tip`, or the anchor's own tip when the histories are unrelated. A
+/// local anchor that already contains `tip` is skipped (its merge-base
+/// would be `tip` itself, so a branch created or moved at the agent's own
+/// tip would anchor the agent's own policy). With no usable anchor, `tip`
+/// itself.
 pub fn policy_base(
     git: &Git,
     tip: Option<&Oid>,
     trusted: &[String],
-    rules: &RefRules,
-) -> Result<PolicyBase, GitError> {
+    anchor_names: &[String],
+    own_ref: Option<&str>,
+) -> Result<PolicyBase, PolicyError> {
     let Some(tip) = tip else {
         return Ok(PolicyBase {
             commit: None,
@@ -131,13 +229,12 @@ pub fn policy_base(
             committer_date: None,
         });
     };
-    let anchors = anchors(git, trusted, rules)?;
-    let (commit, anchor) = if anchors.is_empty() {
-        (tip.clone(), None)
-    } else {
-        let mut args = vec!["merge-base".to_owned(), tip.to_string()];
-        args.extend(anchors.iter().cloned());
-        let out = git.output(&args)?;
+    let mut chosen = None;
+    for a in anchors(git, trusted, anchor_names, own_ref)? {
+        if a.local && is_ancestor(git, tip, &a.tip)? {
+            continue;
+        }
+        let out = git.output(["merge-base", tip.as_str(), a.tip.as_str()])?;
         let commit = if out.status.success() {
             Oid::parse(String::from_utf8_lossy(&out.stdout).trim()).map_err(|detail| {
                 GitError::Output {
@@ -148,13 +245,14 @@ pub fn policy_base(
         } else {
             // No common history: the anchor's own policy applies, never the
             // branch's.
-            git.rev_parse_verify(&format!("{}^{{commit}}", anchors[0]))?
-                .ok_or_else(|| GitError::Output {
-                    args: "rev-parse".into(),
-                    detail: format!("anchor {} does not resolve", anchors[0]),
-                })?
+            a.tip.clone()
         };
-        (commit, Some(anchors[0].clone()))
+        chosen = Some((commit, a.refname));
+        break;
+    }
+    let (commit, anchor) = match chosen {
+        Some((c, a)) => (c, Some(a)),
+        None => (tip.clone(), None),
     };
     let date = git.run_line(["log", "-1", "--format=%cs", commit.as_str()])?;
     Ok(PolicyBase {
@@ -271,27 +369,28 @@ fn config_at(git: &Git, entries: &[TreeEntry]) -> Result<Option<(Oid, RepoConfig
 }
 
 /// Resolves the policy of a job on tree `tree_entries` whose new commit is
-/// `tip` (L2, R49, R65, R71).
+/// `tip` on ref `own_ref` (L2, R49, R65, R71).
 pub fn resolve(
     git: &Git,
     tree_entries: &[TreeEntry],
     tip: Option<&Oid>,
     trusted: &[String],
+    own_ref: Option<&str>,
 ) -> Result<Policy, PolicyError> {
-    let default_rules = RepoConfig::default()
-        .ref_rules()
-        .map_err(PolicyError::Config)?;
-    let mut base = policy_base(git, tip, trusted, &default_rules)?;
+    let default_anchors = RepoConfig::default().policy.anchors;
+    let mut base = policy_base(git, tip, trusted, &default_anchors, own_ref)?;
     let mut base_entries = match &base.commit {
         Some(c) => git.ls_tree(c)?,
         None => tree_entries.to_vec(),
     };
     let mut found = config_at(git, &base_entries)?;
-    if let Some((_, c)) = &found
-        && c.tiers.full_refs != RepoConfig::default().tiers.full_refs
+    // The anchor commit's own config may name other anchors; it sits on a
+    // protected ref, so its list can be trusted.
+    if base.anchor.is_some()
+        && let Some((_, c)) = &found
+        && c.policy.anchors != default_anchors
     {
-        let rules = c.ref_rules().map_err(PolicyError::Config)?;
-        let again = policy_base(git, tip, trusted, &rules)?;
+        let again = policy_base(git, tip, trusted, &c.policy.anchors, own_ref)?;
         if again.commit != base.commit {
             base = again;
             base_entries = match &base.commit {

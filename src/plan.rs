@@ -225,7 +225,13 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
     let scope = CompiledScope::new(&host.scope, req.dirs).map_err(PlanError::Config)?;
     let trusted = trusted_remotes(req.git, &scope)?;
     let entries = req.git.ls_tree(&req.tree)?;
-    let policy = policy::resolve(req.git, &entries, req.tip.as_ref(), &trusted)?;
+    let policy = policy::resolve(
+        req.git,
+        &entries,
+        req.tip.as_ref(),
+        &trusted,
+        Some(&req.refname),
+    )?;
     let config = &policy.config;
     let rules = config.ref_rules().map_err(PlanError::Config)?;
     // L16: no reuse for full jobs of full refs, or on --rerun.

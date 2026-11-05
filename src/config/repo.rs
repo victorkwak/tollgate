@@ -124,12 +124,51 @@ pub struct BudgetOverrides {
 }
 
 /// `[policy]`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     /// Extra files (globs) treated as policy (R71).
     #[serde(default)]
     pub files: Vec<String>,
+    /// Branch names whose tips anchor the policy commit (L2), in priority
+    /// order: exact and case-sensitive, no globs. `integration/*` and other
+    /// full refs are not anchors: an agent can create such a branch at its
+    /// own tip.
+    #[serde(default = "default_anchors")]
+    pub anchors: Vec<String>,
+}
+
+/// L2: `main`, then `master`.
+fn default_anchors() -> Vec<String> {
+    vec!["main".into(), "master".into()]
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            files: Vec::new(),
+            anchors: default_anchors(),
+        }
+    }
+}
+
+/// True when `name` is a plain branch name usable as a policy anchor: no
+/// glob characters, no `refs/` prefix, no `..`, no spaces or control
+/// characters (`git check-ref-format` rules that matter here).
+#[must_use]
+pub fn valid_anchor(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with("refs/")
+        && !name.starts_with('-')
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.ends_with(".lock")
+        && !name.contains("..")
+        && !name.contains("//")
+        && !name.contains("@{")
+        && !name
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || "*?[]\\~^:".contains(c))
 }
 
 /// `[select]` (R57, R61).
@@ -541,6 +580,17 @@ impl RepoConfig {
             v.error("tiers/push", e);
         }
         globs(&mut v, "policy.files", &self.policy.files);
+        if self.policy.anchors.is_empty() {
+            v.error("policy.anchors", "needs at least one branch name (L2)");
+        }
+        for a in &self.policy.anchors {
+            if !valid_anchor(a) {
+                v.error(
+                    "policy.anchors",
+                    format!("{a:?} is not a plain branch name (exact, no globs)"),
+                );
+            }
+        }
         globs(&mut v, "select.global", &self.select.global);
         globs(&mut v, "select.docs_only", &self.select.docs_only);
         for (pattern, packages) in &self.select.owners {
@@ -1053,6 +1103,22 @@ issue = ""
                 .to_string()
                 .contains("no such test")
         );
+    }
+
+    #[test]
+    fn policy_anchors_are_exact_branch_names_l2() {
+        assert_eq!(
+            RepoConfig::default().policy.anchors,
+            ["main".to_owned(), "master".to_owned()]
+        );
+        let c = parse("version = 1\n[policy]\nanchors = [\"trunk\", \"release/1\"]\n");
+        assert!(c.validate().is_ok());
+        for bad in ["integration/*", "refs/heads/main", "", "a..b", "x y"] {
+            let c = parse(&format!("version = 1\n[policy]\nanchors = [{bad:?}]\n"));
+            assert!(!c.validate().is_ok(), "{bad:?} must be refused");
+        }
+        let empty = parse("version = 1\n[policy]\nanchors = []\n");
+        assert!(!empty.validate().is_ok());
     }
 
     #[test]
