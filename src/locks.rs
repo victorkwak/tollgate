@@ -113,7 +113,10 @@ pub fn is_held(path: &Path) -> io::Result<bool> {
 }
 
 /// Queue rank of a waiter (R89).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Priority {
     /// A hook is waiting for this job.
     Hook = 0,

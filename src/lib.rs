@@ -26,6 +26,7 @@ pub mod policy;
 pub mod procs;
 pub mod report;
 pub mod runner;
+pub mod sched;
 pub mod select;
 pub mod steps;
 
