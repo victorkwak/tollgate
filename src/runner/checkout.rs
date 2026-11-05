@@ -428,16 +428,22 @@ impl Checkout {
 
     /// R42 after a step: tracked files whose content differs from the
     /// index, index entries that differ from `tree` (a step ran `git add`),
-    /// and untracked files that were not in `before`. Paths in `allowed`
-    /// (the R71 tool configs the job itself replaced) do not count.
+    /// and untracked files that were not in `before`. The R71 tool configs
+    /// the job itself replaced (`overlay`) differ from the index on
+    /// purpose: each counts when it no longer holds what the overlay wrote
+    /// (content, mode, link target, or absence).
     pub fn changes(
         &self,
         env: &JobEnv,
         tree: &Oid,
         cache_dirs: &[String],
         before: &std::collections::BTreeSet<String>,
-        allowed: &std::collections::BTreeSet<String>,
+        overlay: &std::collections::BTreeMap<PathBuf, crate::policy::OverlayFile>,
     ) -> Result<Vec<String>, CheckoutError> {
+        let allowed: std::collections::BTreeSet<String> = overlay
+            .keys()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         let git = self.git(env);
         let mut changed: std::collections::BTreeSet<String> =
             self.tracked_changes(env)?.into_iter().collect();
@@ -453,7 +459,7 @@ impl Checkout {
                 .into_iter()
                 .filter(|p| !before.contains(p)),
         );
-        Ok(changed
+        let mut out: Vec<String> = changed
             .into_iter()
             .filter(|p| {
                 !allowed.contains(p)
@@ -461,7 +467,56 @@ impl Checkout {
                         .iter()
                         .any(|a| p.ends_with('/') && a.starts_with(p.as_str()))
             })
-            .collect())
+            .collect();
+        out.extend(self.overlay_changes(overlay));
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// R71: the overlay paths that no longer hold what
+    /// [`Checkout::apply_overlay`] wrote: other content or mode, another
+    /// link target, a file where none should be, or a parent dir that is a
+    /// symlink now.
+    #[must_use]
+    pub fn overlay_changes(
+        &self,
+        overlay: &std::collections::BTreeMap<PathBuf, crate::policy::OverlayFile>,
+    ) -> Vec<String> {
+        use crate::policy::OverlayFile;
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut out = Vec::new();
+        for (rel, want) in overlay {
+            let path = self.path.join(rel);
+            let mut dir = self.path.clone();
+            let linked_parent = rel
+                .parent()
+                .into_iter()
+                .flat_map(Path::components)
+                .any(|c| {
+                    dir.push(c);
+                    dir.symlink_metadata()
+                        .is_ok_and(|m| m.file_type().is_symlink())
+                });
+            let md = path.symlink_metadata();
+            let same = !linked_parent
+                && match (want, &md) {
+                    (OverlayFile::Absent, Err(e)) => e.kind() == io::ErrorKind::NotFound,
+                    (OverlayFile::Absent, Ok(_)) => false,
+                    (OverlayFile::File { text, executable }, Ok(m)) if m.file_type().is_file() => {
+                        (m.permissions().mode() & 0o100 != 0) == *executable
+                            && fs::read(&path).is_ok_and(|b| b == text.as_bytes())
+                    }
+                    (OverlayFile::Symlink { target }, Ok(m)) if m.file_type().is_symlink() => {
+                        fs::read_link(&path).is_ok_and(|t| t == Path::new(target))
+                    }
+                    _ => false,
+                };
+            if !same {
+                out.push(rel.to_string_lossy().into_owned());
+            }
+        }
+        out
     }
 
     /// Tracked files whose content differs from the index.

@@ -909,19 +909,14 @@ impl Runner<'_> {
         let mut verdict = Verdict::Pass;
         let mut error_end: Option<End> = None;
         // R42: what the checkout holds before the first step (setup and
-        // `cargo metadata` may add untracked files such as `Cargo.lock`);
-        // R71: the tool configs the job replaced itself.
+        // `cargo metadata` may add untracked files such as `Cargo.lock`).
+        // R71: after each step, each overlaid tool config must still hold
+        // what the overlay wrote (setup steps included, as the first
+        // check runs after them).
         let cache_dirs: Vec<String> = config
             .steps
             .iter()
             .flat_map(|s| s.cache_dirs.iter().cloned())
-            .collect();
-        let allowed: BTreeSet<String> = self
-            .spec
-            .policy
-            .overlay
-            .keys()
-            .map(|p| p.to_string_lossy().into_owned())
             .collect();
         let before = match co.map(|c| c.untracked(&self.env, &cache_dirs)).transpose() {
             Ok(b) => b.unwrap_or_default(),
@@ -1260,7 +1255,13 @@ impl Runner<'_> {
             // R42 after every step that ran, so a step that changes the tree
             // is named and its pass is never stored for reuse (L16).
             if !stop && let Some(co) = co {
-                match co.changes(&self.env, &self.spec.tree, &cache_dirs, &before, &allowed) {
+                match co.changes(
+                    &self.env,
+                    &self.spec.tree,
+                    &cache_dirs,
+                    &before,
+                    &self.spec.policy.overlay,
+                ) {
                     Ok(changed) if !changed.is_empty() => {
                         rep.status = StepStatus::Error;
                         rep.message = Some(format!(

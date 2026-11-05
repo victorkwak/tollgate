@@ -321,6 +321,34 @@ fn tool_configs_reached_through_symlinks_are_refused_r71() {
     assert_eq!(r.code, Some(0), "{}", r.out);
 }
 
+/// R71, R42, item 5: the overlaid tool configs are exempt from the
+/// tracked-change check (the job wrote them), so after each step each one
+/// must still hold the policy commit's version, or still be absent.
+#[test]
+fn a_step_that_rewrites_an_overlaid_tool_config_is_an_error_r71_r42() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"rewrite\"\nkind = \"command\"\nrun = \"echo y > rustfmt.toml; touch clippy.toml\"\n[[step]]\nname = \"after\"\nkind = \"command\"\nrun = \"true\"\n",
+    );
+    sb.commit_file(&repo, "rustfmt.toml", "max_width = 100\n", "fmt");
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(&repo, "rustfmt.toml", "max_width = 80\n", "weaken");
+    sb.commit_file(&repo, "clippy.toml", "\n", "lint");
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("cause checkout")
+            && r.out.contains("\"rewrite\" changed")
+            && r.out.contains("clippy.toml")
+            && r.out.contains("rustfmt.toml"),
+        "{}",
+        r.out
+    );
+}
+
 #[test]
 fn unborn_repo_and_lru_eviction_r41_l15() {
     let sb = Sandbox::new();
