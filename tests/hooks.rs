@@ -873,8 +873,8 @@ fn a_killed_hook_leaves_no_commit_and_no_record_t18_r31_r37() {
             .stderr(std::process::Stdio::null());
         let mut git = cmd.spawn().unwrap();
         // Signal the hook only once its job runs: the job dir appears
-        // before job.json and the runner, and a busy host can stretch that
-        // window past the first poll.
+        // before the runner starts, and a busy host can stretch that window
+        // past the first poll.
         let mut pid = None;
         assert!(
             eventually(60, || {
@@ -897,6 +897,90 @@ fn a_killed_hook_leaves_no_commit_and_no_record_t18_r31_r37() {
         assert_eq!(w.code, Some(1), "{}", w.out);
         assert_eq!(sb.record_count(), 0);
     }
+}
+
+/// R82: a hook killed at any point while it makes its job leaves either no
+/// job dir or a whole one (`spec.json` and `job.json`), never a half-made
+/// dir that `tollgate cancel` and gc cannot read. The test kills the hook as
+/// soon as anything appears under `jobs/`, many times, so most kills land
+/// inside job creation.
+#[test]
+fn a_hook_killed_while_it_makes_its_job_leaves_no_half_made_job_r82() {
+    let sb = Sandbox::new();
+    sb.scoped_host("");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"slow\"\nkind = \"command\"\nrun = \"sleep 30\"\n",
+    );
+    let jobs = sb.state().join("jobs");
+    let entries = || -> Vec<String> {
+        std::fs::read_dir(&jobs)
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+                    .filter(|n| n != "by-key" && n != "queue")
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for round in 0..15 {
+        stage(&sb, &repo, "a.txt", &format!("{round}\n"));
+        let before = entries().len();
+        let mut cmd = std::process::Command::new("git");
+        cmd.env_clear()
+            .current_dir(&repo)
+            .args(["commit", "-m", "a"]);
+        for (k, v) in sb.env().iter() {
+            cmd.env(k, v);
+        }
+        for (k, v) in sb.injection() {
+            cmd.env(k, v);
+        }
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut git = cmd.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut pid = None;
+        while Instant::now() < deadline {
+            pid = pid.or_else(|| hook_pid(git.id(), "pre-commit"));
+            if pid.is_some() && entries().len() > before {
+                break;
+            }
+        }
+        let pid = pid.expect("the hook never started");
+        let _ = tollgate::procs::signal(pid, libc::SIGKILL);
+        let _ = git.wait().unwrap();
+    }
+    for name in entries() {
+        let dir = jobs.join(&name);
+        if name.starts_with('.') {
+            continue; // a staging dir no reader looks at; gc removes it
+        }
+        assert!(
+            dir.join("job.json").is_file() && dir.join("spec.json").is_file(),
+            "half-made job dir {name}: {:?}",
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
+        );
+        let c = sb.tollgate(&repo, &["cancel", &name]);
+        assert_eq!(c.code, Some(0), "cancel {name}: {}", c.out);
+    }
+    // A half-made job dir as older versions left it: `spec.json` only.
+    let legacy = jobs.join("20261105-000000-deadbeef");
+    std::fs::create_dir(&legacy).unwrap();
+    std::fs::write(legacy.join("spec.json"), b"{}").unwrap();
+    let g = sb.tollgate(&repo, &["gc", "--all"]);
+    assert_eq!(g.code, Some(0), "{}", g.out);
+    let left: Vec<String> = entries()
+        .into_iter()
+        .filter(|n| n.starts_with('.'))
+        .collect();
+    assert!(left.is_empty(), "gc left staging dirs: {left:?}");
+    assert!(!legacy.exists(), "gc left a job dir without job.json");
 }
 
 /// Item 17 (detection only): `--no-verify` skips `pre-commit` and

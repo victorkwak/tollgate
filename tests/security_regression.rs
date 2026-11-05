@@ -754,7 +754,7 @@ fn s8_a_killed_hook_leaves_no_commit_and_no_record() {
         .spawn()
         .unwrap();
     // Kill the hook only once its job runs ("while its job runs"): the job
-    // dir appears before job.json and the runner.
+    // dir appears before the runner starts.
     let mut pid = None;
     assert!(
         eventually(60, || {

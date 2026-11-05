@@ -236,6 +236,17 @@ pub fn gc(dirs: &Dirs, host: &HostConfig, env: &EnvSnapshot, all: bool) -> GcRep
         }
     }
     for job in files(&dirs.jobs_dir()) {
+        // R82: staging dirs of job creations that were killed, and job
+        // dirs without `job.json` that older versions left the same way.
+        let name = job.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let half_made = name.starts_with(crate::fsx::STAGING_PREFIX)
+            || (JobId::parse(name).is_ok() && !job.join("job.json").exists());
+        if half_made && older_than(&job, ticket_age, now) {
+            if fs::remove_dir_all(&job).is_ok() {
+                rep.jobs += 1;
+            }
+            continue;
+        }
         for w in files(&job.join("waiters")) {
             if older_than(&w, ticket_age, now) && remove_unheld(&w) {
                 rep.tickets += 1;

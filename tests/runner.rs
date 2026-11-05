@@ -1062,19 +1062,22 @@ fn a_cancelled_docs_only_job_writes_no_pass_r89_r61() {
     // A queued job (as plan::start makes it), cancelled before its runner
     // gets to run.
     let spec = &plan.spec;
-    spec.write(&dirs).unwrap();
+    let spec_json = spec.to_json().unwrap();
     let store = JobStore::new(&dirs);
     store
-        .create(&JobMeta {
-            id: spec.id.clone(),
-            key: spec.key.clone(),
-            tree: spec.tree.clone(),
-            tier: spec.tier,
-            origin: spec.origin.clone(),
-            priority: spec.priority,
-            created: spec.created,
-            state: JobState::Queued,
-        })
+        .create_with(
+            &JobMeta {
+                id: spec.id.clone(),
+                key: spec.key.clone(),
+                tree: spec.tree.clone(),
+                tier: spec.tier,
+                origin: spec.origin.clone(),
+                priority: spec.priority,
+                created: spec.created,
+                state: JobState::Queued,
+            },
+            &[("spec.json", &spec_json)],
+        )
         .unwrap();
     assert_eq!(
         store.request_cancel(&spec.id).unwrap(),

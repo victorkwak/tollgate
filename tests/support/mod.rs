@@ -324,8 +324,7 @@ impl Sandbox {
     }
 
     /// The `state` of `jobs/<id>/job.json` (`queued`, `running`, ...), or
-    /// `None` while the file does not exist: the hook makes the job dir
-    /// (`spec.json`) before it writes `job.json` and spawns the runner.
+    /// `None` while the job dir does not exist.
     pub fn job_state(&self, job: &str) -> Option<String> {
         let text =
             std::fs::read_to_string(self.state().join("jobs").join(job).join("job.json")).ok()?;

@@ -314,7 +314,7 @@ R46. Tools from lockfiles run from the project: `node_modules/.bin/<tool>` and `
 R47. CI mode `tollgate run --tier <t> --here [--report junit]` runs the steps in the current directory with no verify checkout and no result cache, exits non-zero on fail, writes `report.json` (and `junit.xml`). When a host config exists it takes the same resource slots (R86) unless `--no-host-locks` is given (hosted runners only).
 Reason: the GitLab runner on this workstation shares the test Postgres with local jobs; without slots the "too many clients" storm returns (critique).
 
-R48. `tollgate gc` removes verify checkouts whose repo is gone, records older than 90 days, bulky step logs older than 14 days (keeping `report.json` and `junit.xml` as long as the record, R82), tickets and markers older than 1 day.
+R48. `tollgate gc` removes verify checkouts whose repo is gone, records older than 90 days, bulky step logs older than 14 days (keeping `report.json` and `junit.xml` as long as the record, R82), tickets, markers and job staging dirs (and job dirs without `job.json`) older than 1 day.
 
 R49. Policy base checkout. Policy files (R71) that differ between `T` and the base are read from the base with `git show <base commit>:<path>` into the job dir; nextest gets `--config-file <that file>`; baseline steps read the base baseline file. The checkout itself stays at `T`.
 
@@ -479,7 +479,7 @@ R80. `selection` in a record: `all`, or `{base, packages: [..], roots: [..], ste
 R81. A `pass` record whose `report.json` is missing from `jobs/<job id>/` is invalid and treated as no record. A record also counts only as the record of its own key (its tree, tier and fingerprint hash to the file name) and only when its `report.json` says the same job, tree, tier and verdict; the store refuses to write any other (S11).
 Reason: a one-word edit of a record file (`fail` to `pass`) or a copy of another tree's pass record must not let a tree through. Same-user code can still write two consistent files: that is out of scope (section 1).
 
-R82. Job dirs `$XDG_STATE_HOME/tollgate/jobs/<job id>/` hold `<step>.log`, `report.json`, `junit.xml`. `report.json` and `junit.xml` live as long as the record (R48).
+R82. Job dirs `$XDG_STATE_HOME/tollgate/jobs/<job id>/` hold `job.json`, `spec.json`, `<step>.log`, `report.json`, `junit.xml`. `report.json` and `junit.xml` live as long as the record (R48). A job dir appears whole: the hook fills a hidden staging dir (`jobs/.new-*`) with `job.json`, `spec.json` and `waiters/`, then renames it. A hook killed at any point leaves no job dir or a whole one; readers skip staging dirs. A waiter never makes the job dir.
 
 R83. Poisoning. Records are written only by the job runner. The guard denies writes under the state dir (R25, R26). `tollgate audit [--since]` lists records with duration, job log size, tollgate version and `moved` tips (R30), so a 0 s pass or an old-version record stands out. Waive records (R113) carry `waived: true` and a synthetic job dir with the waiver text. The README states the same-user limitation.
 

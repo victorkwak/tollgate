@@ -170,10 +170,10 @@ impl JobSpec {
         Ok(spec)
     }
 
-    /// Writes the spec by atomic rename.
-    pub fn write(&self, dirs: &Dirs) -> std::io::Result<()> {
-        let json = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
-        fsx::write_atomic(&Self::path(dirs, &self.id), &json)
+    /// The spec as `spec.json` bytes. It is written with `job.json` when the
+    /// job dir is made ([`JobStore::create_with`]).
+    pub fn to_json(&self) -> std::io::Result<Vec<u8>> {
+        serde_json::to_vec_pretty(self).map_err(std::io::Error::other)
     }
 
     /// The base job environment.
