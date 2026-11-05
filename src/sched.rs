@@ -140,6 +140,36 @@ pub fn running_job(dirs: &Dirs, key: &RecordKey) -> Result<Option<JobId>, SchedE
     Ok(JobId::parse(text.trim()).ok())
 }
 
+/// R35, R85: a job that has not ended and whose runner no longer holds its
+/// key lock (SIGKILL, OOM) is lost. Its leftover processes (found by the
+/// job's `TMPDIR` entry, R52) are killed, which releases the resource slots
+/// and checkout lock they inherited, and the job is marked `lost`. Returns
+/// true when this call marked it.
+pub fn reap_if_lost(dirs: &Dirs, id: &JobId) -> Result<bool, SchedError> {
+    let store = JobStore::new(dirs);
+    let meta = store.read(id)?;
+    if meta.state.is_terminal() || running_job(dirs, &meta.key)?.as_ref() == Some(id) {
+        return Ok(false);
+    }
+    let mut marker = b"TMPDIR=".to_vec();
+    marker.extend_from_slice(dirs.job_dir(id).join("tmp").as_os_str().as_encoded_bytes());
+    let (killed, left) = crate::procs::kill_marked(&marker, Duration::from_secs(10));
+    let reason = format!(
+        "its runner died; {killed} leftover process(es) killed{}",
+        if left > 0 {
+            format!(", {left} still alive")
+        } else {
+            String::new()
+        }
+    );
+    let done = store.transition(
+        id,
+        &[StateKind::Queued, StateKind::Running],
+        JobState::Lost { reason },
+    )?;
+    Ok(matches!(done, Transition::Done(_)))
+}
+
 /// A waiting hook's registration (R89). Removed on drop or process death.
 #[derive(Debug)]
 pub struct Waiter {
@@ -259,6 +289,11 @@ pub enum JobState {
         /// Why.
         reason: String,
     },
+    /// Its runner died before the job ended (R35): no record.
+    Lost {
+        /// What was found and done.
+        reason: String,
+    },
 }
 
 /// [`JobState`] without data, for transition guards.
@@ -276,6 +311,8 @@ pub enum StateKind {
     Cancelled,
     /// Deferred.
     Deferred,
+    /// Lost.
+    Lost,
 }
 
 impl JobState {
@@ -289,6 +326,7 @@ impl JobState {
             Self::Superseded => StateKind::Superseded,
             Self::Cancelled => StateKind::Cancelled,
             Self::Deferred { .. } => StateKind::Deferred,
+            Self::Lost { .. } => StateKind::Lost,
         }
     }
 

@@ -231,6 +231,10 @@ struct Runner<'a> {
     /// L16: at least one step result was reused, so this job did not run
     /// every step fresh.
     reused: bool,
+    /// Lock fds every process of the job inherits: the checkout lock (R35,
+    /// R87), so a step that outlives a dead runner keeps the checkout from
+    /// the next job until it is reaped.
+    inherit: Vec<std::os::fd::RawFd>,
     /// `run --here` (R47): no checkout, no record, report in this dir.
     here: bool,
     /// Take resource slots (R85; `run --here --no-host-locks` turns it off).
@@ -337,6 +341,7 @@ impl<'a> Runner<'a> {
             known_tests_full: None,
             pending_steps: Vec::new(),
             reused: false,
+            inherit: Vec::new(),
             here,
             use_locks,
         }
@@ -376,12 +381,22 @@ impl Runner<'_> {
             self.spec.tier,
             &self.spec.origin.worktree,
         );
-        // Queue: the sticky checkout lock (R87), within the queue budget.
+        // Queue: the sticky checkout lock (R87), within the queue budget. A
+        // lock held by the leftover steps of a job whose runner died is
+        // freed by reaping that job (R35).
         let store = self.store.clone();
         let id = self.spec.id.clone();
-        let mut abort = || queued_abort(&store, &id);
+        let dirs = self.dirs.clone();
+        let lock_path = place.lock.clone();
+        let mut abort = || {
+            reap_holder(&dirs, &lock_path, &id);
+            queued_abort(&store, &id)
+        };
         let lock = match checkout::lock(&place, self.queue_deadline(), &mut abort) {
-            Ok(l) => l,
+            Ok(l) => {
+                let _ = l.set_holder(self.spec.id.as_str());
+                l
+            }
             Err(LockWait::Deadline) => {
                 return error(
                     ErrorCause::Deferred,
@@ -447,6 +462,7 @@ impl Runner<'_> {
             Ok(c) => c,
             Err(e) => return error(ErrorCause::Checkout, e.to_string()),
         };
+        self.inherit = vec![co.lock_fd()];
         let end = self.in_checkout(&co);
         self.max_target(&co);
         end
@@ -592,6 +608,7 @@ impl Runner<'_> {
                 &log,
                 None,
                 &mut abort,
+                &self.inherit,
             ) {
                 SetupResult::UpToDate => self.say(&format!("setup {:?}: up to date", s.name)),
                 SetupResult::Ran(d) => {
@@ -639,6 +656,7 @@ impl Runner<'_> {
             deadline: Some(Instant::now() + Duration::from_secs(600)),
             grace: Duration::from_secs(10),
             abort: &mut abort,
+            inherit: &self.inherit,
         });
         let parsed = if out.success() {
             std::fs::read_to_string(&out_file)
@@ -970,13 +988,25 @@ impl Runner<'_> {
             };
             let store = self.store.clone();
             let id = self.spec.id.clone();
-            let mut abort_wait = || running_abort(&store, &id);
+            let dirs = self.dirs.clone();
+            let slot_paths: Vec<PathBuf> = sems
+                .iter()
+                .flat_map(|s| s.slot_paths().iter().cloned())
+                .collect();
+            let mut abort_wait = || {
+                // Slots held by the leftovers of a dead runner (R35, R85).
+                for p in &slot_paths {
+                    reap_holder(&dirs, p, &id);
+                }
+                running_abort(&store, &id)
+            };
             let held = match locks::acquire(
                 &sems,
                 AcquireOptions {
                     priority: self.spec.priority,
                     deadline: Some(Instant::now() + self.spec.budgets.queue.get()),
                     abort: Some(&mut abort_wait),
+                    holder: Some(self.spec.id.as_str()),
                     ..AcquireOptions::default()
                 },
             ) {
@@ -1022,6 +1052,17 @@ impl Runner<'_> {
             let mut abort = || running_abort(&cancel_store, &cancel_id);
             let cwd = workdir.join(&root);
             let quarantined_before = self.report.quarantined.len();
+            // R85: the step's processes hold its slots (and the checkout)
+            // while they live, also after a runner death.
+            let inherit: Vec<std::os::fd::RawFd> = self
+                .inherit
+                .iter()
+                .copied()
+                .chain(held.slots().iter().map(|h| {
+                    use std::os::fd::AsRawFd as _;
+                    h.lock().file().as_raw_fd()
+                }))
+                .collect();
             let out = exec::run(ExecSpec {
                 program: inv.program.clone(),
                 args: inv.args.clone(),
@@ -1032,6 +1073,7 @@ impl Runner<'_> {
                 deadline: Some(Instant::now() + step_limit),
                 grace: s.grace(),
                 abort: &mut abort,
+                inherit: &inherit,
             });
             drop(held);
             self.run_time += out.duration;
@@ -1320,6 +1362,7 @@ impl Runner<'_> {
                 deadline: Some(Instant::now() + Duration::from_secs(600)),
                 grace: Duration::from_secs(10),
                 abort: &mut never,
+                inherit: &self.inherit,
             });
         }
     }
@@ -1485,6 +1528,17 @@ fn queued_abort(store: &JobStore, id: &JobId) -> Option<String> {
         return Some("superseded".into());
     }
     None
+}
+
+/// R35: when the lock file at `lock` names another job whose runner died,
+/// stop that job's leftover processes (they hold the lock through inherited
+/// fds) and mark it lost.
+fn reap_holder(dirs: &Dirs, lock: &Path, me: &JobId) {
+    if let Some(holder) = locks::holder(lock).and_then(|h| JobId::parse(&h).ok())
+        && &holder != me
+    {
+        let _ = crate::sched::reap_if_lost(dirs, &holder);
+    }
 }
 
 /// While running: `tollgate cancel` (R89).

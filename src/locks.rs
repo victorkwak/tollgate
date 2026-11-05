@@ -24,6 +24,7 @@
 use std::cmp::Ordering;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
@@ -54,29 +55,69 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+/// True when `file` is the file `path` names now. A lock taken on a file
+/// that was unlinked (gc) or replaced after it was opened guards nothing:
+/// another process can create and lock a new file at the path.
+fn still_at(file: &File, path: &Path) -> io::Result<bool> {
+    let held = file.metadata()?;
+    match fs::metadata(path) {
+        Ok(now) => Ok(held.dev() == now.dev() && held.ino() == now.ino()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 impl LockFile {
     /// Takes the lock on `path` (created if needed) without waiting.
     /// `Ok(None)` when another open file holds it.
     pub fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
-        let file = open_lock_file(path)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(Self {
-                file,
-                path: path.to_owned(),
-            })),
-            Err(TryLockError::WouldBlock) => Ok(None),
-            Err(TryLockError::Error(e)) => Err(e),
+        loop {
+            let file = open_lock_file(path)?;
+            match file.try_lock() {
+                Ok(()) => {}
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Error(e)) => return Err(e),
+            }
+            if still_at(&file, path)? {
+                return Ok(Some(Self {
+                    file,
+                    path: path.to_owned(),
+                }));
+            }
         }
     }
 
     /// Takes the lock on `path`, waiting as long as needed.
     pub fn acquire(path: &Path) -> io::Result<Self> {
-        let file = open_lock_file(path)?;
-        file.lock()?;
-        Ok(Self {
-            file,
-            path: path.to_owned(),
-        })
+        loop {
+            let file = open_lock_file(path)?;
+            file.lock()?;
+            if still_at(&file, path)? {
+                return Ok(Self {
+                    file,
+                    path: path.to_owned(),
+                });
+            }
+        }
+    }
+
+    /// Removes the lock file while the lock is still held, then releases
+    /// it, so no other process can hold a lock on the removed file while a
+    /// third one creates a new one (gc).
+    pub fn remove_locked(self) -> io::Result<()> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Writes `text` (a job id) as the lock's holder, for processes that
+    /// find the lock busy and check whether its holder is still alive.
+    pub fn set_holder(&self, text: &str) -> io::Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        self.file.set_len(0)?;
+        self.file.write_all_at(text.as_bytes(), 0)
     }
 
     /// The lock file.
@@ -99,8 +140,19 @@ impl LockFile {
     }
 }
 
+/// The holder text of the lock file at `path` ([`LockFile::set_holder`]).
+#[must_use]
+pub fn holder(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let t = text.trim();
+    (!t.is_empty()).then(|| t.to_owned())
+}
+
 /// True when another open file holds the lock on `path` (a missing file is
-/// not held).
+/// not held). It tests by taking the lock for a moment: a concurrent
+/// non-blocking taker can see it busy then (callers retry). `flock(2)`
+/// locks cannot be queried without taking them (`F_GETLK` sees only POSIX
+/// locks).
 pub fn is_held(path: &Path) -> io::Result<bool> {
     match File::open(path) {
         Ok(f) => match f.try_lock() {
@@ -348,6 +400,8 @@ pub struct AcquireOptions<'a> {
     /// Called before each attempt; `Some(reason)` stops the wait
     /// (cancellation, supersession, R89).
     pub abort: Option<&'a mut dyn FnMut() -> Option<String>>,
+    /// Written into each slot file once taken ([`LockFile::set_holder`]).
+    pub holder: Option<&'a str>,
 }
 
 impl Default for AcquireOptions<'_> {
@@ -357,6 +411,7 @@ impl Default for AcquireOptions<'_> {
             poll: DEFAULT_POLL,
             deadline: None,
             abort: None,
+            holder: None,
         }
     }
 }
@@ -463,6 +518,11 @@ pub fn acquire(sems: &[Semaphore], mut opts: AcquireOptions<'_>) -> Result<Held,
             }
             if got.len() == ordered.len() {
                 drop(ticket);
+                if let Some(h) = opts.holder {
+                    for slot in &got {
+                        slot.lock.set_holder(h)?;
+                    }
+                }
                 return Ok(Held { slots: got });
             }
             // Not all free: release what was taken (no hold-and-wait).
@@ -491,6 +551,28 @@ mod tests {
         assert_eq!(TicketName::parse("0-1-2-3-4"), None);
         // Lexical order of file names matches the order.
         assert!(a.file_name() < b.file_name());
+    }
+
+    #[test]
+    fn a_lock_on_a_removed_file_is_not_the_lock_r87_r88() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("by-key/k.lock");
+        // A process opens the lock file; gc removes it (holding the lock),
+        // and a second process creates and locks a new one.
+        let early = open_lock_file(&p).unwrap();
+        let gc = LockFile::try_acquire(&p).unwrap().unwrap();
+        gc.remove_locked().unwrap();
+        assert!(!p.exists());
+        let owner = LockFile::try_acquire(&p).unwrap().unwrap();
+        // The early opener can lock its (removed) file, but that lock is
+        // not on the file the path names: acquire must not accept it.
+        early.try_lock().unwrap();
+        assert!(!still_at(&early, &p).unwrap());
+        assert!(still_at(owner.file(), &p).unwrap());
+        assert!(LockFile::try_acquire(&p).unwrap().is_none());
+        owner.set_holder("job-1").unwrap();
+        owner.set_holder("j2").unwrap();
+        assert_eq!(holder(&p).as_deref(), Some("j2"));
     }
 
     #[test]

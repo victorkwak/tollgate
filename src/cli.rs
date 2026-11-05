@@ -410,7 +410,14 @@ pub fn cancel(ctx: &Ctx, job: &str) -> u8 {
             exit::OK
         }
         Ok(CancelOutcome::Requested) => {
-            println!("tollgate: job {id}: cancel requested; its runner stops the steps");
+            // A runner that died cannot act on the request (R35).
+            if matches!(crate::sched::reap_if_lost(&dirs, &id), Ok(true)) {
+                println!(
+                    "tollgate: job {id}: its runner was gone; its processes are stopped and the job is lost"
+                );
+            } else {
+                println!("tollgate: job {id}: cancel requested; its runner stops the steps");
+            }
             exit::OK
         }
         Ok(CancelOutcome::AlreadyEnded(s)) => {
@@ -432,6 +439,7 @@ fn state_text(s: &JobState) -> String {
         JobState::Superseded => "superseded".into(),
         JobState::Cancelled => "cancelled".into(),
         JobState::Deferred { reason } => format!("deferred: {reason}"),
+        JobState::Lost { reason } => format!("lost: {reason}"),
     }
 }
 

@@ -971,3 +971,77 @@ echo "$(basename "$0") $ch"
         "{cwds}"
     );
 }
+
+#[test]
+fn a_dead_runner_leaves_no_step_and_no_free_slot_behind_r35_r85() {
+    let sb = Sandbox::new();
+    host(&sb, "[resources]\ncpu = 1\n");
+    // The leader shell and a child that stays: the child must keep the
+    // slot (and the checkout) until it is reaped.
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"s\"\nkind = \"command\"\nresources = [\"cpu\"]\nrun = '''\ntest -e a.txt && exit 0\necho $$ > $TMPDIR/../leader\nsh -c 'echo $$ > $TMPDIR/../child; exec sleep 30' &\nwait\n'''\n",
+    );
+    let r = sb.tollgate(&repo, &["check", "--detach"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let job = job_id(&r.out);
+    let dir = sb.state().join("jobs").join(&job);
+    assert!(eventually(20, || !pids(&dir.join("child")).is_empty()));
+    let leader = pids(&dir.join("leader"))[0];
+    let child = pids(&dir.join("child"))[0];
+    let runner = pids(&dir.join("runner.pid"))[0];
+    tollgate::procs::signal(runner, libc::SIGKILL).unwrap();
+    // R35: the leader dies with the runner (parent-death signal).
+    assert!(
+        eventually(10, || !alive(leader)),
+        "leader survived the runner"
+    );
+    assert!(alive(child));
+    // R85: the slot stays taken while a step process lives.
+    let slot = sb.state().join("locks/cpu/slot-0");
+    assert!(tollgate::locks::is_held(&slot).unwrap(), "slot freed early");
+
+    // The next job of this worktree finds the checkout held by the dead
+    // job's leftover and reaps it.
+    std::fs::write(repo.join("a.txt"), "x").unwrap();
+    sb.git(&repo, &["add", "a.txt"]);
+    let next = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(next.code, Some(0), "{}", next.out);
+    assert!(eventually(10, || !alive(child)), "leftover not reaped");
+    assert!(!tollgate::locks::is_held(&slot).unwrap());
+    let w = sb.tollgate(&repo, &["wait", &job, "--timeout", "10s"]);
+    assert_eq!(w.code, Some(1), "{}", w.out);
+    assert!(w.out.contains("lost"), "{}", w.out);
+}
+
+#[test]
+fn waiting_on_a_dead_runner_reaps_its_steps_r35() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"s\"\nkind = \"command\"\nrun = '''\nsh -c 'echo $$ > $TMPDIR/../child; exec sleep 30' &\nwait\n'''\n",
+    );
+    let r = sb.tollgate(&repo, &["check", "--detach"]);
+    let job = job_id(&r.out);
+    let dir = sb.state().join("jobs").join(&job);
+    assert!(eventually(20, || !pids(&dir.join("child")).is_empty()));
+    let child = pids(&dir.join("child"))[0];
+    tollgate::procs::signal(pids(&dir.join("runner.pid"))[0], libc::SIGKILL).unwrap();
+    let w = sb.tollgate(&repo, &["wait", &job, "--timeout", "20s"]);
+    assert_eq!(w.code, Some(1), "{}", w.out);
+    assert!(
+        w.out.contains("runner is gone") && w.out.contains("killed"),
+        "{}",
+        w.out
+    );
+    assert!(eventually(10, || !alive(child)));
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("job.json")).unwrap()).unwrap();
+    assert_eq!(meta["state"], "lost", "{meta}");
+    // cancel on a lost job only reports.
+    let c = sb.tollgate(&repo, &["cancel", &job]);
+    assert_eq!(c.code, Some(0), "{}", c.out);
+}

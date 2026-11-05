@@ -51,6 +51,10 @@ pub struct ExecSpec<'a> {
     pub grace: Duration,
     /// Called while the step runs; `Some(reason)` stops it (cancel, R89).
     pub abort: &'a mut dyn FnMut() -> Option<String>,
+    /// Lock fds the step's processes inherit (resource slots, the checkout
+    /// lock): a lock stays held while any process of the step lives, also
+    /// when the runner itself dies (R35, R85, R87).
+    pub inherit: &'a [std::os::fd::RawFd],
 }
 
 /// How a step ended.
@@ -201,6 +205,35 @@ pub fn run(spec: ExecSpec<'_>) -> ExecOutcome {
         .stdout(stdout)
         .stderr(log)
         .process_group(0);
+    let inherit: Vec<std::os::fd::RawFd> = spec.inherit.to_vec();
+    #[cfg(target_os = "linux")]
+    let parent = std::process::id();
+    // SAFETY: the closure runs in the forked child before exec and calls
+    // only async-signal-safe functions (prctl, getppid, raise, fcntl); it
+    // reads `inherit` and `parent`, which were set up before the fork.
+    unsafe {
+        cmd.pre_exec(move || {
+            // R35: the step leader dies with the runner (SIGKILL, OOM), and
+            // a runner that died before this point leaves no orphan step.
+            #[cfg(target_os = "linux")]
+            {
+                #[allow(clippy::cast_sign_loss)]
+                let sig = libc::SIGKILL as libc::c_ulong;
+                if libc::prctl(libc::PR_SET_PDEATHSIG, sig, 0, 0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid().cast_unsigned() != parent {
+                    libc::raise(libc::SIGKILL);
+                }
+            }
+            for fd in &inherit {
+                if libc::fcntl(*fd, libc::F_SETFD, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return failed(e),
@@ -296,6 +329,7 @@ mod tests {
             deadline: None,
             grace: Duration::from_secs(1),
             abort: &mut never,
+            inherit: &[],
         });
         assert_eq!(out.exit_code(), Some(3));
         assert!(!out.success());
@@ -325,6 +359,7 @@ mod tests {
             deadline: Some(Instant::now() + Duration::from_millis(400)),
             grace: Duration::from_millis(300),
             abort: &mut never,
+            inherit: &[],
         });
         assert!(matches!(out.end, ExecEnd::TimedOut), "{:?}", out.end);
         assert!(start.elapsed() < Duration::from_secs(10));
@@ -356,6 +391,7 @@ mod tests {
             deadline: None,
             grace: Duration::from_secs(5),
             abort: &mut abort,
+            inherit: &[],
         });
         assert!(
             matches!(out.end, ExecEnd::Aborted(ref r) if r == "cancelled"),
@@ -385,6 +421,7 @@ mod tests {
             deadline: None,
             grace: Duration::from_secs(1),
             abort: &mut never,
+            inherit: &[],
         });
         assert!(out.success());
         assert_eq!(out.killed, 1);
@@ -411,6 +448,7 @@ mod tests {
             deadline: None,
             grace: Duration::from_secs(1),
             abort: &mut never,
+            inherit: &[],
         });
         assert!(matches!(out.end, ExecEnd::SpawnFailed(_)));
     }

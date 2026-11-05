@@ -335,6 +335,14 @@ impl Checkout {
         Git::for_checkout(env, &self.path, &self.git_dir, &self.git_dir.join("index"))
     }
 
+    /// The checkout lock's fd, for processes that must keep the lock held
+    /// while they live (R87).
+    #[must_use]
+    pub fn lock_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd as _;
+        self._lock.file().as_raw_fd()
+    }
+
     /// The meta file content.
     #[must_use]
     pub fn meta(&self) -> Option<CheckoutMeta> {

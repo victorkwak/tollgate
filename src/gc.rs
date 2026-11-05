@@ -135,9 +135,15 @@ pub fn gc(dirs: &Dirs, host: &HostConfig, env: &EnvSnapshot, all: bool) -> GcRep
         let _ = fs::remove_dir(&shard);
     }
 
-    // Job dirs.
-    for meta in jobs.list().unwrap_or_default() {
+    // Job dirs. A job whose runner died is reaped first (R35).
+    for mut meta in jobs.list().unwrap_or_default() {
         let dir = dirs.job_dir(&meta.id);
+        if !meta.state.is_terminal()
+            && matches!(crate::sched::reap_if_lost(dirs, &meta.id), Ok(true))
+            && let Ok(m) = jobs.read(&meta.id)
+        {
+            meta = m;
+        }
         if !meta.state.is_terminal() {
             continue;
         }
@@ -195,8 +201,9 @@ pub fn gc(dirs: &Dirs, host: &HostConfig, env: &EnvSnapshot, all: bool) -> GcRep
                         let _ = fs::remove_file(&meta_path);
                     }
                 }
-                drop(held);
-                let _ = fs::remove_file(&lock);
+                // Unlink while locked (a runner that opened the old file
+                // finds it gone and opens the new one).
+                let _ = held.remove_locked();
                 rep.checkouts += 1;
             }
             let _ = fs::remove_dir(&tier_dir);
@@ -221,7 +228,10 @@ pub fn gc(dirs: &Dirs, host: &HostConfig, env: &EnvSnapshot, all: bool) -> GcRep
         let _ = fs::remove_dir(&origin);
     }
     for l in files(&dirs.jobs_dir().join("by-key")) {
-        if older_than(&l, ticket_age, now) && remove_unheld(&l) {
+        if older_than(&l, ticket_age, now)
+            && let Ok(Some(held)) = LockFile::try_acquire(&l)
+            && held.remove_locked().is_ok()
+        {
             rep.tickets += 1;
         }
     }

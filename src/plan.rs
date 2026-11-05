@@ -679,6 +679,9 @@ pub fn wait(dirs: &Dirs, id: &JobId, deadline: Option<Instant>) -> WaitEnd {
             }
         };
         let owner = sched::running_job(dirs, &meta.key).ok().flatten();
+        if let JobState::Lost { reason } = &meta.state {
+            return WaitEnd::Lost(format!("job {id} is lost: {reason}"));
+        }
         if meta.state.is_terminal() {
             match JobReport::read(dirs, id) {
                 Ok(Some(r)) => return WaitEnd::Done(Box::new(r)),
@@ -694,9 +697,22 @@ pub fn wait(dirs: &Dirs, id: &JobId, deadline: Option<Instant>) -> WaitEnd {
         }
         if owner.as_ref() != Some(id) {
             // Seen twice in a row: the runner died without a final state.
+            // Its leftover step processes still hold slots and the checkout
+            // (R35, R85): stop them and mark the job lost.
             if dead_once {
+                let reaped = match sched::reap_if_lost(dirs, id) {
+                    Ok(true) => store
+                        .read(id)
+                        .ok()
+                        .and_then(|m| match m.state {
+                            JobState::Lost { reason } => Some(format!("; {reason}")),
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
                 return WaitEnd::Lost(format!(
-                    "job {id}: its runner is gone (see {})",
+                    "job {id}: its runner is gone (see {}){reaped}",
                     dirs.job_dir(id).join("runner.log").display()
                 ));
             }

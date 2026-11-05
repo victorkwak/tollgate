@@ -63,6 +63,7 @@ pub fn run(
     log: &Path,
     deadline: Option<Instant>,
     abort: &mut dyn FnMut() -> Option<String>,
+    inherit: &[std::os::fd::RawFd],
 ) -> SetupResult {
     if last == Some(hash) {
         return SetupResult::UpToDate;
@@ -84,6 +85,7 @@ pub fn run(
         deadline,
         grace: Duration::from_secs(10),
         abort,
+        inherit,
     });
     match out.end {
         ExecEnd::Exited(s) if s.success() => SetupResult::Ran(out.duration),

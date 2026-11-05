@@ -124,6 +124,58 @@ pub fn signal(pid: i32, signal: i32) -> io::Result<()> {
     }
 }
 
+/// R35 after a runner died: the live processes (other than this one) whose
+/// environment has the entry `marker` (`TMPDIR=<job dir>/tmp`, unique per
+/// job, R52), plus the members of their process groups. A pid number seen
+/// in a table proves nothing after reuse; the marker does. Linux reads
+/// `/proc/<pid>/environ`; on macOS the set is empty (no portable way to
+/// read another process's environment), so nothing is killed there.
+#[must_use]
+pub fn marked(table: &ProcTable, marker: &[u8]) -> BTreeSet<i32> {
+    let me = std::process::id().cast_signed();
+    let mut out: BTreeSet<i32> = table
+        .procs
+        .values()
+        .filter(|p| p.pid != me && !p.zombie && platform::environ_has(p.pid, marker))
+        .map(|p| p.pid)
+        .collect();
+    let groups: BTreeSet<i32> = out
+        .iter()
+        .filter_map(|p| table.get(*p).map(|i| i.pgid))
+        .collect();
+    for g in groups {
+        out.extend(
+            table
+                .group_members(g)
+                .into_iter()
+                .filter(|p| *p != me && table.alive(*p)),
+        );
+    }
+    out
+}
+
+/// SIGKILLs every process [`marked`] finds until none is left or `limit`
+/// passes. Returns how many it signalled and how many were still alive at
+/// the end.
+pub fn kill_marked(marker: &[u8], limit: std::time::Duration) -> (usize, usize) {
+    let end = std::time::Instant::now() + limit;
+    let mut killed = BTreeSet::new();
+    loop {
+        let Ok(table) = ProcTable::snapshot() else {
+            return (killed.len(), 0);
+        };
+        let set = marked(&table, marker);
+        if set.is_empty() || std::time::Instant::now() >= end {
+            return (killed.len(), set.len());
+        }
+        for pid in set {
+            let _ = signal(pid, libc::SIGKILL);
+            killed.insert(pid);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// Reaps `pid` when it is a zombie child of this process. Returns true when
 /// it was reaped.
 pub fn reap_if_zombie(pid: i32) -> bool {
@@ -191,6 +243,12 @@ mod platform {
         Ok(out)
     }
 
+    /// True when `/proc/<pid>/environ` holds the entry `marker` exactly.
+    pub(super) fn environ_has(pid: i32, marker: &[u8]) -> bool {
+        fs::read(format!("/proc/{pid}/environ"))
+            .is_ok_and(|env| env.split(|b| *b == 0).any(|e| e == marker))
+    }
+
     pub(super) fn set_subreaper() -> io::Result<bool> {
         // SAFETY: prctl(PR_SET_CHILD_SUBREAPER, 1) changes only how orphans
         // of this process's descendants are reparented.
@@ -253,6 +311,11 @@ mod platform {
 
     pub(super) fn set_subreaper() -> io::Result<bool> {
         Ok(false)
+    }
+
+    /// No portable way to read another process's environment here.
+    pub(super) fn environ_has(_pid: i32, _marker: &[u8]) -> bool {
+        false
     }
 }
 
