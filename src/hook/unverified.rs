@@ -293,7 +293,19 @@ pub fn detect(hook: &PostHook<'_>, dirs: &Dirs) {
     {
         return;
     }
+    // Item 37: cheap checks before Gate::open (L19, 5 ms). A fast-forward
+    // merge (a `git pull`) makes no commit: its new HEAD is the tip of
+    // another ref. Read from the git dir files, no subprocess.
+    if hook.name == "post-merge" && fast_forward(hook.layout) {
+        return;
+    }
     let env = dirs.env_for(hook.env);
+    // A HEAD whose tree passed has nothing to record: one rev-parse.
+    if let Ok(Some(tree)) = Git::scrubbed(&env, hook.layout.hooks_cwd()).tree_of("HEAD")
+        && tree_passed(dirs, &tree)
+    {
+        return;
+    }
     let Ok(gate) =
         super::gate::Gate::open(hook.name, &env, hook.exe, hook.layout.clone(), dirs.clone())
     else {
@@ -321,6 +333,22 @@ pub fn detect(hook: &PostHook<'_>, dirs: &Dirs) {
             ..entry
         },
     );
+}
+
+/// Item 37: `HEAD` is the tip of a ref other than its own branch, so the
+/// merge before this `post-merge` was a fast-forward and made no commit.
+/// False when the git dir files cannot tell (the caller then checks).
+fn fast_forward(layout: &RepoLayout) -> bool {
+    use crate::gitx::ref_files::{self, Head};
+    let (oid, own) = match ref_files::head(layout) {
+        Some(Head::Symbolic(r)) => match ref_files::resolve(layout, &r) {
+            Some(oid) => (oid, Some(r)),
+            None => return false,
+        },
+        Some(Head::Detached(oid)) => (oid, None),
+        None => return false,
+    };
+    ref_files::other_ref_points_at(layout, &oid, own.as_deref()) == Some(true)
 }
 
 /// `HEAD` when its tree never passed and no trusted remote-tracking ref

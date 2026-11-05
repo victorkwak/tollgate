@@ -140,6 +140,28 @@ fn hook_latency_budgets_l19() {
         Duration::from_millis(5),
     );
 
+    // post-merge after a fast-forward (a `git pull`): no gate hook ran, so
+    // no marker; the new HEAD is the tip of another ref, so the merge made
+    // no commit and item 17 has nothing to record. Cheap checks only, no
+    // Gate::open (item 37), same budget.
+    sb.git(&repo, &["checkout", "-q", "-b", "ff"]);
+    sb.commit_file(&repo, "ff.txt", "1\n", "ff");
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    sb.git(&repo, &["merge", "-q", "--ff-only", "ff"]);
+    let t = p95(3, 40, || {
+        let out = hook("post-merge");
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    });
+    within_budget(
+        "chained hook (post-merge after a fast-forward)",
+        t,
+        Duration::from_millis(5),
+    );
+
     // pre-commit on a cache hit: under 200 ms.
     stage(&sb, &repo, "a.txt", "1\n");
     assert_eq!(sb.hooked(&repo, &["commit", "-m", "a"]).code, Some(0));

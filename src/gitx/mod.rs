@@ -24,6 +24,7 @@ pub mod config_file;
 pub mod hooks_path;
 pub mod layout;
 pub mod lockfiles;
+pub mod ref_files;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
