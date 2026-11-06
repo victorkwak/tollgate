@@ -151,21 +151,34 @@ fn terminate(
     term_targets: &BTreeSet<i32>,
     grace: Duration,
 ) -> (usize, usize) {
+    // Without a subreaper (macOS), a process the signal orphans reparents to
+    // launchd and leaves the walk: what the walk saw before the signal stays
+    // in the set.
+    let before = live_set(leader, child, leader_reaped);
+    let live = |child: &mut Child, leader_reaped: &mut bool| {
+        let mut set = live_set(leader, child, leader_reaped);
+        if !procs::is_subreaper()
+            && let Ok(table) = ProcTable::snapshot()
+        {
+            set.extend(before.iter().filter(|p| table.alive(**p)));
+        }
+        set
+    };
     for pid in term_targets {
         let _ = procs::signal(*pid, libc::SIGTERM);
     }
     let grace_end = Instant::now() + grace;
-    let mut set = live_set(leader, child, leader_reaped);
+    let mut set = live(child, leader_reaped);
     let found = set.len().max(term_targets.len());
     while !set.is_empty() && Instant::now() < grace_end {
         std::thread::sleep(POLL);
-        set = live_set(leader, child, leader_reaped);
+        set = live(child, leader_reaped);
     }
     let kill_end = Instant::now() + KILL_WAIT;
     while !set.is_empty() && Instant::now() < kill_end {
         kill_all(&set, leader);
         std::thread::sleep(POLL);
-        set = live_set(leader, child, leader_reaped);
+        set = live(child, leader_reaped);
     }
     if !*leader_reaped {
         let _ = child.wait();
