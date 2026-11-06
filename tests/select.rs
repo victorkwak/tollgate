@@ -16,11 +16,16 @@ use tollgate::steps::nextest;
 
 /// cargo from the system toolchain with the sandbox HOME, as jobs run it.
 fn cargo(sb: &Sandbox, dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("cargo")
-        .args(args)
-        .current_dir(dir)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+    let mut path = String::from("/usr/bin:/bin");
+    let mut cmd = Command::new("cargo");
+    cmd.args(args).current_dir(dir).env_clear();
+    for (key, value) in support::rustup_dirs() {
+        if key == "CARGO_HOME" {
+            path = format!("{}/bin:{path}", Path::new(&value).display());
+        }
+        cmd.env(key, value);
+    }
+    cmd.env("PATH", path)
         .env("HOME", &sb.home)
         .env("CARGO_TARGET_DIR", dir.join("target"))
         .output()

@@ -322,15 +322,16 @@ fn doctor_reports_links_settings_injection_and_stale_locks_r39_r97() {
         "{}",
         r.out
     );
-    let st = std::process::Command::new("touch")
-        .args(["-d", "5 minutes ago"])
-        .arg(repo.join(".git/index.lock"))
-        .status()
-        .unwrap();
-    assert!(st.success());
+    support::backdate(&repo.join(".git/index.lock"), 300);
     let r = e.run(&bin, &["doctor", "--repo", repo.to_str().unwrap()], &[]);
+    // macOS cannot tell whether a live git owns the lock, so it only warns.
+    let stale = if cfg!(target_os = "linux") {
+        "FAIL locks: stale:"
+    } else {
+        "warn locks:"
+    };
     assert!(
-        r.out.contains("FAIL locks: stale:") && r.out.contains("index.lock"),
+        r.out.contains(stale) && r.out.contains("index.lock"),
         "{}",
         r.out
     );

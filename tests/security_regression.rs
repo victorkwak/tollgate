@@ -419,14 +419,10 @@ fn hook_pid(root: u32, name: &str) -> Option<i32> {
         .descendants(i32::try_from(root).ok()?)
         .into_iter()
         .find(|p| {
-            std::fs::read(format!("/proc/{p}/cmdline"))
-                .ok()
-                .and_then(|c| {
-                    c.split(|b| *b == 0)
-                        .next()
-                        .map(|a| a.ends_with(name.as_bytes()))
-                })
-                .unwrap_or(false)
+            tollgate::procs::argv(*p).is_some_and(|argv| {
+                argv.first()
+                    .is_some_and(|a| a.as_encoded_bytes().ends_with(name.as_bytes()))
+            })
         })
 }
 

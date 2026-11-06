@@ -238,12 +238,7 @@ fn a_failing_tree_is_denied_with_the_report_r15_r91() {
     // `tollgate doctor --repo .`; no output names `rm`.
     let lock = repo.join(".git/refs/heads/other.lock");
     std::fs::write(&lock, b"").unwrap();
-    let st = std::process::Command::new("touch")
-        .args(["-d", "5 minutes ago"])
-        .arg(&lock)
-        .status()
-        .unwrap();
-    assert!(st.success());
+    support::backdate(&lock, 300);
     let r = sb.hooked(&repo, &["commit", "-m", "bad"]);
     assert_eq!(r.code, Some(1), "{}", r.out);
     assert!(
@@ -836,14 +831,10 @@ fn hook_pid(git: u32, name: &str) -> Option<i32> {
         .descendants(i32::try_from(git).ok()?)
         .into_iter()
         .find(|p| {
-            std::fs::read(format!("/proc/{p}/cmdline"))
-                .ok()
-                .and_then(|c| {
-                    c.split(|b| *b == 0)
-                        .next()
-                        .map(|a| a.ends_with(name.as_bytes()))
-                })
-                .unwrap_or(false)
+            tollgate::procs::argv(*p).is_some_and(|argv| {
+                argv.first()
+                    .is_some_and(|a| a.as_encoded_bytes().ends_with(name.as_bytes()))
+            })
         })
 }
 

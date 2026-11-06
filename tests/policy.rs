@@ -239,7 +239,10 @@ fn a_branch_made_at_the_own_tip_does_not_anchor_l2() {
     // integration/* is a full ref but not an anchor; a case variant of main
     // is not main.
     sb.git(&repo, &["branch", "integration/x", "HEAD"]);
-    sb.git(&repo, &["branch", "Main", "HEAD"]);
+    // (APFS is case-insensitive by default: there `Main` is `main`.)
+    if cfg!(not(target_os = "macos")) {
+        sb.git(&repo, &["branch", "Main", "HEAD"]);
+    }
     let p = resolve_at(&sb, &repo, &tip, &RemoteRefs::none(), "refs/heads/feat").unwrap();
     assert_eq!(p.base.commit.as_ref(), Some(&main_tip));
     assert_eq!(p.base.anchor.as_deref(), Some("refs/heads/main"));

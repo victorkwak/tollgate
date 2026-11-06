@@ -328,7 +328,7 @@ fn a_python_tool_missing_from_the_venv_is_a_setup_error_r46() {
     sb.commit_file(
         &repo,
         "pyproject.toml",
-        "[project]\nname = \"app\"\nversion = \"0.1.0\"\nrequires-python = \">=3.11\"\n",
+        "[project]\nname = \"app\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\n",
         "py",
     );
     let env = sb.env();
@@ -412,8 +412,8 @@ fn on_pty(
             &raw mut m,
             &raw mut s,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     };
     assert_eq!(r, 0, "openpty");

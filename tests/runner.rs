@@ -123,6 +123,12 @@ fn timeout_kills_the_whole_step_tree_t20_r33_r35() {
     // The step's child ignores SIGTERM; its grandchild left the group with
     // setsid. Both must be gone after the grace.
     let script = r#"sh -c 'trap "" TERM; setsid sh -c "trap \"\" TERM; echo \$\$ >> $TMPDIR/../pids; exec sleep 60" & echo $$ >> $TMPDIR/../pids; sleep 60' & echo $$ >> $TMPDIR/../pids; wait"#;
+    // macOS has no setsid(1).
+    let script = if cfg!(target_os = "macos") {
+        script.replace("setsid", r#"perl -MPOSIX -e "POSIX::setsid(); exec @ARGV""#)
+    } else {
+        script.to_owned()
+    };
     let repo = repo_with(
         &sb,
         "r",
