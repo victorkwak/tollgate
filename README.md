@@ -39,10 +39,10 @@ Expect changes.
 
 ## Install
 
-Requirements: Rust 1.89 or later, and Claude Code. Build from source:
+Requirements: Rust 1.89 or later, and Claude Code. Install from crates.io:
 
 ```sh
-cargo install --locked --git https://github.com/victorkwak/tollgate
+cargo install --locked tollgate
 # or, from a clone:
 cargo install --locked --path .
 ```
