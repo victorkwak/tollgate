@@ -295,6 +295,14 @@ pub struct Walker<'a> {
     pub(super) foreign: Vec<String>,
     /// Commands in the chain now being walked ([`MAX_RUN_DEPTH`]).
     run_depth: usize,
+    /// G3 (review 39e178e): names declared as namerefs anywhere in the
+    /// command, and loop variables of `for` loops over words that may not
+    /// be plain names. A `for` loop over a nameref makes each word its
+    /// target, so the two sets may not meet: a function body is walked
+    /// where it is defined, before a later `declare -n` of its loop
+    /// variable.
+    namerefs: BTreeSet<String>,
+    loose_for: BTreeSet<String>,
 }
 
 /// R25/R26/R28 for a Bash command.
@@ -355,6 +363,8 @@ impl<'a> Walker<'a> {
             runner_depth: 0,
             foreign: Vec::new(),
             run_depth: 0,
+            namerefs: BTreeSet::new(),
+            loose_for: BTreeSet::new(),
         }
     }
 
@@ -655,6 +665,17 @@ impl<'a> Walker<'a> {
                     self.word(it, &f2)?;
                 }
                 self.var_write(&name, "a for loop")?;
+                // G3: over a nameref, each word becomes its target. A
+                // literal word without `[` (no subscript, no glob) is a
+                // plain name or no name at all.
+                let plain = items.as_ref().is_some_and(|its| {
+                    its.iter()
+                        .all(|w| w.literal().is_some_and(|l| !l.contains('[')))
+                });
+                if !plain {
+                    self.loose_for.insert(name.clone());
+                    self.nameref_loops()?;
+                }
                 // Literal items (`for f in a.rs b.rs`): the body is walked
                 // once per value, so `$f` is known in it.
                 let values: Option<Vec<String>> = items
@@ -709,6 +730,7 @@ impl<'a> Walker<'a> {
                 for w in words {
                     self.word(w, &f2)?;
                 }
+                self.test_names(words, true)?;
                 // `[[ a -eq b ]]`: both operands are arithmetic.
                 for (k, w) in words.iter().enumerate() {
                     let op = w.literal();
@@ -797,6 +819,28 @@ impl<'a> Walker<'a> {
                         return Err(format!(
                             "`${{{inner}}}` assigns a variable named at run time (G5)"
                         ));
+                    }
+                    if let Some(ind) = inner.strip_prefix('!') {
+                        let end = ind
+                            .char_indices()
+                            .skip(1)
+                            .find(|&(_, c)| {
+                                matches!(
+                                    c,
+                                    ':' | '-' | '+' | '=' | '?' | '#' | '%' | '/' | '^' | ',' | '@'
+                                )
+                            })
+                            .map_or(ind.len(), |(k, _)| k);
+                        let (head, tail) = ind.split_at(end);
+                        // `${!prefix@}` lists names; `${!x@Q}` reads x's
+                        // value as a name. `${!a[@]}` lists keys, but with
+                        // an operator (`${!a[@]:-x}`) it reads every
+                        // element as a name.
+                        if tail == "@" || (head.contains('[') && !tail.is_empty()) {
+                            self.indirection(ind)?;
+                        } else {
+                            self.indirection(head)?;
+                        }
                     }
                     let name: String = inner
                         .chars()
@@ -1040,6 +1084,155 @@ impl<'a> Walker<'a> {
             ));
         }
         self.arith_reads(sub)
+    }
+
+    /// G3 (review 39e178e): `text` is a word bash reads as a variable name
+    /// (`test -v`, `printf -v`, `read`, `unset`, `declare`, `${!x}`, a
+    /// nameref target). It may name an array element, and bash expands
+    /// and evaluates the subscript, running the substitutions in it, so
+    /// it must be `NAME`, `NAME[@]`, `NAME[*]` or `NAME[sub]` with plain
+    /// arithmetic `sub`. Returns `NAME`.
+    fn name_ref<'t>(&self, text: &'t str, how: &str) -> Result<&'t str, String> {
+        let deny = || {
+            format!(
+                "{how} `{text}`: bash reads it as a variable name and evaluates a subscript in it, which can run code; use a literal NAME or NAME[number] (G3)"
+            )
+        };
+        let (name, sub) = match text.split_once('[') {
+            Some((n, rest)) => (n, Some(rest.strip_suffix(']').ok_or_else(deny)?)),
+            None => (text, None),
+        };
+        if !shell::is_name(name) {
+            return Err(deny());
+        }
+        match sub {
+            None | Some("@" | "*") => Ok(name),
+            Some(sub) => {
+                // Arithmetic text only: no expansion, quote or escape
+                // (`$(`, backquotes, `<(`, `\x24`) reaches bash's
+                // expansion of the subscript.
+                let plain =
+                    |c: char| c.is_ascii_alphanumeric() || " _+-*/%<>=!&|^~?:,()[].#".contains(c);
+                if sub.is_empty()
+                    || !sub.chars().all(plain)
+                    || sub.contains("<(")
+                    || sub.contains(">(")
+                {
+                    return Err(deny());
+                }
+                self.arith_reads(sub)
+                    .map_err(|e| format!("{how} `{text}`: {e}"))?;
+                Ok(name)
+            }
+        }
+    }
+
+    /// `test -v NAME`, `[ -R NAME ]`, `[[ -v NAME ]]`: bash evaluates a
+    /// subscript in the operand. `words` are the operands after the
+    /// command name; `cond` is `[[ ]]`, where no word is globbed and an
+    /// operator is never built at run time.
+    fn test_names(&self, words: &[Word], cond: bool) -> W {
+        let value = |w: &Word| {
+            if cond {
+                let w2 = Word {
+                    parts: w
+                        .parts
+                        .iter()
+                        .map(|p| match p {
+                            Part::Glob(c) => Part::Lit(c.to_string()),
+                            other => other.clone(),
+                        })
+                        .collect(),
+                    brace: false,
+                    raw: w.raw.clone(),
+                };
+                self.arg_value(&w2)
+            } else {
+                self.arg_value(w)
+            }
+        };
+        for (k, op) in words.iter().enumerate() {
+            let Some(next) = words.get(k + 1) else {
+                break;
+            };
+            let op = value(op);
+            // An operator bash builds at run time may be `-v`, except in
+            // `[[ ]]`, which parses operators first.
+            if cond && op.is_none() {
+                continue;
+            }
+            if op.as_deref().is_some_and(|o| o != "-v" && o != "-R") {
+                continue;
+            }
+            let how = format!("test {}", op.as_deref().unwrap_or("-v"));
+            match value(next) {
+                // No `[`: bash looks the name up and evaluates nothing.
+                Some(v) if !v.contains('[') => {}
+                // `[ x = -v ]`: the closing bracket.
+                Some(v) if !cond && v == "]" && k + 2 == words.len() => {}
+                Some(v) => {
+                    self.name_ref(&v, &how)?;
+                }
+                None if op.is_none() => {
+                    return Err(format!(
+                        "test with `{}` and `{}`, both built at run time: the first may be -v, and bash evaluates a subscript in the second (G3)",
+                        words[k].raw, next.raw
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "{how} `{}`: a variable name bash builds at run time can name an array element whose subscript runs code (G3)",
+                        next.raw
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `${!x}`: bash reads the value of `x` as a variable name, and
+    /// evaluates a subscript in it (G3, review 39e178e). `ind` is the text
+    /// after the `!`.
+    fn indirection(&self, ind: &str) -> W {
+        let name: String = ind
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let rest = &ind[name.len()..];
+        if shell::is_name(&name) && matches!(rest, "*" | "@" | "[@]" | "[*]") {
+            // `${!prefix*}`, `${!a[@]}`: names and keys, nothing is read
+            // as a name.
+            return Ok(());
+        }
+        if name.is_empty() && rest.starts_with('#') && !rest.starts_with("##") {
+            // `${!#}`: the last positional parameter; its name is a number.
+            return Ok(());
+        }
+        let deny = |why: &str| {
+            format!(
+                "`${{!{ind}}}` reads {why} as a variable name, and bash evaluates a subscript in it, which can run code (G3)"
+            )
+        };
+        if !shell::is_name(&name) || rest.starts_with('[') {
+            return Err(deny("a value the guard does not know"));
+        }
+        let v = self
+            .lookup(&name)
+            .ok_or_else(|| deny(&format!("`{name}`, whose value the guard does not know,")))?;
+        if v.contains('[') {
+            self.name_ref(&v, &format!("`${{!{ind}}}`"))?;
+        }
+        Ok(())
+    }
+
+    /// A `for` loop over a nameref makes each of its words the target.
+    fn nameref_loops(&self) -> W {
+        if let Some(n) = self.namerefs.intersection(&self.loose_for).next() {
+            return Err(format!(
+                "`{n}` is a nameref and the variable of a for loop over words that may not be plain names: bash makes each word its target and evaluates a subscript in it, which can run code (G3)"
+            ));
+        }
+        Ok(())
     }
 
     fn arith(&mut self, p: &Part, f: &Frame) -> W {
@@ -1407,6 +1600,9 @@ impl<'a> Walker<'a> {
             if let Some(l) = runners::launch(&base, &lits) {
                 return self.runner(&base, l, argv, env, f, via, certain);
             }
+        }
+        if matches!(base.as_str(), "test" | "[") {
+            self.test_names(&argv[1..], false)?;
         }
         match class {
             Class::Wrapper(w) => self.wrapper(w, argv, env, f, via, certain),
@@ -2786,6 +2982,8 @@ impl<'a> Walker<'a> {
             "export" | "declare" | "typeset" | "local" | "readonly" => {
                 let mut funcs = false;
                 let mut nameref = false;
+                // `-n`, not `+n` (which drops the attribute).
+                let mut sets_nameref = false;
                 let mut options = true;
                 for (k, w) in argv.iter().enumerate().skip(1) {
                     let (prefix, full) = w.literal_prefix();
@@ -2800,6 +2998,8 @@ impl<'a> Walker<'a> {
                     {
                         funcs |= prefix.contains('f') || prefix.contains('F');
                         nameref |= prefix.contains('n') && b != "export";
+                        sets_nameref |=
+                            prefix.starts_with('-') && prefix.contains('n') && b != "export";
                         if prefix.starts_with('-') && prefix.contains('i') && b != "export" {
                             return Err(format!(
                                 "{b} {prefix}: the integer attribute makes every later assignment arithmetic, which can run code from a value (G3)"
@@ -2816,10 +3016,7 @@ impl<'a> Walker<'a> {
                         None if full => (prefix.clone(), None),
                         None => return Err(nonlit(w)),
                     };
-                    let name = name.split('[').next().unwrap_or_default().to_owned();
-                    if !shell::is_name(&name) {
-                        return Err(nonlit(w));
-                    }
+                    let name = self.name_ref(&name, b)?.to_owned();
                     let v = value
                         .and_then(|w| shell::split_assign(w).and_then(|(_, v)| self.resolve(&v)));
                     let written = match (value, v.as_deref()) {
@@ -2831,14 +3028,30 @@ impl<'a> Walker<'a> {
                     };
                     self.var_set(&name, b, written)?;
                     if nameref {
-                        // `declare -n ref=NAME`: writes through ref reach NAME.
+                        // `declare -n ref=NAME`: writes through ref reach
+                        // NAME, and bash evaluates a subscript in NAME
+                        // wherever ref is used (G3).
                         let target = lits[k]
                             .as_deref()
                             .and_then(|l| l.split_once('=').map(|(_, t)| t.to_owned()));
                         match target {
-                            Some(t) => self.var_write(&t, "a nameref")?,
+                            Some(t) => {
+                                let t = self.name_ref(&t, &format!("{b} -n target"))?;
+                                self.var_write(t, "a nameref")?;
+                            }
                             None if value.is_some() => return Err(nonlit(w)),
+                            // `declare -n ref` takes ref's value, or the
+                            // next one assigned to it, as the target.
+                            None if sets_nameref => {
+                                return Err(format!(
+                                    "{b} -n {name} without a target: bash takes the value ref has or gets next as the name, and evaluates a subscript in it (G3)"
+                                ));
+                            }
                             None => {}
+                        }
+                        if sets_nameref {
+                            self.namerefs.insert(name.clone());
+                            self.nameref_loops()?;
                         }
                         // Writes through the reference change another
                         // variable from here on.
@@ -2862,8 +3075,10 @@ impl<'a> Walker<'a> {
                         continue;
                     }
                     if !funcs {
-                        self.var_set(a, "unset", Written::Kept)?;
-                        self.scope.vars.insert(a.to_owned(), Some(String::new()));
+                        let n = self.name_ref(a, "unset")?;
+                        self.var_set(n, "unset", Written::Kept)?;
+                        let v = (n == a).then(String::new);
+                        self.scope.vars.insert(n.to_owned(), v);
                     }
                 }
                 Ok(())
@@ -2887,7 +3102,8 @@ impl<'a> Walker<'a> {
                                 if c == 'a' {
                                     let v =
                                         v.ok_or_else(|| nonlit(&argv[k.min(argv.len() - 1)]))?;
-                                    self.var_write(&v, "read -a")?;
+                                    let n = self.name_ref(&v, "read -a")?;
+                                    self.var_write(n, "read -a")?;
                                 }
                                 break;
                             }
@@ -2895,8 +3111,9 @@ impl<'a> Walker<'a> {
                         k += 1;
                         continue;
                     }
-                    self.var_write(a, "read")?;
-                    self.scope.vars.insert(a.to_owned(), None);
+                    let n = self.name_ref(a, "read")?;
+                    self.var_write(n, "read")?;
+                    self.scope.vars.insert(n.to_owned(), None);
                     k += 1;
                 }
                 Ok(())
@@ -2919,7 +3136,8 @@ impl<'a> Walker<'a> {
                         k += 1;
                         continue;
                     }
-                    self.var_write(a, b)?;
+                    let n = self.name_ref(a, b)?;
+                    self.var_write(n, b)?;
                     k += 1;
                 }
                 Ok(())
@@ -2931,10 +3149,12 @@ impl<'a> Walker<'a> {
                             argv.get(2)
                                 .map_or_else(|| "printf -v without a name".to_owned(), nonlit)
                         })?;
-                        self.var_write(n.split('[').next().unwrap_or_default(), "printf -v")?;
+                        let n = self.name_ref(&n, "printf -v")?;
+                        self.var_write(n, "printf -v")?;
                     }
                     Some(v) if v.starts_with("-v") && v.len() > 2 => {
-                        self.var_write(v[2..].split('[').next().unwrap_or_default(), "printf -v")?;
+                        let n = self.name_ref(&v[2..], "printf -v")?;
+                        self.var_write(n, "printf -v")?;
                     }
                     None if argv.len() > 1 && argv[1].literal_prefix().0.starts_with("-v") => {
                         return Err(nonlit(&argv[1]));
@@ -2946,7 +3166,34 @@ impl<'a> Walker<'a> {
             "getopts" => {
                 if let Some(w) = argv.get(2) {
                     let n = w.literal().ok_or_else(|| nonlit(w))?;
-                    self.var_write(&n, "getopts")?;
+                    let n = self.name_ref(&n, "getopts")?;
+                    self.var_write(n, "getopts")?;
+                }
+                Ok(())
+            }
+            "wait" => {
+                // `wait -p NAME` stores a process id in NAME.
+                let mut k = 1;
+                while k < argv.len() {
+                    let Some(a) = lits[k].as_deref() else {
+                        return Err(nonlit(&argv[k]));
+                    };
+                    if a == "--" || !a.starts_with('-') || a.len() < 2 {
+                        break;
+                    }
+                    if let Some(j) = a.find('p') {
+                        let rest = &a[j + 1..];
+                        let v = if rest.is_empty() {
+                            k += 1;
+                            let w = argv.get(k).ok_or("wait -p without a name")?;
+                            lits[k].clone().ok_or_else(|| nonlit(w))?
+                        } else {
+                            rest.to_owned()
+                        };
+                        let n = self.name_ref(&v, "wait -p")?;
+                        self.var_write(n, "wait -p")?;
+                    }
+                    k += 1;
                 }
                 Ok(())
             }

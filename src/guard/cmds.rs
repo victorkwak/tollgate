@@ -249,6 +249,7 @@ const VAR_WRITERS: &[&str] = &[
     "printf",
     "getopts",
     "let",
+    "wait",
 ];
 
 /// The class of command name `base` (a basename).

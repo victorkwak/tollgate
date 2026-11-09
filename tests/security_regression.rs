@@ -2779,6 +2779,103 @@ fn s39_arithmetic_never_runs_code_from_a_value() {
     }
 }
 
+/// S39 (G3, review 39e178e): a word bash reads as a variable name may be
+/// an array element, and bash evaluates its subscript, running the
+/// substitutions in it: the operand of `test -v`, `[ -v ]` and
+/// `[[ -v ]]`, the names `printf -v`, `read`, `mapfile`, `unset`,
+/// `declare` and its family, `wait -p` and `getopts` write, the name
+/// `${!x}` reads and a nameref's target. Such a name must be literal and
+/// its subscript plain arithmetic.
+#[test]
+fn s39_names_bash_reads_never_run_code_in_a_subscript() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    let l = "'a[$(git commit -n -m x >&2)]'";
+    let x = "x=$(printf 'a[$(git commit -n -m x >&2)]')";
+    let bad = lab.not_denied(&[
+        format!("test -v {l}"),
+        format!("[ -v {l} ]"),
+        format!("[ ! -v {l} ]"),
+        format!("test -R {l}"),
+        format!("builtin test -v {l}"),
+        format!("command [ -v {l} ]"),
+        format!("[[ -v {l} ]] || true"),
+        format!("printf -v {l} %s y"),
+        format!("printf -v{l} %s y"),
+        format!("command printf -v {l} %s y"),
+        format!("read {l} <<< y"),
+        format!("read -r -a {l} <<< y"),
+        format!("mapfile {l} <<< y"),
+        format!("readarray -t {l} <<< y"),
+        format!("a=(1); unset {l}"),
+        format!("a=(1); unset -v {l}"),
+        format!("declare {}", l.replace("]'", "]=1'")),
+        format!("typeset {}", l.replace("]'", "]=1'")),
+        format!("f(){{ local {}; }}; f", l.replace("]'", "]=1'")),
+        format!("a=(1); export {l}"),
+        format!("a=(1); readonly {l}"),
+        format!("sleep 0 & wait -p {l}"),
+        format!("getopts x {l} -x"),
+        format!("x={l}; echo ${{!x}}"),
+        format!("x={l}; echo \"${{!x:-z}}\""),
+        format!("x={l}; echo ${{!x#q}}"),
+        format!("set -- {l}; echo ${{!1}}"),
+        format!("{x}; echo \"${{!x}}\""),
+        format!("{x}; test -v \"$x\""),
+        format!("{x}; [ -v \"$x\" ]"),
+        format!("{x}; [[ -v $x ]] || true"),
+        format!("{x}; [[ -v \"$x\" ]] || true"),
+        format!("{x}; printf -v \"$x\" %s y"),
+        format!("{x}; read \"$x\" <<< y"),
+        format!("{x}; unset \"$x\""),
+        format!("declare -n r={l}; echo $r"),
+        format!("{x}; declare -n r=\"$x\"; echo $r"),
+        format!("declare -n r; r={l}; echo $r"),
+        format!("r={l}; declare -n r; echo $r"),
+        format!("declare -n r=y; for r in {l}; do echo $r; done"),
+        format!("f(){{ for r in \"$@\"; do echo $r; done; }}; declare -n r=y; f {l}"),
+        "exec {a[$(git commit -n -m x >&2)]}>/dev/null".to_owned(),
+        // Encodings and quotes inside the subscript, a subscript that
+        // reads a variable holding code, a run-time operator, a glob.
+        "test -v $'a[\\x24(git commit -n -m x >&2)]'".to_owned(),
+        "a=(1); test -v 'a[\"$(git commit -n -m x >&2)\"]'".to_owned(),
+        "a=(1); printf -v 'a[`git commit -n -m x >&2`]' %s y".to_owned(),
+        format!("{x}; i=$x; a=(1); test -v 'a[i]'"),
+        format!("{x}; i=$x; a=(1); read 'a[i]' <<< y"),
+        format!("{x}; op=-v; test $op \"$x\""),
+        format!("{x}; test \"$1\" \"$x\""),
+        format!("a=({l}); echo ${{!a[@]:-x}}"),
+        format!("a=({l}); echo ${{!a[0]}}"),
+        format!("x={l}; echo ${{!x@Q}}"),
+        format!("sleep 0 & wait -np {l}"),
+        format!("declare -n r=y; for r in {{q,{l}}}; do echo $r; done"),
+        "declare -n r=y; for r in *; do echo $r; done".to_owned(),
+    ]);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    for cmd in [
+        "test -v HOME && [ -v PATH ] && [[ -v HOME ]] && echo ok",
+        "a=(1 2); test -v 'a[1]' && [[ -v a[0] ]] && [ ! -v 'a[5]' ]",
+        "i=1; a=(1 2); test -v 'a[i]'",
+        "printf -v y %s z; echo $y",
+        "printf -v 'a[2]' %s z; echo ${a[2]}",
+        "read -r line <<< hi; echo $line",
+        "read -r -a parts <<< 'a b'; echo ${parts[1]}",
+        "mapfile -t lines <<< hi; echo ${#lines[@]}",
+        "x=1; unset x; a=(1 2); unset 'a[0]'",
+        "declare -a a; declare 'a[1]=2'; export Y=1; readonly Z=2",
+        "for v in HOME PATH; do echo ${!v} >/dev/null; done",
+        "v=HOME; echo ${!v}",
+        "a=(1 2); echo ${!a[@]}",
+        "declare -n r=y; y=1; echo $r",
+        "for f in a b; do echo $f; done",
+        "OPTIND=1; getopts x opt -x; echo $opt",
+        "sleep 0 & wait -p pid; echo $pid",
+    ] {
+        let s = lab.session(cmd);
+        assert_eq!(s.code(), Some(0), "{cmd}: {s:?}");
+    }
+}
+
 /// S40 (G3): interpreter code that reaches a process call without naming
 /// one: Python's object graph (`__subclasses__`, `__globals__`), code
 /// built from strings (`eval`, `Function`, a constructor), a module name
