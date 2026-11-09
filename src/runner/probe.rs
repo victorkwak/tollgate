@@ -27,7 +27,10 @@
 //!   is a finding (a step can write `../.cargo/config.toml`, and it would
 //!   apply to every later job), except the host's own config;
 //! - the host's own config (`$CARGO_HOME/config.toml`, rustfmt's home and
-//!   config dir files): a change since the job started is a finding.
+//!   config dir files): one whose content the host config does not
+//!   approve (`[job.host_tool_configs]`), or that is not a plain file, is
+//!   a finding from the start (the session can write it, item 35, review
+//!   note 12), and so is a change since the job started.
 //!
 //! A job runs the probe after the overlay (before setup) and after every
 //! setup step and step. Each run is a few stats per dir of the tree.
@@ -42,7 +45,7 @@ use crate::gitx::TreeEntry;
 use crate::policy::{
     CARGO_CONFIG_NAMES, CARGO_DIR, OverlayFile, TOOL_CONFIG_NAMES, is_tool_config,
 };
-use crate::runner::env::JobEnv;
+use crate::runner::env::{JobEnv, host_tool_configs};
 
 /// What a host config path was when the job started.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,9 +147,10 @@ pub struct ToolProbe {
     links: BTreeSet<PathBuf>,
     /// Paths above the checkout that must not exist.
     above: Vec<PathBuf>,
-    /// Host config paths with what they were at job start.
-    host: Vec<(PathBuf, Stamp)>,
-    /// The same paths (canonical dirs).
+    /// Host config paths with what they were at job start and why a job
+    /// may not read them (not approved).
+    host: Vec<(PathBuf, Stamp, Option<String>)>,
+    /// The same paths, as spelled and with canonical dirs.
     host_paths: BTreeSet<PathBuf>,
 }
 
@@ -162,32 +166,146 @@ struct Walk {
 
 /// The tool-config paths in each ancestor of `dir` (not `dir` itself),
 /// except the host's own config (`~/.cargo` as `CARGO_HOME`,
-/// `~/.rustfmt.toml`), which is compared with the job start instead.
+/// `~/.rustfmt.toml`), which must be approved instead. `dir` is canonical,
+/// so its ancestors are; a path is exempt only when it is a host config
+/// path as spelled or with its dir resolved, never because a `.cargo`
+/// there links to the host's dir (review note 12).
 fn ancestor_configs(dir: &Path, host_paths: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
     let mut out = Vec::new();
     for a in dir.ancestors().skip(1) {
         let names = TOOL_CONFIG_NAMES
             .iter()
             .map(|n| a.join(n))
             .chain(CARGO_CONFIG_NAMES.iter().map(|n| a.join(CARGO_DIR).join(n)));
-        for p in names {
-            let host = p
-                .parent()
-                .zip(p.file_name())
-                .is_some_and(|(d, n)| host_paths.contains(&canon(d).join(n)));
-            if !host {
-                out.push(p);
-            }
-        }
+        out.extend(names.filter(|p| !host_paths.contains(p)));
     }
     out
+}
+
+/// `path` with its dir resolved through symlinks (when it resolves).
+fn canon_dir(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(d), Some(n)) => {
+            std::fs::canonicalize(d).map_or_else(|_| path.to_owned(), |d| d.join(n))
+        }
+        _ => path.to_owned(),
+    }
+}
+
+/// Largest host tool config the probe reads.
+const HOST_CONFIG_MAX: u64 = 1 << 20;
+
+/// Why the host tool config at `path` (stamped `st` just before) may not
+/// be read by a job, or `None` when it is absent or its content is the
+/// approved one (`approved`: canonical-dir path -> blake3 hex).
+fn unapproved(path: &Path, st: &Stamp, approved: &BTreeMap<PathBuf, String>) -> Option<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    match st {
+        Stamp::Absent => return None,
+        Stamp::Error(k) => return Some(format!("cannot be checked ({k})")),
+        Stamp::Present(..) => {}
+    }
+    // Never block on a FIFO or a device: open without waiting, then
+    // read only a regular file.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if absent(&e) => {
+            return Some("is a dangling link (a step could create its target)".to_owned());
+        }
+        Err(e) => return Some(format!("cannot be read ({e})")),
+    };
+    match file.metadata() {
+        Ok(m) if m.is_file() && m.len() <= HOST_CONFIG_MAX => {}
+        Ok(m) if m.is_file() => return Some(format!("is too large to check ({} bytes)", m.len())),
+        Ok(_) => return Some("is not a regular file".to_owned()),
+        Err(e) => return Some(format!("cannot be read ({e})")),
+    }
+    let mut bytes = Vec::new();
+    if let Err(e) = file.take(HOST_CONFIG_MAX + 1).read_to_end(&mut bytes) {
+        return Some(format!("cannot be read ({e})"));
+    }
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    if approved.get(&canon_dir(path)) == Some(&hash) {
+        return None;
+    }
+    Some(format!(
+        "is not approved (blake3 {hash}); review it, then approve that content in the host config `[job.host_tool_configs]`"
+    ))
+}
+
+/// One host tool config: its path, what it was when the job started, and
+/// why a job may not read it (`None`: absent or approved).
+type HostEntry = (PathBuf, Stamp, Option<String>);
+
+/// The host tool configs of a job with environment `env`, stamped and
+/// checked against `approved` (`~` is the job's `HOME`), and the set of
+/// their paths as spelled and with canonical dirs.
+fn host_entries(
+    env: &JobEnv,
+    approved: &BTreeMap<String, String>,
+) -> (Vec<HostEntry>, BTreeSet<PathBuf>) {
+    let get = |k: &str| env.get(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let home = get("HOME");
+    let cargo_home = get("CARGO_HOME").or_else(|| home.as_ref().map(|h| h.join(".cargo")));
+    let config_home = get("XDG_CONFIG_HOME").or_else(|| home.as_ref().map(|h| h.join(".config")));
+    let host_list: Vec<PathBuf> = match (&home, &cargo_home, &config_home) {
+        (Some(h), Some(c), Some(x)) => host_tool_configs(h, c, x),
+        _ => cargo_home
+            .iter()
+            .flat_map(|c| CARGO_CONFIG_NAMES.iter().map(move |n| c.join(n)))
+            .collect(),
+    };
+    let approved: BTreeMap<PathBuf, String> = approved
+        .iter()
+        .filter_map(|(k, v)| {
+            let p = match k.strip_prefix("~/") {
+                Some(rest) => home.as_ref()?.join(rest),
+                None => PathBuf::from(k),
+            };
+            Some((canon_dir(&p), v.clone()))
+        })
+        .collect();
+    let mut host_paths: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut host = Vec::new();
+    for p in host_list {
+        if !host_paths.insert(p.clone()) {
+            continue;
+        }
+        host_paths.insert(canon_dir(&p));
+        let st = stamp(&p);
+        let why = unapproved(&p, &st, &approved);
+        host.push((p, st, why));
+    }
+    (host, host_paths)
+}
+
+/// Each host tool config a job with environment `env` would find, with
+/// why it may not read it (`None`: approved); absent ones are left out
+/// (`tollgate doctor`, item 35).
+#[must_use]
+pub fn host_tool_config_report(
+    env: &JobEnv,
+    approved: &BTreeMap<String, String>,
+) -> Vec<(PathBuf, Option<String>)> {
+    host_entries(env, approved)
+        .0
+        .into_iter()
+        .filter(|(_, st, _)| *st != Stamp::Absent)
+        .map(|(p, _, why)| (p, why))
+        .collect()
 }
 
 impl ToolProbe {
     /// The probe for a checkout at canonical `root` holding `tree` with
     /// `overlay` applied, for steps run in `cwds` with job environment
-    /// `env`. Takes the host config's stamps now (call it before setup).
+    /// `env`. Takes the host config's stamps now and checks each present
+    /// one against `approved` (host `[job.host_tool_configs]`: path, `~`
+    /// for the job's `HOME`, -> blake3 hex); call it before setup.
     #[must_use]
     pub fn new<'c>(
         root: &Path,
@@ -195,6 +313,7 @@ impl ToolProbe {
         overlay: &BTreeMap<PathBuf, OverlayFile>,
         cwds: impl IntoIterator<Item = &'c str>,
         env: &JobEnv,
+        approved: &BTreeMap<String, String>,
     ) -> Self {
         let mut dirs = BTreeSet::from([PathBuf::new()]);
         let mut known = BTreeSet::new();
@@ -240,27 +359,8 @@ impl ToolProbe {
         }
         cwd_set.insert(PathBuf::new());
 
-        let get = |k: &str| env.get(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-        let home = get("HOME");
-        let cargo_home = get("CARGO_HOME").or_else(|| home.as_ref().map(|h| h.join(".cargo")));
-        let config_home =
-            get("XDG_CONFIG_HOME").or_else(|| home.as_ref().map(|h| h.join(".config")));
-        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
-        let mut host_paths: BTreeSet<PathBuf> = BTreeSet::new();
-        if let Some(c) = &cargo_home {
-            let c = canon(c);
-            host_paths.extend(CARGO_CONFIG_NAMES.iter().map(|n| c.join(n)));
-        }
-        let rustfmt = ["rustfmt.toml", ".rustfmt.toml"];
-        for d in [home.clone(), config_home.map(|c| c.join("rustfmt"))]
-            .into_iter()
-            .flatten()
-        {
-            let d = canon(&d);
-            host_paths.extend(rustfmt.iter().map(|n| d.join(n)));
-        }
+        let (host, host_paths) = host_entries(env, approved);
         let above = ancestor_configs(root, &host_paths);
-        let host = host_paths.iter().map(|p| (p.clone(), stamp(p))).collect();
         Self {
             root: root.to_owned(),
             dirs,
@@ -302,8 +402,10 @@ impl ToolProbe {
                 out.push(format!("{}: {why} above the checkout", p.display()));
             }
         }
-        for (p, was) in &self.host {
-            if stamp(p) != *was {
+        for (p, was, why) in &self.host {
+            if let Some(why) = why {
+                out.push(format!("{}: host tool config {why}", p.display()));
+            } else if stamp(p) != *was {
                 out.push(format!(
                     "{}: host tool config changed during the job",
                     p.display()
@@ -627,9 +729,22 @@ mod tests {
         }
     }
 
+    fn approve(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(p, c)| {
+                (
+                    (*p).to_owned(),
+                    blake3::hash(c.as_bytes()).to_hex().to_string(),
+                )
+            })
+            .collect()
+    }
+
     /// The host's own config (`$CARGO_HOME/config.toml`, `~/.rustfmt.toml`)
-    /// may sit above the checkout; only a change during the job counts.
-    /// Any other tool config above the checkout counts as it is.
+    /// may sit above the checkout when the host config approves its
+    /// content; a change during the job counts. Any other tool config
+    /// above the checkout counts as it is.
     #[test]
     fn host_config_counts_when_it_changes_other_config_above_always() {
         let t = tempfile::tempdir().unwrap();
@@ -643,7 +758,18 @@ mod tests {
             ("HOME", home.as_os_str()),
             ("CARGO_HOME", home.join(".cargo").as_os_str()),
         ]);
-        let probe = ToolProbe::new(&root, &[entry("src/lib.rs")], &BTreeMap::new(), [], &env);
+        let ok = approve(&[
+            ("~/.cargo/config.toml", "[alias]\n"),
+            (home.join(".rustfmt.toml").to_str().unwrap(), "\n"),
+        ]);
+        let probe = ToolProbe::new(
+            &root,
+            &[entry("src/lib.rs")],
+            &BTreeMap::new(),
+            [],
+            &env,
+            &ok,
+        );
         assert_eq!(probe.findings(), Vec::<String>::new());
         std::fs::write(home.join(".cargo/config.toml"), "[alias]\nx = \"y\"\n").unwrap();
         std::fs::write(home.join("state/clippy.toml"), "\n").unwrap();
@@ -654,11 +780,136 @@ mod tests {
         // `~/clippy.toml` is no host config: clippy has none.
         std::fs::remove_file(home.join("state/clippy.toml")).unwrap();
         std::fs::write(home.join("clippy.toml"), "\n").unwrap();
-        let probe = ToolProbe::new(&root, &[entry("src/lib.rs")], &BTreeMap::new(), [], &env);
+        std::fs::write(home.join(".cargo/config.toml"), "[alias]\n").unwrap();
+        let probe = ToolProbe::new(
+            &root,
+            &[entry("src/lib.rs")],
+            &BTreeMap::new(),
+            [],
+            &env,
+            &ok,
+        );
         let found = probe.findings();
         assert!(
             found.len() == 1
                 && found[0].ends_with("home/clippy.toml: a tool config above the checkout"),
+            "{found:?}"
+        );
+    }
+
+    /// Review note 12: a host tool config the host config does not approve
+    /// (absent from it, other content, another path) fails the job before
+    /// its first step, and so does one the probe cannot read as a plain
+    /// file: a dangling link, a FIFO (never waited on), a dir.
+    #[test]
+    fn an_unapproved_host_tool_config_counts() {
+        let t = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(t.path()).unwrap().join("home");
+        let root = home.join("state/verify/r/fast/w");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(home.join(".cargo")).unwrap();
+        std::fs::create_dir_all(home.join(".config/rustfmt")).unwrap();
+        let runner = "[target.'cfg(all())']\nrunner = \"true\"\n";
+        let config = home.join(".cargo/config.toml");
+        std::fs::write(&config, runner).unwrap();
+        let env = JobEnv::from_vars([
+            ("HOME", home.as_os_str()),
+            ("CARGO_HOME", home.join(".cargo").as_os_str()),
+        ]);
+        let run = |approved: &BTreeMap<String, String>| {
+            ToolProbe::new(
+                &root,
+                &[entry("src/lib.rs")],
+                &BTreeMap::new(),
+                [],
+                &env,
+                approved,
+            )
+            .findings()
+        };
+        let not_approved = |found: &[String], path: &str| {
+            found.len() == 1
+                && found[0].ends_with(&format!(
+                    "{path}: host tool config is not approved (blake3 {}); review it, then approve that content in the host config `[job.host_tool_configs]`",
+                    blake3::hash(runner.as_bytes()).to_hex()
+                ))
+        };
+        let found = run(&BTreeMap::new());
+        assert!(not_approved(&found, ".cargo/config.toml"), "{found:?}");
+        let found = run(&approve(&[("~/.cargo/config.toml", "[alias]\n")]));
+        assert!(not_approved(&found, ".cargo/config.toml"), "{found:?}");
+        let found = run(&approve(&[("~/.cargo/config", runner)]));
+        assert!(not_approved(&found, ".cargo/config.toml"), "{found:?}");
+        assert_eq!(
+            run(&approve(&[("~/.cargo/config.toml", runner)])),
+            Vec::<String>::new()
+        );
+        // Through a link: the content counts, wherever it lives.
+        std::fs::remove_file(&config).unwrap();
+        std::fs::write(home.join("dotfile"), runner).unwrap();
+        std::os::unix::fs::symlink(home.join("dotfile"), &config).unwrap();
+        assert_eq!(
+            run(&approve(&[("~/.cargo/config.toml", runner)])),
+            Vec::<String>::new()
+        );
+        std::fs::remove_file(home.join("dotfile")).unwrap();
+        let found = run(&BTreeMap::new());
+        assert!(
+            found.len() == 1 && found[0].ends_with("config.toml: host tool config is a dangling link (a step could create its target)"),
+            "{found:?}"
+        );
+        std::fs::remove_file(&config).unwrap();
+        assert_eq!(run(&BTreeMap::new()), Vec::<String>::new());
+        let fifo = home.join(".config/rustfmt/rustfmt.toml");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let found = run(&BTreeMap::new());
+        assert!(
+            found.len() == 1
+                && found[0]
+                    .ends_with("rustfmt/rustfmt.toml: host tool config is not a regular file"),
+            "{found:?}"
+        );
+        std::fs::remove_file(&fifo).unwrap();
+        std::fs::create_dir(home.join(".rustfmt.toml")).unwrap();
+        let found = run(&BTreeMap::new());
+        assert!(
+            found.len() == 1
+                && found[0].ends_with(".rustfmt.toml: host tool config is not a regular file"),
+            "{found:?}"
+        );
+    }
+
+    /// Review note 12: only the host config's own path is exempt above the
+    /// checkout, not another `.cargo` that links to the host's dir (cargo
+    /// reads it as one more ancestor config).
+    #[test]
+    fn an_ancestor_link_to_the_host_cargo_dir_counts() {
+        let t = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(t.path()).unwrap().join("home");
+        let root = home.join("state/verify/r/fast/w");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(home.join(".cargo")).unwrap();
+        std::fs::write(home.join(".cargo/config.toml"), "[alias]\n").unwrap();
+        std::os::unix::fs::symlink(home.join(".cargo"), home.join("state/.cargo")).unwrap();
+        let env = JobEnv::from_vars([
+            ("HOME", home.as_os_str()),
+            ("CARGO_HOME", home.join(".cargo").as_os_str()),
+        ]);
+        let probe = ToolProbe::new(
+            &root,
+            &[entry("src/lib.rs")],
+            &BTreeMap::new(),
+            [],
+            &env,
+            &BTreeMap::new(),
+        );
+        let found = probe.findings();
+        assert!(
+            found
+                .iter()
+                .any(|f| f.ends_with("state/.cargo/config.toml: a tool config above the checkout")),
             "{found:?}"
         );
     }
@@ -677,7 +928,14 @@ mod tests {
         link.mode = "120000".into();
         let tree = [entry("real/app/main.rs"), entry("real/clippy.toml"), link];
         let env = JobEnv::from_vars([("HOME", "/nonexistent")]);
-        let probe = ToolProbe::new(&root, &tree, &BTreeMap::new(), ["lnk/app", "./real"], &env);
+        let probe = ToolProbe::new(
+            &root,
+            &tree,
+            &BTreeMap::new(),
+            ["lnk/app", "./real"],
+            &env,
+            &BTreeMap::new(),
+        );
         assert_eq!(probe.findings(), Vec::<String>::new());
         std::fs::remove_file(root.join("lnk")).unwrap();
         std::fs::create_dir_all(t.path().join("out/app")).unwrap();
@@ -733,7 +991,14 @@ mod tests {
             }
         }
         let env = JobEnv::from_vars([("HOME", "/nonexistent")]);
-        let probe = ToolProbe::new(&root, &entries, &BTreeMap::new(), ["d1/e1"], &env);
+        let probe = ToolProbe::new(
+            &root,
+            &entries,
+            &BTreeMap::new(),
+            ["d1/e1"],
+            &env,
+            &BTreeMap::new(),
+        );
         assert!(probe.dir_count() > 222, "{}", probe.dir_count());
         let runs = 20;
         let (wall, cpu) = (std::time::Instant::now(), cpu_time());

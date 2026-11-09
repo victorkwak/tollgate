@@ -538,6 +538,7 @@ impl Runner<'_> {
                 .filter_map(|s| s.cwd.as_deref())
                 .chain(config.steps.iter().filter_map(|s| s.cwd.as_deref())),
             &self.env,
+            &self.spec.host.job.host_tool_configs,
         );
         let found = probe.findings();
         self.probe = Some(probe);

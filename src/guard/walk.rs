@@ -2831,6 +2831,19 @@ impl<'a> Walker<'a> {
                 p.display()
             ));
         }
+        // Item 35, review note 12: a tool the job PATH finds, a toolchain,
+        // registry source or host tool config changes what every later
+        // job runs. A removal alone puts nothing there; a mode change can
+        // make a file run.
+        let leaves_text = matches!(how, "touch" | "mkdir" | "setfattr" | "chown" | "chgrp");
+        let only_removes = removal && how != "mv";
+        if !leaves_text
+            && !only_removes
+            && let Some(t) = paths::tool_path(self.ctx, &p)
+        {
+            let why = paths::tool_write_reason(how, &p, t);
+            self.ask(why);
+        }
         // Modes, owners, attributes, times and new dirs leave the text of
         // every file as it was.
         if !matches!(

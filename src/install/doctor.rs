@@ -272,6 +272,30 @@ fn check_injection(out: &mut Out, ctx: &Ctx, rec: Option<&InstallRecord>) {
 /// its absolute path (item 39); the step tools on the job `PATH` (R52),
 /// which is what steps get. A tool only this process can find is a warning
 /// that names the `[job] path_prepend` fix (R46, R97).
+/// Item 35, review note 12: each host tool config jobs would read, and
+/// whether the host config approves its content (else every job fails).
+fn check_host_tool_configs(out: &mut Out, dirs: &Dirs, job: &JobConfig) {
+    let (cargo_home, _) = crate::runner::env::tool_homes(dirs, job);
+    let env = JobEnv::from_vars([
+        ("HOME", dirs.home().as_os_str()),
+        ("CARGO_HOME", cargo_home.as_os_str()),
+    ]);
+    for (path, why) in crate::runner::probe::host_tool_config_report(&env, &job.host_tool_configs) {
+        match why {
+            None => out.line(
+                Level::Ok,
+                "host tool config",
+                format!("{} approved", path.display()),
+            ),
+            Some(why) => out.line(
+                Level::Fail,
+                "host tool config",
+                format!("{} {why}; every job fails until then", path.display()),
+            ),
+        }
+    }
+}
+
 fn check_tools(out: &mut Out, ctx: &Ctx, dirs: &Dirs, job: &JobConfig) {
     let path = ctx.env.get("PATH");
     let found = |p: &Path, args: &[&str]| {
@@ -695,6 +719,7 @@ pub fn doctor(ctx: &Ctx, opts: &Options) -> u8 {
     let host = check_host(&mut out, ctx, &dirs);
     let job = host.as_ref().map(|h| h.job.clone()).unwrap_or_default();
     check_tools(&mut out, ctx, &dirs, &job);
+    check_host_tool_configs(&mut out, &dirs, &job);
     if let Some(repo) = &opts.repo {
         let repo = if repo.is_absolute() {
             repo.clone()

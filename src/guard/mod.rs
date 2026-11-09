@@ -295,12 +295,27 @@ fn context(
     if let Some(r) = record {
         names.push(r.binary.to_string_lossy().into_owned());
     }
+    // Item 35: the host config picks the tool homes and PATH dirs jobs
+    // use; when it does not parse, jobs fail anyway, and the defaults
+    // still count.
+    let job = HostConfig::load(dirs)
+        .map(|h| h.config.job)
+        .unwrap_or_default();
+    let mut tool_paths = Vec::new();
+    for t in crate::runner::env::guarded_tool_paths(dirs, &job) {
+        let c = paths::canon(&t);
+        if c != t {
+            tool_paths.push(c);
+        }
+        tool_paths.push(t);
+    }
     Context {
         cwd: cwd.to_owned(),
         home,
         vars,
         protected,
         host_config: dirs.host_config_file(),
+        tool_paths,
         full_refs,
         tollgate_names: names,
         inline_cap,

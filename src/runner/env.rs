@@ -139,6 +139,78 @@ pub fn parse_env_file(text: &str) -> Result<BTreeMap<String, String>, String> {
     Ok(vars)
 }
 
+/// `CARGO_HOME` and `RUSTUP_HOME` of jobs: host `[job]` `cargo_home` and
+/// `rustup_home` (`~` expands), else `<home>/.cargo` and `<home>/.rustup`;
+/// never the environment that started the job (item 38).
+#[must_use]
+pub fn tool_homes(dirs: &Dirs, job: &JobConfig) -> (PathBuf, PathBuf) {
+    let tool_home = |configured: Option<&String>, default: &str| {
+        configured.map_or_else(|| dirs.home().join(default), |p| dirs.expand_tilde(p))
+    };
+    (
+        tool_home(job.cargo_home.as_ref(), ".cargo"),
+        tool_home(job.rustup_home.as_ref(), ".rustup"),
+    )
+}
+
+/// The dirs of the job PATH before the system ones, in order:
+/// `job.path_prepend`, `$CARGO_HOME/bin`, `~/.local/bin`, `~/.bun/bin`.
+#[must_use]
+pub fn user_path_dirs(dirs: &Dirs, job: &JobConfig) -> Vec<PathBuf> {
+    let home = dirs.home();
+    let mut out: Vec<PathBuf> = job
+        .path_prepend
+        .iter()
+        .map(|p| dirs.expand_tilde(p))
+        .collect();
+    out.extend([
+        tool_homes(dirs, job).0.join("bin"),
+        home.join(".local/bin"),
+        home.join(".bun/bin"),
+    ]);
+    out
+}
+
+/// rustfmt's config names in its home and config dirs.
+const RUSTFMT_NAMES: [&str; 2] = ["rustfmt.toml", ".rustfmt.toml"];
+
+/// The host tool configs cargo and rustfmt read in every job, wherever it
+/// runs: `config.toml` and `config` in `cargo_home`, and rustfmt's names in
+/// `home` and in `<config_home>/rustfmt` (item 35).
+#[must_use]
+pub fn host_tool_configs(home: &Path, cargo_home: &Path, config_home: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = crate::policy::CARGO_CONFIG_NAMES
+        .iter()
+        .map(|n| cargo_home.join(n))
+        .collect();
+    for d in [home.to_owned(), config_home.join("rustfmt")] {
+        out.extend(RUSTFMT_NAMES.iter().map(|n| d.join(n)));
+    }
+    out
+}
+
+/// What jobs run, build from or read as tool config in the user's home,
+/// which a session may change only with a person's yes (item 35, review
+/// note 12): the user dirs of the job PATH, `CARGO_HOME` (tools,
+/// registry sources, config), `RUSTUP_HOME` (toolchains, overrides),
+/// `~/.bun`, uv's cache and data dirs, and the host tool configs. Jobs
+/// get no `XDG_*` variable, so these are the default dirs.
+#[must_use]
+pub fn guarded_tool_paths(dirs: &Dirs, job: &JobConfig) -> Vec<PathBuf> {
+    let home = dirs.home();
+    let (cargo_home, rustup_home) = tool_homes(dirs, job);
+    let mut out = user_path_dirs(dirs, job);
+    out.extend(host_tool_configs(home, &cargo_home, &home.join(".config")));
+    out.extend([
+        cargo_home,
+        rustup_home,
+        home.join(".bun"),
+        home.join(".cache/uv"),
+        home.join(".local/share/uv"),
+    ]);
+    out
+}
+
 /// A built job environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobEnv {
@@ -155,21 +227,9 @@ impl JobEnv {
             tmpdir,
         } = *inputs;
         let home = dirs.home();
-        let tool_home = |configured: Option<&String>, default: &str| {
-            configured.map_or_else(|| home.join(default), |p| dirs.expand_tilde(p))
-        };
-        let cargo_home = tool_home(job.cargo_home.as_ref(), ".cargo");
-        let rustup_home = tool_home(job.rustup_home.as_ref(), ".rustup");
-        let cargo_bin = cargo_home.join("bin");
-        let mut path_dirs: Vec<PathBuf> = job
-            .path_prepend
-            .iter()
-            .map(|p| dirs.expand_tilde(p))
-            .collect();
+        let (cargo_home, rustup_home) = tool_homes(dirs, job);
+        let mut path_dirs = user_path_dirs(dirs, job);
         path_dirs.extend([
-            cargo_bin,
-            home.join(".local/bin"),
-            home.join(".bun/bin"),
             PathBuf::from("/usr/local/bin"),
             PathBuf::from("/usr/bin"),
             PathBuf::from("/bin"),

@@ -64,6 +64,9 @@ pub struct Context {
     pub protected: Vec<PathBuf>,
     /// The host config (R26: ask, not deny, for Write/Edit).
     pub host_config: PathBuf,
+    /// What gate jobs run, build from or read as host tool config (item
+    /// 35, review note 12): writes there ask. As spelled and canonical.
+    pub tool_paths: Vec<PathBuf>,
     /// `tiers.full_refs`, matched case-insensitively (R27).
     pub full_refs: GlobSet,
     /// Names the tollgate binary goes by (PATH name, installed copy).
@@ -218,6 +221,9 @@ pub fn file_ruling(ctx: &Context, file: &str) -> Ruling {
             "edit of git's config file {}, whose program keys every git command runs (item 21)",
             f.display()
         ));
+    }
+    if let Some(t) = paths::tool_path(ctx, &p) {
+        return Ruling::Ask(paths::tool_write_reason("an edit", &p, t));
     }
     if comps.iter().any(|c| c == ".githooks") {
         return Ruling::Ask(format!("edit of a repo hook {} (R26)", p.display()));

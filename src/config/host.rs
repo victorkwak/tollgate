@@ -365,6 +365,12 @@ pub struct JobConfig {
     /// `RUSTUP_HOME` of jobs (`~` expands); default `<home>/.rustup`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rustup_home: Option<String>,
+    /// The host tool configs jobs may read (`$CARGO_HOME/config.toml`,
+    /// rustfmt's home and config dir files; `~` expands), each with the
+    /// blake3 of the content a person approved. Any other host tool
+    /// config fails the job (item 35, review note 12).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub host_tool_configs: BTreeMap<String, String>,
 }
 
 /// Error when the host config cannot be read or parsed.
@@ -483,6 +489,20 @@ impl HostConfig {
                 && !(h.starts_with('/') || h == "~" || h.starts_with("~/"))
             {
                 v.error(field, format!("{h:?} must be absolute or start with ~/"));
+            }
+        }
+        for (p, hash) in &self.job.host_tool_configs {
+            if !(p.starts_with('/') || p.starts_with("~/")) {
+                v.error(
+                    "job.host_tool_configs",
+                    format!("{p:?} must be absolute or start with ~/"),
+                );
+            }
+            if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                v.error(
+                    "job.host_tool_configs",
+                    format!("{p:?}: {hash:?} is not a blake3 digest (64 lowercase hex)"),
+                );
             }
         }
         for p in &self.scope.trusted_paths {
@@ -606,6 +626,9 @@ full = "2h"
 allow_ssh_agent = false
 # cargo_home = "~/.cargo"     # item 38: jobs never take these from the hook's env
 # rustup_home = "~/.rustup"
+# Host tool configs jobs may read, each with the blake3 of its reviewed
+# content (`tollgate doctor` prints it); any other one fails every job.
+# host_tool_configs = {{ "~/.cargo/config.toml" = "<blake3>" }}
 [job.env]
 # Variables every step gets, for example SQLX_OFFLINE = "true"
 "#
@@ -876,6 +899,20 @@ SQLX_OFFLINE = "true"
             .map(ToString::to_string)
             .collect();
         assert_eq!(errs.len(), 6, "{errs:?}");
+        // Item 35: approved host tool configs name a path and a digest.
+        let good = "a".repeat(64);
+        let c = HostConfig::from_toml(&format!(
+            "[job.host_tool_configs]\n\"~/.cargo/config.toml\" = \"{good}\"\n\".rustfmt.toml\" = \"{good}\"\n\"/h/x\" = \"{}\"\n",
+            "A".repeat(64)
+        ))
+        .unwrap();
+        let errs: Vec<String> = c
+            .validate()
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(errs.len(), 2, "{errs:?}");
     }
 
     #[test]

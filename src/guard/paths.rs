@@ -139,6 +139,32 @@ pub fn git_global_config(ctx: &Context, path: &Path) -> Option<PathBuf> {
         })
 }
 
+/// Item 35, review note 12: the tool path ([`Context::tool_paths`]: a dir
+/// of the job PATH, a tool home, a host tool config) that a write of
+/// `path` changes: `path` is it or lies under it, or it lies under `path`
+/// and `path` is the home dir or inside it (`cp -r x/. ~/.local`).
+/// Case-insensitive.
+#[must_use]
+pub fn tool_path<'a>(ctx: &'a Context, path: &Path) -> Option<&'a PathBuf> {
+    let home = lower(&canon(&ctx.home));
+    let p = lower(path);
+    let in_home = p == home || p.starts_with(&format!("{home}/"));
+    ctx.tool_paths.iter().find(|t| {
+        let t = lower(t);
+        p == t || p.starts_with(&format!("{t}/")) || (in_home && t.starts_with(&format!("{p}/")))
+    })
+}
+
+/// The ask reason for a write of `path` that changes tool path `tool`.
+#[must_use]
+pub fn tool_write_reason(how: &str, path: &Path, tool: &Path) -> String {
+    format!(
+        "{how} writes {} in {}, which gate jobs run, build from or read as tool config; a person decides (item 35)",
+        path.display(),
+        tool.display()
+    )
+}
+
 /// G7 for a removal: `rm -rf .git` (or a dir above it) removes the refs
 /// with it.
 #[must_use]

@@ -2035,6 +2035,90 @@ fn s45_a_bracket_in_the_userinfo_never_trusts_the_host_after_it() {
     }
 }
 
+/// S46 (item 35, review note 12): cargo reads `$CARGO_HOME/config.toml`
+/// (the job's is `<home>/.cargo`) and the job PATH starts with
+/// `$CARGO_HOME/bin` and `~/.local/bin`, so a session that writes a
+/// runner into that config, or a fake cargo into those dirs, would make
+/// the next gated commit run every test binary through `true`. The guard
+/// asks a person before a Bash or Write call writes there. A host config
+/// written anyway (interpreter code the guard does not read) fails every
+/// job until the host config approves its exact content
+/// (`[job.host_tool_configs]`, which the guard also asks for).
+#[test]
+fn s46_a_host_tool_config_the_session_writes_never_passes() {
+    let lab = Lab::new(RUST_POLICY);
+    let home = lab.sb().home.clone();
+    let mut not_asked = Vec::new();
+    for c in [
+        "printf '[target.x86_64-unknown-linux-gnu]\\nrunner = \"true\"\\n' >> ~/.cargo/config.toml",
+        "printf '[build]\\n' > $HOME/.cargo/config",
+        "cp /bin/true ~/.cargo/bin/cargo",
+        "install -m 755 /bin/true ~/.cargo/bin/cargo-nextest",
+        "ln -sf /bin/true ~/.local/bin/cargo",
+        "cd ~/.local/bin && ln -sf /bin/true uv",
+        "mv /tmp/x ~/.bun/bin/bun",
+        "echo 'max_width = 1' | tee ~/.rustfmt.toml",
+        "sed -i s/a/b/ ~/.config/rustfmt/rustfmt.toml",
+        "cp -r /tmp/evil/. ~/.local",
+        "chmod +x ~/.local/bin/x",
+        "cp /tmp/x ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc",
+        "cp /tmp/x ~/.cargo/registry/src/index/serde-1.0.0/src/lib.rs",
+    ] {
+        if !matches!(lab.guard(c), Guarded::Asked(_)) {
+            not_asked.push(c);
+        }
+    }
+    assert!(not_asked.is_empty(), "not asked: {not_asked:?}");
+    for c in [
+        "rm -rf ~/.cargo/registry/cache",
+        "cat ~/.cargo/config.toml",
+        "ls ~/.local/bin > /tmp/list",
+    ] {
+        assert!(matches!(lab.guard(c), Guarded::Allowed(_)), "{c}");
+    }
+    for f in [".cargo/config.toml", ".local/bin/cargo", ".rustfmt.toml"] {
+        let write = serde_json::json!({
+            "tool_name": "Write",
+            "cwd": lab.repo,
+            "tool_input": {"file_path": home.join(f), "content": "x"},
+        });
+        assert!(matches!(lab.guard_json(&write), Guarded::Asked(_)), "{f}");
+    }
+
+    let config = home.join(".cargo/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[target.'cfg(all())']\nrunner = \"true\"\n").unwrap();
+    lab.stage_failing_test();
+    let s = lab.refused("git commit -m x");
+    assert!(
+        s.out().contains("DENIED pre-commit")
+            && s.out().contains(".cargo/config.toml")
+            && s.out().contains("not approved"),
+        "{s:?}"
+    );
+    lab.assert_no_bad_pass_of(None);
+
+    // A reviewed config that the host config approves passes; the
+    // failing test still fails under it.
+    let benign = "[net]\nretry = 3\n";
+    std::fs::write(&config, benign).unwrap();
+    lab.sb().host_config(&format!(
+        "[scope]\ntrusted_paths = [\"{}\"]\n[verify]\nmin_free = \"1M\"\n[job.host_tool_configs]\n\"~/.cargo/config.toml\" = \"{}\"\n",
+        lab.bare.display(),
+        blake3::hash(benign.as_bytes()).to_hex()
+    ));
+    let s = lab.refused("git commit -m y");
+    assert!(
+        s.out().contains("DENIED pre-commit") && s.out().contains("FAIL b b tests::fails"),
+        "{s:?}"
+    );
+    write_b(&lab.repo, 2);
+    lab.plain(&["add", "crates/b/src/lib.rs"]);
+    lab.stage_code_change("approved");
+    let s = lab.session("git commit -q -m z");
+    assert_eq!(s.code(), Some(0), "{s:?}");
+}
+
 /// S36 (item 12): the guard checks the command as it came and Bash runs
 /// the whole of it, so the rewrite never drops client text. A client
 /// `export TOLLGATE_INLINE_CAP=...; ` prefix whose value is a quote that

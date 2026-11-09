@@ -25,6 +25,24 @@ fn ctx_at(cwd: &Path, home: &Path) -> Context {
             h.join(".config/tollgate"),
         ],
         host_config: h.join(".config/tollgate/config.toml"),
+        tool_paths: [
+            ".local/bin",
+            ".bun/bin",
+            ".cargo/config.toml",
+            ".cargo/config",
+            ".rustfmt.toml",
+            "rustfmt.toml",
+            ".config/rustfmt/rustfmt.toml",
+            ".config/rustfmt/.rustfmt.toml",
+            ".cargo",
+            ".rustup",
+            ".bun",
+            ".cache/uv",
+            ".local/share/uv",
+        ]
+        .iter()
+        .map(|p| h.join(p))
+        .collect(),
         full_refs: glob::compile(
             &["main", "master", "integration/*"],
             GlobOpts {
@@ -1299,4 +1317,66 @@ fn tmp_probe() {
     ] {
         eprintln!("{cmd} -> {:?}", bash_ruling(&ctx(), cmd));
     }
+}
+
+/// Item 35, review note 12: a Bash or Write call that changes what gate
+/// jobs run or read as host tool config asks a person, in every write
+/// form the guard knows; reads, removals and new dirs do not.
+#[test]
+fn tool_writes_ask_item35() {
+    asked(&[
+        "printf '[target.x86_64-unknown-linux-gnu]\\nrunner = \"true\"\\n' >> ~/.cargo/config.toml",
+        "printf x > \"$HOME\"/.cargo/config",
+        "echo x >| /h/.cargo/config.toml",
+        "cp /bin/true ~/.cargo/bin/cargo",
+        "cp -t ~/.cargo/bin /bin/true",
+        "install -m 755 /bin/true /h/.cargo/bin/cargo-nextest",
+        "ln -sf /bin/true ~/.local/bin/cargo",
+        "ln -s ~/.cargo /tmp/c",
+        "cd ~/.local/bin && ln -sf /bin/true uv",
+        "cd /h/.local && cp /bin/true bin/bun",
+        "mv /tmp/x ~/.bun/bin/bun",
+        "mv ~/.cargo ~/.cargo.bak",
+        "echo x | tee -a ~/.rustfmt.toml",
+        "sed -i s/a/b/ ~/.config/rustfmt/rustfmt.toml",
+        "truncate -s 0 ~/rustfmt.toml",
+        "cp -r /tmp/evil/. ~/.local",
+        "cp -r /tmp/.cargo ~",
+        "chmod +x ~/.local/bin/x",
+        "cp x ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc",
+        "cp x ~/.rustup/settings.toml",
+        "cp x ~/.cargo/registry/src/index/serde-1.0.0/src/lib.rs",
+        "cp x ~/.cache/uv/archive-v0/a/b.py",
+        "cp x ~/.local/share/uv/python/cpython/bin/python3",
+        "cp x ~/.LOCAL/bin/cargo",
+    ]);
+    for ok in [
+        "cat ~/.cargo/config.toml",
+        "ls ~/.local/bin > /tmp/list",
+        "rm -rf ~/.cargo/registry/cache",
+        "rm ~/.local/bin/old-tool",
+        "mkdir -p ~/.local/bin",
+        "touch ~/.cargo/config.toml",
+        "cp x ~/.local/share/applications/x.desktop",
+        "cp x ~/.config/kitty/kitty.conf",
+        "echo x > ~/notes.txt",
+    ] {
+        assert_eq!(ruling(ok), Ruling::Allow, "{ok}");
+    }
+    assert!(reason("cp /bin/true ~/.cargo/bin/cargo").contains("gate jobs run"));
+    let c = ctx();
+    for f in [
+        "~/.cargo/config.toml",
+        "/h/.cargo/bin/cargo",
+        "/h/.local/bin/cargo",
+        "/h/.rustfmt.toml",
+        "/h/.config/rustfmt/rustfmt.toml",
+        "/h/.rustup/settings.toml",
+    ] {
+        assert!(matches!(file_ruling(&c, f), Ruling::Ask(_)), "{f}");
+    }
+    assert_eq!(
+        file_ruling(&c, "/h/.config/kitty/kitty.conf"),
+        Ruling::Allow
+    );
 }

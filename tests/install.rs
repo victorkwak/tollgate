@@ -359,6 +359,37 @@ fn doctor_reports_links_settings_injection_and_stale_locks_r39_r97() {
     assert!(!r.out.contains("rm "), "R39: never names rm: {}", r.out);
 }
 
+/// Item 35, review note 12: doctor names each host tool config jobs would
+/// read with its blake3, fails while the host config does not approve
+/// that content (every job fails then too), and is ok once it does.
+#[test]
+fn doctor_names_unapproved_host_tool_configs_item35() {
+    let e = Env::new("2.1.317");
+    let r = e.tty(Path::new(BIN), &["install"], &["y"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let bin = e.data().join("bin/tollgate");
+    let r = e.run(&bin, &["doctor"], &[]);
+    assert!(!r.out.contains("host tool config:"), "{}", r.out);
+    let config = e.sb.home.join(".cargo/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let text = "[net]\nretry = 3\n";
+    std::fs::write(&config, text).unwrap();
+    let hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+    let r = e.run(&bin, &["doctor"], &[]);
+    assert_ne!(r.code, Some(0), "{}", r.out);
+    let want = format!(
+        "FAIL host tool config: {} is not approved (blake3 {hash})",
+        config.display()
+    );
+    assert!(r.out.contains(&want), "no {want:?} in:\n{}", r.out);
+    e.sb.host_config(&format!(
+        "[verify]\nmin_free = \"1M\"\n[job.host_tool_configs]\n\"~/.cargo/config.toml\" = \"{hash}\"\n"
+    ));
+    let r = e.run(&bin, &["doctor"], &[]);
+    let want = format!("ok   host tool config: {} approved", config.display());
+    assert!(r.out.contains(&want), "no {want:?} in:\n{}", r.out);
+}
+
 /// Item 48: a remote that reaches a trusted mirror through a symlink (or
 /// a trailing `/`, `..`) is not trusted, since git reads the spelled path
 /// later; doctor names the canonical path to set. A `scope.trusted_paths`
