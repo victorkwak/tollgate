@@ -55,7 +55,7 @@ Roots are found at the repo root and one level down. Detection applies only when
    tollgate install
    ```
 
-   `install` copies the binary to `$XDG_DATA_HOME/tollgate/bin/tollgate`, links the hooks next to it, writes the host config when it is absent, and shows a diff of `~/.claude/settings.json` before it changes it. It asks for confirmation (L10). Agents never run `tollgate install --yes` on the real settings.
+   `install` copies the binary to `$XDG_DATA_HOME/tollgate/bin/tollgate`, links the hooks next to it, writes the host config when it is absent, and shows a diff of `~/.claude/settings.json` before it changes it. It asks for confirmation (L10). `install` and `uninstall` run only in your own terminal (stdin and stdout are TTYs); there is no `--yes`, and the guard denies both in a Claude session (item 29).
 
    `install.json` records the config, state and data dirs that `install` used. The installed hooks read their dirs from there, not from `HOME` or `XDG_*` in git's environment, so `HOME=/tmp/x git commit` is gated like any other commit (R8). Run `install` from an environment with the same `HOME` and `XDG_*` values as your Claude sessions: the guard reports the gate as not armed when they differ.
 

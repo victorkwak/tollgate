@@ -100,8 +100,8 @@ fn run() -> u8 {
         Command::Remotes {
             action: RemotesAction::Forget { repo },
         } => cli::remotes_forget(&ctx, repo.as_deref()),
-        Command::Install { yes } => tollgate::install::install(&ctx, yes),
-        Command::Uninstall { yes } => tollgate::install::uninstall(&ctx, yes),
+        Command::Install => tollgate::install::install(&ctx),
+        Command::Uninstall => tollgate::install::uninstall(&ctx),
         Command::Doctor { repo, injection } => tollgate::install::doctor::doctor(
             &ctx,
             &tollgate::install::doctor::Options { repo, injection },
@@ -254,15 +254,12 @@ impl BaselineStep {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Copy the binary, link the hooks, add the settings entries (R95).
-    Install {
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Remove exactly what install added (R96).
-    Uninstall {
-        #[arg(long)]
-        yes: bool,
-    },
+    /// At an interactive terminal only; asks before the settings change
+    /// (L10, item 29).
+    Install,
+    /// Remove exactly what install added (R96). At an interactive
+    /// terminal only (L10, item 29).
+    Uninstall,
     /// Check the installation, injection, tools, disk and locks (R97).
     Doctor {
         #[arg(long)]

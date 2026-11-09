@@ -1,9 +1,10 @@
 //! Programs whose own arguments can run commands or write files (G3, G7):
 //! `sed` (the `e` command, the `e` and `w` flags of `s`, `w` and `W`),
 //! `tar` (`--to-command`, `-I`, checkpoint actions, volume scripts),
-//! `rg --pre`, `less +!cmd`, the vim family's command options and `gdb`
-//! scripts. A program not listed here runs as it is; its arguments are
-//! data to the guard.
+//! `rg --pre`, `less +!cmd`, the vim family's command options, `gdb`
+//! scripts, socat's `EXEC`/`SYSTEM`/`SHELL` addresses; Tcl (`tclsh`,
+//! `wish`, `expect`) is refused whole (item 29). A program not listed here
+//! runs as it is; its arguments are data to the guard.
 
 /// What the arguments of a listed program do beyond reading.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -95,8 +96,55 @@ pub fn check(base: &str, lits: &[Option<String>]) -> Result<Effects, String> {
             }
             Ok(Effects::default())
         }
+        "socat" => socat_args(lits).map(|()| Effects::default()),
+        b if tcl(b) => Err(format!(
+            "{base} runs Tcl code, which can run any program (`exec`, and `spawn` at a terminal it makes); the guard cannot read it (G3, item 29)"
+        )),
         _ => Ok(Effects::default()),
     }
+}
+
+/// The Tcl interpreters and the `expect` family, versioned too
+/// (`tclsh8.6`).
+fn tcl(base: &str) -> bool {
+    ["tclsh", "wish", "expectk", "expect", "jimsh"]
+        .iter()
+        .any(|stem| {
+            base.strip_prefix(stem)
+                .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        })
+}
+
+/// socat (item 29): an `EXEC`, `SYSTEM` or `SHELL` address runs a program,
+/// with a pty when asked, so it could give a TTY-only command the
+/// terminal it checks for. Address types are case-insensitive; a dual
+/// address (`A!!B`) has two. A word built at run time is refused.
+fn socat_args(lits: &[Option<String>]) -> Result<(), String> {
+    for a in lits.iter().skip(1) {
+        let Some(a) = a else {
+            return Err(
+                "socat with a word bash builds at run time; the guard cannot tell whether an address runs a program (G3)"
+                    .into(),
+            );
+        };
+        if a.starts_with('-') && !a.starts_with("-!!") && a != "-" {
+            continue;
+        }
+        for part in a.split("!!") {
+            let kind = part
+                .split([':', ','])
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(kind.as_str(), "exec" | "system" | "shell") {
+                return Err(format!(
+                    "socat {a}: an {} address runs a program; the guard does not allow it (G3, item 29)",
+                    kind.to_ascii_uppercase()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `tar` options that run a program.

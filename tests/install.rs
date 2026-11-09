@@ -7,7 +7,7 @@ mod support;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use support::{BIN, Run, Sandbox, write_exe};
+use support::{BIN, Run, Sandbox, pty, write_exe};
 
 const FIXTURE: &str = r#"{
   "model": "opus",
@@ -73,26 +73,36 @@ impl Env {
         )
     }
 
-    /// Runs `program` with the sandbox env and the fake claude first on
-    /// PATH. The sandbox settings are not the account's real ones, so
-    /// `--yes` needs no terminal for them (L10); nothing else opens it.
-    fn run(&self, program: &Path, args: &[&str], extra: &[(&str, &str)]) -> Run {
-        let root = self.sb.root();
+    /// `program args` with the sandbox env, the fake claude first on PATH
+    /// and `extra`; no stdio set.
+    fn cmd(&self, program: &Path, args: &[&str], extra: &[(&str, &str)]) -> std::process::Command {
         let path = self.path_var();
-        let mut all: Vec<(&str, &str)> = vec![("PATH", path.as_str())];
-        all.extend_from_slice(extra);
         let mut cmd = std::process::Command::new(program);
-        cmd.env_clear()
-            .current_dir(&root)
-            .args(args)
-            .stdin(std::process::Stdio::null());
+        cmd.env_clear().current_dir(self.sb.root()).args(args);
         for (k, v) in self.sb.env().iter() {
             cmd.env(k, v);
         }
-        for (k, v) in all {
+        cmd.env("PATH", path);
+        for (k, v) in extra {
             cmd.env(k, v);
         }
-        let out = cmd.output().unwrap();
+        cmd
+    }
+
+    /// Runs `program` at an interactive terminal (a pty), as a person
+    /// would, answering its questions with `answers` (L10, item 29).
+    fn tty(&self, program: &Path, args: &[&str], answers: &[&str]) -> Run {
+        pty::run(self.cmd(program, args, &[]), pty::Streams::All, answers)
+    }
+
+    /// Runs `program` without a terminal (stdin is /dev/null), as an
+    /// agent's Bash does.
+    fn run(&self, program: &Path, args: &[&str], extra: &[(&str, &str)]) -> Run {
+        let out = self
+            .cmd(program, args, extra)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
         Run {
             code: out.status.code(),
             out: format!(
@@ -111,7 +121,7 @@ fn ino(p: &Path) -> u64 {
 #[test]
 fn install_adds_tagged_entries_and_uninstall_removes_exactly_them_t43_r95_r96() {
     let e = Env::new("2.1.317");
-    let r = e.run(Path::new(BIN), &["install", "--yes"], &[]);
+    let r = e.tty(Path::new(BIN), &["install"], &["y"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
     // R95c: a unified diff before the edit.
     assert!(
@@ -164,7 +174,7 @@ fn install_adds_tagged_entries_and_uninstall_removes_exactly_them_t43_r95_r96() 
         serde_json::from_slice(&std::fs::read(e.data().join("install.json")).unwrap()).unwrap();
     assert_eq!(rec["hooks"].as_array().unwrap().len(), 14);
     // A second install changes nothing in the settings.
-    let r = e.run(Path::new(BIN), &["install", "--yes"], &[]);
+    let r = e.tty(Path::new(BIN), &["install"], &["y"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
     assert!(
         r.out.contains("already has the injection and the guard"),
@@ -177,7 +187,7 @@ fn install_adds_tagged_entries_and_uninstall_removes_exactly_them_t43_r95_r96() 
     v["env"]["LATER"] = serde_json::json!("kept");
     v["permissions"] = serde_json::json!({"allow": ["Bash(ls)"]});
     std::fs::write(e.settings(), serde_json::to_string_pretty(&v).unwrap()).unwrap();
-    let r = e.run(&bin, &["uninstall", "--yes"], &[]);
+    let r = e.tty(&bin, &["uninstall"], &["y"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
     let v = e.json();
     assert_eq!(v["env"], serde_json::json!({"FOO": "1", "LATER": "kept"}));
@@ -193,7 +203,7 @@ fn install_adds_tagged_entries_and_uninstall_removes_exactly_them_t43_r95_r96() 
 #[test]
 fn reinstall_after_a_new_build_refreshes_the_copy_and_links_t43_r1() {
     let e = Env::new("2.1.317");
-    let r = e.run(Path::new(BIN), &["install", "--yes"], &[]);
+    let r = e.tty(Path::new(BIN), &["install"], &["y"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
     let bin = e.data().join("bin/tollgate");
     let old = ino(&bin);
@@ -206,7 +216,7 @@ fn reinstall_after_a_new_build_refreshes_the_copy_and_links_t43_r1() {
         .status()
         .unwrap();
     assert!(status.success());
-    let r = e.run(&newer, &["install", "--yes"], &[]);
+    let r = e.tty(&newer, &["install"], &["y"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
     assert_ne!(ino(&bin), old);
     assert_eq!(std::fs::read(&bin).unwrap(), std::fs::read(&newer).unwrap());
@@ -218,25 +228,29 @@ fn reinstall_after_a_new_build_refreshes_the_copy_and_links_t43_r1() {
 #[test]
 fn settings_are_never_edited_without_confirmation_l10_r95b() {
     let e = Env::new("2.1.317");
-    // Without --yes and without a TTY: refused; the links are made. (The
-    // real settings refuse --yes without a TTY too: a unit test in
-    // src/install covers that, since no test may touch ~/.claude.)
+    // Without a terminal: refused before anything is done (item 29; S17
+    // tries the ways around it). `--yes` is gone.
+    for args in [&["install"][..], &["install", "--yes"], &["uninstall"]] {
+        let r = e.run(Path::new(BIN), args, &[]);
+        assert_ne!(r.code, Some(0), "{args:?}: {}", r.out);
+        assert_eq!(std::fs::read_to_string(e.settings()).unwrap(), FIXTURE);
+        assert!(!e.data().exists(), "{args:?}: {}", r.out);
+    }
     let r = e.run(Path::new(BIN), &["install"], &[]);
-    assert_eq!(r.code, Some(1), "{}", r.out);
-    assert!(r.out.contains("L10"), "{}", r.out);
-    assert_eq!(std::fs::read_to_string(e.settings()).unwrap(), FIXTURE);
-    assert!(e.data().join("hooks/pre-commit").exists());
-    // The old test switch opens nothing and is not needed for a sandbox.
-    let r = e.run(
-        Path::new(BIN),
-        &["install"],
-        &[("TOLLGATE_TEST_INSTALL", "1"), ("TMPDIR", "/")],
-    );
-    assert_eq!(r.code, Some(1), "{}", r.out);
-    assert_eq!(std::fs::read_to_string(e.settings()).unwrap(), FIXTURE);
+    assert!(r.out.contains("interactive terminal"), "{}", r.out);
+    // At a terminal, a no (or anything but a yes) keeps the settings; the
+    // copy and links are made.
+    for answer in ["n", "", "yy"] {
+        let r = e.tty(Path::new(BIN), &["install"], &[answer]);
+        assert_eq!(r.code, Some(1), "{answer:?}: {}", r.out);
+        assert!(r.out.contains("not confirmed"), "{}", r.out);
+        assert!(r.out.contains("[y/N]"), "{}", r.out);
+        assert_eq!(std::fs::read_to_string(e.settings()).unwrap(), FIXTURE);
+        assert!(e.data().join("hooks/pre-commit").exists());
+    }
     // R95b: Claude Code without onFailure: block.
     let old = Env::new("2.1.200");
-    let r = old.run(Path::new(BIN), &["install", "--yes"], &[]);
+    let r = old.tty(Path::new(BIN), &["install"], &["y"]);
     assert_eq!(r.code, Some(1), "{}", r.out);
     assert!(r.out.contains("older than 2.1.295"), "{}", r.out);
     assert!(!old.data().exists());
@@ -245,7 +259,7 @@ fn settings_are_never_edited_without_confirmation_l10_r95b() {
 #[test]
 fn doctor_reports_links_settings_injection_and_stale_locks_r39_r97() {
     let e = Env::new("2.1.317");
-    let r = e.run(Path::new(BIN), &["install", "--yes"], &[]);
+    let r = e.tty(Path::new(BIN), &["install"], &["y"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
     let bin = e.data().join("bin/tollgate");
     let r = e.run(&bin, &["doctor"], &[]);
@@ -353,7 +367,7 @@ fn doctor_reports_links_settings_injection_and_stale_locks_r39_r97() {
 #[test]
 fn doctor_names_the_canonical_path_of_a_respelled_trusted_mirror_item48() {
     let e = Env::new("2.1.317");
-    let r = e.run(Path::new(BIN), &["install", "--yes"], &[]);
+    let r = e.tty(Path::new(BIN), &["install"], &["y"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
     let bin = e.data().join("bin/tollgate");
     let root = e.sb.root();
@@ -404,18 +418,73 @@ fn doctor_names_the_canonical_path_of_a_respelled_trusted_mirror_item48() {
 #[test]
 fn uninstall_keeps_the_binary_while_the_settings_name_it_r96() {
     let e = Env::new("2.1.317");
-    // Install without the settings edit (no confirmation), then a hand
-    // edit registers the guard: uninstall must not remove the binary the
+    // Install without the settings edit (declined), then a hand edit
+    // registers the guard: uninstall must not remove the binary the
     // settings still run.
-    let r = e.run(Path::new(BIN), &["install"], &[]);
+    let r = e.tty(Path::new(BIN), &["install"], &["n"]);
     assert_eq!(r.code, Some(1), "{}", r.out);
     let bin = e.data().join("bin/tollgate");
     let mut v = e.json();
     v["hooks"]["PreToolUse"][0]["hooks"][0]["command"] =
         serde_json::json!(format!("{} guard # tollgate:guard", bin.display()));
     std::fs::write(e.settings(), serde_json::to_string_pretty(&v).unwrap()).unwrap();
-    let r = e.run(&bin, &["uninstall", "--yes"], &[]);
+    let r = e.tty(&bin, &["uninstall"], &["y"]);
     assert_eq!(r.code, Some(1), "{}", r.out);
     assert!(r.out.contains("still names tollgate"), "{}", r.out);
     assert!(bin.exists());
+}
+
+/// Item 29: a settings file that is a symlink (a dotfiles checkout) is
+/// resolved once, at a terminal: the diff names where it leads, the
+/// target is edited, the link stays, and the backup sits next to the
+/// target. Uninstall reads and restores through the same resolution.
+#[test]
+fn a_symlinked_settings_file_is_edited_at_its_target_item29() {
+    let e = Env::new("2.1.317");
+    let dotfiles = e.sb.root().join("dotfiles");
+    std::fs::create_dir_all(&dotfiles).unwrap();
+    let target = dotfiles.join("claude.json");
+    std::fs::rename(e.settings(), &target).unwrap();
+    std::os::unix::fs::symlink(&target, e.settings()).unwrap();
+    let r = e.tty(Path::new(BIN), &["install"], &["y"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        r.out.contains(&format!("-> {}", target.display())),
+        "{}",
+        r.out
+    );
+    assert!(
+        e.settings()
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("core.hooksPath")
+    );
+    let backups: Vec<_> = std::fs::read_dir(&dotfiles)
+        .unwrap()
+        .flatten()
+        .filter(|d| d.file_name().to_string_lossy().contains("tollgate-bak-"))
+        .collect();
+    assert_eq!(backups.len(), 1, "{}", r.out);
+    assert_eq!(std::fs::read_to_string(backups[0].path()).unwrap(), FIXTURE);
+    let r = e.tty(&e.data().join("bin/tollgate"), &["uninstall"], &["y"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        e.settings()
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        !std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("core.hooksPath")
+    );
+    assert!(!e.data().exists());
 }

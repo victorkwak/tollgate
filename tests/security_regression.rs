@@ -1,9 +1,9 @@
 //! Security regression suite (S1-S29): one test per bypass, each run the
 //! way a Claude Code session runs git.
 //!
-//! The lab: the binary from this build installed by `tollgate install
-//! --yes` into a sandbox (its own HOME, XDG dirs and settings file), the
-//! session environment taken from the `env` that install wrote to that
+//! The lab: the binary from this build installed by `tollgate install` at
+//! a pty (item 29) into a sandbox (its own HOME, XDG dirs and settings
+//! file), the session environment taken from the `env` that install wrote to that
 //! settings file (`GIT_CONFIG_*` -> `core.hooksPath` = the installed hooks
 //! dir), a host config whose `scope.remotes` matches a local bare repo
 //! (the trusted remote), and a repo holding the scratch Rust workspace
@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use support::{Armed, Run, Sandbox, Scratch, eventually, job_id, write_b, write_exe};
+use support::{Armed, Run, Sandbox, Scratch, eventually, job_id, pty, write_b, write_exe};
 
 /// Base policy: the Rust tests step.
 const RUST_POLICY: &str = "version = 1\n[[step]]\nname = \"tests\"\nkind = \"nextest\"\n";
@@ -1230,139 +1230,178 @@ fn s16_a_remote_url_with_a_newline_denies() {
     assert_eq!(lab.refs_in(&mac), "");
 }
 
-/// S17: `install --yes` without a TTY never edits the account's real
-/// settings. The test makes the sandbox home the passwd home (a user and
-/// mount namespace with a bind-mounted /etc/passwd) and tries the real
-/// settings path directly, through `TMPDIR` (the old test switch) and
-/// through symlinks.
-#[cfg(target_os = "linux")]
-#[test]
-fn s17_install_yes_without_a_tty_never_edits_the_real_settings() {
-    let probe = Command::new("unshare")
-        .args(["-rm", "true"])
-        .stderr(Stdio::null())
-        .status();
-    if !probe.is_ok_and(|s| s.success()) {
-        support::tools::skip(
-            "s17_install_yes_without_a_tty_never_edits_the_real_settings",
-            "no unprivileged user namespaces",
+/// A sandbox for `install` (S17, S41): a fake `claude`, a host config and
+/// the settings file `<home>/.claude/settings.json` holding `text`.
+struct InstallLab {
+    sb: Sandbox,
+    path: String,
+}
+
+impl InstallLab {
+    fn new(text: &str) -> Self {
+        let sb = Sandbox::new();
+        let bin_dir = sb.root().join("bin");
+        write_exe(
+            &bin_dir.join("claude"),
+            "#!/bin/sh\necho '2.1.317 (Claude Code)'\n",
         );
-        return;
+        sb.host_config("[verify]\nmin_free = \"1M\"\n");
+        std::fs::create_dir_all(sb.home.join(".claude")).unwrap();
+        std::fs::write(sb.home.join(".claude/settings.json"), text).unwrap();
+        let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap());
+        Self { sb, path }
     }
-    let sb = Sandbox::new();
-    let bin_dir = sb.root().join("bin");
-    write_exe(
-        &bin_dir.join("claude"),
-        "#!/bin/sh\necho '2.1.317 (Claude Code)'\n",
-    );
-    sb.host_config("[verify]\nmin_free = \"1M\"\n");
-    let real = sb.home.join(".claude");
-    std::fs::create_dir_all(&real).unwrap();
-    let original = "{\n  \"env\": {\n    \"KEEP\": \"1\"\n  }\n}\n";
-    std::fs::write(real.join("settings.json"), original).unwrap();
-    // The passwd entry the namespace sees for its uid 0.
-    let passwd = sb.root().join("passwd");
-    std::fs::write(
-        &passwd,
-        format!("root:x:0:0:test:{}:/bin/sh\n", sb.home.display()),
-    )
-    .unwrap();
-    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap());
-    let install = |extra: &[(&str, &std::ffi::OsStr)]| -> Run {
-        let mut cmd = Command::new("unshare");
-        cmd.args([
-            "-rm",
-            "sh",
-            "-c",
-            "mount --bind \"$1\" /etc/passwd && shift && exec \"$@\"",
-            "sh",
-        ])
-        .arg(&passwd)
-        .args([support::BIN, "install", "--yes"])
-        .env_clear()
-        .current_dir(sb.root())
-        .stdin(Stdio::null());
-        for (k, v) in sb.env().iter() {
+
+    fn settings(&self) -> PathBuf {
+        self.sb.home.join(".claude/settings.json")
+    }
+
+    fn data(&self) -> PathBuf {
+        self.sb.root().join("data/tollgate")
+    }
+
+    /// `program args` with the sandbox env, the fake claude on PATH and
+    /// `extra`; no stdio set.
+    fn cmd(&self, program: &Path, args: &[&str], extra: &[(&str, &std::ffi::OsStr)]) -> Command {
+        let mut cmd = Command::new(program);
+        cmd.env_clear().current_dir(self.sb.root()).args(args);
+        for (k, v) in self.sb.env().iter() {
             cmd.env(k, v);
         }
-        cmd.env("PATH", &path);
+        cmd.env("PATH", &self.path);
         for (k, v) in extra {
             cmd.env(k, v);
         }
-        let out = cmd.output().unwrap();
-        Run {
-            code: out.status.code(),
-            out: format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            ),
+        cmd
+    }
+}
+
+/// S17 (L10, items 9 and 29): `install` and `uninstall` change settings
+/// only for a person at an interactive terminal (stdin and stdout).
+/// Without one nothing is written, whatever names the file: the sandbox
+/// home, `--yes`, `CLAUDE_CONFIG_DIR` at the active config (Claude Code's
+/// config dir can be anywhere), the item 9 `TMPDIR` trick, a settings
+/// file that is a symlink to another. A terminal on stdin alone is not
+/// enough either.
+#[test]
+fn s17_install_and_uninstall_need_an_interactive_terminal() {
+    let original = "{\n  \"env\": {\n    \"KEEP\": \"1\"\n  }\n}\n";
+    let lab = InstallLab::new(original);
+    let real = lab.sb.home.join(".claude");
+    let active = lab.sb.root().join("active");
+    std::fs::create_dir_all(&active).unwrap();
+    std::fs::write(active.join("settings.json"), original).unwrap();
+    let linked = lab.sb.root().join("linked");
+    std::fs::create_dir_all(&linked).unwrap();
+    std::os::unix::fs::symlink(real.join("settings.json"), linked.join("settings.json")).unwrap();
+    let unchanged = |what: &str, r: &Run| {
+        assert_ne!(r.code, Some(0), "{what}: {}", r.out);
+        for f in [real.join("settings.json"), active.join("settings.json")] {
+            assert_eq!(
+                std::fs::read_to_string(&f).unwrap(),
+                original,
+                "{what}: {} changed: {}",
+                f.display(),
+                r.out
+            );
         }
-    };
-    let unchanged = || {
-        assert_eq!(
-            std::fs::read_to_string(real.join("settings.json")).unwrap(),
-            original
-        );
-    };
-    // Control: another home's settings are edited (the namespace works,
-    // and --yes is not refused for every file).
-    let other = sb.root().join("other");
-    std::fs::create_dir_all(other.join(".claude")).unwrap();
-    std::fs::write(other.join(".claude/settings.json"), "{}\n").unwrap();
-    let r = install(&[("HOME", other.as_os_str())]);
-    assert_eq!(r.code, Some(0), "{}", r.out);
-    assert!(
-        std::fs::read_to_string(other.join(".claude/settings.json"))
-            .unwrap()
-            .contains("core.hooksPath"),
-        "{}",
-        r.out
-    );
-    let refused = |r: &Run| {
         assert!(
-            r.out.contains("L10") && r.out.contains("the account's real settings"),
-            "{}",
+            !lab.data().exists(),
+            "{what}: the data dir was made: {}",
             r.out
         );
-        unchanged();
     };
-    // The real path.
-    refused(&install(&[("HOME", sb.home.as_os_str())]));
-    // The item 9 trick: TMPDIR at the real config dir.
-    refused(&install(&[
-        ("HOME", sb.home.as_os_str()),
-        ("TMPDIR", real.as_os_str()),
+    let extras: [Vec<(&str, &std::ffi::OsStr)>; 5] = [
+        vec![],
+        vec![("CLAUDE_CONFIG_DIR", active.as_os_str())],
+        vec![("TMPDIR", real.as_os_str())],
+        vec![
+            ("TMPDIR", real.as_os_str()),
+            ("TOLLGATE_TEST_INSTALL", "1".as_ref()),
+        ],
+        vec![("CLAUDE_CONFIG_DIR", linked.as_os_str())],
+    ];
+    for args in [
+        &["install"][..],
+        &["install", "--yes"],
+        &["uninstall"],
+        &["uninstall", "--yes"],
+    ] {
+        for extra in &extras {
+            let what = format!("{args:?} {extra:?}");
+            let out = lab
+                .cmd(Path::new(support::BIN), args, extra)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            let r = Run {
+                code: out.status.code(),
+                out: format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            };
+            unchanged(&format!("no terminal, {what}"), &r);
+            let r = pty::run(
+                lab.cmd(Path::new(support::BIN), args, extra),
+                pty::Streams::StdinOnly,
+                &["y"],
+            );
+            unchanged(&format!("a terminal on stdin only, {what}"), &r);
+        }
+    }
+    // Control: at a terminal, after a yes, install edits the active
+    // config; uninstall without a terminal leaves it, at one removes it.
+    let at_active = [("CLAUDE_CONFIG_DIR", active.as_os_str())];
+    let r = pty::run(
+        lab.cmd(Path::new(support::BIN), &["install"], &at_active),
+        pty::Streams::All,
+        &["y"],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let installed = std::fs::read_to_string(active.join("settings.json")).unwrap();
+    assert!(installed.contains("core.hooksPath"), "{installed}");
+    let bin = lab.data().join("bin/tollgate");
+    let out = lab
+        .cmd(&bin, &["uninstall"], &at_active)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(active.join("settings.json")).unwrap(),
+        installed
+    );
+    assert!(bin.exists());
+    let r = pty::run(
+        lab.cmd(&bin, &["uninstall"], &at_active),
+        pty::Streams::All,
+        &["y"],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        !std::fs::read_to_string(active.join("settings.json"))
+            .unwrap()
+            .contains("core.hooksPath")
+    );
+    assert!(!lab.data().exists());
+
+    // A session cannot make the terminal: a pty wrapper would give one
+    // and type the yes, so the guard denies install and uninstall in a
+    // session in any form (R25).
+    let lab = Lab::new(BAD_FILE_POLICY);
+    let bad = lab.not_denied(&owned(&[
+        "tollgate install",
+        "tollgate uninstall",
+        "printf 'y\\n' | script -qec 'tollgate install' /dev/null",
+        "yes | script -qc 'tollgate uninstall' /dev/null",
+        "unbuffer tollgate install",
+        "socat - EXEC:'tollgate install',pty",
+        "python3 -c \"import pty; pty.spawn(['tollgate', 'install'])\"",
+        "expect -c 'spawn tollgate install; send y\\r; expect eof'",
     ]));
-    refused(&install(&[
-        ("HOME", sb.home.as_os_str()),
-        ("TMPDIR", real.as_os_str()),
-        ("TOLLGATE_TEST_INSTALL", "1".as_ref()),
-    ]));
-    // A settings file that is a symlink to the real one.
-    let linked = sb.root().join("linked");
-    std::fs::create_dir_all(linked.join(".claude")).unwrap();
-    std::os::unix::fs::symlink(
-        real.join("settings.json"),
-        linked.join(".claude/settings.json"),
-    )
-    .unwrap();
-    refused(&install(&[("HOME", linked.as_os_str())]));
-    // A config dir that is a symlink to the real one, by HOME and by
-    // CLAUDE_CONFIG_DIR, and TMPDIR through it.
-    let dir_link = sb.root().join("dirlink");
-    std::fs::create_dir_all(&dir_link).unwrap();
-    std::os::unix::fs::symlink(&real, dir_link.join(".claude")).unwrap();
-    let linked_dir = dir_link.join(".claude");
-    refused(&install(&[("HOME", dir_link.as_os_str())]));
-    refused(&install(&[
-        ("HOME", other.as_os_str()),
-        ("CLAUDE_CONFIG_DIR", linked_dir.as_os_str()),
-    ]));
-    refused(&install(&[
-        ("HOME", dir_link.as_os_str()),
-        ("TMPDIR", linked_dir.as_os_str()),
-    ]));
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
 /// S18: a docs-only commit gets no pass when the base policy is invalid
@@ -2380,6 +2419,12 @@ fn s38_program_arguments_that_run_commands_are_denied() {
         "tar -cf /dev/null --checkpoint=1 --checkpoint-act=exec='git commit -n -m x' .".to_owned(),
         format!("rg --pre {f} x ."),
         "less +'!git commit -n -m x' bad".to_owned(),
+        // Item 29: socat program addresses and Tcl (macOS ships tclsh
+        // and expect).
+        "socat - SYSTEM:'git commit -n -m x'".to_owned(),
+        "socat -u /dev/null EXEC:'git commit -n -m x'".to_owned(),
+        "echo 'exec git commit -n -m x' | tclsh".to_owned(),
+        "expect -c 'spawn git commit -n -m x; expect eof'".to_owned(),
         "vim -es -c '!git commit -n -m x' -c q bad".to_owned(),
         "S='1e git commit -n -m x'; echo x | sed \"$S\"".to_owned(),
         "for s in p '1e git commit -n -m x'; do echo x | sed \"$s\"; done".to_owned(),
@@ -2461,4 +2506,96 @@ fn s40_interpreter_code_cannot_reach_a_process_call_by_a_string() {
     assert!(bad.is_empty(), "{}", bad.join("\n"));
     let s = lab.session("python3 -c 'import json; print(json.dumps([1]))' && node -e 'console.log(require(\"path\").join(\"a\", \"b\"))'");
     assert_eq!(s.code(), Some(0), "{s:?}");
+}
+
+/// S41 (item 29): the settings file is resolved once. What install and
+/// uninstall show and the person confirms is the file they write; when it
+/// is swapped while the question waits (a symlink to another file, a file
+/// renamed over it, an edit in place) nothing is written, and the file it
+/// was swapped for is never written.
+#[test]
+fn s41_a_settings_file_swapped_before_the_answer_is_never_written() {
+    let original = "{\n  \"env\": {\n    \"KEEP\": \"1\"\n  }\n}\n";
+    type Swap = fn(&Path, &Path) -> String;
+    // Each swap gets the settings file and a victim; it returns the text
+    // the settings path must still read after the refused write.
+    let swaps: [(&str, Swap); 3] = [
+        ("symlink", |settings, victim| {
+            std::fs::remove_file(settings).unwrap();
+            std::os::unix::fs::symlink(victim, settings).unwrap();
+            std::fs::read_to_string(victim).unwrap()
+        }),
+        ("rename", |settings, _| {
+            let other = settings.with_file_name("other.json");
+            std::fs::write(&other, "{\"other\": 1}\n").unwrap();
+            std::fs::rename(&other, settings).unwrap();
+            "{\"other\": 1}\n".to_owned()
+        }),
+        ("in place", |settings, _| {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(settings)
+                .unwrap();
+            f.write_all(b"{\"edited\": 1}\n").unwrap();
+            "{\"edited\": 1}\n".to_owned()
+        }),
+    ];
+    let victim_text = "{\"victim\": true}\n";
+    for (name, swap) in swaps {
+        // Install.
+        let lab = InstallLab::new(original);
+        let victim = lab.sb.root().join("victim.json");
+        std::fs::write(&victim, victim_text).unwrap();
+        let mut s = pty::Session::spawn(
+            lab.cmd(Path::new(support::BIN), &["install"], &[]),
+            pty::Streams::All,
+        );
+        assert!(s.wait_for(pty::PROMPT, 1), "{name}: {}", s.output());
+        let want = swap(&lab.settings(), &victim);
+        s.send("y\n");
+        let r = s.finish();
+        assert_ne!(r.code, Some(0), "install, {name}: {}", r.out);
+        assert!(r.out.contains("changed"), "install, {name}: {}", r.out);
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            victim_text,
+            "install, {name}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(lab.settings()).unwrap(),
+            want,
+            "install, {name}"
+        );
+
+        // Uninstall, after an install that went through.
+        let lab = InstallLab::new(original);
+        let victim = lab.sb.root().join("victim.json");
+        std::fs::write(&victim, victim_text).unwrap();
+        let r = pty::run(
+            lab.cmd(Path::new(support::BIN), &["install"], &[]),
+            pty::Streams::All,
+            &["y"],
+        );
+        assert_eq!(r.code, Some(0), "{}", r.out);
+        let bin = lab.data().join("bin/tollgate");
+        let mut s = pty::Session::spawn(lab.cmd(&bin, &["uninstall"], &[]), pty::Streams::All);
+        assert!(s.wait_for(pty::PROMPT, 1), "{name}: {}", s.output());
+        let want = swap(&lab.settings(), &victim);
+        s.send("y\n");
+        let r = s.finish();
+        assert_ne!(r.code, Some(0), "uninstall, {name}: {}", r.out);
+        assert!(r.out.contains("changed"), "uninstall, {name}: {}", r.out);
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            victim_text,
+            "uninstall, {name}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(lab.settings()).unwrap(),
+            want,
+            "uninstall, {name}"
+        );
+        assert!(bin.exists(), "uninstall, {name}: the data dir stays");
+    }
 }

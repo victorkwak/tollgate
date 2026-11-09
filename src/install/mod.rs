@@ -8,17 +8,19 @@
 //! (what install wrote; the guard's self-check and `uninstall` read it,
 //! R24, R96).
 //!
-//! L10: the settings file is never edited without an interactive
-//! confirmation. Without a TTY on stdin, `--yes` is refused for the
-//! account's real settings (any file under `<passwd home>/.claude/`,
-//! symlinks resolved); tests use a sandbox settings file. No variable
-//! changes that.
+//! L10, item 29: install and uninstall run only at an interactive
+//! terminal (stdin and stdout), and the settings file is never edited
+//! without a confirmation of its diff. No flag or variable changes that.
+//! The file is resolved once ([`settings_file`]): what is shown is what
+//! is written.
 
 pub mod diff;
 pub mod doctor;
 pub mod settings;
+pub mod settings_file;
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -34,6 +36,7 @@ use crate::exit;
 use crate::fsx;
 
 pub use settings::SettingsRecord;
+use settings_file::SettingsFile;
 
 /// Version of `install.json`.
 pub const RECORD_VERSION: u32 = 1;
@@ -263,103 +266,25 @@ pub fn claude_version(env: &EnvSnapshot) -> Result<(String, (u32, u32, u32)), St
     Ok((text, v))
 }
 
-/// The home dir of this account from the password database, which no
-/// environment variable changes.
-#[must_use]
-pub fn passwd_home() -> Option<PathBuf> {
-    use std::ffi::CStr;
-    let mut buf = vec![0 as libc::c_char; 16 * 1024];
-    // SAFETY: an all-zero passwd is a valid out-parameter.
-    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut result: *mut libc::passwd = std::ptr::null_mut();
-    // SAFETY: getpwuid_r writes into `pw` and `buf`, both owned and sized
-    // here; `result` points at `pw` on success.
-    let rc = unsafe {
-        libc::getpwuid_r(
-            libc::getuid(),
-            &mut pw,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &mut result,
-        )
-    };
-    if rc != 0 || result.is_null() || pw.pw_dir.is_null() {
-        return None;
-    }
-    // SAFETY: pw_dir points into `buf` and is NUL-terminated.
-    let dir = unsafe { CStr::from_ptr(pw.pw_dir) };
-    Some(PathBuf::from(dir.to_string_lossy().into_owned()))
-}
-
-/// The canonical form of a file that may not exist yet: its parent made
-/// canonical, the name kept.
-fn canonical_file(path: &Path) -> PathBuf {
-    match (path.parent(), path.file_name()) {
-        (Some(dir), Some(name)) => {
-            std::fs::canonicalize(dir).map_or_else(|_| path.to_owned(), |d| d.join(name))
-        }
-        _ => path.to_owned(),
-    }
-}
-
-fn inside(path: &Path, dir: &Path) -> bool {
-    path.starts_with(dir)
-}
-
-/// L10: may this run edit `settings` without asking? With a terminal on
-/// stdin the user is there: `--yes` is their choice. Without one, see
-/// [`yes_without_tty`].
-fn yes_allowed(settings: &Path) -> Result<(), String> {
-    if std::io::stdin().is_terminal() {
+/// L10, item 29: `install` and `uninstall` run only for a person at an
+/// interactive terminal: stdin (the answer) and stdout (the diff and the
+/// question) are TTYs. Claude's Bash has none. No flag, variable or path
+/// rule opens a way around it: Claude Code's active config dir can be
+/// anywhere (`CLAUDE_CONFIG_DIR`), so no file is safe to edit unasked.
+fn interactive(what: &str) -> Result<(), String> {
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         return Ok(());
     }
-    yes_without_tty(settings, passwd_home().as_deref())
+    Err(format!(
+        "needs an interactive terminal on stdin and stdout (L10, item 29); it changes the Claude Code settings only after a person confirms the diff; run tollgate {what} in your own terminal"
+    ))
 }
 
-/// Where `path` leads: the file a chain of symlinks names (a dangling link
-/// too), with its parent dir made canonical.
-fn resolve_file(path: &Path) -> PathBuf {
-    let mut p = path.to_owned();
-    for _ in 0..40 {
-        match std::fs::read_link(&p) {
-            Ok(t) if t.is_absolute() => p = t,
-            Ok(t) => p = p.parent().map_or_else(|| t.clone(), |d| d.join(&t)),
-            Err(_) => break,
-        }
-    }
-    canonical_file(&p)
-}
-
-/// L10, item 9: without a terminal, `--yes` is refused for the account's
-/// real settings: any file under `<home>/.claude/` (`home` from the
-/// password database, which no variable changes), after symlinks of the
-/// file and its dirs are resolved. Tests use a settings file elsewhere (a
-/// sandbox `HOME`); no variable or `TMPDIR` rule opens the real one.
-fn yes_without_tty(settings: &Path, home: Option<&Path>) -> Result<(), String> {
-    let refuse = |why: &str| {
-        Err(format!(
-            "--yes needs a terminal on stdin for {} (L10: {why}); run tollgate install in your own terminal",
-            settings.display()
-        ))
-    };
-    let Some(home) = home else {
-        return refuse("the account's home dir is unknown");
-    };
-    let real = home.join(".claude");
-    let real = std::fs::canonicalize(&real).unwrap_or_else(|_| canonical_file(&real));
-    if inside(&resolve_file(settings), &real) {
-        return refuse("these are the account's real settings");
-    }
-    Ok(())
-}
-
-/// Asks on the terminal; false without one.
+/// Asks on the terminal (stdout, which [`interactive`] made sure is one);
+/// anything but a yes is a no.
 fn confirm(question: &str) -> bool {
-    if !std::io::stdin().is_terminal() {
-        return false;
-    }
-    eprint!("{question} [y/N] ");
-    let _ = std::io::stderr().flush();
+    print!("{question} [y/N] ");
+    let _ = std::io::stdout().flush();
     let mut line = String::new();
     if std::io::stdin().lock().read_line(&mut line).is_err() {
         return false;
@@ -367,110 +292,53 @@ fn confirm(question: &str) -> bool {
     matches!(line.trim(), "y" | "Y" | "yes")
 }
 
-/// Settings file text and parsed value; `{}` when it does not exist.
-fn read_settings(path: &Path) -> Result<(String, serde_json::Value, bool), String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => {
-            let v: serde_json::Value =
-                serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-            Ok((text, v, true))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok((String::new(), serde_json::json!({}), false))
-        }
-        Err(e) => Err(format!("{}: {e}", path.display())),
+/// The settings text and its parsed value; `{}` for a file that does not
+/// exist.
+fn parse_settings(file: &SettingsFile) -> Result<(String, serde_json::Value), String> {
+    if !file.existed() {
+        return Ok((String::new(), serde_json::json!({})));
     }
-}
-
-/// Writes `text` to the settings file (through a symlink to its target),
-/// keeping its mode.
-fn write_settings(path: &Path, text: &str) -> Result<(), String> {
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
-    let mode = std::fs::metadata(&target)
-        .ok()
-        .map(|m| m.permissions().mode());
-    if let Some(dir) = target.parent() {
-        fsx::ensure_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
-    fsx::write_atomic(&target, text.as_bytes())
-        .map_err(|e| format!("{}: {e}", target.display()))?;
-    if let Some(m) = mode {
-        let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(m));
-    }
-    Ok(())
-}
-
-/// Writes the backup of the original settings (R95), unless a backup of an
-/// earlier install is there (a regular file: kept as it is). The settings
-/// may hold secrets in `env`, so the file is new (`O_EXCL`, which never
-/// follows a symlink) with mode 0600; any other file at the path (a
-/// symlink, a dir) is refused.
-fn write_backup(path: &Path, text: &str) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let err = |e: &dyn std::fmt::Display| format!("backup {}: {e}", path.display());
-    match path.symlink_metadata() {
-        Ok(m) if m.file_type().is_file() => return Ok(()),
-        Ok(_) => {
-            return Err(err(
-                &"something other than a regular file is there; remove it and run install again",
-            ));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(err(&e)),
-    }
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| err(&e))?;
-    f.write_all(text.as_bytes())
-        .and_then(|()| f.sync_all())
-        .map_err(|e| err(&e))
+    let text = file.text()?;
+    let v = serde_json::from_str(text).map_err(|e| format!("{}: {e}", file.describe()))?;
+    Ok((text.to_owned(), v))
 }
 
 /// How an edit of the settings went.
 enum Edit {
     Unchanged,
     Applied,
-    Declined(String),
+    Declined,
 }
 
-/// Shows the diff of a settings edit and applies it after a yes (L10),
-/// writing `backup` (path, original text) first when it does not exist.
+/// Shows the diff of a settings edit and applies it after a yes (L10).
+/// The file is the one read and shown: a swap since then writes nothing
+/// (item 29). `backup` names the backup to write next to it first (kept
+/// when it exists).
 fn edit_settings(
-    path: &Path,
+    file: &SettingsFile,
     old: &str,
     new: &str,
-    yes: bool,
-    backup: Option<&(PathBuf, String)>,
+    backup: Option<&OsStr>,
 ) -> Result<Edit, String> {
     let d = diff::unified(
         old,
         new,
-        &path.display().to_string(),
-        &format!("{} (new)", path.display()),
+        &file.describe(),
+        &format!("{} (new)", file.describe()),
         3,
     );
     if d.is_empty() {
         return Ok(Edit::Unchanged);
     }
-    eprint!("{d}");
-    if yes {
-        if let Err(e) = yes_allowed(path) {
-            return Ok(Edit::Declined(e));
-        }
-    } else if !confirm(&format!("apply this change to {}?", path.display())) {
-        return Ok(Edit::Declined(if std::io::stdin().is_terminal() {
-            "not confirmed".into()
-        } else {
-            "the settings need this change and there is no terminal to confirm it (L10); run tollgate install in your own terminal".into()
-        }));
+    print!("{d}");
+    if !confirm(&format!("apply this change to {}?", file.describe())) {
+        return Ok(Edit::Declined);
     }
-    if let Some((b, text)) = backup {
-        write_backup(b, text)?;
+    file.check_unchanged()?;
+    if let Some(b) = backup {
+        file.write_backup(b)?;
     }
-    write_settings(path, new)?;
+    file.replace(new)?;
     Ok(Edit::Applied)
 }
 
@@ -479,8 +347,12 @@ fn fail(msg: impl std::fmt::Display) -> u8 {
     exit::FAIL
 }
 
-/// `tollgate install [--yes]` (R95).
-pub fn install(ctx: &Ctx, yes: bool) -> u8 {
+/// `tollgate install` (R95), at an interactive terminal only (L10, item
+/// 29).
+pub fn install(ctx: &Ctx) -> u8 {
+    if let Err(e) = interactive("install") {
+        return fail(e);
+    }
     let dirs = match Dirs::from_env(&ctx.env) {
         Ok(d) => d,
         Err(e) => return fail(e),
@@ -548,15 +420,15 @@ pub fn install(ctx: &Ctx, yes: bool) -> u8 {
         dirs: Some(dirs.clone()),
         git: Some(git),
     };
-    // (c) the settings edit.
+    // (c) the settings edit, on the file resolved once (item 29).
     let path = settings_path(&ctx.env, &dirs);
     let mut status = exit::OK;
-    match read_settings(&path) {
+    match SettingsFile::open(&path).and_then(|f| parse_settings(&f).map(|p| (f, p))) {
         Err(e) => {
             eprintln!("tollgate install: {e}");
             status = exit::FAIL;
         }
-        Ok((old_text, old, existed)) => {
+        Ok((file, (old_text, old))) => {
             let mut new = old.clone();
             let command = settings::guard_command(&binary);
             let prev_settings = previous.as_ref().and_then(|p| p.settings.as_ref());
@@ -566,36 +438,44 @@ pub fn install(ctx: &Ctx, yes: bool) -> u8 {
                     status = exit::FAIL;
                 }
                 Ok(mut srec) => {
-                    let new_text = settings::to_text(&new, &old_text);
-                    if new != old && existed && srec.backup.is_none() {
+                    let changed = new != old;
+                    // The backup sits next to the file the settings path
+                    // leads to, where it is written through the same dir.
+                    let real_dir = file.real().parent().map(Path::to_owned);
+                    if changed
+                        && file.existed()
+                        && srec
+                            .backup
+                            .as_ref()
+                            .is_none_or(|b| b.parent() != real_dir.as_deref())
+                    {
                         let stamp = jiff::Timestamp::now().strftime("%Y%m%dT%H%M%S");
-                        srec.backup = Some(PathBuf::from(format!(
-                            "{}.tollgate-bak-{stamp}",
-                            path.display()
-                        )));
+                        let mut name = file.real().file_name().unwrap_or_default().to_owned();
+                        name.push(format!(".tollgate-bak-{stamp}"));
+                        srec.backup = Some(file.real().with_file_name(name));
                     }
-                    let backup = if new != old && existed {
-                        srec.backup.clone().map(|b| (b, old_text.clone()))
+                    let backup = if changed && file.existed() {
+                        srec.backup.as_ref().and_then(|b| b.file_name())
                     } else {
                         None
                     };
-                    let shown_new = if new == old {
-                        old_text.clone()
+                    let shown_new = if changed {
+                        settings::to_text(&new, &old_text)
                     } else {
-                        new_text
+                        old_text.clone()
                     };
-                    match edit_settings(&path, &old_text, &shown_new, yes, backup.as_ref()) {
+                    match edit_settings(&file, &old_text, &shown_new, backup) {
                         Ok(Edit::Unchanged) => {
                             println!(
                                 "settings: {} already has the injection and the guard",
-                                path.display()
+                                file.describe()
                             );
                             record.settings = Some(srec);
                         }
                         Ok(Edit::Applied) => {
                             println!(
                                 "settings: updated {}{}",
-                                path.display(),
+                                file.describe(),
                                 srec.backup
                                     .as_ref()
                                     .map(|b| format!(" (backup {})", b.display()))
@@ -603,12 +483,12 @@ pub fn install(ctx: &Ctx, yes: bool) -> u8 {
                             );
                             record.settings = Some(srec);
                         }
-                        Ok(Edit::Declined(why)) => {
-                            eprintln!("tollgate install: settings not changed: {why}");
+                        Ok(Edit::Declined) => {
+                            eprintln!("tollgate install: settings not changed: not confirmed");
                             status = exit::FAIL;
                         }
                         Err(e) => {
-                            eprintln!("tollgate install: {e}");
+                            eprintln!("tollgate install: settings not changed: {e}");
                             status = exit::FAIL;
                         }
                     }
@@ -636,12 +516,16 @@ pub fn install(ctx: &Ctx, yes: bool) -> u8 {
     status
 }
 
-/// `tollgate uninstall [--yes]` (R96).
-pub fn uninstall(ctx: &Ctx, yes: bool) -> u8 {
+/// `tollgate uninstall` (R96), at an interactive terminal only (L10, item
+/// 29).
+pub fn uninstall(ctx: &Ctx) -> u8 {
     let fail = |m: String| {
         eprintln!("tollgate uninstall: {m}");
         exit::FAIL
     };
+    if let Err(e) = interactive("uninstall") {
+        return fail(e);
+    }
     let dirs = match Dirs::from_env(&ctx.env) {
         Ok(d) => d,
         Err(e) => return fail(e.to_string()),
@@ -654,9 +538,18 @@ pub fn uninstall(ctx: &Ctx, yes: bool) -> u8 {
             ));
         }
     };
+    // The settings file, resolved once (item 29): the edit, its check and
+    // the final read below all go through it.
+    let path = record
+        .settings
+        .as_ref()
+        .map_or_else(|| settings_path(&ctx.env, &dirs), |s| s.path.clone());
+    let file = match SettingsFile::open(&path) {
+        Ok(f) => f,
+        Err(e) => return fail(format!("{e}; nothing removed")),
+    };
     if let Some(srec) = &record.settings {
-        let path = &srec.path;
-        let edit = read_settings(path).and_then(|(old_text, old, _)| {
+        let edit = parse_settings(&file).and_then(|(old_text, old)| {
             let mut new = old.clone();
             let notes = settings::apply_uninstall(&mut new, srec, dirs.home())?;
             let new_text = settings::to_text(&new, &old_text);
@@ -668,18 +561,20 @@ pub fn uninstall(ctx: &Ctx, yes: bool) -> u8 {
                     println!("settings: {n}");
                 }
                 if changed {
-                    match edit_settings(path, &old_text, &new_text, yes, None) {
+                    match edit_settings(&file, &old_text, &new_text, None) {
                         Ok(Edit::Applied | Edit::Unchanged) => println!(
                             "settings: removed tollgate's entries from {}",
-                            path.display()
+                            file.describe()
                         ),
-                        Ok(Edit::Declined(why)) => {
-                            return fail(format!("settings not changed ({why}); nothing removed"));
+                        Ok(Edit::Declined) => {
+                            return fail(
+                                "settings not changed (not confirmed); nothing removed".into(),
+                            );
                         }
-                        Err(e) => return fail(e),
+                        Err(e) => return fail(format!("{e}; nothing removed")),
                     }
                 } else {
-                    println!("settings: no tollgate entries left in {}", path.display());
+                    println!("settings: no tollgate entries left in {}", file.describe());
                 }
             }
             Err(e) => {
@@ -687,43 +582,43 @@ pub fn uninstall(ctx: &Ctx, yes: bool) -> u8 {
                 let Some(backup) = &srec.backup else {
                     return fail(format!("{e}; no backup to restore; fix the file by hand"));
                 };
-                let Ok(backup_text) = std::fs::read_to_string(backup) else {
-                    return fail(format!(
-                        "{e}; the backup {} cannot be read",
-                        backup.display()
-                    ));
+                let backup_text = match file.read_backup(backup) {
+                    Ok(t) => t,
+                    Err(b) => return fail(format!("{e}; {b}")),
                 };
-                let old_text = std::fs::read_to_string(path).unwrap_or_default();
+                let old_text = file.text_lossy();
                 eprintln!(
                     "tollgate uninstall: {e}; the backup {} would replace it:",
                     backup.display()
                 );
-                match edit_settings(path, &old_text, &backup_text, yes, None) {
+                match edit_settings(&file, &old_text, &backup_text, None) {
                     Ok(Edit::Applied | Edit::Unchanged) => {
-                        println!("settings: restored {}", backup.display())
+                        println!("settings: restored {}", backup.display());
                     }
-                    Ok(Edit::Declined(why)) => {
-                        return fail(format!("settings not changed ({why}); nothing removed"));
+                    Ok(Edit::Declined) => {
+                        return fail(
+                            "settings not changed (not confirmed); nothing removed".into(),
+                        );
                     }
-                    Err(e) => return fail(e),
+                    Err(e) => return fail(format!("{e}; nothing removed")),
                 }
             }
         }
     }
     // The guard must not stay registered for a binary that is gone: with
-    // onFailure: block every Bash call would fail.
-    let path = record
-        .settings
-        .as_ref()
-        .map_or_else(|| settings_path(&ctx.env, &dirs), |s| s.path.clone());
-    if let Ok(text) = std::fs::read_to_string(&path)
-        && (text.contains(&format!("# {}", settings::MARKER))
-            || text.contains(&*record.binary.to_string_lossy())
-            || text.contains(&*record.hooks_dir.to_string_lossy()))
+    // onFailure: block every Bash call would fail. A file that cannot be
+    // read keeps the data dir too.
+    let text = match file.read_now() {
+        Ok(t) => t.unwrap_or_default(),
+        Err(e) => return fail(format!("{e}; the data dir is kept")),
+    };
+    if text.contains(&format!("# {}", settings::MARKER))
+        || text.contains(&*record.binary.to_string_lossy())
+        || text.contains(&*record.hooks_dir.to_string_lossy())
     {
         return fail(format!(
             "{} still names tollgate's guard or hooks dir; remove those entries first (the data dir is kept)",
-            path.display()
+            file.describe()
         ));
     }
     let data = dirs.data_dir();
@@ -750,79 +645,6 @@ mod tests {
         assert_eq!(parse_version("claude v2.1.295"), Some((2, 1, 295)));
         assert_eq!(parse_version("none"), None);
         assert!((2, 1, 317) >= MIN_CLAUDE && (2, 0, 999) < MIN_CLAUDE);
-    }
-
-    /// L10, item 9: without a terminal, `--yes` never edits the account's
-    /// real settings: anything under `<passwd home>/.claude/`, symlinks
-    /// resolved, whatever `TMPDIR` or any variable says. `home` here is a
-    /// temp dir standing in for the passwd home.
-    #[test]
-    fn yes_without_a_tty_never_reaches_the_real_settings_l10() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().canonicalize().unwrap().join("home");
-        let real = home.join(".claude");
-        std::fs::create_dir_all(&real).unwrap();
-        std::fs::write(real.join("settings.json"), "{}").unwrap();
-        let sandbox = tmp.path().canonicalize().unwrap().join("sandbox/.claude");
-        std::fs::create_dir_all(&sandbox).unwrap();
-        let refused = |p: &Path| {
-            let r = yes_without_tty(p, Some(&home));
-            assert!(r.is_err(), "{} allowed", p.display());
-            assert!(r.unwrap_err().contains("L10"));
-        };
-        // The real paths; the TMPDIR trick of item 9 has no input left:
-        // the decision reads no variable.
-        refused(&real.join("settings.json"));
-        refused(&real.join("settings.local.json"));
-        // A symlink to the real file, a dangling one into the real dir,
-        // and a config dir that is a symlink to it.
-        std::os::unix::fs::symlink(real.join("settings.json"), sandbox.join("a.json")).unwrap();
-        refused(&sandbox.join("a.json"));
-        std::os::unix::fs::symlink(real.join("new.json"), sandbox.join("b.json")).unwrap();
-        refused(&sandbox.join("b.json"));
-        let linked = tmp.path().join("cfg");
-        std::os::unix::fs::symlink(&real, &linked).unwrap();
-        refused(&linked.join("settings.json"));
-        // A relative link chain into the real dir.
-        std::os::unix::fs::symlink("a.json", sandbox.join("c.json")).unwrap();
-        refused(&sandbox.join("c.json"));
-        // A sandbox settings file is fine.
-        assert_eq!(
-            yes_without_tty(&sandbox.join("settings.json"), Some(&home)),
-            Ok(())
-        );
-        // No passwd home: refused.
-        assert!(yes_without_tty(&sandbox.join("settings.json"), None).is_err());
-    }
-
-    /// R95, item 10: the backup may hold secrets (settings `env`): mode
-    /// 0600, never written through a symlink, and an earlier install's
-    /// backup is kept as it is.
-    #[test]
-    fn the_settings_backup_is_private_and_follows_no_link_r95() {
-        let tmp = tempfile::tempdir().unwrap();
-        let b = tmp.path().join("settings.json.tollgate-bak-1");
-        write_backup(&b, "{\"env\":{\"TOKEN\":\"x\"}}").unwrap();
-        assert_eq!(
-            std::fs::metadata(&b).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert!(std::fs::read_to_string(&b).unwrap().contains("TOKEN"));
-        // Kept on the next install.
-        write_backup(&b, "other").unwrap();
-        assert!(std::fs::read_to_string(&b).unwrap().contains("TOKEN"));
-        // A dangling link and a link to a file: refused, nothing written
-        // where they point.
-        let target = tmp.path().join("elsewhere");
-        let dangling = tmp.path().join("bak-2");
-        std::os::unix::fs::symlink(&target, &dangling).unwrap();
-        assert!(write_backup(&dangling, "secret").is_err());
-        assert!(!target.exists());
-        std::fs::write(&target, "mine").unwrap();
-        let linked = tmp.path().join("bak-3");
-        std::os::unix::fs::symlink(&target, &linked).unwrap();
-        assert!(write_backup(&linked, "secret").is_err());
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "mine");
     }
 
     #[test]

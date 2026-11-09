@@ -29,12 +29,13 @@ L6. **Selection without guppy.** Use `cargo_metadata` only. Compute the reverse-
 
 L7. `tiers.full_refs` default `["main", "master", "integration/*"]` (Q1). Pushes to trusted remotes need `full` for every branch; `push.fast_refs` default `[]` (Q2).
 
-L8. **Guard when unarmed.** R24 stays (deny every Bash call when the injection, hooks dir or links are wrong), except a command whose first word is the tollgate binary (PATH name or installed copy) with subcommand `install`, `uninstall`, `doctor`, `status`, which is allowed so the state can be repaired from a session (Q14).
+L8. **Guard when unarmed.** R24 stays (deny every Bash call when the injection, hooks dir or links are wrong), except a command whose first word is the tollgate binary (PATH name or installed copy) with subcommand `install`, `uninstall`, `doctor`, `status`, which is allowed so the state can be repaired from a session (Q14). Since item 29, `install` and `uninstall` refuse without a terminal, so from a session only `doctor` and `status` do anything; the armed guard denies `install` and `uninstall` (R25).
 
 L9. Python: `pytest-baseline` runs in `fast` too (Q10). Flaky policy as R93 with `retries = 2` (Q4). Tags not gated (Q7).
 
-L10. `tollgate install` never edits `~/.claude/settings.json` without an interactive confirmation; `--yes` is for tests: when stdin is not a TTY it is refused for the account's real settings, any file under `<passwd home>/.claude/` after symlinks of the file and its dirs are resolved (the passwd home, which no variable changes). Tests use a sandbox settings file. Agents never run `install --yes` on the real settings.
+L10. `tollgate install` and `tollgate uninstall` run only at an interactive terminal (stdin and stdout are TTYs; Claude's Bash has none) and never edit the Claude Code settings file without a `[y/N]` confirmation of the diff, which they print on stdout. There is no `--yes` and no other way around it: no flag, variable or path rule. Tests run them on a pseudo-terminal (`openpty`, `tests/support/pty.rs`) on sandbox settings. The armed guard denies both for sessions (R25), since a pty wrapper (`script -c`, `unbuffer`) would make a terminal and type the yes.
 Note (item 9): the first version allowed a TTY-less `--yes` with `TOLLGATE_TEST_INSTALL=1` and the settings under `$TMPDIR`; `TMPDIR=~/.claude` passed that check. No variable takes part now. A pty (`script -c ...`) still gives stdin a TTY: that is a guard matter.
+Note (item 29): the item 9 fix refused TTY-less `--yes` only for files under `<passwd home>/.claude/`, but Claude Code's active config dir can be anywhere (`CLAUDE_CONFIG_DIR`), and it checked stdin only. `--yes` is gone; both commands refuse before they do anything unless stdin and stdout are TTYs. The settings file is resolved once (`src/install/settings_file.rs`): the parent dir is opened and kept, the file is opened in it with `O_NOFOLLOW` (a symlink there now is refused; a symlinked settings file is resolved to its target once, before), and its device, inode and bytes are kept. The diff shows those bytes; the backup is those bytes, written new (`O_EXCL`, 0600) next to the file; the write is a new file in the same dir, renamed over the name only while the name still holds the same inode with the same bytes (`linkat` for a file that did not exist, which fails when one appeared). So a swap while the question waits (a symlink to another file, a file renamed over it, an edit in place) writes nothing (S41). Limit: no POSIX rename compares the target inode, so a swap in the microseconds between the last check and the rename is not seen.
 
 L11. `~/.claude/settings.json` is per machine (not synced): Q11 resolved, no machine-neutral path needed.
 
@@ -572,7 +573,7 @@ R94. Python baselines: `pyright-baseline` and `pytest-baseline` reimplement the 
 
 ### 4.12 Installation, migration, rollback, workflows
 
-R95. Install: `cargo install --git <gitlab tollgate repo> --locked tollgate` on both machines, then `tollgate install`, which must: (a) copy the binary and link hooks (R1, R2); (b) check `claude --version` >= 2.1.295; (c) back up `~/.claude/settings.json` to `settings.json.tollgate-bak-<timestamp>`, add the `env` entries (R3) and the guard entries (R23) each tagged with the marker string `tollgate:` in the hook command and recorded in `install.json`, remove the `pre-commit-checks.sh` entry, print a unified diff, ask for confirmation unless `--yes`; (d) write the host config when absent; (e) run `tollgate doctor`. Re-running `tollgate install` after a `cargo install` refreshes the copy and the links.
+R95. Install: `cargo install --git <gitlab tollgate repo> --locked tollgate` on both machines, then `tollgate install`, which must: (a) copy the binary and link hooks (R1, R2); (b) check `claude --version` >= 2.1.295; (c) back up `~/.claude/settings.json` to `settings.json.tollgate-bak-<timestamp>`, add the `env` entries (R3) and the guard entries (R23) each tagged with the marker string `tollgate:` in the hook command and recorded in `install.json`, remove the `pre-commit-checks.sh` entry, print a unified diff, ask for confirmation (L10: at a terminal only, no `--yes`); (d) write the host config when absent; (e) run `tollgate doctor`. Re-running `tollgate install` after a `cargo install` refreshes the copy and the links.
 
 R96. `tollgate uninstall` must remove exactly the entries recorded in `install.json` (matched by value), keep every other key and key order (`serde_json` with `preserve_order`), and use the backup only when the structural edit fails, after showing a diff. It removes the data dir and leaves state, records and verify checkouts (`tollgate gc --all` removes them).
 Reason: restoring a day-1 backup loses every later edit (critique).
@@ -594,7 +595,7 @@ R100. `tollgate waive --tree T --tier t --reason S` writes a `pass` record with 
 ### 4.13 CLI summary
 
 ```
-tollgate install [--yes] | uninstall | doctor [--repo P] [--injection]
+tollgate install | uninstall | doctor [--repo P] [--injection]       # install, uninstall: TTY only
 tollgate check [--tier fast|full] [--tree T | --rev R] [--wait | --detach] [--rerun]
 tollgate wait <job> [--timeout D] | cancel <job>
 tollgate status [--rev R] [--json] | report <job|tree> [--json] | log <job> <step> [--tail N]

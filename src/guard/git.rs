@@ -1044,6 +1044,11 @@ impl Walker<'_> {
                 "forgetting a lost trusted remote needs Victor's terminal (item 33, R25)".into(),
             ),
             ["policy", "approve", ..] => Err("policy approval is not for agents (R25)".into()),
+            // A pty wrapper (`script -c`, `unbuffer`) would give it the
+            // terminal it checks for and type the yes.
+            [s, ..] if matches!(*s, "install" | "uninstall") => Err(format!(
+                "tollgate {s} changes the Claude Code settings; it needs Victor's terminal (item 29, L10, R25)"
+            )),
             ["baseline", "record", ..] => {
                 Err("baseline record needs Victor's terminal (R94, R25)".into())
             }

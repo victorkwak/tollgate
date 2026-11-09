@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 pub mod cpu;
+pub mod pty;
 pub mod tools;
 
 use std::ffi::{OsStr, OsString};
@@ -589,19 +590,15 @@ impl Armed {
         a
     }
 
+    /// `tollgate install` at a terminal (a pty), confirming the settings
+    /// edit (L10, item 29).
     pub fn install(&self) -> (Option<i32>, String) {
-        let out = self
-            .cmd(Path::new(BIN), &["install", "--yes"], &[])
-            .output()
-            .unwrap();
-        (
-            out.status.code(),
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            ),
-        )
+        let r = pty::run(
+            self.cmd(Path::new(BIN), &["install"], &[]),
+            pty::Streams::All,
+            &["y"],
+        );
+        (r.code, r.out)
     }
 
     pub fn data(&self) -> PathBuf {

@@ -490,6 +490,45 @@ fn item_42_no_false_denies_from_text() {
     ]);
 }
 
+/// Item 29: install and uninstall are for a person at a terminal. A
+/// session has none, but a pty wrapper (`script -c`, `unbuffer`, `socat`)
+/// makes one and can type the yes; so the guard denies them in a session
+/// (R25), like `remotes forget`, in any spelling. When the gate is not
+/// armed, the L8 repair rule still lets the plain command through; it then
+/// refuses for want of a terminal.
+#[test]
+fn item_29_install_and_uninstall_are_not_for_sessions() {
+    denied(&[
+        "tollgate install",
+        "tollgate uninstall",
+        "tollgate INSTALL",
+        "printf 'y\\n' | script -qec 'tollgate install' /dev/null",
+        "yes | script -qc 'tollgate uninstall' /dev/null",
+        "script -q -c 'tollgate install' /dev/null < answers",
+        "unbuffer tollgate install",
+        "echo y | tollgate install",
+        "python3 -c \"import pty; pty.spawn(['tollgate', 'install'])\"",
+        "socat - EXEC:'tollgate install',pty",
+        "socat - exec:tollgate\\ install,pty,stderr",
+        "socat -d -d STDIO SYSTEM:'tollgate install',pty",
+        "socat - -!!Shell:'tollgate install'",
+        "expect -c 'spawn tollgate install; send y\\r; interact'",
+        "echo 'spawn tollgate install' | expect",
+        "tclsh8.6 x.tcl",
+        "env wish x.tcl",
+        "timeout 5 expect x.exp",
+        "tmux new-session -d 'tollgate install'",
+        "screen -dm tollgate install",
+        "setsid -w tollgate install",
+    ]);
+    // socat that runs no program is data to the guard.
+    allowed(&[
+        "socat - TCP:localhost:5432",
+        "socat -u FILE:a,rdonly STDOUT",
+    ]);
+    allowed(&["tollgate doctor", "tollgate status"]);
+}
+
 /// Item 44: the raw-text rule for the old install test switch is gone;
 /// setting the variable is still a TOLLGATE_* write (G5).
 #[test]
