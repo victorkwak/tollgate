@@ -106,15 +106,34 @@ fn unsafe_url_char(c: char) -> bool {
     matches!(c, '?' | '#' | '\\' | '%') || c.is_whitespace() || c.is_control()
 }
 
+/// Item 47, review note 4: userinfo every parser reads the same way:
+/// `[A-Za-z0-9._~-]+`, not starting with `-` (ssh would read an option;
+/// git refuses it), and `:` (a password) only where `colon` allows it
+/// (https). A `[` in it would end it for git, whose `host_end` reads a
+/// leading `[` as a bracketed host: `[evil]x@host` connects to `evil`.
+fn userinfo_ok(user: &str, colon: bool) -> bool {
+    !user.is_empty()
+        && !user.starts_with('-')
+        && user.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'.' | b'_' | b'~' | b'-')
+                || (colon && b == b':')
+        })
+}
+
 /// `host[:port]` of an authority, without `user[:password]@`. Item 47:
-/// more than one `@` (parsers split at the first or the last) or an
-/// unsafe character in it parses as nothing.
-fn authority_host_port(authority: &str) -> Option<(String, Option<u16>)> {
+/// more than one `@` (parsers split at the first or the last), an unsafe
+/// character, or userinfo other than [`userinfo_ok`] (`colon`: a password
+/// may follow `:`, https only) parses as nothing. A `[` can then only
+/// start the host part, where [`host_port`] reads a bracketed IPv6
+/// address as git does.
+fn authority_host_port(authority: &str, colon: bool) -> Option<(String, Option<u16>)> {
     if authority.chars().any(unsafe_url_char) {
         return None;
     }
     let host = match authority.split_once('@') {
         Some((_, h)) if h.contains('@') => return None,
+        Some((u, _)) if !userinfo_ok(u, colon) => return None,
         Some((_, h)) => h,
         None => authority,
     };
@@ -143,7 +162,7 @@ pub fn parse_url(url: &str) -> Option<RemoteUrl> {
         if path.starts_with('/') {
             return None;
         }
-        let (host, port) = authority_host_port(authority)?;
+        let (host, port) = authority_host_port(authority, scheme == Scheme::Https)?;
         return Some(RemoteUrl {
             scheme,
             host,
@@ -160,7 +179,7 @@ pub fn parse_url(url: &str) -> Option<RemoteUrl> {
         return None;
     }
     let (authority, path) = url.split_at(colon);
-    let (host, port) = authority_host_port(authority)?;
+    let (host, port) = authority_host_port(authority, false)?;
     if port.is_some() {
         return None;
     }
@@ -194,7 +213,7 @@ impl TrustPattern {
             // `host:path` (scp-like) or `host/path`, any allowed scheme.
             let cut = p.find([':', '/'])?;
             let (authority, rest) = p.split_at(cut);
-            let (host, port) = authority_host_port(authority)?;
+            let (host, port) = authority_host_port(authority, false)?;
             (None, host, port, rest[1..].to_owned())
         };
         let path = segments(&path)?
@@ -249,7 +268,7 @@ fn parse_url_pattern(p: &str) -> Option<(Scheme, String, Option<u16>, String)> {
         _ => return None,
     };
     let (authority, path) = rest.split_once('/')?;
-    let (host, port) = authority_host_port(authority)?;
+    let (host, port) = authority_host_port(authority, scheme == Scheme::Https)?;
     Some((scheme, host, port, path.to_owned()))
 }
 
@@ -422,5 +441,128 @@ mod tests {
         ] {
             assert!(TrustPattern::parse(pat).is_none(), "{pat:?}");
         }
+    }
+
+    /// Item 47, review note 4: git reads a leading `[` as a bracketed
+    /// host, so `ssh://[evil.com]x@gitlab.com/...` and the scp-like
+    /// `[evil.com]x@gitlab.com:...` connect to `evil.com`. Userinfo is
+    /// `[A-Za-z0-9._~-]+` (plus `:` for https only): any other character
+    /// in it parses as nothing.
+    #[test]
+    fn userinfo_with_a_bracket_or_other_character_is_never_trusted_item47() {
+        let p = TrustPattern::parse("*gitlab.com/victorkwak/*").unwrap();
+        let trusted = |u: &str| parse_url(u).is_some_and(|u| p.matches(&u));
+        for url in [
+            "ssh://[evil.com]x@gitlab.com/victorkwak/r",
+            "ssh://[evil.com]@gitlab.com/victorkwak/r",
+            "git+ssh://[evil.com]x@gitlab.com/victorkwak/r",
+            "[evil.com]x@gitlab.com:victorkwak/r",
+            "[evil.com]@gitlab.com:victorkwak/r",
+            "https://[evil.com]x@gitlab.com/victorkwak/r",
+            "ssh://u[x@gitlab.com/victorkwak/r",
+            "ssh://u]x@gitlab.com/victorkwak/r",
+            "u]x@gitlab.com:victorkwak/r",
+            "ssh://@gitlab.com/victorkwak/r",
+            "@gitlab.com:victorkwak/r",
+            "ssh://-oProxyCommand=x@gitlab.com/victorkwak/r",
+            "ssh://a:b@gitlab.com/victorkwak/r",
+            "ssh://a!b@gitlab.com/victorkwak/r",
+            "ssh://a;b@gitlab.com/victorkwak/r",
+            "ssh://a$b@gitlab.com/victorkwak/r",
+            "ssh://\u{e9}@gitlab.com/victorkwak/r",
+            "https://a'b@gitlab.com/victorkwak/r",
+            "https://a+b@gitlab.com/victorkwak/r",
+        ] {
+            assert!(!trusted(url), "{url:?} trusted");
+        }
+        for url in [
+            "ssh://git@gitlab.com/victorkwak/r",
+            "ssh://g.i_t~-1@gitlab.com/victorkwak/r",
+            "git@gitlab.com:victorkwak/r",
+            "https://oauth2:tok@gitlab.com/victorkwak/r",
+            "https://user@gitlab.com/victorkwak/r",
+        ] {
+            assert!(trusted(url), "{url:?} not trusted");
+        }
+        for pat in [
+            "*[evil.com]x@gitlab.com:victorkwak/*",
+            "ssh://[evil.com]x@gitlab.com/victorkwak/*",
+            "https://[evil.com]x@gitlab.com/victorkwak/*",
+            "ssh://a:b@gitlab.com/victorkwak/*",
+        ] {
+            assert!(TrustPattern::parse(pat).is_none(), "{pat:?}");
+        }
+    }
+
+    /// Item 47, review note 4: every ssh URL this parser accepts names
+    /// the host, port and path that git itself reads
+    /// (`git fetch-pack --diag-url`). The corpus mixes plain URLs with
+    /// spellings where parsers disagree.
+    #[test]
+    fn accepted_ssh_urls_name_the_host_git_reads_item47() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = crate::gitx::program();
+        let init = std::process::Command::new(git)
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "{init:?}");
+        let corpus = [
+            "ssh://git@gitlab.com/victorkwak/r.git",
+            "ssh://gitlab.com/victorkwak/r",
+            "ssh://git@GitLab.com:2222/victorkwak/r",
+            "git+ssh://git@gitlab.com/victorkwak/r",
+            "ssh+git://git@gitlab.com/victorkwak/r",
+            "ssh://git@[::1]:22/victorkwak/r",
+            "ssh://[::1]/victorkwak/r",
+            "ssh://g.i_t~-1@gitlab.com/victorkwak/r",
+            "git@gitlab.com:victorkwak/r.git",
+            "gitlab.com:victorkwak/r",
+            "ssh://[evil.com]x@gitlab.com/victorkwak/r",
+            "ssh://[evil.com]@gitlab.com/victorkwak/r",
+            "[evil.com]x@gitlab.com:victorkwak/r",
+            "[git@evil.com]:victorkwak/r",
+            "git@[evil.com]x@gitlab.com:victorkwak/r",
+            "ssh://u[x@gitlab.com/victorkwak/r",
+            "ssh://u]x@gitlab.com/victorkwak/r",
+            "ssh://[git@evil.com]:22/victorkwak/r",
+            "ssh://git@[gitlab.com]/victorkwak/r",
+            "ssh://git@gitlab.com:x/victorkwak/r",
+            "ssh://a:b@gitlab.com/victorkwak/r",
+            "a:b@gitlab.com:victorkwak/r",
+            "git@[::1]:victorkwak/r",
+            "ssh://-oProxyCommand=x@gitlab.com/victorkwak/r",
+        ];
+        let mut accepted = 0;
+        for url in corpus {
+            let Some(u) = parse_url(url) else { continue };
+            accepted += 1;
+            let out = std::process::Command::new(git)
+                .args(["fetch-pack", "--diag-url", url])
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            let field = |k: &str| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix(&format!("Diag: {k}=")))
+                    .unwrap_or_else(|| panic!("{url:?}: no {k} in {text}"))
+                    .to_owned()
+            };
+            let userandhost = field("userandhost");
+            let host = userandhost.rsplit('@').next().unwrap().to_ascii_lowercase();
+            let ours = u.host.trim_start_matches('[').trim_end_matches(']');
+            assert_eq!(ours, host, "{url:?}: git reads {userandhost}");
+            let port = field("port");
+            let port = (port != "NONE").then(|| port.parse::<u16>().unwrap());
+            assert_eq!(u.port, port, "{url:?}");
+            assert_eq!(Some(u.path.clone()), segments(&field("path")), "{url:?}");
+        }
+        assert!(accepted >= 10, "only {accepted} accepted");
     }
 }

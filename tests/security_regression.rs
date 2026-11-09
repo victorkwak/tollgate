@@ -1985,6 +1985,56 @@ fn s35_a_query_or_fragment_before_the_at_never_trusts_the_host_after_it() {
     }
 }
 
+/// S45 (item 47, review note 4): git reads a leading `[` in the
+/// authority as a bracketed host, so `ssh://[evil.invalid]x@gitlab.com/`
+/// and the scp-like `[evil.invalid]x@gitlab.com:` connect to
+/// `evil.invalid`. A real `url.<x>.insteadOf` turns the trusted origin
+/// URL into such a URL (git's own reading is checked first); trust never
+/// takes `gitlab.com` from it, so the commit is refused as a redirected
+/// trusted remote.
+#[test]
+fn s45_a_bracket_in_the_userinfo_never_trusts_the_host_after_it() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.sb().host_config(
+        "[scope]\nremotes = [\"*gitlab.com:victorkwak/*\", \"*gitlab.com/victorkwak/*\"]\n[verify]\nmin_free = \"1M\"\n",
+    );
+    for (configured, base, evil) in [
+        (
+            "ssh://git@gitlab.com/victorkwak/ws.git",
+            "ssh://git@gitlab.com/",
+            "ssh://[evil.invalid]x@gitlab.com/",
+        ),
+        (
+            "ssh://git@gitlab.com/victorkwak/ws.git",
+            "ssh://git@gitlab.com/",
+            "git+ssh://[evil.invalid]@gitlab.com/",
+        ),
+        (
+            "git@gitlab.com:victorkwak/ws.git",
+            "git@gitlab.com:",
+            "[evil.invalid]x@gitlab.com:",
+        ),
+    ] {
+        lab.plain(&["remote", "set-url", "origin", configured]);
+        let key = format!("url.{evil}.insteadOf");
+        lab.plain(&["config", &key, base]);
+        let fetch = lab.plain(&["remote", "get-url", "--all", "origin"]);
+        assert!(fetch.starts_with(evil), "{fetch}");
+        let diag = lab.plain(&["fetch-pack", "--diag-url", fetch.trim()]);
+        assert!(diag.contains("userandhost=evil.invalid\n"), "{diag}");
+        lab.stage_bad_file(evil);
+        let s = lab.refused("git commit -m bad");
+        assert!(
+            s.out().contains("DENIED pre-commit")
+                && s.out().contains(&format!("git fetches it from {evil}")),
+            "{evil}: {s:?}"
+        );
+        lab.plain(&["rm", "-q", "--cached", "bad"]);
+        std::fs::remove_file(lab.repo.join("bad")).unwrap();
+        lab.plain(&["config", "--unset", &key]);
+    }
+}
+
 /// S36 (item 12): the guard checks the command as it came and Bash runs
 /// the whole of it, so the rewrite never drops client text. A client
 /// `export TOLLGATE_INLINE_CAP=...; ` prefix whose value is a quote that
