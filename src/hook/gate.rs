@@ -79,8 +79,7 @@ impl<'a> Gate<'a> {
         let git = Git::scrubbed(env, layout.hooks_cwd());
         let scope = CompiledScope::new(&host.config.scope, &dirs)?;
         let trust = plan::remote_trust(&git, &scope).map_err(|e| e.to_string())?;
-        let remote_refs =
-            plan::remote_refs(&dirs, env, &host.config.job, &trust, &layout.repo_key());
+        let remote_refs = plan::remote_refs(&dirs, env, &host.config.job, &trust, &git, &layout);
         Ok(Self {
             hook,
             env,

@@ -309,10 +309,16 @@ impl RemoteRefs {
     }
 
     /// Item 33: checks and updates the record of the trusted remotes of
-    /// the repo whose key is `repo` ([`crate::remote_record`]).
+    /// the repo of `layout`, read through `git` ([`crate::remote_record`]).
     #[must_use]
-    pub fn with_record(mut self, dirs: &Dirs, repo: &crate::ids::RepoKey) -> Self {
-        self.record = Some(crate::remote_record::check(dirs, repo, &self.remotes));
+    pub fn with_record(mut self, dirs: &Dirs, git: &Git, layout: &crate::gitx::RepoLayout) -> Self {
+        self.record = Some(crate::remote_record::check(
+            dirs,
+            git,
+            &layout.repo_key(),
+            &layout.repo_dir(),
+            &self.remotes,
+        ));
         self
     }
 

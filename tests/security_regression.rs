@@ -1938,6 +1938,125 @@ fn s34_a_lost_trusted_remote_never_makes_local_main_the_anchor() {
     );
 }
 
+/// S48 (item 33, secreview notes 2 and 3): the record of a repo's trusted
+/// remotes follows the repo, not its path. The attack: after a gated
+/// commit recorded `origin`, the repo is copied (`cp -a`) or moved (`mv`),
+/// and `origin` is removed in the new path before any gated command runs
+/// there (the guard asks; an approved ask is what the record catches).
+/// With a key by path only, the new path had no record, so local `main`
+/// (weakened by a script) became the policy anchor, or the repo left the
+/// gate. It must be refused, naming the lost remote. A deleted record of
+/// a known repo denies too (never "no record").
+#[test]
+fn s48_a_copied_moved_or_unrecorded_repo_keeps_its_lost_trusted_remote() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    let root = lab.root();
+    let bare = lab.bare.to_str().unwrap().to_owned();
+    std::fs::write(lab.repo.join("ok.txt"), "1\n").unwrap();
+    lab.plain(&["add", "ok.txt"]);
+    let s = lab.session("git commit -q -m ok");
+    assert_eq!(s.code(), Some(0), "{s:?}");
+    std::fs::write(lab.repo.join("tollgate.toml"), WEAK_POLICY).unwrap();
+    lab.plain(&["commit", "-q", "--no-verify", "-am", "weaken"]);
+    lab.plain(&["checkout", "-q", "-b", "feat"]);
+    let commit = |dir: &Path, file: &str| {
+        std::fs::write(dir.join(file), "x\n").unwrap();
+        lab.plain_in(dir, &["add", file]);
+        let before = lab.refs_in(dir);
+        let tree = lab.plain_in(dir, &["write-tree"]);
+        let s = lab.session_in(dir, &format!("git commit -q -m {file}"));
+        if s.code() != Some(0) {
+            assert_eq!(lab.refs_in(dir), before, "{file}: a ref moved: {s:?}");
+            assert!(
+                !lab.pass_trees(None).contains(&tree.trim().to_owned()),
+                "{file}: its tree got a pass"
+            );
+            lab.plain_in(dir, &["rm", "-q", "--cached", file]);
+            std::fs::remove_file(dir.join(file)).unwrap();
+        }
+        s
+    };
+    let refused = |dir: &Path, label: &str, names_remote: bool| {
+        let s = commit(dir, "bad");
+        assert!(
+            s.out().contains("DENIED pre-commit") && s.out().contains("item 33"),
+            "{label}: {s:?}"
+        );
+        if names_remote {
+            assert!(s.out().contains(&bare), "{label}: {s:?}");
+        }
+    };
+    let cp = |to: &Path| {
+        let st = Command::new("cp")
+            .arg("-a")
+            .arg(&lab.repo)
+            .arg(to)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    };
+    // 1. A copy keeps origin: a good commit is allowed, a bad one refused
+    // by the trusted policy.
+    let kept = root.join("ws-kept");
+    cp(&kept);
+    assert_eq!(commit(&kept, "ok2.txt").code(), Some(0));
+    // 2. A copy whose origin is removed before its first gated command.
+    let copy = root.join("ws-copy");
+    cp(&copy);
+    lab.plain_in(&copy, &["remote", "remove", "origin"]);
+    refused(&copy, "copied", true);
+    // 3. The repo itself moved, origin removed in the new path.
+    let moved = root.join("ws-moved");
+    std::fs::rename(&lab.repo, &moved).unwrap();
+    // The guard runs from the old path (an empty dir now).
+    std::fs::create_dir(&lab.repo).unwrap();
+    lab.plain_in(&moved, &["remote", "remove", "origin"]);
+    refused(&moved, "moved", true);
+    // 4. Origin back: allowed; then its record is deleted (a script file)
+    // and origin removed again: a known repo with no record denies.
+    lab.plain_in(&moved, &["remote", "add", "origin", &bare]);
+    lab.plain_in(&moved, &["fetch", "-q", "origin"]);
+    let s = commit(&moved, "ok3.txt");
+    assert_eq!(s.code(), Some(0), "{s:?}");
+    let key = tollgate::ids::RepoKey::of_realpath(&moved.join(".git").canonicalize().unwrap());
+    let record = lab
+        .sb()
+        .state()
+        .join(format!("trusted-remotes/{}.json", key.as_str()));
+    std::fs::remove_file(&record).unwrap();
+    lab.plain_in(&moved, &["remote", "remove", "origin"]);
+    refused(&moved, "record deleted", false);
+    // 5. Victor accepts the copy's change at his own terminal (util-linux
+    // `script` gives one): the confirmation names the remote and the repo
+    // it was recorded in; then the copy commits on its own policy.
+    if cfg!(target_os = "linux") && Path::new("/usr/bin/script").exists() {
+        let mut cmd = Command::new("/usr/bin/script");
+        cmd.env_clear()
+            .current_dir(&copy)
+            .args([
+                "-qec",
+                &format!("{} remotes forget", support::BIN),
+                "/dev/null",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in lab.sb().env().iter() {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
+        child.stdin.as_mut().unwrap().write_all(b"y\n").unwrap();
+        let out = child.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{text}");
+        assert!(
+            text.contains(&bare) && text.contains("recorded in") && text.contains("forgot"),
+            "{text}"
+        );
+        assert_eq!(commit(&copy, "ok4.txt").code(), Some(0));
+    }
+}
+
 /// S35 (item 47, X5): a URL whose authority ends at `?` or `#` names the
 /// host before it: `https://evil.invalid?@gitlab.com/...` is a request to
 /// `evil.invalid` for curl and git. A real `url.<x>.insteadOf` turns the

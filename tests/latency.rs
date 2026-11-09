@@ -373,3 +373,50 @@ fn pre_commit_cache_hit_with_a_trusted_remote_l19_item33() {
         Duration::from_millis(200),
     );
 }
+
+/// Item 33, secreview note 2: a repo with no recorded trusted remote is
+/// looked up in the index of repos that had one (one `git cat-file` of
+/// their root commits) on every `Gate::open`, to tell a copy or a move.
+/// With 300 indexed repos of 2 roots each, a `pre-commit` cache hit of a
+/// repo with no remote stays in its budget.
+#[test]
+fn pre_commit_cache_hit_with_a_full_remote_index_l19_item33() {
+    let meter = CpuMeter::new();
+    let sb = Sandbox::new();
+    sb.scoped_host("");
+    let repo = repo_with(&sb, "r", PASS);
+    stage(&sb, &repo, "a.txt", "1\n");
+    let run = || {
+        let o = sb.run_hook(&repo, "pre-commit", &[]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    };
+    run();
+    let empty = p95(&meter, 3, 20, run);
+    let dir = sb.state().join("trusted-remotes");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut repos = serde_json::Map::new();
+    for i in 0..300u32 {
+        let commits: Vec<String> = (0..2u32)
+            .map(|j| format!("{:040x}", i * 2 + j + 1))
+            .collect();
+        repos.insert(
+            format!("{i:016x}"),
+            serde_json::json!({"dir": format!("/r/{i}"), "commits": commits}),
+        );
+    }
+    std::fs::write(
+        dir.join("index.json"),
+        serde_json::json!({"version": 1, "repos": repos}).to_string(),
+    )
+    .unwrap();
+    let t = p95(&meter, 3, 20, run);
+    eprintln!(
+        "  index of 300 repos adds {:?} p95 cpu",
+        t.cpu.saturating_sub(empty.cpu)
+    );
+    within_budget(
+        "pre-commit cache hit (no remote, full index)",
+        t,
+        Duration::from_millis(200),
+    );
+}

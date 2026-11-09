@@ -115,6 +115,8 @@ cd <repo>
 tollgate remotes forget    # lists what is recorded, asks [y/N]
 ```
 
+This memory follows the repo's history, not its path: a copy (`cp -a`), a move, or a clone of the repo that has none of its trusted remotes is denied the same way, and the message names the repo where the remote was recorded. So a local clone of a gated repo whose `origin` is that local path is denied at its first gated commit until you run `tollgate remotes forget` in it once (or add a trusted remote). Forgetting is remembered: that clone does not take the accepted remotes over again.
+
 That query runs in its own environment, so nothing an agent sets for one git command picks who answers: no repo, global or system git config, no `GIT_*` or proxy variable from the shell, and `ssh -o BatchMode=yes` found on `[job] path_prepend` and then `/usr/local/bin:/usr/bin:/bin`, never on the agent's `PATH`. It keeps your `credential.*` git settings and `SSH_AUTH_SOCK`. So an ssh remote needs a key the ssh agent holds (or one without a passphrase) and a known host key, and an https remote needs a credential helper; `http.*` settings such as a proxy or a CA file do not apply. The guard also denies `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_SSH_VARIANT`, `GIT_PROXY_COMMAND` and `GIT_EXEC_PATH` for git and tollgate, and asks before `git config` writes `core.sshCommand`, `core.gitProxy`, `ssh.*` or `url.*`.
 
 A branch can still change its own code, tests, `package.json` scripts, `tsconfig.json`, `biome.json`, and the tool sections of `pyproject.toml`. Those changes are visible in review and in the diff, and the full check at merge runs on them as they are.

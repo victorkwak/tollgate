@@ -387,8 +387,8 @@ fn push_tiers_tags_and_deletions_t13_r20_r22() {
 /// Item 33 (R4): once a repo had a trusted remote, losing it (removed, or
 /// its URL changed to one that is not trusted) denies: anchors never fall
 /// back to the local `main`, which an agent can move. A rename keeps the
-/// URL and stays trusted; deleting the record (from your own terminal)
-/// accepts the change.
+/// URL and stays trusted; emptying the record (`tollgate remotes forget`,
+/// from your own terminal) accepts the change.
 #[test]
 fn a_lost_trusted_remote_denies_instead_of_local_anchors_item33() {
     let sb = Sandbox::new();

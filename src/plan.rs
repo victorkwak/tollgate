@@ -581,10 +581,11 @@ pub fn remote_refs(
     env: &EnvSnapshot,
     job: &JobConfig,
     trust: &RemoteTrust,
-    repo: &crate::ids::RepoKey,
+    git: &Git,
+    layout: &crate::gitx::RepoLayout,
 ) -> RemoteRefs {
     RemoteRefs::new(dirs, env, &job.path_prepend, trust.trusted_urls.clone())
-        .with_record(dirs, repo)
+        .with_record(dirs, git, layout)
 }
 
 /// R56: a base is trusted when its tree has a pass at `fast` or above, or
@@ -675,7 +676,8 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
         req.env,
         &host.job,
         &remote_trust(req.git, &scope)?,
-        &req.layout.repo_key(),
+        req.git,
+        req.layout,
     );
     let entries = req.git.ls_tree(&req.tree)?;
     let policy = policy::resolve(

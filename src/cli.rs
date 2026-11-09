@@ -980,7 +980,8 @@ pub fn config_effective(ctx: &Ctx) -> u8 {
             &ctx.env,
             &repo.host.config.job,
             &t,
-            &repo.layout.repo_key(),
+            &repo.git,
+            &repo.layout,
         ),
         Err(e) => return fail(e),
     };
@@ -1217,13 +1218,14 @@ pub fn run_job(ctx: &Ctx, job: &str, lock_fd: Option<i32>) -> u8 {
     job::run_job(&dirs, &id, &ctx.env)
 }
 
-/// `tollgate remotes forget [repo]` (item 33): removes the record of the
-/// trusted remotes the repo had, so a lost one no longer denies; the next
-/// gated command records those it has then. At an interactive terminal
-/// only (stdin and stdout are TTYs; Claude's Bash has none) outside a
-/// Claude Code session (review note 1), after a confirmation that lists
-/// what the record holds: forgetting a lost trusted remote lets the
-/// policy anchor fall back to local refs.
+/// `tollgate remotes forget [repo]` (item 33): empties the record of the
+/// trusted remotes the repo had, and of those it would take over from a
+/// repo whose commits it has (a copy or a move), so a lost one no longer
+/// denies; the next gated command records those it has then. At an
+/// interactive terminal only (stdin and stdout are TTYs; Claude's Bash
+/// has none) outside a Claude Code session (review note 1), after a
+/// confirmation that lists what the record holds: forgetting a lost
+/// trusted remote lets the policy anchor fall back to local refs.
 pub fn remotes_forget(ctx: &Ctx, repo: Option<&Path>) -> u8 {
     use std::io::{BufRead as _, IsTerminal as _, Write as _};
     if let Some(var) = crate::install::claude_session(&ctx.env) {
@@ -1248,26 +1250,22 @@ pub fn remotes_forget(ctx: &Ctx, repo: Option<&Path>) -> u8 {
         Err(e) => return fail(format!("not in a git repository: {e}")),
     };
     let key = layout.repo_key();
-    let file = crate::remote_record::file(&dirs, &key);
-    let what: String = match crate::remote_record::read(&file) {
-        Ok(r) if r.is_empty() && !file.exists() => {
-            println!(
-                "{}: no trusted remotes recorded ({})",
-                layout.repo_dir().display(),
-                file.display()
-            );
-            return exit::OK;
-        }
-        Ok(r) => r
-            .iter()
-            .map(|s| format!("  {} {} (since {})\n", s.name, s.url, s.since))
-            .collect(),
-        Err(e) => format!("  (unusable: {e})\n"),
-    };
+    let repo_dir = layout.repo_dir();
+    let git = Git::scrubbed(&dirs.env_for(&ctx.env), layout.hooks_cwd());
+    let view = crate::remote_record::inspect(&dirs, &git, &key, &repo_dir);
+    if view.is_empty() {
+        println!(
+            "{}: no trusted remotes recorded ({})",
+            repo_dir.display(),
+            view.file.display()
+        );
+        return exit::OK;
+    }
     print!(
-        "{}: recorded trusted remotes ({}):\n{what}With no trusted remote left, the policy anchor falls back to local refs. Forget them? [y/N] ",
-        layout.repo_dir().display(),
-        file.display()
+        "{}: recorded trusted remotes ({}):\n{}With no trusted remote left, the policy anchor falls back to local refs. Forget them? [y/N] ",
+        repo_dir.display(),
+        view.file.display(),
+        view.lines()
     );
     let _ = std::io::stdout().flush();
     let mut line = String::new();
@@ -1277,13 +1275,13 @@ pub fn remotes_forget(ctx: &Ctx, repo: Option<&Path>) -> u8 {
         println!("nothing changed");
         return exit::BLOCK;
     }
-    match crate::remote_record::forget(&dirs, &key) {
-        Ok(_) => {
+    match crate::remote_record::forget(&dirs, &git, &key, &repo_dir) {
+        Ok(()) => {
             println!(
                 "forgot; the next gated command records the trusted remotes the repo has then"
             );
             exit::OK
         }
-        Err(e) => fail(format!("cannot remove {}: {e}", file.display())),
+        Err(e) => fail(format!("cannot forget {}: {e}", view.file.display())),
     }
 }
