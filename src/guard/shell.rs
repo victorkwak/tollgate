@@ -4,20 +4,33 @@
 //! removed), leading assignments and redirections. Command substitutions
 //! (`$(...)`, backticks), process substitutions (`<(...)`, `>(...)`) and
 //! subshells are parsed as commands too. Heredoc bodies are data: they are
-//! skipped here and seen only by the guard's substring rules (a heredoc,
-//! here-string or pipe into a shell is denied in commands that name git,
-//! item 31). Best effort: the guard is a backstop behind the git hooks, so
-//! a construct this lexer does not model errs toward more matches, not
-//! fewer.
+//! kept on their redirection, not parsed as commands, except the `$(...)`
+//! and backtick substitutions of a body whose delimiter is not quoted,
+//! which bash runs (a heredoc, here-string or pipe into a shell is denied
+//! in commands that name git, item 31). Words of a top-level command keep
+//! their place in the source, so a rule can tell a literal message from
+//! text bash reads as code (item 42). Best effort: the guard is a backstop
+//! behind the git hooks, so a construct this lexer does not model errs
+//! toward more matches, not fewer.
 
 /// One redirection of a simple command.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Redirect {
-    /// Operator: `>`, `>>`, `>|`, `&>`, `&>>`, `<>`, `<`, `<<`, `<<<`,
-    /// `>&`, `<&`.
+    /// Operator: `>`, `>>`, `>|`, `&>`, `&>>`, `<>`, `<`, `<<` (also for
+    /// `<<-`), `<<<`, `>&`, `<&`.
     pub op: String,
     /// Target word (file, fd, or heredoc delimiter).
     pub target: String,
+    /// The command gets the text as written: for a heredoc, a quoted
+    /// delimiter or a body without `$`, backticks and backslashes; for any
+    /// other target, a word without `$` and backticks.
+    pub literal: bool,
+    /// A heredoc's body as the command reads it (`<<-` without the
+    /// leading tabs); `None` until the line after the operator is read.
+    pub body: Option<String>,
+    /// Where the body is in the source this command came from (char
+    /// indices, delimiter line excluded).
+    pub body_span: Option<(usize, usize)>,
 }
 
 impl Redirect {
@@ -48,6 +61,24 @@ pub struct SimpleCommand {
     pub redirects: Vec<Redirect>,
     /// Its stdin is a pipe (after `|` or `|&`, or in a piped subshell).
     pub piped: bool,
+    /// Where each word is in the source (char indices, parallel to
+    /// `words`). Indices are into the text given to [`parse`] only when
+    /// `top` is set; a nested command's are into its substitution.
+    pub spans: Vec<(usize, usize)>,
+    /// Parsed from the text given to [`parse`], not from a substitution,
+    /// a subshell or a heredoc body.
+    pub top: bool,
+}
+
+/// A heredoc whose body starts after the next newline.
+struct PendingDoc {
+    delim: String,
+    strip_tabs: bool,
+    quoted: bool,
+    /// Index in `out` of its command and of the redirection there; `None`
+    /// while the command is still being read.
+    at: Option<usize>,
+    redirect: usize,
 }
 
 struct Lexer<'a> {
@@ -314,55 +345,119 @@ impl Lexer<'_> {
         ] {
             if rest.starts_with(op) {
                 self.pos += op.chars().count();
-                return if op == "<<-" { "<<".into() } else { op.into() };
+                return op.into();
             }
         }
         self.pos += 1;
         rest.chars().next().map(String::from).unwrap_or_default()
     }
 
-    /// Skips heredoc bodies after a newline.
-    fn skip_heredocs(&mut self, delims: &mut Vec<String>) {
-        for d in std::mem::take(delims) {
-            loop {
-                let start = self.pos;
+    /// Reads the heredoc bodies that start after a newline onto their
+    /// redirections. A line equal to the delimiter ends a body (after
+    /// leading tabs for `<<-` only, as bash does), and so does the end of
+    /// the input. An unquoted body's substitutions are commands.
+    fn read_heredocs(&mut self, docs: &mut Vec<PendingDoc>) {
+        for d in std::mem::take(docs) {
+            let start = self.pos;
+            let mut end = self.pos;
+            let mut body = String::new();
+            while self.peek().is_some() {
+                let line_start = self.pos;
                 while self.peek().is_some_and(|c| c != '\n') {
                     self.pos += 1;
                 }
-                let line: String = self.chars[start..self.pos].iter().collect();
+                let line: String = self.chars[line_start..self.pos].iter().collect();
                 if self.peek().is_some() {
                     self.pos += 1;
                 }
-                if line.trim_start_matches('\t') == d || self.peek().is_none() {
+                let line = if d.strip_tabs {
+                    line.trim_start_matches('\t')
+                } else {
+                    line.as_str()
+                };
+                if line == d.delim {
                     break;
                 }
+                body.push_str(line);
+                body.push('\n');
+                end = self.pos;
+            }
+            let literal = d.quoted || !body.contains(['$', '`', '\\']);
+            if !d.quoted {
+                self.substitutions(&body);
+            }
+            if let Some(r) =
+                d.at.and_then(|at| self.out.get_mut(at))
+                    .and_then(|cmd| cmd.redirects.get_mut(d.redirect))
+            {
+                r.literal = literal;
+                r.body = Some(body);
+                r.body_span = Some((start, end));
             }
         }
     }
 
+    /// Parses the `$(...)` and backtick substitutions of an unquoted
+    /// heredoc body as commands; `\` escapes the next character there.
+    fn substitutions(&mut self, body: &str) {
+        let mut inner = Vec::new();
+        let mut lx = Lexer {
+            chars: body.chars().collect(),
+            pos: 0,
+            out: &mut inner,
+            depth: self.depth,
+            ansi_c: self.ansi_c,
+        };
+        while let Some(c) = lx.peek() {
+            match c {
+                '\\' => lx.pos += 2,
+                '$' if lx.peek_at(1) == Some('(') => {
+                    lx.pos += 2;
+                    let text = lx.read_balanced_paren();
+                    lx.nested(&text);
+                }
+                '`' => {
+                    lx.pos += 1;
+                    let text = lx.read_backticks();
+                    lx.nested(&text);
+                }
+                _ => lx.pos += 1,
+            }
+        }
+        self.out.extend(inner);
+    }
+
+    /// Ends the current command: it goes to `out`, and its heredocs learn
+    /// where it is.
+    fn flush(&mut self, cur: &mut SimpleCommand, docs: &mut [PendingDoc]) {
+        if cur.words.is_empty() && cur.assignments.is_empty() && cur.redirects.is_empty() {
+            return;
+        }
+        cur.top = self.depth == 0;
+        for d in docs.iter_mut().filter(|d| d.at.is_none()) {
+            d.at = Some(self.out.len());
+        }
+        self.out.push(std::mem::take(cur));
+    }
+
     fn run(&mut self) {
         let mut cur = SimpleCommand::default();
-        let mut heredocs: Vec<String> = Vec::new();
-        let flush = |cur: &mut SimpleCommand, out: &mut Vec<SimpleCommand>| {
-            if !cur.words.is_empty() || !cur.assignments.is_empty() || !cur.redirects.is_empty() {
-                out.push(std::mem::take(cur));
-            }
-        };
+        let mut heredocs: Vec<PendingDoc> = Vec::new();
         while let Some(c) = self.peek() {
             match c {
                 ' ' | '\t' => self.pos += 1,
                 '\n' => {
                     self.pos += 1;
-                    flush(&mut cur, self.out);
-                    self.skip_heredocs(&mut heredocs);
+                    self.flush(&mut cur, &mut heredocs);
+                    self.read_heredocs(&mut heredocs);
                 }
                 ';' | ')' => {
                     self.pos += 1;
-                    flush(&mut cur, self.out);
+                    self.flush(&mut cur, &mut heredocs);
                 }
                 '|' => {
                     self.pos += 1;
-                    flush(&mut cur, self.out);
+                    self.flush(&mut cur, &mut heredocs);
                     match self.peek() {
                         // `||`: the next command runs after this one, not
                         // on its output.
@@ -381,17 +476,26 @@ impl Lexer<'_> {
                 '&' if self.peek_at(1) == Some('>') => {
                     let op = self.read_redirect_op();
                     self.skip_blanks();
+                    let start = self.pos;
                     let target = self.read_word().unwrap_or_default();
-                    cur.redirects.push(Redirect { op, target });
+                    let literal = !self.chars[start..self.pos]
+                        .iter()
+                        .any(|c| matches!(c, '$' | '`'));
+                    cur.redirects.push(Redirect {
+                        op,
+                        target,
+                        literal,
+                        ..Redirect::default()
+                    });
                 }
                 '&' => {
                     self.pos += 1;
-                    flush(&mut cur, self.out);
+                    self.flush(&mut cur, &mut heredocs);
                 }
                 '(' => {
                     self.pos += 1;
                     let piped = cur.piped;
-                    flush(&mut cur, self.out);
+                    self.flush(&mut cur, &mut heredocs);
                     cur.piped = false;
                     let inner = self.read_balanced_paren();
                     let first = self.out.len();
@@ -409,13 +513,31 @@ impl Lexer<'_> {
                     }
                 }
                 '<' | '>' if self.peek_at(1) != Some('(') => {
-                    let op = self.read_redirect_op();
+                    let mut op = self.read_redirect_op();
                     self.skip_blanks();
+                    let start = self.pos;
                     let target = self.read_word().unwrap_or_default();
-                    if op == "<<" {
-                        heredocs.push(target.clone());
+                    let raw: String = self.chars[start..self.pos].iter().collect();
+                    let strip_tabs = op == "<<-";
+                    if strip_tabs {
+                        op = "<<".into();
                     }
-                    cur.redirects.push(Redirect { op, target });
+                    let literal = !raw.contains(['$', '`']);
+                    if op == "<<" {
+                        heredocs.push(PendingDoc {
+                            delim: target.clone(),
+                            strip_tabs,
+                            quoted: raw.contains(['\'', '"', '\\']),
+                            at: None,
+                            redirect: cur.redirects.len(),
+                        });
+                    }
+                    cur.redirects.push(Redirect {
+                        op,
+                        target,
+                        literal,
+                        ..Redirect::default()
+                    });
                 }
                 _ => {
                     let before = self.pos;
@@ -439,11 +561,12 @@ impl Lexer<'_> {
                         // Group braces are not command words.
                     } else {
                         cur.words.push(w);
+                        cur.spans.push((before, self.pos));
                     }
                 }
             }
         }
-        flush(&mut cur, self.out);
+        self.flush(&mut cur, &mut heredocs);
     }
 }
 
@@ -588,11 +711,15 @@ mod tests {
             vec![
                 Redirect {
                     op: ">".into(),
-                    target: "out.txt".into()
+                    target: "out.txt".into(),
+                    literal: true,
+                    ..Redirect::default()
                 },
                 Redirect {
                     op: ">&".into(),
-                    target: "1".into()
+                    target: "1".into(),
+                    literal: true,
+                    ..Redirect::default()
                 }
             ]
         );
@@ -679,6 +806,42 @@ mod tests {
                 "{src}"
             );
         }
+    }
+
+    /// A heredoc keeps its body, whether bash expands it, and where it is;
+    /// `<<` ends only at the delimiter itself, `<<-` also after tabs. An
+    /// unquoted body's substitutions are commands; a quoted body's are not.
+    #[test]
+    fn heredoc_bodies_and_word_spans() {
+        let src = "cat <<'A' | x <<-B\n$(no)\nA\n\tb\n\tB\nc \"d e\"";
+        let cmds = parse(src);
+        assert_eq!(cmds[0].redirects[0].body.as_deref(), Some("$(no)\n"));
+        assert!(cmds[0].redirects[0].literal);
+        let (a, b) = cmds[0].redirects[0].body_span.unwrap();
+        assert_eq!(
+            src.chars().skip(a).take(b - a).collect::<String>(),
+            "$(no)\n"
+        );
+        assert_eq!(cmds[1].redirects[0].body.as_deref(), Some("b\n"));
+        assert_eq!(cmds[2].words, vec!["c", "d e"]);
+        assert!(cmds.iter().all(|c| c.top));
+        let (a, b) = cmds[2].spans[1];
+        assert_eq!(&src[a..b], "\"d e\"");
+        // `<<` does not end at a tab-indented delimiter.
+        let cmds = parse("cat <<A\n\tA\n$(y)\nA\nz");
+        assert_eq!(cmds[0].redirects[0].body.as_deref(), Some("\tA\n$(y)\n"));
+        assert!(!cmds[0].redirects[0].literal);
+        let w: Vec<_> = cmds.iter().map(|c| (c.words.clone(), c.top)).collect();
+        assert_eq!(
+            w,
+            vec![
+                (vec!["cat".to_owned()], true),
+                (vec!["y".to_owned()], false),
+                (vec!["z".to_owned()], true)
+            ]
+        );
+        // An escaped `$` is text.
+        assert_eq!(words("cat <<A\n\\$(y)\nA").len(), 1);
     }
 
     /// A command after `|` or `|&` reads a pipe; after `||` it does not.

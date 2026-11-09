@@ -3,8 +3,10 @@
 //! Two layers:
 //!
 //! - Substring rules on the normalized text (lowercase, quotes and
-//!   backslashes removed, whitespace collapsed): they see everything,
-//!   heredoc bodies and commit messages included, and err toward deny.
+//!   backslashes removed, whitespace collapsed): they see everything but
+//!   a few exact forms of data (literal commit messages, item 42; the body
+//!   of `cat > <plain path> <<'QUOTED'` and `grep`/`rg` patterns, item
+//!   51, [`data_spans`]), and err toward deny.
 //! - Word rules on the parsed simple commands ([`super::shell`]), after
 //!   wrappers (`env`, `sudo`, `xargs`, `bash -c`, ...) are stripped: git
 //!   flags (`-n`, `-c <key>`), git subcommands, branch renames, and writes
@@ -14,7 +16,25 @@ use std::path::{Component, Path, PathBuf};
 
 use globset::GlobSet;
 
+use super::data;
 use super::shell::{self, SimpleCommand};
+
+/// Why a rule matched: a stable rule id for the metrics log (item 50)
+/// and the text the agent sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reason {
+    /// Stable id (`no-verify`, `interpreter-stdin`, ...). It never holds
+    /// text from the tool call.
+    pub rule: &'static str,
+    /// The message.
+    pub text: String,
+}
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
 
 /// The guard's verdict on one tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,12 +42,28 @@ pub enum Ruling {
     /// No rule matched.
     Allow,
     /// `permissionDecision: "ask"` with this reason (R26).
-    Ask(String),
+    Ask(Reason),
     /// Exit 2 with this reason (R25).
-    Deny(String),
+    Deny(Reason),
 }
 
 impl Ruling {
+    /// A deny by rule `rule`.
+    pub fn deny(rule: &'static str, text: impl Into<String>) -> Self {
+        Self::Deny(Reason {
+            rule,
+            text: text.into(),
+        })
+    }
+
+    /// An ask by rule `rule`.
+    pub fn ask(rule: &'static str, text: impl Into<String>) -> Self {
+        Self::Ask(Reason {
+            rule,
+            text: text.into(),
+        })
+    }
+
     fn rank(&self) -> u8 {
         match self {
             Self::Allow => 0,
@@ -78,44 +114,68 @@ pub fn normalize(text: &str) -> String {
     lowered.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// R25 substrings that deny wherever they appear.
-const DENY_SUBSTRINGS: &[(&str, &str)] = &[
-    ("--no-verify", "--no-verify skips the gate hooks"),
+/// R25 substrings that deny wherever they appear: (needle, rule id, why).
+const DENY_SUBSTRINGS: &[(&str, &str, &str)] = &[
+    (
+        "--no-verify",
+        "no-verify",
+        "--no-verify skips the gate hooks",
+    ),
     (
         "git_config_count",
+        "git-config-env",
         "GIT_CONFIG_* carries the hook injection",
     ),
-    ("git_config_key", "GIT_CONFIG_* carries the hook injection"),
+    (
+        "git_config_key",
+        "git-config-env",
+        "GIT_CONFIG_* carries the hook injection",
+    ),
     (
         "git_config_value",
+        "git-config-env",
         "GIT_CONFIG_* carries the hook injection",
     ),
     (
         "git_config_parameters",
+        "git-config-parameters",
         "GIT_CONFIG_PARAMETERS overrides git config",
     ),
-    ("env -i", "env -i drops the hook injection"),
-    ("env -u git", "env -u GIT_* drops the hook injection"),
+    ("env -i", "env-i", "env -i drops the hook injection"),
+    (
+        "env -u git",
+        "env-u-git",
+        "env -u GIT_* drops the hook injection",
+    ),
     (
         "unset git_config",
+        "unset-git-config",
         "unset GIT_CONFIG_* drops the hook injection",
     ),
     (
         "export git_config",
+        "export-git-config",
         "export GIT_CONFIG_* changes the hook injection",
     ),
-    ("tollgate waive", "tollgate waive is not for agents"),
+    (
+        "tollgate waive",
+        "tollgate-waive",
+        "tollgate waive is not for agents",
+    ),
     (
         "tollgate policy approve",
+        "policy-approve",
         "policy approval is not for agents",
     ),
     (
         "tollgate baseline record",
+        "baseline-record",
         "baseline record needs Victor's terminal (R94)",
     ),
     // L10: the test switch of `install --yes` is not for sessions.
     (
         "tollgate_test_install",
+        "test-install",
         "TOLLGATE_TEST_INSTALL is for tests only (L10)",
     ),
 ];
@@ -144,11 +204,15 @@ fn no_verify_abbrev(norm: &str) -> bool {
 /// The R25 substring and `--no-verify` abbreviation rules on normalized
 /// text.
 fn text_ruling(norm: &str) -> Option<Ruling> {
-    if let Some((_, why)) = DENY_SUBSTRINGS.iter().find(|(n, _)| norm.contains(n)) {
-        return Some(Ruling::Deny(format!("{why} (R25)")));
+    if let Some((_, rule, why)) = DENY_SUBSTRINGS.iter().find(|(n, _, _)| norm.contains(n)) {
+        return Some(Ruling::deny(rule, format!("{why} (R25)")));
     }
-    no_verify_abbrev(norm)
-        .then(|| Ruling::Deny("an abbreviation of --no-verify skips the gate hooks (R25)".into()))
+    no_verify_abbrev(norm).then(|| {
+        Ruling::deny(
+            "no-verify-abbrev",
+            "an abbreviation of --no-verify skips the gate hooks (R25)",
+        )
+    })
 }
 
 /// Wrapper commands whose arguments are another command, with the options
@@ -221,6 +285,8 @@ pub struct Unwrapped {
     /// Why a wrapper changes its environment in a way that can drop or
     /// replace the hook injection (`env -i`, `exec -c`, ...).
     pub env_loss: Option<String>,
+    /// The command words of the stripped wrappers, in order, as written.
+    pub wrappers: Vec<String>,
 }
 
 /// The R25 reason for an `env` that starts with an empty environment.
@@ -424,6 +490,7 @@ pub fn strip_wrappers(words: &[String]) -> Unwrapped {
         let Some((_, takes_value)) = WRAPPERS.iter().find(|(n, _)| *n == name) else {
             break;
         };
+        out.wrappers.push(first.clone());
         let i = match name.as_str() {
             "env" => env_args(&mut w, &mut out),
             "exec" => exec_args(&w, &mut out),
@@ -442,6 +509,8 @@ struct Feed {
     piped: bool,
     /// A heredoc or a here-string.
     inline_doc: bool,
+    /// A here-string (`<<<`).
+    here_string: bool,
     /// Another input redirection (`<`, `<&`, `<>`).
     input: bool,
 }
@@ -452,6 +521,7 @@ impl Feed {
         Self {
             piped: cmd.piped,
             inline_doc: op(&["<<", "<<<"]),
+            here_string: op(&["<<<"]),
             input: op(&["<", "<&", "<>"]),
         }
     }
@@ -472,10 +542,42 @@ struct Run {
     source: Vec<String>,
     /// Where its stdin comes from.
     feed: Feed,
+    /// It is the own run of a top-level command each of whose words bash
+    /// passes as written (`data::expands_nothing` on its source text), in
+    /// a command with no extglob-like text and no `>(...)`
+    /// ([`literal_runs`]); a word bash expands can be an option (`$opt`,
+    /// `-$X`, `-{C,}`, `~`, `-@(C)`) the guard cannot see (item 51,
+    /// security review). False until [`literal_runs`] sets it.
+    literal: bool,
+    /// Its heredoc bodies and here-strings: the text when the command
+    /// gets it as written ([`shell::Redirect::literal`]), `None` when bash
+    /// expands something in it.
+    docs: Vec<Option<String>>,
+}
+
+/// The commands `find` runs: the words after each `-exec`, `-execdir`,
+/// `-ok` or `-okdir` up to its `;` or `+`.
+fn find_commands(args: &[String]) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if matches!(a.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
+            let sub: Vec<String> = it
+                .by_ref()
+                .take_while(|w| !matches!(w.as_str(), ";" | "+"))
+                .cloned()
+                .collect();
+            if !sub.is_empty() {
+                out.push(sub);
+            }
+        }
+    }
+    out
 }
 
 /// The commands a simple command runs: itself after wrappers, plus the
-/// script of `sh -c`/`bash -c`/`eval` parsed again.
+/// text it runs as shell code parsed again (`sh -c`, `eval`, `alias`, a
+/// literal heredoc read by a shell) and the command of `find -exec`.
 fn expand(cmd: &SimpleCommand, inherited: &[String], depth: usize, out: &mut Vec<Run>) {
     let un = strip_wrappers(&cmd.words);
     let mut assigns = inherited.to_vec();
@@ -484,6 +586,16 @@ fn expand(cmd: &SimpleCommand, inherited: &[String], depth: usize, out: &mut Vec
     let words = un.words;
     let source: Vec<String> = cmd.assignments.iter().chain(&cmd.words).cloned().collect();
     let feed = Feed::of(cmd);
+    let literal = false;
+    let docs: Vec<Option<String>> = cmd
+        .redirects
+        .iter()
+        .filter_map(|r| match r.op.as_str() {
+            "<<" => Some(r.literal.then(|| r.body.clone().unwrap_or_default())),
+            "<<<" => Some(r.literal.then(|| r.target.clone())),
+            _ => None,
+        })
+        .collect();
     if words.is_empty() {
         // An assignment statement, a lone redirection, or a wrapper with
         // no command: kept for the env and redirection rules.
@@ -493,22 +605,49 @@ fn expand(cmd: &SimpleCommand, inherited: &[String], depth: usize, out: &mut Vec
             env_loss: un.env_loss,
             source,
             feed,
+            docs,
+            literal,
         });
         return;
     }
     let name = basename(&words[0]);
     if depth < 4 {
-        let script = match name {
-            "sh" | "bash" | "zsh" | "dash" | "ksh" => words
-                .iter()
-                .position(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('c'))
-                .and_then(|i| words.get(i + 1))
-                .cloned(),
-            "eval" => Some(words[1..].join(" ")),
-            _ => None,
-        };
-        if let Some(s) = script {
-            for inner in shell::parse(&s) {
+        // Text bash runs as commands: the script of `sh -c`, `eval`'s
+        // words, an `alias` value (item 51) and a heredoc or here-string
+        // a shell reads as written (item 51; one that expands is text the
+        // guard cannot read, see [`unseen_shell_text`]).
+        let mut scripts: Vec<String> = Vec::new();
+        match name {
+            "sh" | "bash" | "zsh" | "dash" | "ksh" => scripts.extend(
+                words
+                    .iter()
+                    .position(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('c'))
+                    .and_then(|i| words.get(i + 1))
+                    .cloned(),
+            ),
+            "eval" => scripts.push(words[1..].join(" ")),
+            "alias" => scripts.extend(
+                words[1..]
+                    .iter()
+                    .filter_map(|a| a.split_once('=').map(|(_, v)| v.to_owned())),
+            ),
+            _ => {}
+        }
+        if SHELLS.contains(&name) {
+            scripts.extend(docs.iter().flatten().cloned());
+        }
+        for s in &scripts {
+            for inner in shell::parse(s) {
+                expand(&inner, &assigns, depth + 1, out);
+            }
+        }
+        // The command `find -exec` (and its kin) runs (item 51).
+        if name == "find" {
+            for sub in find_commands(&words[1..]) {
+                let inner = SimpleCommand {
+                    words: sub,
+                    ..SimpleCommand::default()
+                };
                 expand(&inner, &assigns, depth + 1, out);
             }
         }
@@ -519,6 +658,8 @@ fn expand(cmd: &SimpleCommand, inherited: &[String], depth: usize, out: &mut Vec
         env_loss: un.env_loss,
         source,
         feed,
+        docs,
+        literal,
     });
 }
 
@@ -913,10 +1054,13 @@ fn command_ruling(ctx: &Context, words: &[String], redirects: &[shell::Redirect]
     for (t, removal) in &targets {
         let p = resolve_path(ctx, t);
         if let Some(dir) = ctx.protected.iter().find(|d| touches(&p, d, *removal)) {
-            return Ruling::Deny(format!(
-                "writes to tollgate's dir {} (R25); reads are allowed",
-                dir.display()
-            ));
+            return Ruling::deny(
+                "state-dir-write",
+                format!(
+                    "writes to tollgate's dir {} (R25); reads are allowed",
+                    dir.display()
+                ),
+            );
         }
     }
     let Some(first) = words.first() else {
@@ -930,7 +1074,7 @@ fn command_ruling(ctx: &Context, words: &[String], redirects: &[shell::Redirect]
             a.ends_with(".lock") && (a.contains("/.git/") || a.starts_with(".git/"))
         })
     {
-        ruling = ruling.max(Ruling::Ask(format!(
+        ruling = ruling.max(Ruling::ask("git-lock-file", format!(
             "{name} of a git lock file: a live git may hold it; check with tollgate doctor --repo . (R26, R39)"
         )));
     }
@@ -938,18 +1082,20 @@ fn command_ruling(ctx: &Context, words: &[String], redirects: &[shell::Redirect]
         return ruling;
     };
     if let Some(v) = call.config.iter().find(|v| dangerous_config_key(v)) {
-        return Ruling::Deny(format!(
-            "git -c {v}: changes hooks, includes or aliases (R25)"
-        ));
+        return Ruling::deny(
+            "git-c-hooks",
+            format!("git -c {v}: changes hooks, includes or aliases (R25)"),
+        );
     }
     if let Some(v) = call
         .config
         .iter()
         .find(|v| v.to_lowercase().starts_with("url."))
     {
-        ruling = ruling.max(Ruling::Ask(format!(
-            "git -c {v}: rewrites remote URLs, which decide remote trust (R26, R5, R14)"
-        )));
+        ruling = ruling.max(Ruling::ask(
+            "git-c-url",
+            format!("git -c {v}: rewrites remote URLs, which decide remote trust (R26, R5, R14)"),
+        ));
     }
     let Some(sub) = call.sub.as_deref() else {
         return ruling;
@@ -957,27 +1103,42 @@ fn command_ruling(ctx: &Context, words: &[String], redirects: &[shell::Redirect]
     let args = &call.args;
     match sub {
         "send-pack" | "receive-pack" => {
-            return Ruling::Deny(format!("git {sub} skips the pre-push gate (R25)"));
+            return Ruling::deny(
+                "git-pack-direct",
+                format!("git {sub} skips the pre-push gate (R25)"),
+            );
         }
         "replace" => {
-            return Ruling::Deny("git replace changes which tree is checked (R12, R25)".into());
+            return Ruling::deny(
+                "git-replace",
+                "git replace changes which tree is checked (R12, R25)",
+            );
         }
         "symbolic-ref"
             if args
                 .iter()
                 .any(|a| a.to_lowercase().starts_with("refs/heads")) =>
         {
-            return Ruling::Deny("git symbolic-ref on a branch (R10, R25)".into());
+            return Ruling::deny(
+                "git-symbolic-ref",
+                "git symbolic-ref on a branch (R10, R25)",
+            );
         }
         "update-ref"
             if args
                 .iter()
                 .any(|a| a.to_lowercase().starts_with("refs/remotes")) =>
         {
-            return Ruling::Deny("git update-ref of a remote-tracking ref (R13, R25)".into());
+            return Ruling::deny(
+                "git-update-ref-remote",
+                "git update-ref of a remote-tracking ref (R13, R25)",
+            );
         }
         "commit" | "am" | "push" if has_short_n(sub, args) => {
-            return Ruling::Deny(format!("git {sub} -n skips the gate hooks (R25)"));
+            return Ruling::deny(
+                "git-short-n",
+                format!("git {sub} -n skips the gate hooks (R25)"),
+            );
         }
         "branch" => {
             const MOVES: &[&str] = &["-m", "-M", "-c", "-C", "--move", "--copy"];
@@ -992,19 +1153,25 @@ fn command_ruling(ctx: &Context, words: &[String], redirects: &[shell::Redirect]
                 if let Some(t) = target {
                     let branch = t.strip_prefix("refs/heads/").unwrap_or(t);
                     if ctx.full_refs.is_match(branch) {
-                        return Ruling::Deny(format!(
-                            "git branch rename/copy onto full ref {t}: use tollgate merge (R25)"
-                        ));
+                        return Ruling::deny(
+                            "branch-move-full",
+                            format!(
+                                "git branch rename/copy onto full ref {t}: use tollgate merge (R25)"
+                            ),
+                        );
                     }
-                    ruling = ruling.max(Ruling::Ask(format!(
-                        "git branch rename/copy to {t} moves a branch without a check (R26)"
-                    )));
+                    ruling = ruling.max(Ruling::ask(
+                        "branch-move",
+                        format!(
+                            "git branch rename/copy to {t} moves a branch without a check (R26)"
+                        ),
+                    ));
                 }
             }
         }
         "config" => {
             if let Some(why) = git_config_write(args) {
-                ruling = ruling.max(Ruling::Ask(why));
+                ruling = ruling.max(Ruling::ask("git-config-write", why));
             }
         }
         _ => {}
@@ -1137,93 +1304,615 @@ const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish", "busybox", "source", ".",
 ];
 
-/// True when python or perl takes its program from stdin: no inline
-/// program (`-c`/`-m` for python, `-e`/`-E` in perl's option clusters) and
-/// no script operand other than `-`.
-fn program_from_stdin(name: &str, args: &[String]) -> bool {
-    let python = name.starts_with("python");
-    // Option letters that give the program inline, and those whose value
-    // is the rest of the cluster (or, for python, the next word).
-    let (inline, valued) = if python {
-        ("cm", "WXQ")
-    } else {
-        ("eE", "IMmxilCd0D")
+/// How an interpreter takes its program on the command line, for one
+/// question only: does it read its program from stdin? (Its program text
+/// is every argument word, [`interpreter_text`]: options are not parsed
+/// for it.)
+struct InterpOptions {
+    /// Short options whose value is the program (`python -c`, `perl -e`).
+    code: &'static str,
+    /// Long options whose value is the program (`--eval`).
+    code_long: &'static [&'static str],
+    /// Short options that take a value.
+    valued: &'static str,
+    /// Short options that take none.
+    flags: &'static str,
+    /// Its first operand is the program (`awk '...'`).
+    operand_is_code: bool,
+    /// It reads commands from stdin whatever its arguments (`ed`, `dc`,
+    /// `sqlite3`).
+    stdin_always: bool,
+}
+
+/// The interpreters the guard knows (item 51): their argument words can
+/// be program text. Any other program that reads text (a heredoc, a
+/// here-string, a pipe) is treated as one too, unless it is a
+/// [`STDIN_DATA_READERS`] program ([`hidden_text`]).
+fn interp_options(name: &str) -> Option<InterpOptions> {
+    let o = |code, code_long, valued, flags, operand_is_code, stdin_always| InterpOptions {
+        code,
+        code_long,
+        valued,
+        flags,
+        operand_is_code,
+        stdin_always,
     };
+    let any = |prefixes: &[&str]| prefixes.iter().any(|p| name.starts_with(p));
+    if any(&["python", "pypy"]) {
+        Some(o("cm", &[], "WXQ", "bBdEhiIOPqsSuvVx", false, false))
+    } else if any(&["perl"]) {
+        Some(o("eE", &[], "IMmxilCd0D", "acnpsStTuUvwWX", false, false))
+    } else if any(&["ruby", "irb"]) {
+        Some(o("e", &[], "IrCEFTKWx0", "acdhlnpsSvwy", false, false))
+    } else if matches!(name, "node" | "nodejs" | "bun" | "deno") {
+        Some(o("ep", &["--eval", "--print"], "rC", "hvic", false, false))
+    } else if any(&["php"]) {
+        Some(o("rBREf", &[], "cdzSt", "ahilmnqsvwHe", false, false))
+    } else if any(&["lua"]) {
+        Some(o("e", &[], "l", "iEvW", false, false))
+    } else if any(&["awk", "gawk", "mawk", "nawk"]) {
+        Some(o("", &["--source", "--file"], "fvF", "", true, false))
+    } else if matches!(name, "ed" | "red" | "dc" | "sqlite3") {
+        Some(o("", &[], "", "", false, true))
+    } else if name == "R"
+        || any(&[
+            "Rscript",
+            "tclsh",
+            "wish",
+            "expect",
+            "julia",
+            "pwsh",
+            "powershell",
+            "osascript",
+            "guile",
+            "racket",
+            "jshell",
+            "groovy",
+            "scala",
+            "elixir",
+            "iex",
+            "erl",
+            "escript",
+            "gdb",
+        ])
+    {
+        Some(o("ce", &[], "", "", false, false))
+    } else {
+        None
+    }
+}
+
+/// True when interpreter `o` with `args` reads its program from stdin:
+/// no inline program and no script operand other than `-`. Fail closed:
+/// after an option it does not know (which can take the next word as its
+/// value), a later operand is not taken for the script.
+fn reads_program_from_stdin(name: &str, o: &InterpOptions, args: &[String]) -> bool {
+    if o.stdin_always {
+        return true;
+    }
+    if name == "deno" {
+        return args.is_empty() || args.iter().any(|a| a == "-");
+    }
+    let mut unsure = false;
     let mut i = 0;
     while let Some(a) = args.get(i) {
         i += 1;
         match a.as_str() {
             "-" => return true,
-            "--" => return args.get(i).is_none_or(|s| s == "-"),
+            "--" => return unsure || args.get(i).is_none_or(|s| s == "-"),
             _ => {}
         }
-        let Some(cluster) = a.strip_prefix('-') else {
-            // A script file.
-            return false;
-        };
-        if cluster.starts_with('-') {
+        if let Some(long) = a.strip_prefix("--") {
+            let opt = long.split_once('=').map_or(long, |(o, _)| o);
+            if o.code_long.contains(&format!("--{opt}").as_str()) {
+                if opt == "file" {
+                    // `awk --file -`.
+                    let value = long
+                        .split_once('=')
+                        .map(|(_, v)| v.to_owned())
+                        .or_else(|| args.get(i).cloned());
+                    if value
+                        .as_deref()
+                        .is_some_and(|v| v == "-" || v == "/dev/stdin")
+                    {
+                        return true;
+                    }
+                }
+                return unsure;
+            }
+            if !long.contains('=') {
+                unsure = true;
+            }
             continue;
         }
+        let Some(cluster) = a.strip_prefix('-') else {
+            // The first operand: the script, or for awk the program.
+            return unsure;
+        };
         for (k, c) in cluster.char_indices() {
-            if inline.contains(c) {
-                return false;
+            let rest = &cluster[k + c.len_utf8()..];
+            if o.code.contains(c) {
+                return unsure;
             }
+            if o.valued.contains(c) {
+                let value = if rest.is_empty() {
+                    i += 1;
+                    args.get(i - 1).map(String::as_str)
+                } else {
+                    Some(rest)
+                };
+                // `awk -f -` reads its program from stdin.
+                if o.operand_is_code && c == 'f' && matches!(value, Some("-" | "/dev/stdin")) {
+                    return true;
+                }
+                if o.operand_is_code && c == 'f' {
+                    return unsure;
+                }
+                break;
+            }
+            if !o.flags.contains(c) {
+                unsure = true;
+                break;
+            }
+        }
+    }
+    !o.operand_is_code || unsure
+}
+
+/// Programs whose stdin is data (item 51), with the exact short options
+/// each may take: (flags, options that take a value). They run no line
+/// of stdin and pass none of it to a program as an argument. Any other
+/// option, short or long, makes the program an interpreter of its text,
+/// since the guard does not read what each option does (security review,
+/// 2026-11-09: `sort --compress-program` runs a program, `mapfile -C`
+/// runs its callback as shell code). `git` takes any option: a message on
+/// `-F -` is item 42's, a patch or a ref list is data.
+const STDIN_DATA_READERS: &[(&str, &str, &str)] = &[
+    ("cat", "nbsvETA", ""),
+    ("tee", "a", ""),
+    ("head", "qv0123456789", "nc"),
+    ("tail", "qv0123456789", "nc"),
+    ("wc", "lwcmL", ""),
+    ("grep", "ivnclLhHEFGwxqsor", "eABCm"),
+    ("egrep", "ivnclLhHwxqsor", "eABCm"),
+    ("fgrep", "ivnclLhHwxqsor", "eABCm"),
+    ("cut", "s", "dfcb"),
+    ("tr", "dscC", ""),
+    ("jq", "rcnsSje", ""),
+    ("read", "rs", "pdnNta"),
+    ("mapfile", "t", "dnOsu"),
+    ("readarray", "t", "dnOsu"),
+];
+
+/// True when `name` with `args` reads its stdin as data
+/// ([`STDIN_DATA_READERS`]): git, or a listed program whose every option
+/// before `--` is one of its own (a value glued to or after a valued
+/// option is skipped).
+fn stdin_data_reader(name: &str, args: &[String]) -> bool {
+    if name == "git" {
+        return true;
+    }
+    let Some(&(_, flags, valued)) = STDIN_DATA_READERS.iter().find(|(n, _, _)| *n == name) else {
+        return false;
+    };
+
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        i += 1;
+        if a == "--" {
+            return true;
+        }
+        let Some(cluster) = a.strip_prefix('-') else {
+            continue;
+        };
+        if cluster.is_empty() {
+            continue;
+        }
+        if cluster.starts_with('-') {
+            return false;
+        }
+        for (k, c) in cluster.char_indices() {
             if valued.contains(c) {
-                if python && k + c.len_utf8() == cluster.len() {
+                if k + c.len_utf8() == cluster.len() {
                     i += 1;
                 }
                 break;
+            }
+            if !flags.contains(c) {
+                return false;
             }
         }
     }
     true
 }
 
-/// Item 31 (21c): in a command that mentions git or tollgate, text the
-/// guard does not check is denied instead of decoded: ANSI-C quoting, a
-/// `\c` escape, and text fed to a shell (or to python or perl) through a
-/// pipe, a heredoc, a here-string or an input redirection, at any depth
-/// (`bash -c '... | sh'` included).
-fn hidden_text(
-    command: &str,
-    cmds: &[SimpleCommand],
-    ansi_c: bool,
-    runs: &[Vec<Run>],
-) -> Option<Ruling> {
-    if !mentions_git_or_tollgate(command, cmds) {
+/// True when run `r` reads its stdin as data: its program does
+/// ([`stdin_data_reader`]) and no `xargs` or `parallel` in front of it
+/// turns stdin into its arguments.
+fn run_reads_data(r: &Run) -> bool {
+    let wrappers = r.source.len().saturating_sub(r.words.len());
+    r.literal
+        && r.words
+            .first()
+            .is_some_and(|w| stdin_data_reader(basename(w), &r.words[1..]))
+        && !r.source[..wrappers]
+            .iter()
+            .any(|w| matches!(basename(w), "xargs" | "parallel"))
+}
+
+/// True when `text` names git or tollgate as a program ([`names_program`]),
+/// as written or without quotes and backslashes (they do not hide a name:
+/// `g"i"t`). ASCII lowercase finds the same names as the Unicode one: no
+/// other character lowercases to a run of these ASCII letters (L19: one
+/// copy of a large heredoc each).
+fn names_git_or_tollgate(text: &str) -> bool {
+    let raw = text.to_ascii_lowercase();
+    let names = |t: &str| ["git", "tollgate"].iter().any(|n| names_program(t, n) > 0);
+    if names(&raw) {
+        return true;
+    }
+    raw.contains(['\'', '"', '\\', '`'])
+        && names(
+            &raw.chars()
+                .filter(|c| !matches!(c, '\'' | '"' | '\\' | '`'))
+                .collect::<String>(),
+        )
+}
+
+/// What a program of run `r` reads as code (item 51; the lead's
+/// correction of 2026-11-09: there is no OS sandbox, so the guard is the
+/// only layer), when `r` runs an interpreter or reads text.
+struct CodeText {
+    /// The program is a shell or a known interpreter ([`interp_options`]).
+    interpreter: bool,
+    /// It reads its program from stdin (always for a shell).
+    from_stdin: bool,
+    /// Text the guard can read: its literal heredocs and here-strings;
+    /// for an interpreter every argument word (for a shell, all but its
+    /// `-c` script, which is parsed as commands) and the assignments it
+    /// sees (`env_text` too).
+    texts: Vec<String>,
+    /// It reads program text the guard cannot see: an input redirection,
+    /// a heredoc or here-string that expands, or (for an interpreter) a
+    /// pipe it reads its program from.
+    unseen: bool,
+    /// It reads a pipe or an input file: what the rest of the command
+    /// prints can be its program, or code it runs (`awk '{system($0)}'`),
+    /// see [`flow_text`].
+    flow: bool,
+}
+
+/// The [`CodeText`] of run `r`; `None` for a program that reads its stdin
+/// as data ([`stdin_data_reader`]), and for one that is no interpreter
+/// and reads no text.
+fn code_text(r: &Run, env_text: &[String]) -> Option<CodeText> {
+    let first = r.words.first()?;
+    let name = basename(first);
+    let args = &r.words[1..];
+    if run_reads_data(r) {
         return None;
     }
-    if ansi_c {
-        return Some(Ruling::Deny(
-            "ANSI-C quoting ($'...') in a command that runs git or tollgate is not checked: write the words plainly, and give a multi-line commit message with -F <file> or a quoted heredoc (item 31, R25)".into(),
+    let shell = SHELLS.contains(&name);
+    let interp = interp_options(name);
+    // `mapfile -C <callback>` runs the callback as shell code for lines
+    // it reads: its words are code like an interpreter's.
+    let callback = matches!(name, "mapfile" | "readarray")
+        && (!r.literal
+            || args
+                .iter()
+                .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('C')));
+    let interpreter = shell || interp.is_some() || callback;
+    let Feed {
+        piped,
+        inline_doc,
+        input,
+        ..
+    } = r.feed;
+    if !(interpreter || piped || inline_doc || input) {
+        return None;
+    }
+    let from_stdin = shell
+        || interp
+            .as_ref()
+            .is_some_and(|o| reads_program_from_stdin(name, o, args));
+    let mut texts: Vec<String> = r.docs.iter().flatten().cloned().collect();
+    if shell {
+        let script = args
+            .iter()
+            .position(|w| w.starts_with('-') && !w.starts_with("--") && w.contains('c'))
+            .map(|i| i + 1);
+        texts.extend(
+            args.iter()
+                .enumerate()
+                .filter(|(i, _)| Some(*i) != script)
+                .map(|(_, a)| a.clone()),
+        );
+    } else if interpreter {
+        texts.extend(args.iter().cloned());
+    }
+    if interpreter || inline_doc {
+        texts.extend(r.assigns.iter().cloned());
+        texts.extend(env_text.iter().cloned());
+    }
+    let expands = r.docs.iter().any(Option::is_none);
+    Some(CodeText {
+        interpreter,
+        from_stdin,
+        texts,
+        unseen: input || expands || (interpreter && piped && from_stdin),
+        flow: piped || input,
+    })
+}
+
+/// Assignments a later program can see in its environment: bare
+/// assignment statements and the words of `export`, `declare`, `typeset`,
+/// `readonly` and `local` (item 51).
+fn env_assignments(runs: &[Vec<Run>]) -> Vec<String> {
+    runs.iter()
+        .flatten()
+        .flat_map(|r| match r.words.first().map(|w| basename(w)) {
+            None => r.assigns.clone(),
+            Some("export" | "declare" | "typeset" | "readonly" | "local") => r.words[1..].to_vec(),
+            Some(_) => Vec::new(),
+        })
+        .collect()
+}
+
+/// Item 51 (security review, 2026-11-09, fail closed): the text that can
+/// flow through a pipe or a file into a program: every argument word,
+/// literal heredoc and here-string and assignment of the command's runs,
+/// but those of a git or tollgate command (their output is not text the
+/// command chose) and of `cd`. Any program can print its arguments
+/// (`jq`, `grep -o`), so none is left out.
+fn flow_text(ctx: &Context, runs: &[Vec<Run>]) -> Vec<String> {
+    runs.iter()
+        .flatten()
+        .filter(|r| {
+            !runs_git_or_tollgate(ctx, &r.words)
+                && r.words.first().is_none_or(|w| basename(w) != "cd")
+        })
+        .flat_map(|r| {
+            r.words
+                .iter()
+                .skip(1)
+                .chain(r.docs.iter().flatten())
+                .chain(&r.assigns)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Item 51: true when command word `word` may be git or tollgate although
+/// it does not read as either: bash expands it (`$G`, `${G}`, a `$(...)`,
+/// a backtick substitution, which leaves a blank in the word), a brace
+/// list (`g{i,}t`), or a glob that can match a program name `git`,
+/// `git-<x>` or `tollgate` (`/usr/bin/gi?`). A lone `*` is a `case`
+/// pattern in practice (`*) ...;;`), and `[`/`[[` are tests.
+fn hidden_program(word: &str) -> bool {
+    if word.contains(['$', '`']) || word.contains(char::is_whitespace) {
+        return true;
+    }
+    if word.contains('{') && word.contains('}') {
+        return true;
+    }
+    if matches!(word, "*" | "[" | "[[") || !word.contains(['*', '?', '[']) {
+        return false;
+    }
+    globset::Glob::new(basename(word)).map_or(true, |g| {
+        let m = g.compile_matcher();
+        ["git", "git-commit", "tollgate"]
+            .iter()
+            .any(|n| m.is_match(n))
+    })
+}
+
+/// Item 51: true when run `r` changes which program a later command word
+/// names: the command hash table (`hash -p`, `BASH_CMDS`), loaded
+/// builtins (`enable`) or aliases set by assignment (`BASH_ALIASES`; an
+/// `alias` value is parsed as commands by [`expand`]).
+fn renames_programs(r: &Run) -> bool {
+    let first = r.words.first().map(|w| basename(w));
+    first == Some("enable")
+        || first == Some("function")
+        || (first == Some("hash")
+            && r.words[1..]
+                .iter()
+                .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('p')))
+        || r.assigns
+            .iter()
+            .chain(&r.words)
+            .any(|w| w.starts_with("BASH_CMDS") || w.starts_with("BASH_ALIASES"))
+}
+
+/// Item 51: a shell that reads text the guard cannot read: from a pipe,
+/// an input redirection, or a heredoc or here-string that expands. A
+/// heredoc or here-string it reads as written is parsed as its commands
+/// ([`expand`]).
+fn unseen_shell_text(runs: &[Vec<Run>]) -> bool {
+    runs.iter().flatten().any(|r| {
+        r.words
+            .first()
+            .is_some_and(|w| SHELLS.contains(&basename(w)))
+            && (r.feed.piped || r.feed.input || r.docs.iter().any(Option::is_none))
+    })
+}
+
+/// Item 51 (security review notes 2 and 3, 2026-11-09): true when the
+/// command may run git or tollgate, read from the parsed command words
+/// only: a command position after wrappers (`env`, `sudo`, `xargs`, ...),
+/// in a substitution, a subshell, a function body, `sh -c`, `eval`, an
+/// `alias` value, a heredoc or here-string a shell reads, or `find
+/// -exec`, that is git or tollgate or may be one ([`hidden_program`]),
+/// or a run that renames programs ([`renames_programs`]). Words inside
+/// quotes, heredoc bodies and here-strings are data to the program that
+/// gets them, so naming git there (a `cat` heredoc, a `grep` pattern)
+/// does not count; an interpreter's program text is checked on its own
+/// ([`hidden_text`]). Text a shell reads that the guard cannot see (a pipe,
+/// an input file, an expanding heredoc) is the exception: it is the
+/// shell's commands, so there any mention of git or tollgate counts, in
+/// the raw text, the normalized text or the decoded words (`decoded`,
+/// `cd` targets left out), as before item 51.
+fn may_run_git_or_tollgate(
+    ctx: &Context,
+    command: &str,
+    cmds: &[SimpleCommand],
+    runs: &[Vec<Run>],
+    decoded: &[String],
+) -> bool {
+    let named = runs.iter().flatten().any(|r| {
+        renames_programs(r)
+            || r.words
+                .first()
+                .is_some_and(|w| runs_git_or_tollgate(ctx, &r.words) || hidden_program(w))
+    });
+    named
+        || unseen_shell_text(runs)
+            && (mentions_git_or_tollgate(command, cmds)
+                || decoded
+                    .iter()
+                    .filter(|d| !d.starts_with("cd "))
+                    .any(|d| names_program(d, "git") > 0 || names_program(d, "tollgate") > 0))
+}
+
+/// Item 51, exemption 4 (the lead's direction of 2026-11-09): a python,
+/// perl or other non-shell interpreter that reads its text from heredocs
+/// only (no here-string, pipe or input file), whose bodies bash passes as
+/// written and name none of git, tollgate, a guarded flag or a guarded
+/// variable, in a command whose parsed words run no git or tollgate
+/// (`runs_git`). Item 31 does not deny it for a mention of git elsewhere
+/// in the command (a `grep git` next to it). A guarded flag or variable
+/// in a body has denied the command already: the substring rules read
+/// the whole command first, and an interpreter's body is never data
+/// ([`data_spans`]).
+fn clean_heredoc_program(r: &Run, runs_git: bool) -> bool {
+    let Some(first) = r.words.first() else {
+        return false;
+    };
+    let name = basename(first);
+    let Feed {
+        piped,
+        inline_doc,
+        here_string,
+        input,
+    } = r.feed;
+    !runs_git
+        && !SHELLS.contains(&name)
+        && interp_options(name).is_some()
+        && inline_doc
+        && !(here_string || piped || input)
+        && !r.docs.is_empty()
+        && r.docs
+            .iter()
+            .all(|d| d.as_deref().is_some_and(|t| !names_git_or_tollgate(t)))
+}
+
+/// Item 31 (21c): in a command that names git or tollgate (its text
+/// outside the item 51 `data` spans, or its parsed words: `runs_git`;
+/// read only when a rule needs it, L19), text the
+/// guard does not check is denied instead of decoded: ANSI-C quoting, a
+/// `\c` escape, and text fed to an interpreter (a shell or one
+/// [`interp_options`] knows) through a pipe it reads its program from, a
+/// heredoc, a here-string or an input redirection, at any depth (`bash -c
+/// '... | sh'` included), except a [`clean_heredoc_program`].
+///
+/// Item 51 (the lead's correction of 2026-11-09: there is no OS sandbox,
+/// so the guard is the only layer): a program can start git itself
+/// (`subprocess.run(['git', 'commit', '-n'])`), so its text is code, not
+/// data, whatever the command's own words run. A program that runs an
+/// interpreter or reads text is denied when the code it gets names git or
+/// tollgate ([`code_text`]): the text the guard can read; the whole
+/// command when it reads program text the guard cannot see, as item 31
+/// did; and the [`flow_text`] when it reads a pipe or a file. Only a
+/// program that reads its stdin as data ([`STDIN_DATA_READERS`]) is left
+/// out. `plain` is the command without its literal messages (item 42)
+/// and literal heredoc bodies, where the `\c` check does not look;
+/// `decoded` are its decoded words.
+#[allow(clippy::too_many_arguments)]
+fn hidden_text(
+    ctx: &Context,
+    extglob: bool,
+    data: &[(usize, usize)],
+    runs_git: bool,
+    plain: &str,
+    ansi_c: bool,
+    command: &str,
+    cmds: &[SimpleCommand],
+    runs: &[Vec<Run>],
+    decoded: &[String],
+) -> Option<Ruling> {
+    let mut named: Option<bool> = None;
+    let mut gate = || {
+        *named.get_or_insert_with(|| {
+            runs_git || mentions_git_or_tollgate(&blanked(command, data), cmds)
+        })
+    };
+    if ansi_c && gate() {
+        return Some(Ruling::deny(
+            "ansi-c",
+            "ANSI-C quoting ($'...') in a command that runs git or tollgate is not checked: write the words plainly, and give a multi-line commit message with -F <file> or a quoted heredoc (item 31, R25)",
         ));
     }
-    if command.contains("\\c") {
-        return Some(Ruling::Deny(
-            "a \\c escape in a command that runs git or tollgate is not checked; write the text without it (item 31, R25)".into(),
+    if plain.contains("\\c") && gate() {
+        return Some(Ruling::deny(
+            "backslash-c",
+            "a \\c escape in a command that runs git or tollgate is not checked; write the text without it (item 31, R25)",
         ));
     }
+    if extglob && mentions_git_or_tollgate(command, cmds) {
+        return Some(Ruling::deny(
+            "extglob",
+            "an extglob pattern (@(...), !(...), +(...), *(...), ?(...)) in a command that names git or tollgate is not checked; write the words plainly (item 51, R25)",
+        ));
+    }
+    let env_text = env_assignments(runs);
+    let mut anywhere: Option<bool> = None;
+    let mut flows: Option<bool> = None;
     for run in runs.iter().flatten() {
-        let Some(first) = run.words.first() else {
+        let Some(code) = code_text(run, &env_text) else {
             continue;
         };
-        let name = basename(first);
+        let name = basename(&run.words[0]);
         let Feed {
             piped,
             inline_doc,
             input,
+            ..
         } = run.feed;
-        let fed = if SHELLS.contains(&name) {
-            piped || inline_doc || input
-        } else if name.starts_with("python") || name == "perl" {
-            inline_doc || (piped && program_from_stdin(name, &run.words[1..]))
-        } else {
-            false
-        };
-        if fed {
-            return Some(Ruling::Deny(format!(
-                "{name} reads text from a pipe, heredoc or redirection in a command that runs git or tollgate; the guard cannot check that text, so run the commands directly (item 31, R25)"
-            )));
+        if code.interpreter
+            && (inline_doc || input || (piped && code.from_stdin))
+            && !clean_heredoc_program(run, runs_git)
+            && gate()
+        {
+            return Some(Ruling::deny(
+                "interpreter-stdin",
+                format!(
+                    "{name} reads text from a pipe, heredoc or redirection in a command that runs git or tollgate; the guard cannot check that text, so run the commands directly (item 31, R25)"
+                ),
+            ));
+        }
+        let names = code.texts.iter().any(|t| names_git_or_tollgate(t))
+            || code.unseen
+                && *anywhere.get_or_insert_with(|| {
+                    mentions_git_or_tollgate(command, cmds)
+                        || decoded
+                            .iter()
+                            .filter(|d| !d.starts_with("cd "))
+                            .any(|d| names_git_or_tollgate(d))
+                })
+            || code.flow
+                && *flows.get_or_insert_with(|| {
+                    flow_text(ctx, runs)
+                        .iter()
+                        .any(|t| names_git_or_tollgate(t))
+                });
+        if names {
+            return Some(Ruling::deny(
+                "interpreter-text",
+                format!(
+                    "{name} gets program text (an argument, heredoc, here-string, pipe or input file) that names git or tollgate; the guard does not check what that program runs (item 51, R25)"
+                ),
+            ));
         }
     }
     None
@@ -1263,11 +1952,484 @@ fn search_only(cmds: &[SimpleCommand], runs: &[Vec<Run>]) -> bool {
         })
 }
 
+/// Item 42: `command` with the literal messages of its top-level `git
+/// commit`, `git merge` and `git tag` commands blanked out
+/// ([`data::message_words`]), and for each command the indices of its
+/// words that were blanked. A message is blanked only when bash passes it
+/// as written: a literal word, the `"$(cat <<'EOF' ... EOF)"` form, or the
+/// body of a heredoc read by `-F -` whose delimiter is quoted or whose
+/// body expands nothing.
+///
+/// With an editor git runs a program on the message file, so nothing is
+/// blanked in a command that may start one: [`data::message_words`]
+/// gives no words for an edit option, and the git call's
+/// `-c`/`--config-env` must not set an editor ([`EDITOR_KEYS`]).
+///
+/// The message is data only while the program that gets it is the real
+/// git with the words as written: the command word is bare `git` or a
+/// [`SYSTEM_GITS`] path, its wrappers are [`PLAIN_WRAPPERS`], and nothing
+/// in `command` (`runs` are all its runs) can change what `git` runs or
+/// set an editor ([`git_can_change`]).
+fn literal_messages(
+    command: &str,
+    cmds: &[SimpleCommand],
+    runs: &[Vec<Run>],
+) -> (String, Vec<Vec<usize>>) {
+    let chars: Vec<char> = command.chars().collect();
+    let mut blank: Vec<(usize, usize)> = Vec::new();
+    let mut skipped = vec![Vec::new(); cmds.len()];
+    for (cmd, skip) in cmds.iter().zip(&mut skipped) {
+        if !cmd.top || cmd.spans.len() != cmd.words.len() {
+            continue;
+        }
+        let un = strip_wrappers(&cmd.words);
+        if !cmd.words.ends_with(&un.words)
+            || !un
+                .wrappers
+                .iter()
+                .all(|w| PLAIN_WRAPPERS.contains(&w.as_str()))
+            || !un
+                .words
+                .first()
+                .is_some_and(|w| w == "git" || SYSTEM_GITS.contains(&w.as_str()))
+        {
+            continue;
+        }
+        let Some(call) = git_call(&un.words) else {
+            continue;
+        };
+        let Some(sub) = call.sub.as_deref() else {
+            continue;
+        };
+        if call.config.iter().any(|c| {
+            let key = c.split('=').next().unwrap_or(c).to_lowercase();
+            EDITOR_KEYS.contains(&key.as_str())
+        }) {
+            continue;
+        }
+        let first_arg = cmd.words.len() - call.args.len();
+        let msgs = data::message_words(sub, &call.args);
+        // Every other word must reach git as written: one that expands
+        // (`$E`, a glob) can be an edit option the reading never saw.
+        let plain = cmd.spans.iter().enumerate().all(|(w, &(a, b))| {
+            w.checked_sub(first_arg)
+                .is_some_and(|i| msgs.words.contains(&i))
+                || data::plain_word(
+                    &chars[a..b].iter().collect::<String>(),
+                    a.checked_sub(1).map(|k| chars[k]),
+                    chars.get(b).copied(),
+                )
+        });
+        if !plain {
+            continue;
+        }
+        for i in msgs.words {
+            let w = first_arg + i;
+            let Some(&(a, b)) = cmd.spans.get(w) else {
+                continue;
+            };
+            let raw: String = chars[a..b].iter().collect();
+            let before = a.checked_sub(1).map(|k| chars[k]);
+            let after = chars.get(b).copied();
+            if data::literal_word(&raw, before, after)
+                || data::cat_heredoc_word(&raw, before, after)
+            {
+                blank.push((a, b));
+                skip.push(w);
+            }
+        }
+        if msgs.stdin {
+            blank.extend(
+                cmd.redirects
+                    .iter()
+                    .filter(|r| r.op == "<<" && r.literal)
+                    .filter_map(|r| r.body_span),
+            );
+        }
+    }
+    let mut rest = chars;
+    blank_spans(&mut rest, &blank);
+    let rest: String = rest.into_iter().collect();
+    if !blank.is_empty() && git_can_change(&without_literal_docs(&rest, cmds), runs) {
+        return (command.to_owned(), vec![Vec::new(); cmds.len()]);
+    }
+    (rest, skipped)
+}
+
+/// Absolute paths of the system git that a masked message may go to
+/// (item 42); any other path can be a program the agent wrote.
+const SYSTEM_GITS: &[&str] = &["/usr/bin/git", "/bin/git"];
+
+/// Wrappers that run bare `git` with its words unchanged, found the same
+/// way (item 42). `env` can set PATH or split words (`-S`), `xargs` adds
+/// words, `exec`, `sudo` and the others change how or as whom git runs.
+const PLAIN_WRAPPERS: &[&str] = &[
+    "command", "nohup", "time", "timeout", "nice", "then", "do", "else", "elif", "if", "while",
+    "until", "!",
+];
+
+/// Bash builtins and keywords that can set a variable, an alias, a
+/// function, a shell option, a trap or the command hash table, or run
+/// text as shell code. The other builtins (`:`, `true`, `false`, `echo`,
+/// `pwd`, `cd`, `pushd`, `popd`, `dirs`, `test`, `[`, `type`, `help`,
+/// `times`, `ulimit`, `umask`, `jobs`, `bg`, `fg`, `kill`, `disown`,
+/// `suspend`, `logout`, `exit`, `return`, `break`, `continue`, `shift`,
+/// `caller`, `command`, `builtin`, `exec`) change none of these;
+/// `printf` and `wait` do only with an option (`-v`, `-p`).
+const STATE_BUILTINS: &[&str] = &[
+    ".",
+    "source",
+    "eval",
+    "alias",
+    "unalias",
+    "shopt",
+    "set",
+    "hash",
+    "enable",
+    "trap",
+    "declare",
+    "typeset",
+    "local",
+    "readonly",
+    "export",
+    "unset",
+    "read",
+    "mapfile",
+    "readarray",
+    "getopts",
+    "let",
+    "fc",
+    "history",
+    "bind",
+    "compgen",
+    "complete",
+    "compopt",
+    "function",
+    "coproc",
+    "for",
+    "select",
+    "[[",
+];
+
+/// Item 42 recheck: true when Bash command `text` (its masked messages and
+/// literal heredoc bodies blanked; `runs` are all its runs) can change
+/// what its `git` runs or let an editor start, so a message it passes to
+/// git can become code: a function definition (`git() { eval "$3"; }`),
+/// an alias, the hash table (`hash -p`, `BASH_CMDS`), a loaded builtin, a
+/// sourced file, a trap, or PATH, an [`EDITOR_VARS`] variable or a
+/// `BASH*` variable set in any way. Arithmetic (`((`, `$((`, `$[`, `[[`,
+/// `let`) and `${...}` can assign a variable whose name is computed, so
+/// they count too.
+fn git_can_change(text: &str, runs: &[Vec<Run>]) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let fn_def = t
+        .iter()
+        .enumerate()
+        .any(|(i, &c)| c == '(' && t[i + 1..].iter().find(|c| !c.is_whitespace()) == Some(&')'));
+    if fn_def || text.contains("((") || text.contains("$[") || text.contains("${") {
+        return true;
+    }
+    let lookup_var = |a: &String| {
+        let name = a.split(['=', '[', '+']).next().unwrap_or(a);
+        name == "PATH"
+            || name.starts_with("BASH")
+            || EDITOR_VARS.contains(&name)
+            || matches!(name, "ENV" | "SHELLOPTS" | "PS4")
+    };
+    runs.iter().flatten().any(|r| {
+        r.assigns.iter().any(lookup_var)
+            || r.words.first().is_some_and(|w| {
+                w.contains('=')
+                    || STATE_BUILTINS.contains(&w.as_str())
+                    || matches!(w.as_str(), "printf" | "wait")
+                        && r.words[1..]
+                            .iter()
+                            .any(|a| a.starts_with('-') || a.contains('$'))
+            })
+    })
+}
+
+/// Variables that name the program git runs as its editor.
+const EDITOR_VARS: &[&str] = &["GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "VISUAL", "EDITOR"];
+
+/// Config keys that name the program git runs as its editor.
+const EDITOR_KEYS: &[&str] = &["core.editor", "sequence.editor"];
+
+/// Replaces the chars of `spans` with blanks (newlines stay, so lines and
+/// words never join).
+fn blank_spans(chars: &mut [char], spans: &[(usize, usize)]) {
+    for &(a, b) in spans {
+        for c in &mut chars[a..b] {
+            if *c != '\n' {
+                *c = ' ';
+            }
+        }
+    }
+}
+
+/// `text` (the command, messages blanked) without the bodies of its
+/// top-level heredocs that bash passes as written. A `\c` there is a
+/// character of a file or a message, not an escape any shell reads: a
+/// body fed to a shell is denied on its own (item 31).
+fn without_literal_docs(text: &str, cmds: &[SimpleCommand]) -> String {
+    let mut chars: Vec<char> = text.chars().collect();
+    let spans: Vec<(usize, usize)> = cmds
+        .iter()
+        .filter(|c| c.top)
+        .flat_map(|c| &c.redirects)
+        .filter(|r| r.op == "<<" && r.literal)
+        .filter_map(|r| r.body_span)
+        .collect();
+    blank_spans(&mut chars, &spans);
+    chars.into_iter().collect()
+}
+
+/// The words of each run as bash passes them, normalized: one string per
+/// run, so words of separate commands never join. A command's own run is
+/// the last of its runs; its words at the indices in `skip` (per command)
+/// are left out.
+fn decoded_words(cmds: &[SimpleCommand], runs: &[Vec<Run>], skip: &[Vec<usize>]) -> Vec<String> {
+    cmds.iter()
+        .zip(runs)
+        .zip(skip)
+        .flat_map(|((cmd, runs), skip)| {
+            let own = runs.len().saturating_sub(1);
+            runs.iter().enumerate().map(move |(k, r)| {
+                let words: Vec<&str> = r
+                    .source
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| {
+                        k != own
+                            || j.checked_sub(cmd.assignments.len())
+                                .is_none_or(|w| !skip.contains(&w))
+                    })
+                    .map(|(_, w)| w.as_str())
+                    .collect();
+                normalize(&words.join(" "))
+            })
+        })
+        .collect()
+}
+
+/// True when a program that does not read its stdin as data
+/// ([`stdin_data_reader`]: `xargs`, git commands behind it, an
+/// interpreter, a pager) reads a pipe, an input file or an expanding
+/// heredoc: data printed anywhere in the command can become its code or
+/// arguments, so nothing is exempt (item 51, fail closed).
+fn non_data_reader_reads(runs: &[Vec<Run>]) -> bool {
+    runs.iter().flatten().any(|r| {
+        (r.feed.piped || r.feed.input || r.docs.iter().any(Option::is_none)) && !run_reads_data(r)
+    })
+}
+
+/// True when redirection target `target` is a plain path to a regular
+/// file: a word bash takes as written (no `$`, backtick, glob, brace,
+/// tilde or blank), with no `..` part, outside `/dev` and `/proc` however
+/// spelled (`//dev/stdout`, `/./proc/self/fd/1`; a relative `dev/x` too,
+/// since the cwd can be `/`) (item 51, security review note 1).
+fn plain_file_target(r: &shell::Redirect) -> bool {
+    let t = r.target.as_str();
+    let parts: Vec<&str> = t
+        .split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    r.literal
+        && !t.is_empty()
+        && !t.contains(|c: char| {
+            c.is_whitespace() || c.is_control() || "$`*?[]{}~!\\'\"".contains(c)
+        })
+        && !parts.contains(&"..")
+        && parts.first().is_some_and(|p| !matches!(*p, "dev" | "proc"))
+}
+
+/// Item 51, exemption 2 (the lead's direction of 2026-11-09): the body
+/// of `cat > <plain path> <<'QUOTED'`, exactly: a top-level `cat` with no
+/// other word, no assignment and no pipe into it, one `>` to a
+/// [`plain_file_target`] and one heredoc whose delimiter is quoted. The
+/// body goes to a file as written; the command runs none of it.
+fn cat_file_body(chars: &[char], cmd: &SimpleCommand) -> Option<(usize, usize)> {
+    let [to, doc] = cmd.redirects.as_slice() else {
+        return None;
+    };
+    let body = doc.body_span?;
+    let ok = cmd.top
+        && cmd.words == ["cat"]
+        && cmd.spans.len() == 1
+        && cmd.assignments.is_empty()
+        && !cmd.piped
+        && to.op == ">"
+        && plain_file_target(to)
+        && doc.op == "<<"
+        && doc.literal;
+    // The delimiter is quoted: in the source between `cat` and the body,
+    // `<<` (or `<<-`) is followed by a quote or a backslash.
+    let quoted = || {
+        let head: String = chars[cmd.spans[0].1..body.0.min(chars.len())]
+            .iter()
+            .collect();
+        head.find("<<").is_some_and(|at| {
+            head[at + 2..]
+                .trim_start_matches('-')
+                .trim_start_matches([' ', '\t'])
+                .starts_with(['\'', '"', '\\'])
+        })
+    };
+    (ok && quoted()).then_some(body)
+}
+
+/// Item 51, exemption 3 (the lead's direction of 2026-11-09): the
+/// argument words of a top-level `grep`, `egrep`, `fgrep` or `rg` (no
+/// wrapper, no assignment) that cannot print or run them: no option
+/// before `--` reads patterns from a file (`-f`), prints only the match
+/// (`-o`), replaces it (`rg -r`) or runs a program (`rg --pre`,
+/// `--hostname-bin`), and its output goes to no file. `None` otherwise;
+/// else the index of its first argument word.
+fn grep_pattern_words(cmd: &SimpleCommand) -> Option<usize> {
+    let name = cmd.words.first()?.as_str();
+    if !matches!(name, "grep" | "egrep" | "fgrep" | "rg")
+        || !cmd.top
+        || !cmd.assignments.is_empty()
+        || cmd.spans.len() != cmd.words.len()
+        || cmd.redirects.iter().any(shell::Redirect::writes_file)
+    {
+        return None;
+    }
+    let shorts = if name == "rg" { "for" } else { "fo" };
+    for a in cmd.words[1..].iter().take_while(|a| *a != "--") {
+        let unsafe_long = [
+            "--file",
+            "--only-matching",
+            "--replace",
+            "--pre",
+            "--hostname-bin",
+        ]
+        .iter()
+        .any(|o| a.starts_with(o));
+        let unsafe_short = a.len() > 1
+            && a.starts_with('-')
+            && !a.starts_with("--")
+            && a[1..].contains(|c: char| shorts.contains(c));
+        if unsafe_long || unsafe_short {
+            return None;
+        }
+    }
+    Some(1)
+}
+
+/// Item 51 (the lead's direction of 2026-11-09: the smallest set of exact
+/// exemptions): the spans of the command that are data, for the substring
+/// rules and for the item 31 mention of git or tollgate, and per command
+/// the indices of its words among them, for the decoded-word rules: the
+/// body of a [`cat_file_body`] and the words of a [`grep_pattern_words`]
+/// command with no substitution in them. Nothing is data when a program
+/// that does not read its stdin as data reads a pipe, an input file or an
+/// expanding heredoc ([`non_data_reader_reads`]), or output can reach a
+/// process substitution `>(...)` or a `coproc`, and none when the
+/// command can change what `cat`, `grep` or `rg` runs: the check item 42
+/// makes for git ([`git_can_change`]: a function definition, `function`,
+/// `alias`, `hash`, `enable`, `source`/`.`, a PATH or `BASH*`
+/// assignment, ...), and [`renames_programs`] (security review,
+/// 2026-11-09). Item 42's literal messages are the other exemption
+/// ([`literal_messages`]).
+fn data_spans(
+    command: &str,
+    cmds: &[SimpleCommand],
+    runs: &[Vec<Run>],
+    extglob: bool,
+) -> (Vec<(usize, usize)>, Vec<Vec<usize>>) {
+    let mut skip = vec![Vec::new(); cmds.len()];
+    let mut spans = Vec::new();
+    if command.contains(">(")
+        || runs
+            .iter()
+            .flatten()
+            .any(|r| r.words.first().is_some_and(|w| w == "coproc"))
+        || extglob
+        || non_data_reader_reads(runs)
+        || git_can_change(&without_literal_docs(command, cmds), runs)
+        || runs.iter().flatten().any(renames_programs)
+    {
+        return (spans, skip);
+    }
+    let mut chars: Option<Vec<char>> = None;
+    for (cmd, skip) in cmds.iter().zip(skip.iter_mut()) {
+        let chars = chars.get_or_insert_with(|| command.chars().collect());
+        if let Some(body) = cat_file_body(chars, cmd) {
+            spans.push(body);
+        } else if let Some(first_arg) = grep_pattern_words(cmd) {
+            for (w, &(a, b)) in cmd.spans.iter().enumerate().skip(first_arg) {
+                let raw: String = chars[a..b].iter().collect();
+                if !(raw.contains('`') || raw.contains("$(") || raw.contains("<(")) {
+                    spans.push((a, b));
+                    skip.push(w);
+                }
+            }
+        }
+    }
+    (spans, skip)
+}
+
+/// Item 51 (the lead's direction of 2026-11-09, fail closed): the raw
+/// command has `@`, `!`, `+`, `*` or `?` right before `(`, which bash can
+/// read as an extglob (`-@(C)`, `@(#$(...))`, also in a redirection
+/// target or an assignment). `bash_ruling` passes the command without
+/// its literal messages and literal top-level heredoc bodies, where bash
+/// expands nothing (Rust's `assert!(`), and hands the answer on as
+/// `extglob`. The lexer does not read extglobs, so no data
+/// exemption applies, no program reads stdin as data, `mapfile` counts
+/// as running a callback, and a mention of git or tollgate anywhere
+/// denies ([`hidden_text`]).
+fn extglob_like(command: &str) -> bool {
+    command
+        .as_bytes()
+        .windows(2)
+        .any(|w| matches!(w[0], b'@' | b'!' | b'+' | b'*' | b'?') && w[1] == b'(')
+}
+
+/// Sets [`Run::literal`] (item 51): the own run (the last) of a top-level
+/// command whose words bash all passes as written, read from its source
+/// text; never in a command with extglob-like text or `>(...)`, whose
+/// commands the lexer may not see whole.
+fn literal_runs(command: &str, cmds: &[SimpleCommand], runs: &mut [Vec<Run>], extglob: bool) {
+    if extglob || command.contains(">(") {
+        return;
+    }
+    let chars: Vec<char> = command.chars().collect();
+    // A nested command's source text is not at hand: its words (quotes
+    // removed) must hold no char that can expand, and no blank, which a
+    // backtick substitution leaves (fail closed: a quoted `*` counts).
+    let plain = |w: &String| !w.contains(|c: char| c.is_whitespace() || "$`*?[]{}~!()".contains(c));
+    for (cmd, runs) in cmds.iter().zip(runs.iter_mut()) {
+        let own = runs.len().saturating_sub(1);
+        for (k, r) in runs.iter_mut().enumerate() {
+            r.literal = if cmd.top && k == own {
+                cmd.spans.len() == cmd.words.len()
+                    && cmd.spans.iter().all(|&(a, b)| {
+                        data::expands_nothing(&chars[a..b].iter().collect::<String>())
+                    })
+            } else {
+                r.source.iter().all(plain)
+            };
+        }
+    }
+}
+
+/// `text` with the chars of `spans` blanked ([`blank_spans`]).
+fn blanked(text: &str, spans: &[(usize, usize)]) -> String {
+    if spans.is_empty() {
+        return text.to_owned();
+    }
+    let mut chars: Vec<char> = text.chars().collect();
+    blank_spans(&mut chars, spans);
+    chars.into_iter().collect()
+}
+
 /// R25/R26 for a Bash command.
 #[must_use]
 pub fn bash_ruling(ctx: &Context, command: &str) -> Ruling {
     let (cmds, ansi_c) = shell::parse_flagged(command);
-    let runs: Vec<Vec<Run>> = cmds
+    let mut runs: Vec<Vec<Run>> = cmds
         .iter()
         .map(|cmd| {
             let mut runs = Vec::new();
@@ -1276,20 +2438,38 @@ pub fn bash_ruling(ctx: &Context, command: &str) -> Ruling {
         })
         .collect();
     let search = search_only(&cmds, &runs);
-    if !search && let Some(deny) = text_ruling(&normalize(command)) {
+    let (masked, mut skip) = literal_messages(command, &cmds, &runs);
+    let plain = without_literal_docs(&masked, &cmds);
+    let extglob = extglob_like(&plain);
+    literal_runs(command, &cmds, &mut runs, extglob);
+    let (data, data_words) = data_spans(command, &cmds, &runs, extglob);
+    for (s, d) in skip.iter_mut().zip(data_words) {
+        s.extend(d);
+    }
+    if !search && let Some(deny) = text_ruling(&normalize(&blanked(&masked, &data))) {
         return deny;
     }
-    if let Some(deny) = hidden_text(command, &cmds, ansi_c, &runs) {
+    let decoded_all = decoded_words(&cmds, &runs, &vec![Vec::new(); cmds.len()]);
+    let runs_git = may_run_git_or_tollgate(ctx, command, &cmds, &runs, &decoded_all);
+    if let Some(deny) = hidden_text(
+        ctx,
+        extglob,
+        &data,
+        runs_git,
+        &plain,
+        ansi_c,
+        command,
+        &cmds,
+        &runs,
+        &decoded_all,
+    ) {
         return deny;
     }
     // The same rules on the words as bash passes them: quoting hides a
     // name from the text (`$'\x2d-no-verify'`, `$'\x47IT_CONFIG_COUNT'`).
-    // One command per segment, so words of separate commands never join.
-    let decoded: Vec<String> = runs
-        .iter()
-        .flatten()
-        .map(|r| normalize(&r.source.join(" ")))
-        .collect();
+    // Literal messages (item 42) and grep patterns (item 51) are left
+    // out.
+    let decoded = decoded_words(&cmds, &runs, &skip);
     if !search && let Some(deny) = text_ruling(&decoded.join(" ; ")) {
         return deny;
     }
@@ -1309,7 +2489,7 @@ pub fn bash_ruling(ctx: &Context, command: &str) -> Ruling {
         let ctx = &here;
         for (k, run) in runs.iter().enumerate() {
             if let Some(why) = &run.env_loss {
-                return Ruling::Deny(format!("{why} (R25)"));
+                return Ruling::deny("env-loss", format!("{why} (R25)"));
             }
             if runs_git_or_tollgate(ctx, &run.words)
                 && let Some((var, why)) = run
@@ -1318,7 +2498,10 @@ pub fn bash_ruling(ctx: &Context, command: &str) -> Ruling {
                     .find_map(|a| sets_guarded_var(a))
                     .or(shell_sets)
             {
-                return Ruling::Deny(format!("{var} set for git or tollgate {why}"));
+                return Ruling::deny(
+                    "guarded-var",
+                    format!("{var} set for git or tollgate {why}"),
+                );
             }
             // Redirections belong to the outer command only.
             let redirects: &[shell::Redirect] = if k + 1 == runs.len() {
@@ -1410,16 +2593,16 @@ pub fn is_repair_command(ctx: &Context, command: &str) -> bool {
 pub fn file_ruling(ctx: &Context, file: &str) -> Ruling {
     let p = resolve_path(ctx, file);
     if lower(&p) == lower(&ctx.host_config) {
-        return Ruling::Ask(format!(
-            "edit of the tollgate host config {} (R26)",
-            p.display()
-        ));
+        return Ruling::ask(
+            "host-config-edit",
+            format!("edit of the tollgate host config {} (R26)", p.display()),
+        );
     }
     if let Some(dir) = ctx.protected.iter().find(|d| touches(&p, d, false)) {
-        return Ruling::Deny(format!(
-            "write under tollgate's dir {} (R25, R26)",
-            dir.display()
-        ));
+        return Ruling::deny(
+            "state-dir-write",
+            format!("write under tollgate's dir {} (R25, R26)", dir.display()),
+        );
     }
     let comps: Vec<String> = p
         .components()
@@ -1431,19 +2614,25 @@ pub fn file_ruling(ctx: &Context, file: &str) -> Ruling {
         && file_name.starts_with("settings")
         && file_name.ends_with(".json")
     {
-        return Ruling::Ask(format!(
-            "edit of Claude Code settings {} (R26)",
-            p.display()
-        ));
+        return Ruling::ask(
+            "claude-settings-edit",
+            format!("edit of Claude Code settings {} (R26)", p.display()),
+        );
     }
     if comps.iter().any(|c| c == ".git") {
-        return Ruling::Ask(format!("write under .git/: {} (R26)", p.display()));
+        return Ruling::ask(
+            "git-dir-write",
+            format!("write under .git/: {} (R26)", p.display()),
+        );
     }
     if comps.iter().any(|c| c == ".githooks") {
-        return Ruling::Ask(format!("edit of a repo hook {} (R26)", p.display()));
+        return Ruling::ask(
+            "repo-hook-edit",
+            format!("edit of a repo hook {} (R26)", p.display()),
+        );
     }
-    if let Some(why) = super::repo_rules(&p) {
-        return Ruling::Ask(why);
+    if let Some((rule, why)) = super::repo_rules(&p) {
+        return Ruling::ask(rule, why);
     }
     Ruling::Allow
 }
@@ -1485,6 +2674,66 @@ mod tests {
 
     fn ask(cmd: &str) -> bool {
         matches!(bash_ruling(&ctx(), cmd), Ruling::Ask(_))
+    }
+
+    /// Item 50: `tollgate stats` groups by these ids, so they stay put.
+    #[test]
+    fn rule_ids_are_stable_and_hold_no_command_text() {
+        let c = ctx();
+        let rule = |r: Ruling| match r {
+            Ruling::Deny(r) => ("deny", r.rule),
+            Ruling::Ask(r) => ("ask", r.rule),
+            Ruling::Allow => ("allow", ""),
+        };
+        for (cmd, want) in [
+            ("git commit --no-verify -m x", ("deny", "no-verify")),
+            ("git push --no-ver origin x", ("deny", "no-verify-abbrev")),
+            ("GIT_CONFIG_COUNT=0 git commit", ("deny", "git-config-env")),
+            ("env -i git commit", ("deny", "env-i")),
+            ("tollgate waive --tree x", ("deny", "tollgate-waive")),
+            (
+                "echo x > /h/.local/state/tollgate/a",
+                ("deny", "state-dir-write"),
+            ),
+            ("git -c core.hooksPath=/x commit", ("deny", "git-c-hooks")),
+            ("git -c url.a.insteadOf=b fetch", ("ask", "git-c-url")),
+            ("git send-pack o main", ("deny", "git-pack-direct")),
+            ("git replace a b", ("deny", "git-replace")),
+            (
+                "git symbolic-ref HEAD refs/heads/x",
+                ("deny", "git-symbolic-ref"),
+            ),
+            (
+                "git update-ref refs/remotes/o/x HEAD",
+                ("deny", "git-update-ref-remote"),
+            ),
+            ("git commit -n -m x", ("deny", "git-short-n")),
+            ("git branch -M x main", ("deny", "branch-move-full")),
+            ("git branch -m x y", ("ask", "branch-move")),
+            ("git config core.hooksPath x", ("ask", "git-config-write")),
+            ("rm .git/index.lock", ("ask", "git-lock-file")),
+            ("git commit -m $'x'", ("deny", "ansi-c")),
+            ("HOME=/tmp git commit -m x", ("deny", "guarded-var")),
+            ("bash <<'E'\ngit status\nE", ("deny", "interpreter-stdin")),
+            ("ls", ("allow", "")),
+        ] {
+            assert_eq!(rule(bash_ruling(&c, cmd)), want, "{cmd}");
+        }
+        for (file, want) in [
+            (
+                "/h/.config/tollgate/config.toml",
+                ("ask", "host-config-edit"),
+            ),
+            ("/h/.local/state/tollgate/x", ("deny", "state-dir-write")),
+            (
+                "/w/repo/.claude/settings.json",
+                ("ask", "claude-settings-edit"),
+            ),
+            ("/w/repo/.git/config", ("ask", "git-dir-write")),
+            ("/w/repo/.githooks/pre-commit", ("ask", "repo-hook-edit")),
+        ] {
+            assert_eq!(rule(file_ruling(&c, file)), want, "{file}");
+        }
     }
 
     #[test]
@@ -1563,9 +2812,11 @@ mod tests {
         assert_eq!(bash_ruling(&ctx(), "echo env; echo -u git"), Ruling::Allow);
     }
 
-    /// Item 31 (21c): in a command that mentions git or tollgate, ANSI-C
+    /// Item 31 (21c): in a command that runs git or tollgate, ANSI-C
     /// quoting, a `\c` escape and text fed to an interpreter's stdin
-    /// deny; the guard does not chase bash's decoding there.
+    /// deny; the guard does not chase bash's decoding there. Item 51: a
+    /// python or perl program whose text names git denies with or without
+    /// a git command next to it.
     #[test]
     fn hidden_text_in_git_commands_denies_r25() {
         for cmd in [
@@ -1574,7 +2825,6 @@ mod tests {
             r"git commit $'\c\\' -n -m x",
             r"git commit $'\c-\c-no-verify' -m x",
             r"git commit -m $'two\nlines'",
-            r"git commit -m 'path C:\code'",
             r"tollgate check $'\x2d-tier' full",
             "bash <<< 'git commit -n -m x'",
             "sh <<'EOF'\ngit commit -n -m x\nEOF",
@@ -1587,6 +2837,9 @@ mod tests {
             "sh -c 'sh <<< \"git push -n origin x\"'",
             "bash < /dev/stdin <<< 'git commit -n -m x'",
             ". /dev/stdin <<< 'git commit -n -m x'",
+            "git status; python3 - <<'EOF'\nimport os; os.system('git commit -n -m x')\nEOF",
+            "git status; python3 <<< 'import os; os.system(\"git commit -n\")'",
+            "git status; perl <<< 'system(\"git commit -n -m x\")'",
             "python3 - <<'EOF'\nimport os; os.system('git commit -n -m x')\nEOF",
             "python3 <<< 'import os; os.system(\"git commit -n\")'",
             "perl <<< 'system(\"git commit -n -m x\")'",
@@ -1625,12 +2878,13 @@ mod tests {
         for cmd in [
             "python3 - <<'EOF'\nimport os; os.system('git commit -m x')\nEOF",
             "python3 - <<'EOF'\nimport os; os.system('/usr/bin/git commit -m x')\nEOF",
-            "python3 - <<'EOF'\nopen('.git/hooks/pre-commit','w')\nEOF",
             "python3 - <<'EOF'\nimport os; os.system('tollgate check')\nEOF",
             "python3 - <<'EOF'\nimport os; os.system('g\"i\"t status')\nEOF",
-            "cd /h/Repos/tollgate; git status; python3 - <<'EOF'\nprint(1)\nEOF",
-            "cd git; git status; python3 - <<'EOF'\nprint(1)\nEOF",
             "cd /h/git; python3 - <<'EOF'\nimport os; os.system('git push')\nEOF",
+            "/usr/bin/git status; python3 - <<'EOF'\nprint(1)\nEOF",
+            "g\"i\"t status; python3 - <<'EOF'\nprint(1)\nEOF",
+            "cd /h/Repos/tollgate; git status; python3 - <<'EOF'\nimport subprocess\nEOF",
+            "cd git; git status; python3 - <<'EOF'\nimport subprocess\nEOF",
             "cd /h/Repos/tollgate; echo 'git commit -m x' | sh",
             // A `cd` target never removes part of another word.
             "printf 'git commit -n' | sh; cd g",
@@ -1691,6 +2945,7 @@ mod tests {
             "env -i grep x a",
             "rg --pre ./f GIT_CONFIG_COUNT a",
             "cat <<'EOF' > run.sh\ngit commit --no-verify\nEOF",
+            "cat <<'EOF' | sh\ngit commit --no-verify\nEOF",
             "grep -- --no-verify a > run.sh",
             "export GIT_CONFIG_COUNT=0",
         ] {
@@ -1698,9 +2953,9 @@ mod tests {
         }
     }
 
-    /// A command that does not mention git or tollgate keeps the ANSI-C
-    /// decoder, which reads `$'...'` as bash does (`\c\\` is one
-    /// character), so the words it hides are checked (R25).
+    /// The ANSI-C decoder reads `$'...'` as bash does (`\c\\` is one
+    /// character), so the words it hides are checked (R25): a decoded
+    /// `git` is a command word that runs git (item 51).
     #[test]
     fn decoded_words_without_a_git_mention_deny_r25() {
         for cmd in [
@@ -1985,6 +3240,552 @@ mod tests {
         assert!(!is_repair_command(&c, "cd x && tollgate doctor"));
         assert!(!is_repair_command(&c, "tollgate doctor $(git commit -n)"));
         assert!(!is_repair_command(&c, "git status"));
+    }
+
+    /// Item 42: a commit, merge or tag message is data git stores. A
+    /// literal message value (`-m`, `--message`, a quoted heredoc on
+    /// `-F -`, the `"$(cat <<'EOF' ... EOF)"` form) is not scanned by the
+    /// text rules, so a message can name a flag or a variable.
+    #[test]
+    fn literal_messages_are_data_item42() {
+        for cmd in [
+            "git commit -m \"docs: mention --no-verify in README\"",
+            "git commit -m 'Fix env' -i src/a.rs",
+            "git commit -m 'GIT_CONFIG_COUNT and core.hooksPath in docs'",
+            "git commit -am 'explain env -i'",
+            "git commit -m'--no-verify' a.rs",
+            "git commit --message='skip --no-v in tests'",
+            "git commit --message 'x --no-verify'",
+            "git commit -m subject -m 'body: unset GIT_CONFIG_KEY_0'",
+            "git commit -m 'it'\"'\"'s --no-verify'",
+            "git commit -m 'path C:\\code'",
+            "/usr/bin/git commit -m 'mention --no-verify'",
+            "git -C /w/repo commit -q -m 'tollgate waive is not for agents'",
+            "cd /w/repo && git add a.md && git commit -m 'docs: --no-verify'",
+            "git commit -m \"$(cat <<'EOF'\nGuard: deny --no-verify\n\nGIT_CONFIG_COUNT (item 42)\nEOF\n)\"",
+            "git commit -m \"$(cat <<\"EOF\"\nenv -i drops it)\nEOF\n)\" a.rs",
+            "git commit -F - <<'EOF'\nsubject --no-verify\n\nenv -i and GIT_CONFIG_COUNT\nEOF",
+            "git commit --file=- <<'MSG'\ntollgate waive\nMSG",
+            "git commit -F - <<EOF\nplain --no-verify\nEOF",
+            "git tag -a v1 -m 'no --no-verify here'",
+            "git merge --no-ff -m 'merge: env -i fix' feat",
+        ] {
+            assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
+        for cmd in [
+            // The flag outside the message, or a word git reads as a flag.
+            "git commit -m x --no-verify",
+            "git commit -m 'x' --no-verify",
+            "git commit -um --no-verify",
+            "git commit -F -m --no-verify",
+            "git commit -C -m --no-verify",
+            "git commit --author -m --no-verify",
+            "git commit --mess '--no-verify'",
+            "git commit -- -m --no-verify",
+            "git commit -m x 'b --no-verify'",
+            "git commit -m 'a' -m 'b' -n",
+            "git commit -m {x,--no-verify}",
+            "git commit -m --no-verif?",
+            "git commit -nm 'mention'",
+            // Text that is not a literal: variables, substitutions,
+            // ANSI-C.
+            "git commit -m \"$X --no-verify\"",
+            "git commit -m \"$(echo --no-verify)\"",
+            "git commit -m \"`echo --no-verify`\"",
+            "git commit -m $'x\\n--no-verify'",
+            "git commit -m \"$(cat <<EOF\n$(env -i git commit)\nEOF\n)\"",
+            "git commit -m \"$(cat <<'EOF'\nx\nEOF\necho --no-verify)\"",
+            "git commit -m \"$(cat <<'EOF'\nx\nEOF\n)\" ; git commit --no-verify -m y",
+            "git commit -F - <<EOF\n$(echo --no-verify)\nEOF",
+            "git commit -F - <<EOF\n`git commit -n -m x`\nEOF",
+            "git commit -F msg.txt <<'EOF'\n--no-verify\nEOF",
+            // A message of another command, a nested shell, a subshell.
+            "echo git commit -m '--no-verify' | sh",
+            "bash -c \"git commit -m '--no-verify'\"",
+            "eval git commit -m \"'--no-verify'\"",
+            "(git commit -m 'a' --no-verify)",
+            // (`cat > m.txt <<'EOF'` with the flag is item 51's exemption 2.)
+            "cat <<'EOF' | sh\ngit commit -m '--no-verify'\nEOF",
+            // Variables, aliases, -c and env stay checked.
+            "GIT_CONFIG_COUNT=1 git commit -m 'x'",
+            "git -c core.hooksPath=/x commit -m 'core.hooksPath'",
+            "env -i git commit -m 'x'",
+            "alias g='git commit --no-verify'; g -m 'x'",
+            "git commit -m 'x'; export GIT_CONFIG_COUNT=0",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+    }
+
+    /// Item 42 follow-up: with `-e`/`--edit` git runs the editor on a file
+    /// that holds the message, so the message is no longer only data
+    /// (`GIT_EDITOR=bash git tag -a -e -m '<script>' t1` runs the script).
+    /// A message is masked only when git cannot start an editor on it:
+    /// no edit option (also in a cluster or abbreviated), no option the
+    /// table does not know, and no editor set by the same Bash command.
+    #[test]
+    fn literal_messages_stay_checked_when_an_editor_can_run() {
+        for cmd in [
+            "GIT_EDITOR=bash git tag -a -e -m 'git push --no-verify origin HEAD' t1",
+            "export GIT_EDITOR=bash; git tag -a -em 'git push --no-verify origin HEAD' t1",
+            "env GIT_EDITOR=bash git commit --allow-empty --edit --message='GIT_CONFIG_COUNT=0 git push origin HEAD'",
+            "GIT_EDITOR=bash git merge -e -m 'git push --no-verify origin HEAD' feature",
+            "GIT_EDITOR=bash git tag -a -e t1 -F - <<'EOF'\ngit push --no-verify origin HEAD\nEOF",
+            // The editor from config or the inherited environment.
+            "git tag -a -e -m 'git push --no-verify origin HEAD' t1",
+            "git commit --allow-empty -m 'git push --no-verify' -e",
+            "git commit --allow-empty -m 'git push --no-verify' -ve",
+            "git tag -m 'git push --no-verify' -ase t1",
+            "git merge -m 'git push --no-verify' --edit feat",
+            "git commit -m 'git push --no-verify' --no-edit --edit",
+            "git commit -F - --edit <<'EOF'\ngit push --no-verify\nEOF",
+            // git takes an abbreviation: `--edi` is `--edit`.
+            "git tag -a -m 'git push --no-verify' --edi t1",
+            "git commit -m 'git push --no-verify' --ed",
+            // An option the table does not know can be one that edits.
+            "git commit -m 'git push --no-verify' --bogus",
+            "git commit -m 'git push --no-verify' -Z",
+            // An editor set by the same command, without an edit option.
+            "GIT_EDITOR=bash git commit -m 'git push --no-verify'",
+            "VISUAL=sh git tag -a -m 'git push --no-verify' t1",
+            "EDITOR=sh git merge -m 'git push --no-verify' feat",
+            "GIT_SEQUENCE_EDITOR=sh git commit -m 'git push --no-verify'",
+            "env EDITOR=sh git commit -m 'git push --no-verify'",
+            "export VISUAL=sh && git commit -m 'git push --no-verify'",
+            "declare -x GIT_EDITOR=sh; git commit -m 'git push --no-verify'",
+            "GIT_EDITOR=sh; git commit -m 'git push --no-verify'",
+            "git -c core.editor=sh tag -a -m 'git push --no-verify' t1",
+            "git -c Core.Editor=sh commit -m 'git push --no-verify'",
+            "git -c sequence.editor=sh commit -m 'git push --no-verify'",
+            "git --config-env=core.editor=E commit -m 'git push --no-verify'",
+            "git -C /w/repo -c core.editor=sh commit -m 'git push --no-verify'",
+            "env -S 'GIT_EDITOR=bash' git commit -m 'git push --no-verify'",
+            // A quoted edit option is still one.
+            "git tag -a \"-e\" -m 'git push --no-verify' t1",
+            "git tag -a '--edit' -m 'git push --no-verify' t1",
+            // A word that expands can become the edit option.
+            "E=-e; git tag -a $E -m 'git push --no-verify' t1",
+            "git tag -a \"$E\" -m 'git push --no-verify' t1",
+            "git tag -a -m 'git push --no-verify' t1 $(printf -- -e)",
+            "git tag -a -m 'git push --no-verify' t1 *",
+            "git tag -a -m 'git push --no-verify' t1 {-e,x}",
+            "git tag -a -m 'git push --no-verify' t1 ~",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+        for cmd in [
+            "git commit -m 'docs: mention --no-verify'",
+            "git commit --no-edit -m 'docs: mention --no-verify'",
+            "git merge --no-edit -m 'merge: --no-verify docs' feat",
+            "git tag -a v1 -m 'no --no-verify here'",
+            "git commit -e -m 'plain message'",
+            "GIT_EDITOR=true git commit -m 'plain message'",
+            "GIT_EDITOR=true git rebase --continue",
+            "git commit -m 'docs: GIT_EDITOR and core.editor'",
+            "git commit -m 'docs: --no-verify' -- 'a b.md' c\\ d.md",
+            "cd /w/repo;git commit -m 'docs: --no-verify' a.md",
+        ] {
+            assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
+    }
+
+    /// Item 42 recheck: a masked message is data only while the `git` that
+    /// gets it is the real git. A function, an alias, the hash table, a
+    /// loaded builtin, a sourced file, a trap or a changed PATH can turn
+    /// the message into code (`git() { eval "$3"; }; git commit -m
+    /// '<script>'`), and a wrapper can add `-e`. Nothing is masked in a
+    /// Bash command that can change what `git` runs, or when the command
+    /// word is not bare `git` or a system path to it.
+    #[test]
+    fn literal_messages_stay_checked_when_git_can_be_redefined() {
+        let mut allowed = Vec::new();
+        let p = "git push --no-verify origin HEAD";
+        for cmd in [
+            // Functions.
+            format!("git() {{ eval \"$3\"; }}; git commit -m '{p}'"),
+            "git() { bash -c \"$3\"; }; git commit -m 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null git push'".to_owned(),
+            "git() { eval \"$3\"; }; git commit -m 'tollgate waive --tree x'".to_owned(),
+            format!("git () {{ eval \"$3\"; }}\ngit commit -m '{p}'"),
+            format!("git()(eval \"$3\"); git commit -m '{p}'"),
+            format!("function git {{ eval \"$3\"; }}; git commit -m '{p}'"),
+            format!("function git() {{ eval \"$3\"; }}\ngit commit -m '{p}'"),
+            format!("'git'() {{ eval \"$3\"; }}; git commit -m '{p}'"),
+            format!("unset GIT_EDITOR; git() {{ command git -c core.editor=bash \"$@\" -e; }}; git tag -a -m '{p}' t1"),
+            // Aliases.
+            format!("shopt -s expand_aliases\nalias git='eval'\ngit commit -m '{p}'"),
+            format!("shopt -s expand_aliases\nalias git='GIT_EDITOR=bash git '; alias tag='tag -e '\ngit tag -a -m '{p}' t1"),
+            format!("alias git=eval\ngit commit -m '{p}'"),
+            format!("shopt -s expand_aliases; BASH_ALIASES[git]=eval\ngit commit -m '{p}'"),
+            // The hash table, loaded builtins, sourced files, traps.
+            format!("hash -p /tmp/x/run git; git commit -m '{p}'"),
+            format!("BASH_CMDS[git]=/tmp/x/run; git commit -m '{p}'"),
+            format!("enable -f /tmp/x/git.so git; git commit -m '{p}'"),
+            format!("source /tmp/x/fn.sh; git commit -m '{p}'"),
+            format!(". ./fn.sh && git commit -m '{p}'"),
+            format!("trap 'eval \"${{BASH_COMMAND#*-m }}\"' DEBUG; git commit -m '{p}'"),
+            format!("eval x; git commit -m '{p}'"),
+            // PATH.
+            format!("PATH=/tmp/x:$PATH git commit -m '{p}'"),
+            format!("PATH=/tmp/x:$PATH; git commit -m '{p}'"),
+            format!("export PATH=/tmp/x:$PATH; git commit -m '{p}'"),
+            format!("env PATH=/tmp/x git commit -m '{p}'"),
+            format!("read -r PATH <<< /tmp/x; git commit -m '{p}'"),
+            format!("printf -v PATH /tmp/x; git commit -m '{p}'"),
+            format!("mapfile -t PATH <<< /tmp/x; git commit -m '{p}'"),
+            format!("T=TH; export \"PA$T=/tmp/x\"; git commit -m '{p}'"),
+            format!("declare -n P=PATH; P=/tmp/x; git commit -m '{p}'"),
+            format!("X=PATH=1; : $((X)); git commit -m '{p}'"),
+            format!("((PATH=1)); git commit -m '{p}'"),
+            format!("let PATH=1; git commit -m '{p}'"),
+            format!(": ${{PATH:=/tmp/x}}; git commit -m '{p}'"),
+            format!("[[ X -eq 1 ]]; git commit -m '{p}'"),
+            format!("for PATH in /tmp/x; do git commit -m '{p}'; done"),
+            format!("select PATH in /tmp/x; do git commit -m '{p}'; done"),
+            format!("coproc PATH {{ :; }}; git commit -m '{p}'"),
+            // An editor set without `=`, or one from config let back in.
+            format!("printf -v GIT_EDITOR bash; export GIT_EDITOR; git commit -m '{p}'"),
+            format!("read GIT_EDITOR <<< bash; git commit -m '{p}'"),
+            format!("unset GIT_EDITOR; git commit -m '{p}'"),
+            format!("declare -n E=GIT_EDITOR; E=bash; git commit -m '{p}'"),
+            // A command word that is not the real git, or a wrapper that
+            // adds words or changes the lookup.
+            format!("./git commit -m '{p}'"),
+            format!("../x/git commit -m '{p}'"),
+            format!("/tmp/x/git commit -m '{p}'"),
+            format!("x/git commit -m '{p}'"),
+            format!("git-commit -m '{p}'"),
+            format!("printf -- '-e\\n' | xargs git tag -a -m '{p}' t1"),
+            format!("env -S 'git' commit -m '{p}'"),
+            format!("sudo git commit -m '{p}'"),
+            format!("exec git commit -m '{p}'"),
+        ] {
+            if !deny(&cmd) {
+                allowed.push(cmd);
+            }
+        }
+        assert!(allowed.is_empty(), "allowed: {allowed:#?}");
+        for cmd in [
+            "git commit -m 'docs: mention --no-verify'",
+            "/usr/bin/git commit -m 'docs: mention --no-verify'",
+            "/bin/git commit -m 'docs: mention --no-verify'",
+            "command git commit -m 'docs: mention --no-verify'",
+            "timeout 600 git commit -m 'docs: mention --no-verify'",
+            "cd /w/repo && git add a.md && git commit -m 'docs: --no-verify'",
+            "tollgate wait j1 && git commit -m 'docs: --no-verify'",
+            "cargo fmt && git add -A && git commit -m \"$(cat <<'EOF'\nGuard: GIT_CONFIG_COUNT, alias, hash, PATH=x, git() { eval; }\nEOF\n)\"",
+            "git commit -m 'docs: alias git=eval, hash -p, export PATH, unset GIT_EDITOR'",
+            "if git diff --quiet; then git commit -m 'docs: --no-verify'; fi",
+            "RUST_LOG=debug cargo test && git commit -m 'docs: --no-verify'",
+        ] {
+            assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
+    }
+
+    /// Item 51 (security review notes 2 and 3, and the lead's correction of
+    /// 2026-11-09: there is no OS sandbox, so the guard is the only
+    /// layer). Whether a command runs git or tollgate is read from its
+    /// parsed command words; data (a `cat` heredoc, a `grep` pattern) does
+    /// not make it run git. An interpreter's program is code, not data:
+    /// it can start git itself, so one whose program text names git or
+    /// tollgate (a heredoc, a here-string, `-c`/`-e`, the assignments it
+    /// sees, or a pipe it reads its program from) denies whatever the
+    /// command's own words run. There is no allow-list of safe programs.
+    #[test]
+    fn interpreter_text_is_code_item51() {
+        for cmd in [
+            // Programs whose text names no git, tollgate, flag or variable.
+            "python3 - <<'PY'\np='notes.md'; s=open(p).read()\ns=s.replace('a', 'b')\nopen(p,'w').write(s)\nPY\ncp notes.md b.md && grep -n x b.md",
+            "python3 -c 'import json; print(json.dumps({\"a\": 1}))'",
+            "git show HEAD:a.json | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
+            "git log --format=%s | perl -ne 'print if /fix/'",
+            "node -e 'console.log(1)' && cargo test",
+            "python3 scripts/stats.py --repo acme",
+            "cd /h/Repos/tollgate && python3 -I - a <<'EOF'\nprint(1)\nEOF",
+            // Data that names git does not run git.
+            "cat > notes.md <<'EOF'\ngit commit, then tollgate status\nEOF\npython3 - <<'EOF'\nprint(1)\nEOF",
+            // Exemption 4: a clean heredoc program in a command whose
+            // words run no git, next to a mention of git or tollgate.
+            "grep -n git a.md; python3 - <<'EOF'\nprint(1)\nEOF",
+            "echo tollgate; python3 - <<'EOF'\nprint(1)\nEOF",
+            "echo git; perl - <<'EOF'\nprint 1;\nEOF",
+        ] {
+            assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
+        for cmd in [
+            // A program that starts git with a hook-skip flag, in a command
+            // with no git word.
+            "python3 - <<'EOF'\nimport subprocess\nsubprocess.run(['git', 'commit', '-n', '-m', 'x'])\nEOF",
+            "python3 - <<'EOF'\nimport subprocess\nsubprocess.run(['git', 'commit', '--no-verify', '-m', 'x'])\nEOF",
+            "perl - <<'EOF'\nsystem('git', 'commit', '-n', '-m', 'x');\nEOF",
+            "bash -s <<'EOF'\ngit commit -n -m x\nEOF",
+            "bash -s <<'EOF'\ngit commit --no-verify -m x\nEOF",
+            "python3 <<< 'import os; os.system(\"git push -n\")'",
+            "python3 -c 'import subprocess; subprocess.run([\"git\", \"commit\", \"-n\"])'",
+            "perl -e 'system(\"git commit -n -m x\")'",
+            "ruby -e 'system(\"git commit -n -m x\")'",
+            "node -e 'require(\"child_process\").execSync(\"git commit -n -m x\")'",
+            "deno eval 'new Deno.Command(\"git\", {args: [\"commit\", \"-n\"]}).outputSync()'",
+            "php -r 'system(\"git commit -n -m x\");'",
+            "lua -e 'os.execute(\"git commit -n -m x\")'",
+            "Rscript -e 'system(\"git commit -n -m x\")'",
+            "python3 - <<'EOF'\nimport os; os.system('tollgate waive --tree x')\nEOF",
+            // The name built from what the program sees.
+            "G=git python3 - <<'EOF'\nimport os; os.system(os.environ['G'] + ' commit -n')\nEOF",
+            "export G=git; python3 - <<'EOF'\nimport os; os.system(os.environ['G'] + ' commit -n')\nEOF",
+            // Program text the guard cannot see: the whole command counts.
+            "printf 'import os; os.system(\"git commit -n\")' | python3",
+            "echo 'print(\"git\")' | python3 -",
+            "python3 - <<EOF\nprint(\"$X git\")\nEOF",
+            "python3 x.py <<'EOF'\ngit commit -n\nEOF",
+            "sh <<'EOF'\necho git\nEOF",
+            // The 2026-11-09 commands that only named git or tollgate in
+            // python strings now deny again: no OS sandbox stands behind
+            // the guard (agents use a script file).
+            "cd /w/repo && python3 -I - a.md <<'PY'\nimport sys\np = sys.argv[1]; s = open(p).read()\ns = s.replace('git commit -n', 'tollgate wait x && git commit')\nopen(p, 'w').write(s)\nPY\ncp a.md b.md && grep -n 'tollgate' b.md",
+            "cd /w/repo && python3 -I - a.jsonl <<'PY'\nimport json, sys\nfor l in open(sys.argv[1]):\n    x = json.loads(l)\n    if 'env -i' in x['err'] or 'GIT_CONFIG_COUNT' in x['err']:\n        print(x['cmd'])\nPY",
+            // Not exemption 4: a here-string, a pipe, or text that names a
+            // guarded flag or variable, next to a mention of git.
+            "echo git; python3 <<< 'print(1)'",
+            "echo git; printf 'print(1)' | python3",
+            "echo git; python3 - <<'EOF'\nprint('env -i')\nEOF",
+            "echo git; python3 - <<'EOF'\nprint('GIT_CONFIG_COUNT')\nEOF",
+            // An interpreter that reads text from stdin next to git or
+            // tollgate (item 31), whatever the text.
+            "python3 - <<'EOF'\nprint(1)\nEOF\ngit commit -m x",
+            "python3 - <<'EOF'\nprint(1)\nEOF\n/usr/bin/git status",
+            "tollgate status; python3 - <<'EOF'\nprint(1)\nEOF",
+            "python3 - <<'EOF' && git diff --stat\nprint(1)\nEOF",
+            "git status && python3 <<< 'print(1)'",
+            "git status && perl - <<'EOF'\nprint 1;\nEOF",
+            "git status && ruby <<'EOF'\nputs 1\nEOF",
+            "printf 'print(1)' | python3; git status",
+            "python3 < x.py; git status",
+            "python3 x.py <<'EOF'\ndata\nEOF\ngit status",
+            // git where the words run it: a substitution, a subshell, a
+            // nested shell, eval, a function body, an alias value, find
+            // -exec, a wrapper, a shell's heredoc.
+            "echo $(git rev-parse HEAD); python3 - <<'EOF'\nprint(1)\nEOF",
+            "echo `git rev-parse HEAD`; python3 - <<'EOF'\nprint(1)\nEOF",
+            "(git status); python3 - <<'EOF'\nprint(1)\nEOF",
+            "bash -c 'git status'; python3 - <<'EOF'\nprint(1)\nEOF",
+            "eval git status; python3 - <<'EOF'\nprint(1)\nEOF",
+            "f() { git status; }; python3 - <<'EOF'\nprint(1)\nEOF\nf",
+            "function f { git status; }; python3 - <<'EOF'\nprint(1)\nEOF\nf",
+            "alias g='git status'; python3 - <<'EOF'\nprint(1)\nEOF\ng",
+            "find . -name x -exec git add {} +; python3 - <<'EOF'\nprint(1)\nEOF",
+            "find . -exec sh -c 'git add \"$1\"' _ {} \\;; python3 - <<'EOF'\nprint(1)\nEOF",
+            "echo a | xargs git add; python3 - <<'EOF'\nprint(1)\nEOF",
+            "sudo -u x env git status; python3 - <<'EOF'\nprint(1)\nEOF",
+            "eval \"python3 - <<'EOF'\nprint(1)\nEOF\ngit status\"",
+            "(python3 - <<'EOF'\nprint(1)\nEOF\ngit status)",
+            // A command word the guard cannot read may be git.
+            "G=x; $G status; python3 - <<'EOF'\nprint(1)\nEOF",
+            "/usr/bin/gi? status; python3 - <<'EOF'\nprint(1)\nEOF",
+            "/usr/bin/g{i,}t status; python3 - <<'EOF'\nprint(1)\nEOF",
+            "hash -p /usr/bin/x g; g status; python3 - <<'EOF'\nprint(1)\nEOF",
+            "BASH_ALIASES[g]=x; g status; python3 - <<'EOF'\nprint(1)\nEOF",
+            "enable -f ./x.so g; g status; python3 - <<'EOF'\nprint(1)\nEOF",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+    }
+
+    /// Item 51, security review of 9efeca2: an interpreter's options are
+    /// not parsed for its program text. Every argument word is program
+    /// text (fail closed: a value of an option the guard does not know, a
+    /// `perl -M` module line, `php -R`), and a program that reads text
+    /// (a heredoc, a here-string, a pipe) is code unless it is a known
+    /// data reader, so an interpreter missing from the list is still
+    /// checked. Data readers with the same text pass.
+    #[test]
+    fn interpreter_options_and_registry_fail_closed_item51() {
+        for cmd in [
+            // Values and code options the old option table missed.
+            "perl \"-Mstrict; system(q(git commit -n -m x))\" -e 1",
+            "perl -I 'lib; system(q(git commit -n))' -e 1",
+            "php -R 'system(\"git commit -n -m x\");'",
+            "php -B 'system(\"git commit -n -m x\");' -r 1",
+            "python3 --check-hash-based-pycs never -c 'import os; os.system(\"git commit -n\")'",
+            "node --input-type module -e 'require(\"child_process\").execSync(\"git commit -n\")'",
+            "deno eval 'eval(Deno.args[0])' 'new Deno.Command(\"git\", {args: [\"commit\", \"-n\"]}).outputSync()'",
+            // Interpreters the old list did not know.
+            "pypy3 -c \"import os; os.system('git commit -n -m x')\"",
+            "pypy3 - <<'EOF'\nimport os; os.system('git commit -n -m x')\nEOF",
+            "gawk 'BEGIN { system(\"git commit -n -m x\") }'",
+            "awk 'BEGIN { system(\"git commit -n -m x\") }' /dev/null",
+            "busybox awk 'BEGIN { system(\"git commit -n -m x\") }'",
+            "tclsh <<'EOF'\nexec git commit -n -m x\nEOF",
+            "pwsh -c 'git commit -n -m x'",
+            "osascript -e 'do shell script \"git commit -n -m x\"'",
+            "sqlite3 a.db '.shell git commit -n -m x'",
+            // A program the guard does not know, reading text.
+            "guile <<'EOF'\n(system \"git commit -n -m x\")\nEOF",
+            "ssh localhost <<'EOF'\ngit commit -n -m x\nEOF",
+            "printf '!git commit -n -m x\\n' | ed notes.txt",
+            "echo 'git commit -n -m x' | some-runner",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+        for cmd in [
+            "cat > notes.tcl <<'EOF'\nexec git commit -n -m x\nEOF",
+            "grep -n 'system(\"git commit -n -m x\")' notes.awk",
+            "jq -r '.cmd' <<'EOF'\n{\"cmd\": \"git commit -n -m x\"}\nEOF",
+            "git status | sed -n 1p",
+            "git log --oneline | awk '{print $1}'",
+            "cargo test 2>&1 | tail -3",
+            "bash scripts/ci.sh tollgate-core2",
+            "python3 scripts/stats.py --repo acme",
+            "cat > f.md <<'EOF'\nnever push -f\nEOF\ngit diff | less",
+            "git diff | some-pager",
+        ] {
+            assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
+    }
+
+    /// Item 51 (the lead's direction of 2026-11-09: the smallest set of
+    /// exact exemptions). Besides item 42's literal messages, only two
+    /// kinds of text are data to the substring rules and to the item 31
+    /// mention of git: the body of `cat > <plain path> <<'QUOTED'`, and
+    /// the arguments of a `grep`/`rg` that cannot print or run them, in a
+    /// command where no program that reads a pipe or a file is anything
+    /// but a data reader. Everything else is checked as before item 51.
+    #[test]
+    fn exact_data_exemptions_item51() {
+        for cmd in [
+            // `cat > <plain path> <<'QUOTED'`.
+            "cat > /tmp/s/msg.txt <<'EOF'\nnever use --no-verify, env -i or GIT_CONFIG_COUNT=0\nEOF\ngit commit -F /tmp/s/msg.txt",
+            "cd /w/repo && cat > tests/x.rs <<'RS'\n    \"git commit --no-verify -m x\",\nRS\ncargo test",
+            "cat > m.txt <<'EOF'\n--no-verify\nEOF",
+            "cat > notes.md <<'EOF'\nrun git commit\nEOF\necho $'x'",
+            // grep and rg patterns.
+            "grep -c 'GIT_CONFIG_KEY_0' src/guard/rules.rs; git status -sb",
+            "grep -n 'gitlab\\|--no-verify' notes.md; tollgate report j",
+            "cd /w/repo && grep -rn -i 'tollgate_test_install' src | head; git log -1",
+            "rg -n -- 'env -i|GIT_CONFIG_COUNT' docs; git status",
+            "grep -c 'GIT_CONFIG_KEY_0' src/a.rs; tollgate config --effective | tail -2",
+            "jq -r .x <<'EOF'\n{\"x\": \"git commit -n\"}\nEOF",
+            "mapfile -t lines <<'EOF'\ngit commit -n -m x\nEOF",
+            "head -n 2 <<'EOF'\ngit commit -n -m x\nEOF",
+            "cut -d: -f1 <<'EOF'\ngit:commit\nEOF",
+        ] {
+            assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
+        for cmd in [
+            // Not exactly `cat > <plain path> <<'QUOTED'`.
+            "cat >> notes.md <<'EOF'\n--no-verify\nEOF",
+            "cat > $F <<'EOF'\n--no-verify\nEOF",
+            "cat > ~/notes.md <<'EOF'\n--no-verify\nEOF",
+            "cat > notes.md <<EOF\n--no-verify\nEOF",
+            "cat -v > notes.md <<'EOF'\n--no-verify\nEOF",
+            "cat <<'EOF' > run.sh\ngit commit --no-verify\nEOF",
+            "env cat > notes.md <<'EOF'\n--no-verify\nEOF",
+            "X=1 cat > notes.md <<'EOF'\n--no-verify\nEOF",
+            "tee notes.md <<'EOF' >/dev/null\ntollgate waive\nEOF",
+            "jq -r .x <<'EOF'\n{\"x\": \"git commit --no-verify\"}\nEOF",
+            // Security review note 1: a "file" that is the pipe again.
+            "cat > /dev/stdout <<'EOF' | sh\ngit commit --no-verify\nEOF",
+            "cat > /proc/self/fd/1 <<'EOF'\ngit commit --no-verify\nEOF",
+            "cat > //dev/stdout <<'EOF'\n--no-verify\nEOF",
+            "cat > /dev/./stdout <<'EOF'\n--no-verify\nEOF",
+            "cat > /./proc/123/fd/1 <<'EOF'\n--no-verify\nEOF",
+            "cat > a/../dev/stdout <<'EOF'\n--no-verify\nEOF",
+            "cat > dev/stdout <<'EOF'\n--no-verify\nEOF",
+            // A data body next to a program that reads a pipe.
+            "cat > f.txt <<'EOF'\n--no-verify\nEOF\ngit diff | less",
+            "cat > f.txt <<'EOF'\n--no-verify\nEOF\ncat f.txt | xargs git commit -m x",
+            "cat > f.txt <<'EOF' > >(sh)\n--no-verify\nEOF",
+            // Security review note 2: a program that repeats its words into
+            // a pipe or a file, or reads them from one.
+            "grep -o -- --no-verify notes.md | some-runner",
+            "rg --pre ./x -- --no-verify notes.md",
+            "grep -- --no-verify notes.md > run.sh",
+            "grep -- --no-verify notes.md | sed 's/x/y/e'",
+            "jq -rn '\"git commit --no-verify\"' | some-runner",
+            "jq -rn '\"git commit -n\"' | some-runner",
+            "echo --no-verify",
+            "echo 'git commit -n -m x' | some-runner",
+            // Security review note 3: a reader with an option that runs a
+            // program is no data reader.
+            "sort --compress-program=sh <<'EOF'\ngit commit -n -m x\nEOF",
+            "sort --compress-prog=sh <<'EOF'\ngit commit -n -m x\nEOF",
+            "cat --show-all <<'EOF'\ngit commit -n -m x\nEOF",
+            "grep --pre=sh x <<'EOF'\ngit commit -n -m x\nEOF",
+            "tee >(sh) <<'EOF'\ngit commit -n -m x\nEOF",
+            // Review note on stdin_data_reader: only exact options keep a
+            // reader a data reader, short ones included.
+            "mapfile -C 'git commit -n -m x' -c 1 lines <<'EOF'\nx\nEOF",
+            "readarray -tC 'git commit -n -m x' -c 1 lines <<'EOF'\nx\nEOF",
+            "mapfile -c 1 -C \"$CB\" lines <<'EOF'\ngit commit -n -m x\nEOF",
+            "head -z <<'EOF'\ngit commit -n -m x\nEOF",
+            "cut -z -f1 <<'EOF'\ngit commit -n -m x\nEOF",
+            // Review note: `cat`, `grep` or `rg` redefined in the command.
+            "cat() { git commit --no-verify -m x; }; cat > notes.md <<'EOF'\n--no-verify\nEOF",
+            "function cat { bash; }; cat > notes.md <<'EOF'\ngit commit --no-verify -m x\nEOF",
+            "shopt -s expand_aliases; alias grep='sh -c'; grep 'git commit --no-verify -m x' f",
+            "PATH=/tmp/evil:$PATH; cat > notes.md <<'EOF'\ngit commit --no-verify -m x\nEOF",
+            "export PATH=/tmp/evil:$PATH; grep -- --no-verify f",
+            "hash -p /bin/sh cat; cat > notes.md <<'EOF'\ngit commit --no-verify -m x\nEOF",
+            ". ./env.sh; cat > notes.md <<'EOF'\n--no-verify\nEOF",
+            // Review note: an option bash builds by expansion.
+            "o=-C; mapfile $o 'git commit -n -m x' -c 1 lines <<'EOF'\nx\nEOF",
+            "X=C; mapfile -$X 'git commit -n -m x' -c 1 lines <<'EOF'\nx\nEOF",
+            "mapfile -{C,} 'git commit -n -m x' -c 1 lines <<'EOF'\nx\nEOF",
+            "mapfile `echo -C` 'git commit -n -m x' -c 1 lines <<'EOF'\nx\nEOF",
+            "mapfile -[C] 'git commit -n -m x' -c 1 lines <<'EOF'\nx\nEOF",
+            "cat $opt <<'EOF'\ngit commit -n -m x\nEOF",
+            "head -$N <<'EOF'\ngit commit -n -m x\nEOF",
+            // Review note: tilde, extglob and brace forms.
+            "mapfile ~ 'git commit -n -m x' -c 1 lines <<'EOF'\nx\nEOF",
+            "shopt -s extglob; mapfile -@(C) 'git commit -n -m x' -c 1 lines <<'EOF'\nx\nEOF",
+            "mapfile -!(t) 'git commit -n -m x' -c 1 lines <<'EOF'\nx\nEOF",
+            "cat -{v,} <<'EOF'\ngit commit -n -m x\nEOF",
+            "cat ~ <<'EOF'\ngit commit -n -m x\nEOF",
+            // Review note: a substitution inside an extglob, and `!(` at the
+            // command word.
+            "ls !($(git commit -n -m x))",
+            "mapfile -@(`git commit -n -m x`) lines <<'EOF'\nx\nEOF",
+            "!(git commit -n -m x)",
+            "ls @(#$(git commit -n -m x))",
+            "cat > @(#$(git commit -n -m x)) <<'EOF'\nx\nEOF",
+            "X=@(#$(git commit -n -m x)) ls",
+            "mapfile -@(C) lines <<'EOF'\nx\nEOF\ngit status",
+            "ls @($'\\''$(git commit -n -m x)'')",
+            "mapfile -@(C) lines 'git commit -n -m x' <<'EOF'\nx\nEOF",
+            "ls *(a|#`git commit -n -m x`)",
+            "ls @(#<(git commit -n -m x))",
+            "ls !(x#>(git commit -n -m x))",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+    }
+
+    /// An unquoted heredoc body runs its `$(...)` and backtick
+    /// substitutions; a quoted one is data. `<<` ends the body only at
+    /// the delimiter itself, `<<-` also after leading tabs.
+    #[test]
+    fn heredoc_substitutions_are_commands() {
+        for cmd in [
+            "cat <<EOF\n$(git commit -n -m x)\nEOF",
+            "cat <<EOF\n`git commit -n -m x`\nEOF",
+            "cat <<EOF > f\n${X:-$(git push -n origin x)}\nEOF",
+            "cat <<EOF\n\tEOF\n'\nEOF\ngit commit -n -m x #'",
+            // A `\c` outside a literal body still denies.
+            "cat <<EOF\n\\cdot\nEOF\ngit status",
+            "echo -e 'x\\c'; git status",
+            "sh <<'EOF'\nprintf '\\c'; git commit -n -m x\nEOF",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+        for cmd in [
+            "cat <<'EOF'\n$(git commit -n -m x)\nEOF",
+            "cat <<EOF\n\\$(git commit -n -m x)\nEOF",
+            "cat <<-EOF\n\tbody\n\tEOF\necho done",
+            // A `\c` in a literal body is a character (LaTeX `\cdot`).
+            "cd /w/repo && cat >> t.rs <<'EOF'\nassert_eq!(r, \"2 \\\\cdot x\");\nEOF\ngit diff --stat",
+            "git commit -F - <<'EOF'\nfix: C:\\code\nEOF",
+        ] {
+            assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
     }
 
     #[test]

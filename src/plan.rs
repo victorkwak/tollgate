@@ -22,7 +22,7 @@ use crate::cache::toolcache::ToolCache;
 use crate::cache::{Fingerprint, record_key};
 use crate::config::host::JobConfig;
 use crate::config::repo::StepKind;
-use crate::config::{CompiledScope, LoadedHost, Platform, Tier};
+use crate::config::{CompiledScope, LoadedHost, Platform, Tier, TrustedUrls};
 use crate::dirs::Dirs;
 use crate::env::EnvSnapshot;
 use crate::gitx::{Git, GitError, Oid, RepoLayout};
@@ -506,6 +506,24 @@ pub fn remote_trust(git: &Git, scope: &CompiledScope) -> Result<RemoteTrust, Pla
     Ok(t)
 }
 
+/// True when remote `name` alone has one fetch URL, as git uses it, that
+/// matches `scope.remotes`: one `git remote get-url` (item 37, L19).
+/// Whenever [`remote_trust`] succeeds, its `trusted` holds `name` exactly
+/// when this is true; where it fails (a URL with a control character, a
+/// configured URL a rewrite sends elsewhere), nothing that trusts its
+/// answer runs. An error (no such remote) is not trusted.
+pub fn remote_fetch_trusted(
+    git: &Git,
+    trusted: &TrustedUrls,
+    name: &str,
+) -> Result<bool, PlanError> {
+    let fetch = get_urls(git, name, false)?;
+    Ok(match fetch.as_slice() {
+        [url] => !has_control(url) && trusted.matches(url),
+        _ => false,
+    })
+}
+
 /// Remote names whose fetch URL, as git uses it, matches `scope.remotes`
 /// (R5, R14, L2); see [`remote_trust`].
 pub fn trusted_remotes(git: &Git, scope: &CompiledScope) -> Result<Vec<String>, PlanError> {
@@ -937,75 +955,91 @@ pub enum WaitEnd {
     Lost(String),
 }
 
+/// How long [`wait`] sees a state that should not last (no `job.json` yet,
+/// an ended job without its report, a job whose runner does not hold its
+/// key) before it acts on it: the runner writes those files one after the
+/// other, so one look can fall between two writes.
+const WAIT_SETTLE: Duration = Duration::from_millis(200);
+
+/// The pause of [`wait`] after its `n`th look: 1 ms, then doubling up to
+/// 100 ms. A job of a few ms (a docs-only tree) is seen to end near its run
+/// time, a long one costs no more looks than before (item 41, L19).
+fn wait_pause(n: u32) -> Duration {
+    Duration::from_millis((1u64 << n.min(7)).min(100))
+}
+
 /// Waits for job `id` until it ends or `deadline` passes, holding a waiter
 /// lock (R89) meanwhile.
 pub fn wait(dirs: &Dirs, id: &JobId, deadline: Option<Instant>) -> WaitEnd {
     let store = JobStore::new(dirs);
     // An attached job's dir may not exist yet: register once it does.
     let mut waiter = None;
-    let mut dead_once = false;
+    // Since when the state seen is one that should not last.
+    let mut odd_since: Option<Instant> = None;
+    let mut looks = 0_u32;
     loop {
         if waiter.is_none() {
             waiter = sched::register_waiter(&dirs.job_dir(id)).ok();
         }
-        let meta = match store.read(id) {
-            Ok(m) => m,
+        let settled = |since: &mut Option<Instant>| {
+            since.get_or_insert_with(Instant::now).elapsed() >= WAIT_SETTLE
+        };
+        let pause = wait_pause(looks);
+        looks += 1;
+        match store.read(id) {
             Err(e) => {
                 // An attached job may not have written job.json yet.
-                if dead_once {
+                if settled(&mut odd_since) {
                     return WaitEnd::Lost(e.to_string());
                 }
-                dead_once = true;
-                std::thread::sleep(Duration::from_millis(200));
-                continue;
             }
-        };
-        let owner = sched::running_job(dirs, &meta.key).ok().flatten();
-        if let JobState::Lost { reason } = &meta.state {
-            return WaitEnd::Lost(format!("job {id} is lost: {reason}"));
-        }
-        if meta.state.is_terminal() {
-            match JobReport::read(dirs, id) {
-                Ok(Some(r)) => return WaitEnd::Done(Box::new(r)),
-                // A queued job cancelled or superseded by another process:
-                // its runner writes the report on its way out.
-                Ok(None) if owner.as_ref() == Some(id) => {}
-                Ok(None) if !dead_once => dead_once = true,
-                Ok(None) => return WaitEnd::Lost(format!("job {id} ended without a report")),
-                Err(e) => return WaitEnd::Lost(e.to_string()),
+            Ok(meta) => {
+                let owner = sched::running_job(dirs, &meta.key).ok().flatten();
+                if let JobState::Lost { reason } = &meta.state {
+                    return WaitEnd::Lost(format!("job {id} is lost: {reason}"));
+                }
+                if meta.state.is_terminal() {
+                    match JobReport::read(dirs, id) {
+                        Ok(Some(r)) => return WaitEnd::Done(Box::new(r)),
+                        // A queued job cancelled or superseded by another
+                        // process: its runner writes the report on its way
+                        // out.
+                        Ok(None) if owner.as_ref() == Some(id) => {}
+                        Ok(None) if !settled(&mut odd_since) => {}
+                        Ok(None) => {
+                            return WaitEnd::Lost(format!("job {id} ended without a report"));
+                        }
+                        Err(e) => return WaitEnd::Lost(e.to_string()),
+                    }
+                } else if owner.as_ref() == Some(id) {
+                    odd_since = None;
+                } else if settled(&mut odd_since) {
+                    // The runner died without a final state. Its leftover
+                    // step processes still hold slots and the checkout
+                    // (R35, R85): stop them and mark the job lost.
+                    let reaped = match sched::reap_if_lost(dirs, id) {
+                        Ok(true) => store
+                            .read(id)
+                            .ok()
+                            .and_then(|m| match m.state {
+                                JobState::Lost { reason } => Some(format!("; {reason}")),
+                                _ => None,
+                            })
+                            .unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    return WaitEnd::Lost(format!(
+                        "job {id}: its runner is gone (see {}){reaped}",
+                        dirs.job_dir(id).join("runner.log").display()
+                    ));
+                }
             }
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
         }
-        if owner.as_ref() != Some(id) {
-            // Seen twice in a row: the runner died without a final state.
-            // Its leftover step processes still hold slots and the checkout
-            // (R35, R85): stop them and mark the job lost.
-            if dead_once {
-                let reaped = match sched::reap_if_lost(dirs, id) {
-                    Ok(true) => store
-                        .read(id)
-                        .ok()
-                        .and_then(|m| match m.state {
-                            JobState::Lost { reason } => Some(format!("; {reason}")),
-                            _ => None,
-                        })
-                        .unwrap_or_default(),
-                    _ => String::new(),
-                };
-                return WaitEnd::Lost(format!(
-                    "job {id}: its runner is gone (see {}){reaped}",
-                    dirs.job_dir(id).join("runner.log").display()
-                ));
-            }
-            dead_once = true;
-        } else {
-            dead_once = false;
-        }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        let now = Instant::now();
+        if deadline.is_some_and(|d| now >= d) {
             return WaitEnd::Running;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(deadline.map_or(pause, |d| pause.min(d - now)));
     }
 }
 

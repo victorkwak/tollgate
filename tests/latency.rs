@@ -17,6 +17,19 @@ use support::{Armed, Sandbox, test_hooks_dir};
 
 const PASS: &str = "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n";
 
+/// A docs-only `pre-commit` (L19 budget 200 ms) waits for a job of a few
+/// ms; item 41: the hook sees its end near its run time, not at the next
+/// 100 ms poll (wall p95 before: 128 ms; after: 42 ms alone, 47-55 ms
+/// during the whole parallel suite). Asserted on CPU time like every
+/// budget here (measured 34 ms at load 14): tighter than L19, so a hook
+/// that does more work fails well before the 200 ms budget.
+const DOCS_ONLY: Duration = Duration::from_millis(90);
+
+/// [`DOCS_ONLY`] with detected Bun and Python roots (R65 detection runs on
+/// the hook path; wall p95 before: 151 ms; after: 69 ms alone, 71-77 ms
+/// during the whole suite). CPU measured: 49 ms at load 14.
+const DOCS_ONLY_DETECTED: Duration = Duration::from_millis(120);
+
 fn repo_with(sb: &Sandbox, name: &str, toml: &str) -> PathBuf {
     let repo = sb.repo(name);
     sb.commit_file(&repo, "tollgate.toml", toml, "policy");
@@ -82,14 +95,9 @@ fn p95(meter: &CpuMeter, rounds: usize, runs: usize, mut f: impl FnMut()) -> P95
     best.unwrap()
 }
 
-#[test]
-fn hook_latency_budgets_l19() {
-    let meter = CpuMeter::new();
-    let sb = Sandbox::new();
-    sb.scoped_host("");
-    let repo = repo_with(&sb, "r", PASS);
-    // Chained hook with no repo hook: under 5 ms (L19). The env as on a
-    // real machine: git's system config path comes from the tool cache.
+/// The env of a hook as on a real machine: the sandbox env and the
+/// injection, with git's system config path from the tool cache.
+fn hook_env(sb: &Sandbox) -> Vec<(String, String)> {
     let mut sys_env = sb.env();
     sys_env.remove("GIT_CONFIG_NOSYSTEM");
     let mut cmd_env: Vec<(String, String)> = sys_env
@@ -106,22 +114,36 @@ fn hook_latency_budgets_l19() {
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v.to_string_lossy().into_owned())),
     );
-    let hook = |name: &str| {
-        let mut cmd = std::process::Command::new(test_hooks_dir().join(name));
-        cmd.env_clear()
-            .current_dir(&repo)
-            .stdin(std::process::Stdio::null());
-        for (k, v) in &cmd_env {
-            cmd.env(k, v);
-        }
-        let out = cmd.output().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        out
-    };
+    cmd_env
+}
+
+/// Runs hook link `name` in `repo` with `env` alone; asserts it exits 0.
+fn run_hook(env: &[(String, String)], repo: &Path, name: &str) -> std::process::Output {
+    let mut cmd = std::process::Command::new(test_hooks_dir().join(name));
+    cmd.env_clear()
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+#[test]
+fn hook_latency_budgets_l19() {
+    let meter = CpuMeter::new();
+    let sb = Sandbox::new();
+    sb.scoped_host("");
+    let repo = repo_with(&sb, "r", PASS);
+    // Chained hook with no repo hook: under 5 ms (L19).
+    let cmd_env = hook_env(&sb);
+    let hook = |name: &str| run_hook(&cmd_env, &repo, name);
     let chained = || {
         hook("post-checkout");
     };
@@ -186,7 +208,89 @@ fn hook_latency_budgets_l19() {
         let o = sb.run_hook(&repo, "pre-commit", &[]);
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     });
-    within_budget("pre-commit docs-only", t, Duration::from_millis(200));
+    within_budget("pre-commit docs-only", t, DOCS_ONLY);
+}
+
+/// post-merge after a `git pull`, a fast-forward to the tip of a trusted
+/// remote's ref: no gate hook ran, so no marker; the merge made no commit
+/// and brought only what the trusted remote has, so item 17 has nothing
+/// to record. Cheap checks only (item 37): the ref files, the host config
+/// and one `git remote get-url`, no Gate::open. Same 5 ms budget as every
+/// chained hook (L19), asserted in a release build: that one subprocess
+/// costs about 1.5 ms of CPU from a debug hook, which itself starts in
+/// about 2 ms, so a debug build measures 4.4-4.9 ms (release 2.6-2.8 ms)
+/// and an absolute assert there would fail on a busy host. Every build
+/// asserts that it costs well under the full check (post-merge after a
+/// fast-forward to a local branch at a commit no gate checked, security
+/// review note 1). Before that note any other ref at `HEAD` counted, with
+/// no host config and no subprocess: release p95 cpu 1.1 ms, debug 2.4 ms.
+#[test]
+fn post_merge_after_a_trusted_fast_forward_stays_in_budget_l19_item37() {
+    let meter = CpuMeter::new();
+    let sb = Sandbox::new();
+    sb.scoped_host("remotes = [\"*/remotes/trusted*\"]");
+    let repo = repo_with(&sb, "r", PASS);
+    let bare = sb.root().join("remotes/trusted.git");
+    std::fs::create_dir_all(&bare).unwrap();
+    sb.git(&bare, &["init", "-q", "--bare"]);
+    sb.git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    sb.git(&repo, &["push", "-q", "origin", "main"]);
+    sb.git(&repo, &["checkout", "-q", "-b", "up"]);
+    sb.commit_file(&repo, "ff.txt", "1\n", "ff");
+    sb.git(&repo, &["push", "-q", "origin", "up"]);
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    sb.git(&repo, &["branch", "-q", "-D", "up"]);
+    sb.git(&repo, &["merge", "-q", "--ff-only", "origin/up"]);
+    let env = hook_env(&sb);
+    let fast = p95(&meter, 3, 40, || {
+        let out = run_hook(&env, &repo, "post-merge");
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    });
+    // The full check: Gate::open, which records the commit.
+    sb.git(&repo, &["checkout", "-q", "-b", "side"]);
+    let side = sb.commit_file(&repo, "s.txt", "1\n", "side");
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    sb.git(&repo, &["merge", "-q", "--ff-only", "side"]);
+    let full = p95(&meter, 1, 20, || {
+        let out = run_hook(&env, &repo, "post-merge");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(&side[..12]),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    });
+    {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "L19 post-merge full check (local fast-forward, records): p95 cpu {:.2} ms, wall {:.2} ms (no budget)",
+            full.cpu.as_secs_f64() * 1000.0,
+            full.wall.as_secs_f64() * 1000.0
+        );
+    }
+    assert!(
+        fast.cpu * 2 < full.cpu,
+        "the trusted fast-forward ({fast:?}) does not skip the full check ({full:?})"
+    );
+    if cfg!(debug_assertions) {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "L19 chained hook (post-merge after a trusted fast-forward): p95 cpu {:.2} ms, wall {:.2} ms (debug build: 5 ms asserted in release)",
+            fast.cpu.as_secs_f64() * 1000.0,
+            fast.wall.as_secs_f64() * 1000.0
+        );
+    } else {
+        within_budget(
+            "chained hook (post-merge after a trusted fast-forward)",
+            fast,
+            Duration::from_millis(5),
+        );
+    }
 }
 
 #[test]
@@ -204,6 +308,47 @@ fn the_guard_answers_in_under_10_ms_l19() {
         assert_eq!(code, Some(0), "{err}");
     });
     within_budget("guard", t, Duration::from_millis(10));
+
+    // A deny has more work than an allow: the keyed hash of the command
+    // for the metrics log (item 50), which reads `metrics.key`.
+    let deny = serde_json::json!({
+        "cwd": a.sb.root(),
+        "tool_name": "Bash",
+        "tool_input": {"command": "git commit --no-verify -m x"},
+    })
+    .to_string();
+    let denied = || {
+        let (code, _, err) = a.guard_raw(&deny, &[]);
+        assert_eq!(code, Some(2), "{err}");
+    };
+    denied();
+    let key = a.sb.state().join("metrics.key");
+    assert!(key.is_file(), "the first deny creates the key");
+    let t = p95(&meter, 3, 200, denied);
+    within_budget("guard deny", t, Duration::from_millis(10));
+
+    // The first deny also creates the key: random bytes from /dev/urandom,
+    // a 0600 file and a hard link into place.
+    let mut best: Option<P95> = None;
+    for _ in 0..3 {
+        let t: Vec<Sample> = (0..50)
+            .map(|_| {
+                std::fs::remove_file(&key).unwrap();
+                let s = meter.measure(denied);
+                assert!(key.is_file());
+                s
+            })
+            .collect();
+        let p = P95::of(&t);
+        if best.is_none_or(|b| p.cpu < b.cpu) {
+            best = Some(p);
+        }
+    }
+    within_budget(
+        "guard deny that creates metrics.key",
+        best.unwrap(),
+        Duration::from_millis(10),
+    );
 }
 
 /// Detection runs on the `pre-commit` path when the policy commit has no
@@ -254,7 +399,7 @@ fn docs_only_pre_commit_with_detected_roots_stays_in_budget_l19_r61_r65() {
     within_budget(
         "pre-commit docs-only (detected Bun and Python roots)",
         t,
-        Duration::from_millis(200),
+        DOCS_ONLY_DETECTED,
     );
     // Each run was docs-only: no job ran a step.
     let jobs = sb.jobs();
@@ -270,5 +415,58 @@ fn docs_only_pre_commit_with_detected_roots_stays_in_budget_l19_r61_r65() {
                 .all(|s| s["status"] == "skipped"),
             "{report}"
         );
+    }
+}
+
+/// A 100 KB heredoc costs the guard about what reading the command costs
+/// (the same heredoc fed to `cat` next to a git command). Item 51: a
+/// python program next to git denies, and one in a command that runs no
+/// git passes once its text names no git or tollgate, both within 1.6x of
+/// `cat`, and a release build answers in the guard's 10 ms budget. A
+/// debug build reads any 100 KB command, `cat`'s too, in about 55 ms, so
+/// there only the ratio holds. Before (item 51 review, with the removed
+/// python check): `a.\n` 50000 times 1.95x `cat` in a debug build.
+#[test]
+fn large_python_heredocs_cost_little_more_than_reading_them_l19() {
+    let meter = CpuMeter::new();
+    let a = Armed::new();
+    let guard = |head: &str, body: &str, tail: &str, code: i32| {
+        let command = format!("{head} <<'EOF'\n{body}EOF{tail}");
+        let input = serde_json::json!({
+            "cwd": a.sb.root(),
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        })
+        .to_string();
+        p95(&meter, 3, 30, || {
+            let (got, out, err) = a.guard_raw(&input, &[]);
+            assert_eq!(got, Some(code), "{head}: {out}{err}");
+        })
+    };
+    for (what, line) in [
+        (
+            "code lines",
+            "total = sum(x * 2 for x in range(10))  # Doubles: a.B\n",
+        ),
+        ("dotted words", "a.\n"),
+    ] {
+        let body = line.repeat(100 * 1024 / line.len());
+        let cat = guard("cat", &body, "\ngit status", 0);
+        for (case, tail, code) in [("next to git", "\ngit status", 2), ("no git", "", 0)] {
+            let python = guard("python3 -", &body, tail, code);
+            let ratio = python.cpu.as_secs_f64() / cat.cpu.as_secs_f64();
+            let what = format!("guard, 100 KB python heredoc of {what}, {case} ({ratio:.2}x cat)");
+            if cfg!(debug_assertions) {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "L19 {what}: p95 cpu {:.2} ms (debug build: ratio asserted)",
+                    python.cpu.as_secs_f64() * 1000.0
+                );
+            } else {
+                within_budget(&what, python, Duration::from_millis(10));
+            }
+            assert!(ratio < 1.6, "{what}: python {python:?}, cat {cat:?}");
+        }
     }
 }

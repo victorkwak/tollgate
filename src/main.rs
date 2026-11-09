@@ -93,6 +93,7 @@ fn run() -> u8 {
         Command::Gc { all } => cli::gc(&ctx, all),
         Command::Audit { since } => cli::audit(&ctx, since.as_deref()),
         Command::Flaky { days } => cli::flaky(&ctx, days),
+        Command::Stats { since, json } => cli::stats(&ctx, since.as_deref(), json),
         Command::RunJob { job, lock_fd } => cli::run_job(&ctx, &job, lock_fd),
         Command::Merge { branch } => tollgate::merge::merge(&ctx, &branch),
         Command::Install { yes } => tollgate::install::install(&ctx, yes),
@@ -119,6 +120,7 @@ fn run() -> u8 {
 /// Runs a gate or chained hook (R1, R7, R17, R20). R31: a hook that cannot
 /// even read its cwd denies.
 fn hook_main(name: &'static str, args: &[OsString]) -> u8 {
+    let started = std::time::Instant::now();
     let cwd = match std::env::current_dir() {
         Ok(c) => c,
         Err(e) => {
@@ -133,6 +135,7 @@ fn hook_main(name: &'static str, args: &[OsString]) -> u8 {
             env: tollgate::env::EnvSnapshot::capture(),
             cwd,
             exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tollgate")),
+            started,
         },
     )
 }
@@ -337,6 +340,17 @@ enum Command {
     Flaky {
         #[arg(long, default_value_t = 14)]
         days: u32,
+    },
+    /// How much time the gate costs: hook outcomes, job and queue times,
+    /// guard decisions by rule (item 50).
+    Stats {
+        /// Only events after this: a date `YYYY-MM-DD`, `<n>d` or a
+        /// duration (`12h`).
+        #[arg(long)]
+        since: Option<String>,
+        /// JSON instead of the table.
+        #[arg(long)]
+        json: bool,
     },
     /// List records for review (R83).
     Audit {

@@ -579,11 +579,35 @@ allow_ssh_agent = false
     }
 }
 
+/// `scope.remotes` compiled: which remote URLs are trusted (R5, R20).
+#[derive(Debug, Clone)]
+pub struct TrustedUrls(GlobSet);
+
+impl TrustedUrls {
+    /// Compiles `scope.remotes` alone, without the rest of the scope (item
+    /// 37: a post hook needs only this). Case-insensitive and `*` crosses
+    /// `/`, so a URL spelled differently still counts as trusted (errs
+    /// toward gating).
+    pub fn new(scope: &ScopeConfig) -> Result<Self, String> {
+        let loose_ci = GlobOpts {
+            case_insensitive: true,
+            literal_separator: false,
+        };
+        glob::compile(&scope.remotes, loose_ci).map(Self)
+    }
+
+    /// True when `url` matches `scope.remotes`.
+    #[must_use]
+    pub fn matches(&self, url: &str) -> bool {
+        self.0.is_match(url)
+    }
+}
+
 /// `[scope]` compiled for matching (L4).
 #[derive(Debug, Clone)]
 pub struct CompiledScope {
     roots: Vec<PathBuf>,
-    remotes: GlobSet,
+    remotes: TrustedUrls,
     include: GlobSet,
     exclude: GlobSet,
 }
@@ -597,19 +621,13 @@ impl CompiledScope {
             .iter()
             .filter_map(|r| std::fs::canonicalize(dirs.expand_tilde(r)).ok())
             .collect();
-        // Remote URLs: case-insensitive and `*` crosses `/`, so a URL spelled
-        // differently still counts as trusted (errs toward gating).
-        let loose_ci = GlobOpts {
-            case_insensitive: true,
-            literal_separator: false,
-        };
         let names = GlobOpts {
             case_insensitive: false,
             literal_separator: false,
         };
         Ok(Self {
             roots,
-            remotes: glob::compile(&scope.remotes, loose_ci)?,
+            remotes: TrustedUrls::new(scope)?,
             include: glob::compile(&scope.include, names)?,
             exclude: glob::compile(&scope.exclude, names)?,
         })
@@ -618,7 +636,7 @@ impl CompiledScope {
     /// True when `url` matches `scope.remotes` (R5, R20).
     #[must_use]
     pub fn remote_trusted(&self, url: &str) -> bool {
-        self.remotes.is_match(url)
+        self.remotes.matches(url)
     }
 
     /// True when `include`/`exclude` allow the repo name `name`.

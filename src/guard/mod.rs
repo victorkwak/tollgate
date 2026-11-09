@@ -24,6 +24,7 @@
 //! permission rules still decide (UNVERIFIED that Claude Code applies
 //! `updatedInput` without one; if not, the 100 s default cap stands, R28).
 
+pub mod data;
 pub mod rules;
 pub mod shell;
 
@@ -37,6 +38,7 @@ use crate::dirs::Dirs;
 use crate::env::EnvSnapshot;
 use crate::exit;
 use crate::install::{self, InstallRecord};
+use crate::metrics;
 use rules::{Context, Ruling};
 
 /// The guard's answer.
@@ -77,15 +79,87 @@ const CAP_PREFIX: &str = "export TOLLGATE_INLINE_CAP=";
 /// Default `tiers.full_refs` (L7).
 const DEFAULT_FULL_REFS: &[&str] = &["main", "master", "integration/*"];
 
-/// Runs the guard on PreToolUse input `input` (R23).
+/// What the metrics log keeps of one guard call (item 50).
+#[derive(Debug, Default)]
+struct Note {
+    tool: Option<String>,
+    /// The command or file path; only its keyed hash is logged.
+    subject: Option<String>,
+    rule: Option<&'static str>,
+    ask: bool,
+    rewrite: bool,
+}
+
+impl Note {
+    fn ruling(&mut self, ruling: &Ruling) {
+        match ruling {
+            Ruling::Allow => {}
+            Ruling::Ask(r) => {
+                self.rule = Some(r.rule);
+                self.ask = true;
+            }
+            Ruling::Deny(r) => self.rule = Some(r.rule),
+        }
+    }
+}
+
+/// Runs the guard on PreToolUse input `input` (R23), and logs the
+/// decision to the metrics log (item 50). The log never changes the
+/// answer: [`metrics::record`] drops every error.
 #[must_use]
 pub fn guard(env: &EnvSnapshot, input: &[u8], exe: &Path, process_cwd: &Path) -> Answer {
+    let start = std::time::Instant::now();
+    let mut note = Note::default();
+    let answer = answer(env, input, exe, process_cwd, &mut note);
+    let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+    if let Ok(dirs) = Dirs::from_env(env) {
+        let decision = if answer.code != exit::OK {
+            metrics::Decision::Deny
+        } else if note.ask {
+            metrics::Decision::Ask
+        } else {
+            metrics::Decision::Allow
+        };
+        // Only asks and denies carry the hash: it serves the false-deny
+        // review (distinct commands per rule), and skipping it keeps the
+        // key read off the common allow path (about 25 µs of the 55 µs
+        // the log costs) and leaves fewer hashes to guess against.
+        let cmd = note
+            .subject
+            .as_deref()
+            .filter(|_| decision != metrics::Decision::Allow)
+            .and_then(|s| metrics::keyed_hash(&dirs, s));
+        metrics::record(
+            &dirs,
+            &[metrics::Event::Guard(metrics::GuardEvent {
+                t: jiff::Timestamp::now(),
+                tool: note.tool.unwrap_or_else(|| "?".into()),
+                decision,
+                rule: note.rule.map(str::to_owned),
+                rewrite: note.rewrite,
+                us,
+                cmd,
+            })],
+        );
+    }
+    answer
+}
+
+fn answer(
+    env: &EnvSnapshot,
+    input: &[u8],
+    exe: &Path,
+    process_cwd: &Path,
+    note: &mut Note,
+) -> Answer {
+    note.rule = Some("malformed-input");
     let Ok(v) = serde_json::from_slice::<Value>(input) else {
         return Answer::deny("tollgate guard: malformed hook input (not JSON)");
     };
     let Some(tool) = v.get("tool_name").and_then(Value::as_str) else {
         return Answer::deny("tollgate guard: malformed hook input (no tool_name)");
     };
+    note.tool = Some(tool.chars().take(64).collect());
     let Some(tool_input) = v.get("tool_input").and_then(Value::as_object) else {
         return Answer::deny("tollgate guard: malformed hook input (no tool_input)");
     };
@@ -97,27 +171,33 @@ pub fn guard(env: &EnvSnapshot, input: &[u8], exe: &Path, process_cwd: &Path) ->
         Ok(d) => d,
         Err(e) => return Answer::deny(format!("tollgate guard: {e}")),
     };
+    note.rule = None;
     let record = InstallRecord::read(&dirs);
     let ctx = context(env, &dirs, &cwd, record.as_ref().ok());
     match tool {
         "Bash" => {
             let Some(command) = tool_input.get("command").and_then(Value::as_str) else {
+                note.rule = Some("malformed-input");
                 return Answer::deny("tollgate guard: malformed Bash input (no command)");
             };
+            note.subject = Some(command.to_owned());
             if let Err(reason) = self_check(env, &dirs, exe, record.as_ref()) {
                 if rules::is_repair_command(&ctx, command) {
                     return Answer::allow();
                 }
+                note.rule = Some("not-armed");
                 return Answer::deny(format!(
                     "tollgate: gate not armed ({reason}); run: tollgate install"
                 ));
             }
             let ruling = rules::bash_ruling(&ctx, command);
+            note.ruling(&ruling);
             if let Ruling::Deny(why) = &ruling {
                 return Answer::deny(format!("tollgate guard: denied: {why}"));
             }
             let updated = rules::needs_long_timeout(&ctx, command)
                 .then(|| rewrite(&dirs, tool_input, command));
+            note.rewrite = updated.is_some();
             respond(&ruling, updated)
         }
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
@@ -127,9 +207,12 @@ pub fn guard(env: &EnvSnapshot, input: &[u8], exe: &Path, process_cwd: &Path) ->
                 "file_path"
             };
             let Some(file) = tool_input.get(key).and_then(Value::as_str) else {
+                note.rule = Some("malformed-input");
                 return Answer::deny(format!("tollgate guard: malformed {tool} input (no {key})"));
             };
+            note.subject = Some(file.to_owned());
             let ruling = rules::file_ruling(&ctx, file);
+            note.ruling(&ruling);
             if let Ruling::Deny(why) = &ruling {
                 return Answer::deny(format!("tollgate guard: denied: {why}"));
             }
@@ -264,16 +347,19 @@ fn context(env: &EnvSnapshot, dirs: &Dirs, cwd: &Path, record: Option<&InstallRe
 }
 
 /// R26: policy files (R71) and the repo's own hooks dir ask.
-pub(crate) fn repo_rules(path: &Path) -> Option<String> {
+pub(crate) fn repo_rules(path: &Path) -> Option<(&'static str, String)> {
     let root = repo_root(path)?;
     let rel = path.strip_prefix(&root).ok()?;
     let config = repo_config(&root);
     if let Ok(m) = crate::policy::PolicyMatcher::new(&config)
         && m.is_policy_file(rel)
     {
-        return Some(format!(
-            "edit of policy file {} (R26, R71; it applies after it merges to a full ref)",
-            rel.display()
+        return Some((
+            "policy-file-edit",
+            format!(
+                "edit of policy file {} (R26, R71; it applies after it merges to a full ref)",
+                rel.display()
+            ),
         ));
     }
     let env = EnvSnapshot::default();
@@ -283,9 +369,12 @@ pub(crate) fn repo_rules(path: &Path) -> Option<String> {
         && d != layout.default_hooks_dir()
         && path.starts_with(&d)
     {
-        return Some(format!(
-            "edit of a repo hook in core.hooksPath {} (R26)",
-            d.display()
+        return Some((
+            "repo-hook-edit",
+            format!(
+                "edit of a repo hook in core.hooksPath {} (R26)",
+                d.display()
+            ),
         ));
     }
     None

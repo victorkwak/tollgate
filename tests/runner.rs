@@ -41,13 +41,16 @@ fn inline_budget_denies_then_wait_and_cache_hit_t19_r32_l17() {
     let repo = repo_with(
         &sb,
         "r",
-        "version = 1\n[budget]\ninline = \"1s\"\n[[step]]\nname = \"slow\"\nkind = \"command\"\nrun = \"sleep 2\"\n",
+        "version = 1\n[budget]\ninline = \"1s\"\n[[step]]\nname = \"slow\"\nkind = \"command\"\nrun = \"sleep 4\"\n",
     );
     let start = Instant::now();
     let r = sb.tollgate(&repo, &["check"]);
     assert_eq!(r.code, Some(3), "{}", r.out);
+    // Back at the 1 s budget, well before the 4 s job ends. The margin
+    // holds at a load of 47 on 16 cores, where the old 2 s job and bound
+    // failed three tries in a row (1.2-1.6 s of start-up and plan).
     assert!(
-        start.elapsed() < Duration::from_secs(2),
+        start.elapsed() < Duration::from_secs(4),
         "{:?}",
         start.elapsed()
     );

@@ -37,6 +37,12 @@ fn deny_patterns_exit_2_and_reads_stay_open_t15_r23_r25() {
         // HOME and XDG decide where tollgate finds its config (R8).
         "HOME=/tmp/x git commit -m x".to_owned(),
         "XDG_CONFIG_HOME=/tmp/c git commit -m x".to_owned(),
+        // A masked message given to a `git` that is not the real git runs
+        // (item 42 recheck).
+        "git() { eval \"$3\"; }; git commit -m 'git push --no-verify origin HEAD'".to_owned(),
+        "shopt -s expand_aliases\nalias git='eval'\ngit commit -m 'tollgate waive --tree x'"
+            .to_owned(),
+        "./git commit -m 'git push --no-verify origin HEAD'".to_owned(),
     ] {
         let (code, out, err) = a.bash(&cmd);
         assert_eq!(code, Some(2), "{cmd}: {out}{err}");
@@ -68,6 +74,50 @@ fn deny_patterns_exit_2_and_reads_stay_open_t15_r23_r25() {
     }
     let (code, _, err) = a.bash_with("ls", &[("TOLLGATE_TEST_PANIC", "guard")]);
     assert_eq!(code, Some(2), "{err}");
+}
+
+/// Item 51 (security review notes 2 and 3, and the lead's direction of
+/// 2026-11-09: no OS sandbox stands behind the guard, so only exact
+/// exemptions). A python program is code: one whose text names git or
+/// tollgate denies, with or without a git command next to it, and one
+/// that reads its text from stdin denies next to git whatever the text,
+/// unless it is a clean heredoc in a command that runs no git. Data is
+/// not code only in exact forms: `cat > <plain path> <<'QUOTED'` and a
+/// `grep` or `rg` pattern may name git, `--no-verify` or `env -i`.
+#[test]
+fn python_heredocs_are_code_and_exact_forms_are_data_item51() {
+    let a = Armed::new();
+    for cmd in [
+        "python3 <<'EOF'\nfrom os import (\n    system,\n)\nsystem(\"git commit -n -m x\")\nEOF",
+        "python3 <<'EOF'\nimport subprocess\nsubprocess.run(['git', 'commit', '-n', '-m', 'x'])\nEOF",
+        "python3 <<'EOF'\nimport timeit\ntimeit.timeit(\"import os\\nos.sys\" \"tem('git commit -n -m x')\", number=1)\nEOF",
+        "perl - <<'EOF'\nsystem('git', 'commit', '-n', '-m', 'x');\nEOF",
+        "bash -s <<'EOF'\ngit commit -n -m x\nEOF",
+        "python3 - <<'PY'\np = 'notes.md'\ns = 'run git commit, then tollgate status; never env -i'\nopen(p, 'w').write(s)\nPY\ncp notes.md b.md && grep -n git b.md",
+        "git status && python3 <<'EOF'\n# coding: utf-7\n+AGkAbQBwAG8AcgB0ACAAbwBzADsAIABvAHMALgBzAHkAcwB0AGUAbQAoACcAZwBpAHQAIABjAG8AbQBtAGkAdAAgAC0AbgAgAC0AbQAgAHgAJwAp-\nEOF",
+        "git status && python3 <<< '# -*- coding: utf-7 -*-\n+AGkAbQBwAG8AcgB0ACAAbwBzADsAIABvAHMALgBzAHkAcwB0AGUAbQAoACcAZwBpAHQAIABjAG8AbQBtAGkAdAAgAC0AbgAgAC0AbQAgAHgAJwAp-'",
+        "git status && python3 <<'EOF'\n# -*- coding: utf-8 -*-\nprint('x')\nEOF",
+        "cd r && tollgate status; python3 - <<'EOF'\nprint(1)\nEOF",
+        "jq '.cmd | select(test(\"--no-verify|GIT_CONFIG_COUNT\"))' log.jsonl; git status",
+        "cat >> notes.md <<'EOF'\n--no-verify\nEOF",
+        "cat > /proc/self/fd/1 <<'EOF'\ngit commit --no-verify\nEOF",
+        "grep -o -- --no-verify notes.md | some-runner",
+        "sort --compress-program=sh <<'EOF'\ngit commit -n -m x\nEOF",
+    ] {
+        let (code, out, err) = a.bash(cmd);
+        assert_eq!(code, Some(2), "{cmd}: {out}{err}");
+    }
+    for cmd in [
+        "python3 - <<'PY'\np = 'notes.md'\ns = open(p).read().replace('a', 'b')\nopen(p, 'w').write(s)\nPY\ncp notes.md b.md && grep -n x b.md",
+        "cat > notes.md <<'EOF'\nrun git commit, then tollgate status\nEOF\ngit add notes.md",
+        "cat > msg.txt <<'EOF'\nGuard: deny --no-verify and env -i\nEOF\ngit commit -F msg.txt",
+        "grep -n -- '--no-verify\\|env -i' notes.md; git status",
+        "rg -n 'GIT_CONFIG_COUNT|env -i' docs; git status",
+        "grep -n git notes.md; python3 - <<'EOF'\nprint(1)\nEOF",
+    ] {
+        let (code, _, err) = a.bash(cmd);
+        assert_eq!(code, Some(0), "{cmd}: {err}");
+    }
 }
 
 #[test]
