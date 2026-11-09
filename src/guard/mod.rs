@@ -15,19 +15,30 @@
 //! installed copy, and every hook link shares its inode. A missing hooks
 //! dir or link is recreated first (L18) and logged to `repairs.log`.
 //!
-//! R28 as changed by L17: for a command that runs a waiting git command or
-//! `tollgate check|wait|merge`, `updatedInput` raises `timeout` to 600000
-//! and prefixes `export TOLLGATE_INLINE_CAP=<n>; ` (540, or the `fast`
-//! budget for `run_in_background`) to the command exactly as it was
-//! checked; input that already starts with that prefix is denied (item
-//! 12). `export` instead of a bare assignment,
-//! so the cap reaches git also after `cd x &&` or in a pipeline. The output
+//! Bash commands go through a closed grammar (G1-G8, [`walk`]): the
+//! command is parsed as bash parses it ([`shell`]), and every simple
+//! command in it must fit an allowed shape; anything else is denied with
+//! the shape to use.
+//!
+//! R28 as changed by L17 and G6: for a command that runs a waiting git
+//! command or `tollgate check|wait|merge`, `updatedInput` raises `timeout`
+//! to 600000 and puts `export TOLLGATE_INLINE_CAP=<n>; ` (540, or the
+//! `fast` budget for `run_in_background`) in front of the command exactly
+//! as it was checked; the guard never removes or changes client text
+//! (item 12). `export` instead of a bare assignment, so the cap reaches git
+//! also after `cd x &&` or in a pipeline. A client may only lower the cap,
+//! with a literal number in front of git or tollgate (G6). The output
 //! carries no `permissionDecision` for a plain rewrite, so Claude Code's own
 //! permission rules still decide (UNVERIFIED that Claude Code applies
 //! `updatedInput` without one; if not, the 100 s default cap stands, R28).
 
+mod cmds;
+mod git;
+pub mod paths;
+mod progs;
 pub mod rules;
 pub mod shell;
+mod walk;
 
 use std::path::{Path, PathBuf};
 
@@ -100,7 +111,9 @@ pub fn guard(env: &EnvSnapshot, input: &[u8], exe: &Path, process_cwd: &Path) ->
         Err(e) => return Answer::deny(format!("tollgate guard: {e}")),
     };
     let record = InstallRecord::read(&dirs);
-    let ctx = context(env, &dirs, &cwd, record.as_ref().ok());
+    let background = tool_input.get("run_in_background").and_then(Value::as_bool) == Some(true);
+    let cap = inline_cap(&dirs, background);
+    let ctx = context(env, &dirs, &cwd, record.as_ref().ok(), cap);
     match tool {
         "Bash" => {
             let Some(command) = tool_input.get("command").and_then(Value::as_str) else {
@@ -116,19 +129,18 @@ pub fn guard(env: &EnvSnapshot, input: &[u8], exe: &Path, process_cwd: &Path) ->
             }
             // Item 12: the rewrite puts its prefix in front of the exact
             // checked text and never removes any, so a command that
-            // already starts with it is a client imitating the guard.
+            // already starts with it imitates the guard.
             if command.trim_start().starts_with(CAP_PREFIX) {
                 return Answer::deny(format!(
                     "tollgate guard: denied: the command starts with `{CAP_PREFIX}`, which only the guard adds; send the command without it"
                 ));
             }
-            let ruling = rules::bash_ruling(&ctx, command);
-            if let Ruling::Deny(why) = &ruling {
-                return Answer::deny(format!("tollgate guard: denied: {why}"));
+            let a = rules::assess(&ctx, command);
+            if let Ruling::Deny(why) = &a.ruling {
+                return Answer::deny(format!("tollgate guard: denied: {}", one_line(why)));
             }
-            let updated = rules::needs_long_timeout(&ctx, command)
-                .then(|| rewrite(&dirs, tool_input, command));
-            respond(&ruling, updated)
+            let updated = a.long_timeout.then(|| rewrite(tool_input, command, cap));
+            respond(&a.ruling, updated)
         }
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
             let key = if tool == "NotebookEdit" {
@@ -141,7 +153,7 @@ pub fn guard(env: &EnvSnapshot, input: &[u8], exe: &Path, process_cwd: &Path) ->
             };
             let ruling = rules::file_ruling(&ctx, file);
             if let Ruling::Deny(why) = &ruling {
-                return Answer::deny(format!("tollgate guard: denied: {why}"));
+                return Answer::deny(format!("tollgate guard: denied: {}", one_line(why)));
             }
             respond(&ruling, None)
         }
@@ -172,18 +184,28 @@ fn respond(ruling: &Ruling, updated: Option<Value>) -> Answer {
     }
 }
 
-/// R28/L17: the same input with the timeout raised and the cap exported
-/// in front of the command exactly as it was checked (item 12: client text
-/// is never removed or changed).
-fn rewrite(dirs: &Dirs, input: &serde_json::Map<String, Value>, command: &str) -> Value {
-    let background = input.get("run_in_background").and_then(Value::as_bool) == Some(true);
-    let cap = if background {
+/// The cap the guard exports (L17): 540 s, or the `fast` budget for a
+/// background call.
+fn inline_cap(dirs: &Dirs, background: bool) -> u64 {
+    if background {
         HostConfig::load(dirs)
             .map(|h| h.config.budget.fast.get().as_secs())
             .unwrap_or(20 * 60)
     } else {
         crate::config::host::FOREGROUND_INLINE_CAP.as_secs()
-    };
+    }
+}
+
+/// A deny reason on one line (R23): newlines from quoted text become
+/// `\n`.
+fn one_line(why: &str) -> String {
+    why.replace('\n', "\\n")
+}
+
+/// R28/L17: the same input with the timeout raised and the cap exported
+/// in front of the command exactly as it was checked (item 12: client
+/// text is never removed or changed).
+fn rewrite(input: &serde_json::Map<String, Value>, command: &str, cap: u64) -> Value {
     let mut out = input.clone();
     out.insert(
         "command".into(),
@@ -211,7 +233,13 @@ fn repo_config(root: &Path) -> RepoConfig {
         .unwrap_or_default()
 }
 
-fn context(env: &EnvSnapshot, dirs: &Dirs, cwd: &Path, record: Option<&InstallRecord>) -> Context {
+fn context(
+    env: &EnvSnapshot,
+    dirs: &Dirs,
+    cwd: &Path,
+    record: Option<&InstallRecord>,
+    inline_cap: u64,
+) -> Context {
     let home = dirs.home().to_owned();
     let mut vars: Vec<(String, String)> =
         vec![("HOME".into(), home.to_string_lossy().into_owned())];
@@ -225,6 +253,13 @@ fn context(env: &EnvSnapshot, dirs: &Dirs, cwd: &Path, record: Option<&InstallRe
             str::to_owned,
         );
         vars.push((var.into(), v));
+    }
+    // Session values the rules may expand in paths, and CDPATH, which
+    // makes a relative `cd` unpredictable (G8).
+    for var in ["TMPDIR", "CDPATH", "USER", "LOGNAME"] {
+        if let Some(v) = env.get_str(var) {
+            vars.push((var.into(), v.to_owned()));
+        }
     }
     let mut protected = Vec::new();
     for d in [dirs.state_dir(), dirs.data_dir(), dirs.config_dir()] {
@@ -268,6 +303,7 @@ fn context(env: &EnvSnapshot, dirs: &Dirs, cwd: &Path, record: Option<&InstallRe
         host_config: dirs.host_config_file(),
         full_refs,
         tollgate_names: names,
+        inline_cap,
     }
 }
 
@@ -380,20 +416,32 @@ mod tests {
 
     #[test]
     fn rewrite_raises_the_timeout_and_exports_the_cap_r28_l17() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dirs =
-            Dirs::from_env(&EnvSnapshot::from_pairs([("HOME", tmp.path().as_os_str())])).unwrap();
-        let input = json!({"command": "cd r && git commit -m x", "timeout": 1000});
-        let out = rewrite(&dirs, input.as_object().unwrap(), "cd r && git commit -m x");
+        let cmd = "cd r && git status -m x";
+        let input = json!({"command": cmd, "timeout": 1000});
+        let out = rewrite(input.as_object().unwrap(), cmd, 540);
         assert_eq!(
             out["command"],
-            "export TOLLGATE_INLINE_CAP=540; cd r && git commit -m x"
+            format!("export TOLLGATE_INLINE_CAP=540; {cmd}")
         );
         assert_eq!(out["timeout"], BASH_TIMEOUT_MS);
         let bg = json!({"command": "git push", "run_in_background": true, "timeout": 900_000});
-        let out = rewrite(&dirs, bg.as_object().unwrap(), "git push");
+        let out = rewrite(bg.as_object().unwrap(), "git push", 1200);
         assert_eq!(out["command"], "export TOLLGATE_INLINE_CAP=1200; git push");
         assert_eq!(out["timeout"], 900_000);
+    }
+
+    /// Item 12: the guard checks the whole command as received and only
+    /// puts its own export in front of that exact text; it never strips a
+    /// client prefix (the old rewrite checked only the text after the
+    /// first `; ` of a client `TOLLGATE_INLINE_CAP=...; ` prefix).
+    #[test]
+    fn the_rewrite_never_strips_client_text_item_12() {
+        let cmd = "export TOLLGATE_INLINE_CAP=1; git push -m x; ls";
+        let out = rewrite(json!({"command": cmd}).as_object().unwrap(), cmd, 540);
+        assert_eq!(
+            out["command"],
+            format!("export TOLLGATE_INLINE_CAP=540; {cmd}")
+        );
     }
 
     #[test]

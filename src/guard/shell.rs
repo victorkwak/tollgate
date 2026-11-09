@@ -1,696 +1,1994 @@
-//! A small POSIX-shell lexer for the guard's text rules (R25, R26, R28).
+//! A bash parser for the guard's closed grammar (R25, G1-G8).
 //!
-//! It splits a Bash command into simple commands with their words (quotes
-//! removed), leading assignments and redirections. Command substitutions
-//! (`$(...)`, backticks), process substitutions (`<(...)`, `>(...)`) and
-//! subshells are parsed as commands too. Heredoc bodies are data: they are
-//! skipped here and seen only by the guard's substring rules (a heredoc,
-//! here-string or pipe into a shell is denied in commands that name git,
-//! item 31). Best effort: the guard is a backstop behind the git hooks, so
-//! a construct this lexer does not model errs toward more matches, not
-//! fewer.
+//! It builds the command tree bash would run: lists, and-or lists,
+//! pipelines, simple commands, subshells, groups, `if`, `while`, `until`,
+//! `for`, `select`, `case`, `[[ ]]`, `(( ))` and function definitions,
+//! with their redirections and heredocs. Words keep their parts (literal
+//! text, quotes, parameters, substitutions, globs, tilde, brace
+//! expansion), so the rules can tell a literal word from one bash builds at
+//! run time. Command and process substitutions are parsed in place, as
+//! bash 5 does, so a heredoc or a quote inside `$(...)` cannot move the
+//! end of the substitution.
+//!
+//! The parser is strict: input it does not model (an unterminated quote,
+//! `coproc`, extended globs, a stray `(`) is a [`ParseError`], and the
+//! guard denies the call (the grammar is closed). ANSI-C strings
+//! (`$'...'`) are found as bash finds them (a backslash escapes the next
+//! character) and kept undecoded: they are never literal.
 
-/// One redirection of a simple command.
+use std::cell::RefCell;
+use std::rc::Rc;
+
+/// Input the parser does not accept; the guard denies it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Redirect {
-    /// Operator: `>`, `>>`, `>|`, `&>`, `&>>`, `<>`, `<`, `<<`, `<<<`,
-    /// `>&`, `<&`.
-    pub op: String,
-    /// Target word (file, fd, or heredoc delimiter).
-    pub target: String,
+pub struct ParseError(pub String);
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
-impl Redirect {
-    /// True when the redirection writes a file.
+/// One part of a word.
+#[derive(Debug, Clone)]
+pub enum Part {
+    /// Unquoted text, backslash escapes removed.
+    Lit(String),
+    /// `'...'`.
+    Single(String),
+    /// `"..."` (also `$"..."`): literal text, parameters, substitutions.
+    Double(Vec<Part>),
+    /// `$'...'`, undecoded.
+    AnsiC(String),
+    /// `$name`, `$1`, `${...}`: the text after `$` (braces kept), and the
+    /// commands any substitution inside it runs.
+    Param(String, Vec<Script>),
+    /// `$(...)`.
+    CmdSub(Script),
+    /// `` `...` ``.
+    Backtick(Script),
+    /// `$((...))`: the expression and the commands substitutions inside it
+    /// run.
+    Arith(String, Vec<Script>),
+    /// `<(...)` or `>(...)`.
+    ProcSub(Script),
+    /// An unquoted `*`, `?` or `[` (pathname expansion).
+    Glob(char),
+    /// An unquoted `~` or `~user` at the start of a word or value.
+    Tilde(String),
+}
+
+/// A word: its parts, whether bash brace-expands it, and its source text.
+#[derive(Debug, Clone, Default)]
+pub struct Word {
+    pub parts: Vec<Part>,
+    /// An unquoted `{...,...}` or `{a..b}`: bash makes several words.
+    pub brace: bool,
+    /// The source text.
+    pub raw: String,
+}
+
+impl Word {
+    /// The word bash passes when every part is fixed text: literal text,
+    /// quotes with literal text inside, and the heredoc message idiom
+    /// `"$(cat <<'EOF' ... EOF)"` (inside double quotes only: unquoted, its
+    /// output would be split into words). `None` otherwise.
+    #[must_use]
+    pub fn literal(&self) -> Option<String> {
+        self.value(&|_| None, None)
+    }
+
+    /// [`Self::literal`] with `~` and `~/` resolved to `home`.
+    #[must_use]
+    pub fn literal_home(&self, home: &str) -> Option<String> {
+        self.value(&|_| None, Some(home))
+    }
+
+    /// The word with simple parameters (`$NAME`, `${NAME}`) taken from
+    /// `lookup` and `~` from `home`; `None` when anything else is in it.
+    #[must_use]
+    pub fn value(
+        &self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+        home: Option<&str>,
+    ) -> Option<String> {
+        if self.brace {
+            return None;
+        }
+        let mut out = String::new();
+        for (k, p) in self.parts.iter().enumerate() {
+            match p {
+                Part::Lit(s) | Part::Single(s) => out.push_str(s),
+                Part::Double(inner) => {
+                    for q in inner {
+                        match q {
+                            Part::Lit(s) => out.push_str(s),
+                            Part::CmdSub(s) => out.push_str(&s.cat_heredoc()?),
+                            Part::Param(name, subs) if subs.is_empty() => {
+                                out.push_str(&lookup(simple_param(name)?)?);
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+                Part::Param(name, subs) if subs.is_empty() => {
+                    // Unquoted: word splitting; only a value without blanks
+                    // or glob characters stays one word.
+                    let v = lookup(simple_param(name)?)?;
+                    if v.is_empty() || v.contains([' ', '\t', '\n', '*', '?', '[']) {
+                        return None;
+                    }
+                    out.push_str(&v);
+                }
+                Part::Tilde(user) if k == 0 && user.is_empty() => out.push_str(home?),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// True when the word has no parts that run code or expand at run
+    /// time, except simple parameters (`$x`, `"${x}"`): the words of a
+    /// non-gated command whose values do not matter.
+    #[must_use]
+    pub fn is_plain(&self) -> bool {
+        self.literal().is_some()
+    }
+
+    /// Every script that runs while bash builds the word.
+    #[must_use]
+    pub fn scripts(&self) -> Vec<&Script> {
+        let mut out = Vec::new();
+        collect_scripts(&self.parts, &mut out);
+        out
+    }
+
+    /// The literal text before the first non-literal part (quotes
+    /// removed), and whether the whole word is literal.
+    #[must_use]
+    pub fn literal_prefix(&self) -> (String, bool) {
+        let mut out = String::new();
+        for p in &self.parts {
+            match p {
+                Part::Lit(s) | Part::Single(s) => out.push_str(s),
+                Part::Double(inner) => {
+                    for q in inner {
+                        match q {
+                            Part::Lit(s) => out.push_str(s),
+                            _ => return (out, false),
+                        }
+                    }
+                }
+                _ => return (out, false),
+            }
+        }
+        (out, !self.brace)
+    }
+}
+
+/// `NAME` of `$NAME` or `${NAME}` (no operators); `None` otherwise.
+fn simple_param(text: &str) -> Option<&str> {
+    let name = text
+        .strip_prefix('{')
+        .and_then(|t| t.strip_suffix('}'))
+        .unwrap_or(text);
+    is_name(name).then_some(name)
+}
+
+fn collect_scripts<'a>(parts: &'a [Part], out: &mut Vec<&'a Script>) {
+    for p in parts {
+        match p {
+            Part::Double(inner) => collect_scripts(inner, out),
+            Part::Param(_, s) | Part::Arith(_, s) => out.extend(s.iter()),
+            Part::CmdSub(s) | Part::Backtick(s) | Part::ProcSub(s) => out.push(s),
+            _ => {}
+        }
+    }
+}
+
+/// A list: and-or lists separated by `;`, `&` or newlines.
+#[derive(Debug, Clone, Default)]
+pub struct Script {
+    pub items: Vec<AndOr>,
+}
+
+impl Script {
+    /// The text `$(...)` of this script gives when it is exactly
+    /// `cat <<'EOF' ... EOF` (a quoted delimiter, or a body with no
+    /// expansion): the body without its trailing newlines.
+    #[must_use]
+    pub fn cat_heredoc(&self) -> Option<String> {
+        let [ao] = self.items.as_slice() else {
+            return None;
+        };
+        if !ao.rest.is_empty() || ao.background || ao.first.negate {
+            return None;
+        }
+        let [c] = ao.first.cmds.as_slice() else {
+            return None;
+        };
+        let Kind::Simple(s) = &c.kind else {
+            return None;
+        };
+        let [w] = s.words.as_slice() else {
+            return None;
+        };
+        if !s.assigns.is_empty() || w.literal().as_deref() != Some("cat") {
+            return None;
+        }
+        let [r] = c.redirs.as_slice() else {
+            return None;
+        };
+        if r.op != Op::Here || r.fd.is_some_and(|f| f != 0) {
+            return None;
+        }
+        let body = r.doc.as_ref()?.borrow().literal()?;
+        Some(body.trim_end_matches('\n').to_owned())
+    }
+}
+
+/// Pipelines joined by `&&` and `||`.
+#[derive(Debug, Clone)]
+pub struct AndOr {
+    pub first: Pipeline,
+    /// `(true, p)` for `&& p`, `(false, p)` for `|| p`.
+    pub rest: Vec<(bool, Pipeline)>,
+    /// Ended by `&`.
+    pub background: bool,
+}
+
+/// Commands joined by `|` or `|&`.
+#[derive(Debug, Clone)]
+pub struct Pipeline {
+    pub negate: bool,
+    pub cmds: Vec<Command>,
+}
+
+/// A command with its redirections.
+#[derive(Debug, Clone)]
+pub struct Command {
+    pub kind: Kind,
+    pub redirs: Vec<Redir>,
+}
+
+/// The kinds of command.
+#[derive(Debug, Clone)]
+pub enum Kind {
+    Simple(Simple),
+    Subshell(Script),
+    Group(Script),
+    If {
+        arms: Vec<(Script, Script)>,
+        other: Option<Script>,
+    },
+    /// `while` and `until`.
+    Loop {
+        cond: Script,
+        body: Script,
+    },
+    /// `for` and `select`; `var` as written.
+    For {
+        var: Word,
+        items: Option<Vec<Word>>,
+        body: Script,
+    },
+    /// `for ((...))`.
+    ArithFor {
+        header: Part,
+        body: Script,
+    },
+    Case {
+        subject: Word,
+        arms: Vec<(Vec<Word>, Script)>,
+    },
+    Func {
+        name: Word,
+        body: Box<Command>,
+    },
+    /// `[[ ... ]]`.
+    Cond(Vec<Word>),
+    /// `(( ... ))`.
+    Arith(Part),
+}
+
+/// Assignments, then the command name and its arguments.
+#[derive(Debug, Clone, Default)]
+pub struct Simple {
+    pub assigns: Vec<Assign>,
+    pub words: Vec<Word>,
+}
+
+/// `NAME=value`, `NAME+=value`, `NAME[i]=value` or `NAME=(a b)`.
+#[derive(Debug, Clone)]
+pub struct Assign {
+    pub name: String,
+    /// The value (one word), or the items of an array value.
+    pub value: Vec<Word>,
+    pub array: bool,
+    /// The whole assignment as written.
+    pub raw: String,
+}
+
+/// A redirection operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    /// `<`
+    In,
+    /// `>`
+    Out,
+    /// `>>`
+    Append,
+    /// `>|`
+    Clobber,
+    /// `<>`
+    ReadWrite,
+    /// `<<` and `<<-`
+    Here,
+    /// `<<<`
+    HereStr,
+    /// `<&`
+    DupIn,
+    /// `>&`
+    DupOut,
+    /// `&>`
+    OutErr,
+    /// `&>>`
+    AppendErr,
+}
+
+/// One redirection.
+#[derive(Debug, Clone)]
+pub struct Redir {
+    /// An explicit fd number (`2>`).
+    pub fd: Option<u32>,
+    /// `{NAME}>`: bash opens a new fd and assigns its number to `NAME`.
+    pub var: Option<String>,
+    pub op: Op,
+    /// The file, fd, here-string, or heredoc delimiter.
+    pub target: Word,
+    /// The heredoc body, read at the next newline.
+    pub doc: Option<Rc<RefCell<Doc>>>,
+}
+
+impl Redir {
+    /// True when the redirection reads the command's stdin (fd 0).
+    #[must_use]
+    pub fn feeds_stdin(&self) -> bool {
+        matches!(
+            self.op,
+            Op::In | Op::ReadWrite | Op::Here | Op::HereStr | Op::DupIn
+        ) && self.fd.unwrap_or(0) == 0
+            && self.var.is_none()
+    }
+
+    /// True when the redirection writes a file named by its target.
     #[must_use]
     pub fn writes_file(&self) -> bool {
-        match self.op.as_str() {
-            ">" | ">>" | ">|" | "&>" | "&>>" | "<>" => true,
-            // `>&file` (not an fd number or `-`) writes the file in bash.
-            ">&" => {
-                !self.target.is_empty()
-                    && !self.target.bytes().all(|b| b.is_ascii_digit())
-                    && self.target != "-"
-            }
+        match self.op {
+            Op::Out | Op::Append | Op::Clobber | Op::ReadWrite | Op::OutErr | Op::AppendErr => true,
+            // `>&file` (not an fd number or `-`) writes the file.
+            Op::DupOut => self.target.literal().is_none_or(|t| {
+                !(t == "-" || (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())))
+            }),
             _ => false,
         }
     }
 }
 
-/// A simple command.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SimpleCommand {
-    /// `NAME=value` words before the command name.
-    pub assignments: Vec<String>,
-    /// Command name and arguments, quotes removed.
-    pub words: Vec<String>,
-    /// Redirections.
-    pub redirects: Vec<Redirect>,
-    /// Its stdin is a pipe (after `|` or `|&`, or in a piped subshell).
-    pub piped: bool,
+/// A heredoc body.
+#[derive(Debug, Clone, Default)]
+pub struct Doc {
+    /// The delimiter was quoted: the body is literal.
+    pub quoted: bool,
+    pub body: String,
+    /// For an unquoted delimiter: the body's parts after expansion
+    /// (parameters, substitutions).
+    pub parts: Vec<Part>,
 }
 
-struct Lexer<'a> {
-    chars: Vec<char>,
-    pos: usize,
-    out: &'a mut Vec<SimpleCommand>,
-    depth: usize,
-    /// Set when a word uses ANSI-C quoting.
-    ansi_c: &'a mut bool,
-}
-
-const MAX_DEPTH: usize = 16;
-
-/// Parses `src` into simple commands, nested substitutions included.
-#[must_use]
-pub fn parse(src: &str) -> Vec<SimpleCommand> {
-    parse_flagged(src).0
-}
-
-/// [`parse`], and whether a word uses ANSI-C quoting where bash reads it so:
-/// `$'` in single or double quotes or in a heredoc body is data.
-#[must_use]
-pub fn parse_flagged(src: &str) -> (Vec<SimpleCommand>, bool) {
-    let mut out = Vec::new();
-    let mut ansi_c = false;
-    parse_into(src, &mut out, 0, &mut ansi_c);
-    (out, ansi_c)
-}
-
-fn parse_into(src: &str, out: &mut Vec<SimpleCommand>, depth: usize, ansi_c: &mut bool) {
-    if depth > MAX_DEPTH {
-        return;
+impl Doc {
+    /// The body as the command reads it, when nothing in it expands.
+    #[must_use]
+    pub fn literal(&self) -> Option<String> {
+        if self.quoted {
+            return Some(self.body.clone());
+        }
+        let mut out = String::new();
+        for p in &self.parts {
+            match p {
+                Part::Lit(s) => out.push_str(s),
+                _ => return None,
+            }
+        }
+        Some(out)
     }
-    let mut lx = Lexer {
-        chars: src.chars().collect(),
-        pos: 0,
-        out,
+}
+
+/// True for a shell variable name.
+#[must_use]
+pub fn is_name(s: &str) -> bool {
+    let mut c = s.chars();
+    c.next()
+        .is_some_and(|f| f.is_ascii_alphabetic() || f == '_')
+        && c.all(|f| f.is_ascii_alphanumeric() || f == '_')
+}
+
+/// Words that end an unquoted word.
+fn is_meta(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '<' | '>'
+    )
+}
+
+/// How deep lists, substitutions and quotes may nest.
+const MAX_DEPTH: usize = 64;
+
+/// Parses a Bash command (G1-G8).
+///
+/// # Errors
+/// Input bash would reject or the guard does not model.
+pub fn parse(src: &str) -> Result<Script, ParseError> {
+    parse_at(src, 0)
+}
+
+fn parse_at(src: &str, depth: usize) -> Result<Script, ParseError> {
+    let mut p = Parser {
+        s: src.chars().collect(),
+        i: 0,
+        pending: Vec::new(),
         depth,
-        ansi_c,
     };
-    lx.run();
+    let script = p.list(&End::Eof)?;
+    if p.i < p.s.len() {
+        return Err(p.err("unexpected text"));
+    }
+    // A heredoc with no newline after its line: bash reads an empty body.
+    p.pending.clear();
+    Ok(script)
 }
 
-impl Lexer<'_> {
+/// Where a list ends.
+enum End {
+    Eof,
+    /// `)` of a subshell or substitution.
+    Paren,
+    /// One of these reserved words in command position.
+    Words(&'static [&'static str]),
+    /// A case arm: `;;`, `;&`, `;;&` or `esac`.
+    CaseArm,
+}
+
+struct Parser {
+    s: Vec<char>,
+    i: usize,
+    /// Heredocs whose bodies start after the next newline.
+    pending: Vec<(String, bool, Rc<RefCell<Doc>>)>,
+    depth: usize,
+}
+
+type R<T> = Result<T, ParseError>;
+
+impl Parser {
+    fn err(&self, what: &str) -> ParseError {
+        let near: String = self.s.iter().skip(self.i).take(24).collect();
+        ParseError(format!("{what} near `{}`", near.replace('\n', "\\n")))
+    }
+
     fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+        self.s.get(self.i).copied()
     }
 
-    fn peek_at(&self, n: usize) -> Option<char> {
-        self.chars.get(self.pos + n).copied()
+    fn at(&self, n: usize) -> Option<char> {
+        self.s.get(self.i + n).copied()
     }
 
-    fn nested(&mut self, src: &str) {
-        let mut inner = Vec::new();
-        parse_into(src, &mut inner, self.depth + 1, self.ansi_c);
-        self.out.extend(inner);
+    fn starts(&self, t: &str) -> bool {
+        t.chars().enumerate().all(|(k, c)| self.at(k) == Some(c))
     }
 
-    /// Reads up to the `)` that closes a `(` just consumed; returns the
-    /// text between.
-    fn read_balanced_paren(&mut self) -> String {
-        let start = self.pos;
-        let mut level = 1usize;
-        while let Some(c) = self.peek() {
+    fn deeper(&mut self) -> R<()> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(self.err("nested too deeply"));
+        }
+        Ok(())
+    }
+
+    /// Skips blanks, line continuations and a comment (not the newline).
+    fn blanks(&mut self) {
+        loop {
+            match self.peek() {
+                Some(' ' | '\t') => self.i += 1,
+                Some('\\') if self.at(1) == Some('\n') => self.i += 2,
+                Some('#') => {
+                    while self.peek().is_some_and(|c| c != '\n') {
+                        self.i += 1;
+                    }
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// Skips blanks, comments and newlines; reads heredoc bodies.
+    fn blanks_nl(&mut self) -> R<()> {
+        loop {
+            self.blanks();
+            if self.peek() == Some('\n') {
+                self.i += 1;
+                self.heredocs()?;
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Reads the bodies of the pending heredocs (after a newline).
+    fn heredocs(&mut self) -> R<()> {
+        for (delim, strip, doc) in std::mem::take(&mut self.pending) {
+            let mut body = String::new();
+            loop {
+                if self.peek().is_none() {
+                    break;
+                }
+                let start = self.i;
+                while self.peek().is_some_and(|c| c != '\n') {
+                    self.i += 1;
+                }
+                let mut line: String = self.s[start..self.i].iter().collect();
+                if self.peek() == Some('\n') {
+                    self.i += 1;
+                }
+                if strip {
+                    line = line.trim_start_matches('\t').to_owned();
+                }
+                if line == delim {
+                    break;
+                }
+                body.push_str(&line);
+                body.push('\n');
+            }
+            let mut d = doc.borrow_mut();
+            if !d.quoted {
+                d.parts = expand_doc(&body, self.depth + 1)?;
+            }
+            d.body = body;
+        }
+        Ok(())
+    }
+
+    /// The plain word at the cursor (no quotes or expansions) when it is
+    /// followed by a metacharacter or the end: for reserved words.
+    fn plain_word(&self) -> Option<String> {
+        let mut k = self.i;
+        let mut w = String::new();
+        while let Some(&c) = self.s.get(k) {
+            if is_meta(c) {
+                break;
+            }
+            if matches!(c, '\'' | '"' | '\\' | '$' | '`') {
+                return None;
+            }
+            w.push(c);
+            k += 1;
+        }
+        (!w.is_empty()).then_some(w)
+    }
+
+    fn take_word(&mut self, w: &str) -> bool {
+        if self.plain_word().as_deref() == Some(w) {
+            self.i += w.chars().count();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_word(&mut self, w: &str) -> R<()> {
+        self.blanks_nl()?;
+        if self.take_word(w) {
+            Ok(())
+        } else {
+            Err(self.err(&format!("expected `{w}`")))
+        }
+    }
+
+    fn at_end(&self, end: &End) -> bool {
+        match end {
+            End::Eof => self.peek().is_none(),
+            End::Paren => self.peek() == Some(')'),
+            End::Words(ws) => self.plain_word().is_some_and(|w| ws.contains(&w.as_str())),
+            End::CaseArm => {
+                self.starts(";;")
+                    || self.starts(";&")
+                    || self.plain_word().as_deref() == Some("esac")
+            }
+        }
+    }
+
+    fn list(&mut self, end: &End) -> R<Script> {
+        self.deeper()?;
+        let mut items: Vec<AndOr> = Vec::new();
+        loop {
+            self.blanks_nl()?;
+            if self.at_end(end) {
+                break;
+            }
+            if self.peek().is_none() {
+                return Err(self.err("unexpected end of input"));
+            }
+            let ao = self.and_or()?;
+            items.push(ao);
+            self.blanks();
+            match self.peek() {
+                Some(';') if !self.starts(";;") && !self.starts(";&") => self.i += 1,
+                Some('&') if !self.starts("&&") && !self.starts("&>") => {
+                    self.i += 1;
+                    if let Some(last) = items.last_mut() {
+                        last.background = true;
+                    }
+                }
+                Some('\n') | None => {}
+                _ if self.at_end(end) => {}
+                _ => return Err(self.err("unexpected text after a command")),
+            }
+        }
+        self.depth -= 1;
+        Ok(Script { items })
+    }
+
+    fn and_or(&mut self) -> R<AndOr> {
+        let first = self.pipeline()?;
+        let mut rest = Vec::new();
+        loop {
+            self.blanks();
+            let and = if self.starts("&&") {
+                true
+            } else if self.starts("||") {
+                false
+            } else {
+                break;
+            };
+            self.i += 2;
+            self.blanks_nl()?;
+            rest.push((and, self.pipeline()?));
+        }
+        Ok(AndOr {
+            first,
+            rest,
+            background: false,
+        })
+    }
+
+    fn pipeline(&mut self) -> R<Pipeline> {
+        let mut negate = false;
+        loop {
+            self.blanks();
+            if self.take_word("!") {
+                negate = !negate;
+            } else if self.take_word("time") {
+                self.blanks();
+                self.take_word("-p");
+            } else {
+                break;
+            }
+        }
+        let mut cmds = vec![self.command()?];
+        loop {
+            self.blanks();
+            if self.peek() == Some('|') && self.at(1) != Some('|') {
+                self.i += 1;
+                if self.peek() == Some('&') {
+                    self.i += 1;
+                }
+                self.blanks_nl()?;
+                cmds.push(self.command()?);
+            } else {
+                break;
+            }
+        }
+        Ok(Pipeline { negate, cmds })
+    }
+
+    fn command(&mut self) -> R<Command> {
+        self.blanks();
+        let kind = match self.plain_word().as_deref() {
+            _ if self.starts("((") => match self.arith(2)? {
+                Some(a) => Kind::Arith(a),
+                None => {
+                    self.i += 1;
+                    Kind::Subshell(self.sub_list()?)
+                }
+            },
+            _ if self.peek() == Some('(') => {
+                self.i += 1;
+                Kind::Subshell(self.sub_list()?)
+            }
+            Some("if") => self.if_cmd()?,
+            Some("while" | "until") => {
+                self.i += 5;
+                let cond = self.list(&End::Words(&["do"]))?;
+                self.expect_word("do")?;
+                let body = self.list(&End::Words(&["done"]))?;
+                self.expect_word("done")?;
+                Kind::Loop { cond, body }
+            }
+            Some("for" | "select") => self.for_cmd()?,
+            Some("case") => self.case_cmd()?,
+            Some("{") => {
+                self.i += 1;
+                let body = self.list(&End::Words(&["}"]))?;
+                self.expect_word("}")?;
+                Kind::Group(body)
+            }
+            Some("[[") => self.cond_cmd()?,
+            Some("function") => {
+                self.i += "function".len();
+                self.blanks();
+                let name = self.word()?;
+                self.blanks();
+                if self.peek() == Some('(') {
+                    self.i += 1;
+                    self.blanks();
+                    if self.peek() != Some(')') {
+                        return Err(self.err("expected `)`"));
+                    }
+                    self.i += 1;
+                }
+                self.blanks_nl()?;
+                Kind::Func {
+                    name,
+                    body: Box::new(self.command()?),
+                }
+            }
+            Some(
+                "coproc" | "then" | "elif" | "else" | "fi" | "do" | "done" | "esac" | "}" | "in"
+                | "]]",
+            ) => return Err(self.err("unsupported or misplaced reserved word")),
+            _ => return self.simple(),
+        };
+        let redirs = self.redirs()?;
+        Ok(Command { kind, redirs })
+    }
+
+    /// The list of a subshell or substitution, after `(`, through `)`.
+    fn sub_list(&mut self) -> R<Script> {
+        let s = self.list(&End::Paren)?;
+        if self.peek() != Some(')') {
+            return Err(self.err("expected `)`"));
+        }
+        self.i += 1;
+        Ok(s)
+    }
+
+    fn redirs(&mut self) -> R<Vec<Redir>> {
+        let mut out = Vec::new();
+        loop {
+            self.blanks();
+            if !self.at_redir() {
+                return Ok(out);
+            }
+            out.push(self.redir()?);
+        }
+    }
+
+    fn if_cmd(&mut self) -> R<Kind> {
+        self.i += 2;
+        let mut arms = Vec::new();
+        let mut other = None;
+        loop {
+            let cond = self.list(&End::Words(&["then"]))?;
+            self.expect_word("then")?;
+            let body = self.list(&End::Words(&["elif", "else", "fi"]))?;
+            arms.push((cond, body));
+            self.blanks_nl()?;
+            if self.take_word("elif") {
+                continue;
+            }
+            if self.take_word("else") {
+                other = Some(self.list(&End::Words(&["fi"]))?);
+            }
+            self.expect_word("fi")?;
+            return Ok(Kind::If { arms, other });
+        }
+    }
+
+    fn for_cmd(&mut self) -> R<Kind> {
+        let kw = self.plain_word().unwrap_or_default();
+        self.i += kw.len();
+        self.blanks();
+        if kw == "for" && self.starts("((") {
+            let header = self
+                .arith(2)?
+                .ok_or_else(|| self.err("unterminated `for ((`"))?;
+            self.blanks();
+            if self.peek() == Some(';') {
+                self.i += 1;
+            }
+            self.blanks_nl()?;
+            let body = self.loop_body()?;
+            return Ok(Kind::ArithFor { header, body });
+        }
+        let var = self.word()?;
+        self.blanks();
+        if self.peek() == Some(';') {
+            self.i += 1;
+        }
+        self.blanks_nl()?;
+        let mut items = None;
+        if self.take_word("in") {
+            let mut v = Vec::new();
+            loop {
+                self.blanks();
+                match self.peek() {
+                    Some(';') => {
+                        self.i += 1;
+                        break;
+                    }
+                    Some('\n') | None => break,
+                    _ => v.push(self.word()?),
+                }
+            }
+            items = Some(v);
+        }
+        self.blanks_nl()?;
+        let body = self.loop_body()?;
+        Ok(Kind::For { var, items, body })
+    }
+
+    fn loop_body(&mut self) -> R<Script> {
+        if self.take_word("do") {
+            let body = self.list(&End::Words(&["done"]))?;
+            self.expect_word("done")?;
+            return Ok(body);
+        }
+        if self.take_word("{") {
+            let body = self.list(&End::Words(&["}"]))?;
+            self.expect_word("}")?;
+            return Ok(body);
+        }
+        Err(self.err("expected `do`"))
+    }
+
+    fn case_cmd(&mut self) -> R<Kind> {
+        self.i += 4;
+        self.blanks();
+        let subject = self.word()?;
+        self.expect_word("in")?;
+        let mut arms = Vec::new();
+        loop {
+            self.blanks_nl()?;
+            if self.take_word("esac") {
+                return Ok(Kind::Case { subject, arms });
+            }
+            if self.peek() == Some('(') {
+                self.i += 1;
+            }
+            let mut pats = Vec::new();
+            loop {
+                self.blanks();
+                pats.push(self.word()?);
+                self.blanks();
+                match self.peek() {
+                    Some('|') => self.i += 1,
+                    Some(')') => {
+                        self.i += 1;
+                        break;
+                    }
+                    _ => return Err(self.err("expected `)` after a case pattern")),
+                }
+            }
+            let body = self.list(&End::CaseArm)?;
+            arms.push((pats, body));
+            self.blanks();
+            for op in [";;&", ";;", ";&"] {
+                if self.starts(op) {
+                    self.i += op.len();
+                    break;
+                }
+            }
+        }
+    }
+
+    fn cond_cmd(&mut self) -> R<Kind> {
+        self.i += 2;
+        let mut words = Vec::new();
+        loop {
+            self.blanks_nl()?;
+            if self.take_word("]]") {
+                return Ok(Kind::Cond(words));
+            }
+            match self.peek() {
+                None => return Err(self.err("unterminated `[[`")),
+                Some(c @ ('(' | ')' | '!')) => {
+                    self.i += 1;
+                    words.push(lit_word(&c.to_string()));
+                }
+                Some('&' | '|' | '<' | '>') if self.at(1) != Some('(') => {
+                    let start = self.i;
+                    self.i += 1;
+                    if matches!(self.peek(), Some('&' | '|')) {
+                        self.i += 1;
+                    }
+                    let t: String = self.s[start..self.i].iter().collect();
+                    words.push(lit_word(&t));
+                }
+                _ => words.push(self.word()?),
+            }
+        }
+    }
+
+    /// Tries `((...))` (or `$((...))` after the `$`) at the cursor; `skip`
+    /// is the number of `(` to consume. `None` (cursor restored) when the
+    /// text does not close with `))`: it is then a subshell.
+    fn arith(&mut self, skip: usize) -> R<Option<Part>> {
+        let save = self.i;
+        self.i += skip;
+        let mut text = String::new();
+        let mut subs = Vec::new();
+        let mut level = 0usize;
+        loop {
+            let Some(c) = self.peek() else {
+                self.i = save;
+                return Ok(None);
+            };
             match c {
-                '\\' => self.pos += 2,
-                '\'' => {
-                    self.pos += 1;
-                    while self.peek().is_some_and(|c| c != '\'') {
-                        self.pos += 1;
-                    }
-                    self.pos += 1;
-                }
-                '"' => {
-                    self.pos += 1;
-                    while let Some(c) = self.peek() {
-                        if c == '\\' {
-                            self.pos += 2;
-                            continue;
-                        }
-                        self.pos += 1;
-                        if c == '"' {
-                            break;
-                        }
-                    }
-                }
                 '(' => {
                     level += 1;
-                    self.pos += 1;
+                    text.push(c);
+                    self.i += 1;
+                }
+                ')' if level == 0 => {
+                    if self.at(1) == Some(')') {
+                        self.i += 2;
+                        return Ok(Some(Part::Arith(text, subs)));
+                    }
+                    self.i = save;
+                    return Ok(None);
                 }
                 ')' => {
                     level -= 1;
-                    if level == 0 {
-                        let text: String = self.chars[start..self.pos].iter().collect();
-                        self.pos += 1;
-                        return text;
-                    }
-                    self.pos += 1;
+                    text.push(c);
+                    self.i += 1;
                 }
-                _ => self.pos += 1,
+                '$' => {
+                    let p = self.dollar(false)?;
+                    collect_owned(p, &mut subs, &mut text);
+                }
+                '`' => {
+                    self.i += 1;
+                    subs.push(self.backtick(false)?);
+                    text.push_str("`...`");
+                }
+                '\'' | '"' => {
+                    let w = self.word_part_quote()?;
+                    text.push_str(&w);
+                }
+                _ => {
+                    text.push(c);
+                    self.i += 1;
+                }
             }
         }
-        self.pos = self.pos.min(self.chars.len());
-        self.chars[start..].iter().collect()
     }
 
-    /// Reads up to the closing backtick; returns the text between.
-    fn read_backticks(&mut self) -> String {
-        let mut text = String::new();
+    /// A quote inside an arithmetic expression, as text.
+    fn word_part_quote(&mut self) -> R<String> {
+        let q = self.peek().unwrap_or('\'');
+        let start = self.i;
+        self.i += 1;
         while let Some(c) = self.peek() {
-            self.pos += 1;
-            match c {
-                '\\' => {
-                    if let Some(n) = self.peek() {
-                        text.push(n);
-                        self.pos += 1;
+            self.i += 1;
+            if c == '\\' && q == '"' {
+                self.i += 1;
+                continue;
+            }
+            if c == q {
+                return Ok(self.s[start..self.i].iter().collect());
+            }
+        }
+        Err(self.err("unterminated quote"))
+    }
+
+    fn at_redir(&self) -> bool {
+        let mut k = 0;
+        while self.at(k).is_some_and(|c| c.is_ascii_digit()) {
+            k += 1;
+        }
+        if k == 0 && self.peek() == Some('{') {
+            let mut j = 1;
+            while self
+                .at(j)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                j += 1;
+            }
+            if j > 1 && self.at(j) == Some('}') && matches!(self.at(j + 1), Some('<' | '>')) {
+                return true;
+            }
+        }
+        match self.at(k) {
+            Some('<' | '>') => self.at(k + 1) != Some('('),
+            Some('&') => k == 0 && self.at(1) == Some('>'),
+            _ => false,
+        }
+    }
+
+    fn redir(&mut self) -> R<Redir> {
+        let mut fd = None;
+        let mut var = None;
+        let start = self.i;
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.i += 1;
+        }
+        if self.i > start {
+            let n: String = self.s[start..self.i].iter().collect();
+            fd = Some(n.parse().map_err(|_| self.err("bad fd number"))?);
+        } else if self.peek() == Some('{') {
+            let close = (self.i..self.s.len())
+                .find(|&k| self.s[k] == '}')
+                .ok_or_else(|| self.err("bad `{fd}` redirection"))?;
+            var = Some(self.s[self.i + 1..close].iter().collect());
+            self.i = close + 1;
+        }
+        let ops: [(&str, Op); 12] = [
+            ("&>>", Op::AppendErr),
+            ("<<<", Op::HereStr),
+            ("<<-", Op::Here),
+            ("<<", Op::Here),
+            ("<>", Op::ReadWrite),
+            ("<&", Op::DupIn),
+            ("<", Op::In),
+            (">>", Op::Append),
+            (">|", Op::Clobber),
+            (">&", Op::DupOut),
+            (">", Op::Out),
+            ("&>", Op::OutErr),
+        ];
+        let (text, op) = ops
+            .iter()
+            .find(|(t, _)| self.starts(t))
+            .copied()
+            .ok_or_else(|| self.err("bad redirection"))?;
+        self.i += text.len();
+        self.blanks();
+        if self
+            .peek()
+            .is_none_or(|c| is_meta(c) && c != '<' && c != '>')
+        {
+            return Err(self.err("redirection without a target"));
+        }
+        let target = self.word()?;
+        let mut doc = None;
+        if op == Op::Here {
+            let quoted = target.raw.contains(['\'', '"', '\\']);
+            let delim: String = unquote_raw(&target.raw);
+            let d = Rc::new(RefCell::new(Doc {
+                quoted,
+                ..Doc::default()
+            }));
+            self.pending.push((delim, text == "<<-", Rc::clone(&d)));
+            doc = Some(d);
+        }
+        Ok(Redir {
+            fd,
+            var,
+            op,
+            target,
+            doc,
+        })
+    }
+
+    fn simple(&mut self) -> R<Command> {
+        let mut sc = Simple::default();
+        let mut redirs = Vec::new();
+        loop {
+            self.blanks();
+            if self.at_redir() {
+                redirs.push(self.redir()?);
+                continue;
+            }
+            match self.peek() {
+                None | Some('\n' | ';' | '&' | '|' | ')') => break,
+                Some('(') => {
+                    if sc.words.len() == 1 && sc.assigns.is_empty() && redirs.is_empty() {
+                        self.i += 1;
+                        self.blanks();
+                        if self.peek() != Some(')') {
+                            return Err(self.err("unexpected `(`"));
+                        }
+                        self.i += 1;
+                        self.blanks_nl()?;
+                        let body = self.command()?;
+                        let name = sc.words.remove(0);
+                        return Ok(Command {
+                            kind: Kind::Func {
+                                name,
+                                body: Box::new(body),
+                            },
+                            redirs: Vec::new(),
+                        });
+                    }
+                    return Err(self.err("unexpected `(`"));
+                }
+                _ => {}
+            }
+            let w = self.word()?;
+            // `NAME=(a b)`: an array value (also in `declare` arguments).
+            let array_value =
+                self.peek() == Some('(') && w.raw.ends_with('=') && split_assign(&w).is_some();
+            if array_value {
+                self.i += 1;
+                let mut items = Vec::new();
+                loop {
+                    self.blanks_nl()?;
+                    match self.peek() {
+                        Some(')') => {
+                            self.i += 1;
+                            break;
+                        }
+                        None => return Err(self.err("unterminated array")),
+                        _ => items.push(self.word()?),
                     }
                 }
+                let (name, _) = split_assign(&w).unwrap_or_default();
+                if sc.words.is_empty() {
+                    sc.assigns.push(Assign {
+                        name,
+                        raw: w.raw.clone(),
+                        value: items,
+                        array: true,
+                    });
+                } else {
+                    sc.words.push(w);
+                    sc.words.extend(items);
+                }
+                continue;
+            }
+            if sc.words.is_empty()
+                && let Some((name, value)) = split_assign(&w)
+            {
+                sc.assigns.push(Assign {
+                    name,
+                    raw: w.raw.clone(),
+                    value: vec![value],
+                    array: false,
+                });
+                continue;
+            }
+            sc.words.push(w);
+        }
+        Ok(Command {
+            kind: Kind::Simple(sc),
+            redirs,
+        })
+    }
+
+    /// One word at the cursor.
+    fn word(&mut self) -> R<Word> {
+        let start = self.i;
+        let mut parts: Vec<Part> = Vec::new();
+        let mut lit = String::new();
+        // Unquoted `{`, `}`, `,` and `.` with placeholders, for brace
+        // expansion.
+        let mut probe = String::new();
+        let flush = |lit: &mut String, parts: &mut Vec<Part>| {
+            if !lit.is_empty() {
+                parts.push(Part::Lit(std::mem::take(lit)));
+            }
+        };
+        while let Some(c) = self.peek() {
+            match c {
+                c if is_meta(c) && !matches!(c, '<' | '>') => break,
+                '<' | '>' => {
+                    if self.at(1) != Some('(') {
+                        break;
+                    }
+                    self.i += 2;
+                    self.deeper()?;
+                    let s = self.sub_list()?;
+                    self.depth -= 1;
+                    flush(&mut lit, &mut parts);
+                    parts.push(Part::ProcSub(s));
+                    probe.push('x');
+                }
+                '\\' => {
+                    self.i += 1;
+                    match self.peek() {
+                        Some('\n') => self.i += 1,
+                        Some(n) => {
+                            lit.push(n);
+                            self.i += 1;
+                        }
+                        None => lit.push('\\'),
+                    }
+                    probe.push('x');
+                }
+                '\'' => {
+                    self.i += 1;
+                    let mut t = String::new();
+                    loop {
+                        match self.peek() {
+                            None => return Err(self.err("unterminated single quote")),
+                            Some('\'') => {
+                                self.i += 1;
+                                break;
+                            }
+                            Some(ch) => {
+                                t.push(ch);
+                                self.i += 1;
+                            }
+                        }
+                    }
+                    flush(&mut lit, &mut parts);
+                    parts.push(Part::Single(t));
+                    probe.push('x');
+                }
+                '"' => {
+                    self.i += 1;
+                    let d = self.double()?;
+                    flush(&mut lit, &mut parts);
+                    parts.push(d);
+                    probe.push('x');
+                }
+                '`' => {
+                    self.i += 1;
+                    let s = self.backtick(false)?;
+                    flush(&mut lit, &mut parts);
+                    parts.push(Part::Backtick(s));
+                    probe.push('x');
+                }
+                '$' => {
+                    let p = self.dollar(false)?;
+                    match p {
+                        Part::Lit(t) => lit.push_str(&t),
+                        other => {
+                            flush(&mut lit, &mut parts);
+                            parts.push(other);
+                        }
+                    }
+                    probe.push('x');
+                }
+                '*' | '?' => {
+                    self.i += 1;
+                    flush(&mut lit, &mut parts);
+                    parts.push(Part::Glob(c));
+                    probe.push('x');
+                }
+                '[' if self.closes_bracket() => {
+                    self.i += 1;
+                    flush(&mut lit, &mut parts);
+                    parts.push(Part::Glob('['));
+                    probe.push('x');
+                }
+                '~' if self.i == start => {
+                    self.i += 1;
+                    let mut user = String::new();
+                    while let Some(ch) = self.peek() {
+                        if is_meta(ch) || matches!(ch, '/' | '\'' | '"' | '\\' | '$' | '`' | ':') {
+                            break;
+                        }
+                        user.push(ch);
+                        self.i += 1;
+                    }
+                    parts.push(Part::Tilde(user));
+                    probe.push('x');
+                }
+                _ => {
+                    lit.push(c);
+                    self.i += 1;
+                    probe.push(if matches!(c, '{' | '}' | ',' | '.') {
+                        c
+                    } else {
+                        'x'
+                    });
+                }
+            }
+        }
+        flush(&mut lit, &mut parts);
+        if self.i == start {
+            return Err(self.err("expected a word"));
+        }
+        Ok(Word {
+            parts,
+            brace: brace_expands(&probe),
+            raw: self.s[start..self.i].iter().collect(),
+        })
+    }
+
+    /// True when an unquoted `]` follows in the same word (a bracket
+    /// expression).
+    fn closes_bracket(&self) -> bool {
+        let mut k = self.i + 1;
+        while let Some(&c) = self.s.get(k) {
+            if is_meta(c) || matches!(c, '\'' | '"' | '\\' | '$' | '`') {
+                return false;
+            }
+            if c == ']' {
+                return true;
+            }
+            k += 1;
+        }
+        false
+    }
+
+    /// The rest of a double-quoted string, after `"`.
+    fn double(&mut self) -> R<Part> {
+        let mut parts = Vec::new();
+        let mut lit = String::new();
+        loop {
+            let Some(c) = self.peek() else {
+                return Err(self.err("unterminated double quote"));
+            };
+            match c {
+                '"' => {
+                    self.i += 1;
+                    break;
+                }
+                '\\' => {
+                    self.i += 1;
+                    match self.peek() {
+                        Some('\n') => self.i += 1,
+                        Some(n @ ('$' | '`' | '"' | '\\')) => {
+                            lit.push(n);
+                            self.i += 1;
+                        }
+                        _ => lit.push('\\'),
+                    }
+                }
+                '$' => match self.dollar(true)? {
+                    Part::Lit(t) => lit.push_str(&t),
+                    p => {
+                        if !lit.is_empty() {
+                            parts.push(Part::Lit(std::mem::take(&mut lit)));
+                        }
+                        parts.push(p);
+                    }
+                },
+                '`' => {
+                    self.i += 1;
+                    let s = self.backtick(true)?;
+                    if !lit.is_empty() {
+                        parts.push(Part::Lit(std::mem::take(&mut lit)));
+                    }
+                    parts.push(Part::Backtick(s));
+                }
+                _ => {
+                    lit.push(c);
+                    self.i += 1;
+                }
+            }
+        }
+        if !lit.is_empty() {
+            parts.push(Part::Lit(lit));
+        }
+        Ok(Part::Double(parts))
+    }
+
+    /// The text of a backquoted substitution (after the opening
+    /// backquote), parsed.
+    fn backtick(&mut self, in_double: bool) -> R<Script> {
+        let mut text = String::new();
+        loop {
+            let Some(c) = self.peek() else {
+                return Err(self.err("unterminated backquote"));
+            };
+            self.i += 1;
+            match c {
                 '`' => break,
+                '\\' => match self.peek() {
+                    Some(n @ ('$' | '`' | '\\')) => {
+                        text.push(n);
+                        self.i += 1;
+                    }
+                    Some('"') if in_double => {
+                        text.push('"');
+                        self.i += 1;
+                    }
+                    _ => text.push('\\'),
+                },
                 _ => text.push(c),
             }
         }
-        text
+        parse_at(&text, self.depth + 1)
     }
 
-    /// Reads one word (quotes removed); `None` at an operator or the end.
-    fn read_word(&mut self) -> Option<String> {
-        let mut w = String::new();
-        let mut any = false;
-        while let Some(c) = self.peek() {
-            match c {
-                ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' => break,
-                '<' | '>' => {
-                    // `<(` and `>(` inside a word start a process
-                    // substitution; otherwise a redirection ends the word.
-                    if self.peek_at(1) == Some('(') {
-                        self.pos += 2;
-                        let inner = self.read_balanced_paren();
-                        self.nested(&inner);
-                        any = true;
-                        continue;
+    /// A `$` expansion at the cursor. `Part::Lit("$")` for a `$` that
+    /// starts nothing.
+    fn dollar(&mut self, in_double: bool) -> R<Part> {
+        self.i += 1;
+        match self.peek() {
+            Some('(') => {
+                if self.at(1) == Some('(')
+                    && let Some(a) = self.arith(2)?
+                {
+                    return Ok(a);
+                }
+                self.i += 1;
+                self.deeper()?;
+                let s = self.sub_list()?;
+                self.depth -= 1;
+                Ok(Part::CmdSub(s))
+            }
+            Some('{') => {
+                self.i += 1;
+                let (text, subs) = self.braced_param()?;
+                Ok(Part::Param(format!("{{{text}}}"), subs))
+            }
+            Some('\'') if !in_double => {
+                self.i += 1;
+                let start = self.i;
+                loop {
+                    match self.peek() {
+                        None => return Err(self.err("unterminated $'...'")),
+                        Some('\'') => break,
+                        Some('\\') => self.i += 2,
+                        Some(_) => self.i += 1,
                     }
-                    break;
+                }
+                let end = self.i.min(self.s.len());
+                let raw: String = self.s[start..end].iter().collect();
+                self.i = end + 1;
+                Ok(Part::AnsiC(raw))
+            }
+            Some('"') if !in_double => {
+                self.i += 1;
+                self.double()
+            }
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                let mut name = String::new();
+                while let Some(ch) = self.peek() {
+                    if !(ch.is_ascii_alphanumeric() || ch == '_') {
+                        break;
+                    }
+                    name.push(ch);
+                    self.i += 1;
+                }
+                Ok(Part::Param(name, Vec::new()))
+            }
+            Some(c) if c.is_ascii_digit() || "@*#?-$!".contains(c) => {
+                self.i += 1;
+                Ok(Part::Param(c.to_string(), Vec::new()))
+            }
+            _ => Ok(Part::Lit("$".into())),
+        }
+    }
+
+    /// The inside of `${...}` (after `${`), through the closing `}`.
+    fn braced_param(&mut self) -> R<(String, Vec<Script>)> {
+        let mut text = String::new();
+        let mut subs = Vec::new();
+        let mut level = 0usize;
+        loop {
+            let Some(c) = self.peek() else {
+                return Err(self.err("unterminated ${"));
+            };
+            match c {
+                '}' if level == 0 => {
+                    self.i += 1;
+                    return Ok((text, subs));
+                }
+                '}' => {
+                    level -= 1;
+                    text.push(c);
+                    self.i += 1;
+                }
+                '{' => {
+                    level += 1;
+                    text.push(c);
+                    self.i += 1;
                 }
                 '\\' => {
-                    self.pos += 1;
-                    match self.peek() {
-                        Some('\n') => self.pos += 1,
-                        Some(n) => {
-                            w.push(n);
-                            self.pos += 1;
-                        }
-                        None => {}
+                    text.push(c);
+                    self.i += 1;
+                    if let Some(n) = self.peek() {
+                        text.push(n);
+                        self.i += 1;
                     }
-                    any = true;
                 }
                 '\'' => {
-                    self.pos += 1;
-                    while let Some(c) = self.peek() {
-                        self.pos += 1;
-                        if c == '\'' {
-                            break;
-                        }
-                        w.push(c);
-                    }
-                    any = true;
+                    let q = self.word_part_quote()?;
+                    text.push_str(&q);
                 }
                 '"' => {
-                    self.pos += 1;
-                    while let Some(c) = self.peek() {
-                        self.pos += 1;
-                        match c {
-                            '"' => break,
-                            '\\' => match self.peek() {
-                                Some(n @ ('"' | '\\' | '$' | '`')) => {
-                                    w.push(n);
-                                    self.pos += 1;
-                                }
-                                Some('\n') => self.pos += 1,
-                                _ => w.push('\\'),
-                            },
-                            '$' if self.peek() == Some('(') => {
-                                self.pos += 1;
-                                let inner = self.read_balanced_paren();
-                                self.nested(&inner);
-                                w.push_str("$(");
-                                w.push_str(&inner);
-                                w.push(')');
-                            }
-                            '`' => {
-                                let inner = self.read_backticks();
-                                self.nested(&inner);
-                                w.push_str(&inner);
-                            }
-                            _ => w.push(c),
-                        }
-                    }
-                    any = true;
+                    self.i += 1;
+                    let d = self.double()?;
+                    text.push_str("\"...\"");
+                    collect_owned(d, &mut subs, &mut String::new());
+                }
+                '$' => {
+                    let p = self.dollar(false)?;
+                    collect_owned(p, &mut subs, &mut text);
                 }
                 '`' => {
-                    self.pos += 1;
-                    let inner = self.read_backticks();
-                    self.nested(&inner);
-                    w.push_str(&inner);
-                    any = true;
-                }
-                '$' if self.peek_at(1) == Some('(') => {
-                    self.pos += 2;
-                    let inner = self.read_balanced_paren();
-                    self.nested(&inner);
-                    w.push_str("$(");
-                    w.push_str(&inner);
-                    w.push(')');
-                    any = true;
-                }
-                '$' if self.peek_at(1) == Some('\'') => {
-                    self.pos += 2;
-                    *self.ansi_c = true;
-                    self.read_ansi_c(&mut w);
-                    any = true;
-                }
-                // `$"..."` (a locale-translated string) is a double-quoted
-                // string: the next pass reads it.
-                '$' if self.peek_at(1) == Some('"') => self.pos += 1,
-                _ => {
-                    w.push(c);
-                    self.pos += 1;
-                    any = true;
-                }
-            }
-        }
-        any.then_some(w)
-    }
-
-    /// Reads the rest of an ANSI-C quoted string (`$'...'`, after the
-    /// opening quote) into `w`. As bash does, the end is found first (a
-    /// backslash escapes the next character, the first other `'` ends the
-    /// string) and then the text is decoded ([`decode_ansi_c`]), so no
-    /// escape can move the end.
-    fn read_ansi_c(&mut self, w: &mut String) {
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c == '\'' {
-                break;
-            }
-            self.pos += if c == '\\' { 2 } else { 1 };
-        }
-        let end = self.pos.min(self.chars.len());
-        decode_ansi_c(&self.chars[start..end], w);
-        self.pos = (end + 1).min(self.chars.len());
-    }
-
-    fn skip_blanks(&mut self) {
-        while self.peek().is_some_and(|c| c == ' ' || c == '\t') {
-            self.pos += 1;
-        }
-    }
-
-    /// Reads a redirection operator at the current position.
-    fn read_redirect_op(&mut self) -> String {
-        let rest: String = self.chars[self.pos..].iter().take(3).collect();
-        for op in [
-            "&>>", "<<<", "<<-", ">>", ">|", ">&", "<&", "<>", "&>", "<<", ">", "<",
-        ] {
-            if rest.starts_with(op) {
-                self.pos += op.chars().count();
-                return if op == "<<-" { "<<".into() } else { op.into() };
-            }
-        }
-        self.pos += 1;
-        rest.chars().next().map(String::from).unwrap_or_default()
-    }
-
-    /// Skips heredoc bodies after a newline.
-    fn skip_heredocs(&mut self, delims: &mut Vec<String>) {
-        for d in std::mem::take(delims) {
-            loop {
-                let start = self.pos;
-                while self.peek().is_some_and(|c| c != '\n') {
-                    self.pos += 1;
-                }
-                let line: String = self.chars[start..self.pos].iter().collect();
-                if self.peek().is_some() {
-                    self.pos += 1;
-                }
-                if line.trim_start_matches('\t') == d || self.peek().is_none() {
-                    break;
-                }
-            }
-        }
-    }
-
-    fn run(&mut self) {
-        let mut cur = SimpleCommand::default();
-        let mut heredocs: Vec<String> = Vec::new();
-        let flush = |cur: &mut SimpleCommand, out: &mut Vec<SimpleCommand>| {
-            if !cur.words.is_empty() || !cur.assignments.is_empty() || !cur.redirects.is_empty() {
-                out.push(std::mem::take(cur));
-            }
-        };
-        while let Some(c) = self.peek() {
-            match c {
-                ' ' | '\t' => self.pos += 1,
-                '\n' => {
-                    self.pos += 1;
-                    flush(&mut cur, self.out);
-                    self.skip_heredocs(&mut heredocs);
-                }
-                ';' | ')' => {
-                    self.pos += 1;
-                    flush(&mut cur, self.out);
-                }
-                '|' => {
-                    self.pos += 1;
-                    flush(&mut cur, self.out);
-                    match self.peek() {
-                        // `||`: the next command runs after this one, not
-                        // on its output.
-                        Some('|') => {
-                            self.pos += 1;
-                            cur.piped = false;
-                        }
-                        // `|&` pipes stderr too.
-                        Some('&') => {
-                            self.pos += 1;
-                            cur.piped = true;
-                        }
-                        _ => cur.piped = true,
-                    }
-                }
-                '&' if self.peek_at(1) == Some('>') => {
-                    let op = self.read_redirect_op();
-                    self.skip_blanks();
-                    let target = self.read_word().unwrap_or_default();
-                    cur.redirects.push(Redirect { op, target });
-                }
-                '&' => {
-                    self.pos += 1;
-                    flush(&mut cur, self.out);
-                }
-                '(' => {
-                    self.pos += 1;
-                    let piped = cur.piped;
-                    flush(&mut cur, self.out);
-                    cur.piped = false;
-                    let inner = self.read_balanced_paren();
-                    let first = self.out.len();
-                    self.nested(&inner);
-                    // Every command of a piped subshell may read the pipe.
-                    if piped {
-                        for c in &mut self.out[first..] {
-                            c.piped = true;
-                        }
-                    }
-                }
-                '#' => {
-                    while self.peek().is_some_and(|c| c != '\n') {
-                        self.pos += 1;
-                    }
-                }
-                '<' | '>' if self.peek_at(1) != Some('(') => {
-                    let op = self.read_redirect_op();
-                    self.skip_blanks();
-                    let target = self.read_word().unwrap_or_default();
-                    if op == "<<" {
-                        heredocs.push(target.clone());
-                    }
-                    cur.redirects.push(Redirect { op, target });
+                    self.i += 1;
+                    subs.push(self.backtick(false)?);
+                    text.push_str("`...`");
                 }
                 _ => {
-                    let before = self.pos;
-                    let Some(w) = self.read_word() else {
-                        if self.pos == before {
-                            self.pos += 1;
-                        }
-                        continue;
-                    };
-                    // `2>file`: an fd number glued to a redirection.
-                    if matches!(self.peek(), Some('<' | '>'))
-                        && self.peek_at(1) != Some('(')
-                        && !w.is_empty()
-                        && w.bytes().all(|b| b.is_ascii_digit())
-                    {
-                        continue;
-                    }
-                    if cur.words.is_empty() && is_assignment(&w) {
-                        cur.assignments.push(w);
-                    } else if cur.words.is_empty() && matches!(w.as_str(), "{" | "}") {
-                        // Group braces are not command words.
-                    } else {
-                        cur.words.push(w);
-                    }
+                    text.push(c);
+                    self.i += 1;
                 }
             }
         }
-        flush(&mut cur, self.out);
     }
 }
 
-/// bash's `\cx`: toupper(x) & 0x1f, and 0x7f for `?`.
-fn control(x: char) -> char {
-    if x == '?' {
-        return '\x7f';
-    }
-    let v = u32::from(x.to_ascii_uppercase()) & 0x1f;
-    char::from_u32(v).unwrap_or(char::REPLACEMENT_CHARACTER)
-}
-
-/// Decodes the text of an ANSI-C quoted string (`$'...'` without its
-/// quotes) into `w` as bash 5 does: `\a \b \e \E \f \n \r \t \v \\ \' \"
-/// \?`, octal `\nnn` (1-3 digits) and hex `\xHH` (1-2 digits) bytes,
-/// `\uHHHH` and `\UHHHHHHHH` code points, and `\cx` control characters
-/// ([`control`]; in `\c\\` the pair of backslashes is the `x`, and a
-/// `\c` at the end stays as text). An unknown escape keeps its backslash.
-/// A NUL ends the string (bash builds a C string); the rest is dropped. A
-/// byte above 0x7f becomes the code point of the same value: only ASCII
-/// matters to the rules.
-fn decode_ansi_c(text: &[char], w: &mut String) {
-    let code = |v: u32| char::from_u32(v).unwrap_or(char::REPLACEMENT_CHARACTER);
-    // Up to `max` digits of `radix` at `text[*i..]`; `None` when none.
-    let digits = |i: &mut usize, radix: u32, max: usize| -> Option<u32> {
-        let mut value: Option<u32> = None;
-        for _ in 0..max {
-            let Some(d) = text.get(*i).and_then(|c| c.to_digit(radix)) else {
-                break;
-            };
-            value = Some(value.unwrap_or(0).saturating_mul(radix).saturating_add(d));
-            *i += 1;
+/// Adds the scripts of part `p` to `subs` and a stand-in for it to `text`.
+fn collect_owned(p: Part, subs: &mut Vec<Script>, text: &mut String) {
+    match p {
+        Part::Lit(t) => text.push_str(&t),
+        Part::Param(t, s) => {
+            text.push('$');
+            text.push_str(&t);
+            subs.extend(s);
         }
-        value
-    };
-    let mut i = 0;
-    while let Some(&c) = text.get(i) {
-        i += 1;
-        let decoded = if c == '\\' {
-            let Some(&e) = text.get(i) else {
-                w.push('\\');
-                return;
-            };
-            i += 1;
-            let known = match e {
-                'a' => Some('\x07'),
-                'b' => Some('\x08'),
-                'e' | 'E' => Some('\x1b'),
-                'f' => Some('\x0c'),
-                'n' => Some('\n'),
-                'r' => Some('\r'),
-                't' => Some('\t'),
-                'v' => Some('\x0b'),
-                '\\' | '\'' | '"' | '?' => Some(e),
-                '0'..='7' => {
-                    i -= 1;
-                    digits(&mut i, 8, 3).map(|v| code(v & 0xff))
+        Part::Arith(t, s) => {
+            text.push_str("$((");
+            text.push_str(&t);
+            text.push_str("))");
+            subs.extend(s);
+        }
+        Part::CmdSub(s) | Part::Backtick(s) | Part::ProcSub(s) => {
+            text.push_str("$(...)");
+            subs.push(s);
+        }
+        Part::Double(inner) => {
+            for q in inner {
+                collect_owned(q, subs, text);
+            }
+        }
+        Part::AnsiC(t) => {
+            text.push_str("$'");
+            text.push_str(&t);
+            text.push('\'');
+        }
+        Part::Single(t) => text.push_str(&t),
+        Part::Glob(c) => text.push(c),
+        Part::Tilde(u) => {
+            text.push('~');
+            text.push_str(&u);
+        }
+    }
+}
+
+/// A word of fixed text.
+fn lit_word(t: &str) -> Word {
+    Word {
+        parts: vec![Part::Lit(t.to_owned())],
+        brace: false,
+        raw: t.to_owned(),
+    }
+}
+
+/// The delimiter of a heredoc as bash compares it: quotes and backslashes
+/// removed from the source text.
+fn unquote_raw(raw: &str) -> String {
+    let mut out = String::new();
+    let mut chars = raw.chars();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None | Some('"'), '\\') => {
+                if let Some(n) = chars.next() {
+                    out.push(n);
                 }
-                'x' => digits(&mut i, 16, 2).map(code),
-                'u' => digits(&mut i, 16, 4).map(code),
-                'U' => digits(&mut i, 16, 8).map(code),
-                'c' => text.get(i).copied().map(|x| {
-                    i += 1;
-                    if x == '\\' && text.get(i) == Some(&'\\') {
-                        i += 1;
-                    }
-                    control(x)
-                }),
-                _ => None,
-            };
-            known.unwrap_or_else(|| {
-                // Unknown, without digits, or `\c` at the end: the text
-                // stays.
-                w.push('\\');
-                e
-            })
-        } else {
-            c
-        };
-        if decoded == '\0' {
-            return;
+            }
+            _ => out.push(c),
         }
-        w.push(decoded);
     }
+    out
 }
 
-/// `NAME=value` (or bash's `NAME+=value`) with a valid shell name.
+/// True when the unquoted structure of a word (`{`, `}`, `,`, `.`, and `x`
+/// for anything else) has a `{...}` holding a `,` or `..` at its level.
+fn brace_expands(probe: &str) -> bool {
+    let chars: Vec<char> = probe.chars().collect();
+    let mut stack: Vec<bool> = Vec::new();
+    for (k, &c) in chars.iter().enumerate() {
+        match c {
+            '{' => stack.push(false),
+            ',' => {
+                if let Some(top) = stack.last_mut() {
+                    *top = true;
+                }
+            }
+            '.' if chars.get(k + 1) == Some(&'.') => {
+                if let Some(top) = stack.last_mut() {
+                    *top = true;
+                }
+            }
+            '}' if stack.pop() == Some(true) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `NAME=`, `NAME+=` or `NAME[...]=` at the start of a word (the name
+/// unquoted): the name and the value word.
 #[must_use]
-pub fn is_assignment(word: &str) -> bool {
-    let Some((name, _)) = word.split_once('=') else {
-        return false;
+pub fn split_assign(w: &Word) -> Option<(String, Word)> {
+    let Some(Part::Lit(first)) = w.parts.first() else {
+        return None;
     };
-    let name = name.strip_suffix('+').unwrap_or(name);
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let name_len = first
+        .char_indices()
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_'))
+        .map_or(first.len(), |(k, _)| k);
+    let name = &first[..name_len];
+    if !is_name(name) {
+        return None;
+    }
+    let rest = &first[name_len..];
+    // The value text in the literal part `parts[at - 1]`, and the parts
+    // after it.
+    let (after, at) = if let Some(r) = rest.strip_prefix("+=") {
+        (r.to_owned(), 1)
+    } else if let Some(r) = rest.strip_prefix('=') {
+        (r.to_owned(), 1)
+    } else if rest.starts_with('[')
+        || (rest.is_empty() && matches!(w.parts.get(1), Some(Part::Glob('['))))
+    {
+        // `NAME[sub]=`: the subscript closes with `]=` or `]+=` in a later
+        // literal part (a `[` with a `]` in the same word is a glob part).
+        if let Some(v) = after_subscript(rest) {
+            (v, 1)
+        } else {
+            let mut found = None;
+            for (k, p) in w.parts.iter().enumerate().skip(1) {
+                match p {
+                    Part::Lit(t) => {
+                        if let Some(v) = after_subscript(t) {
+                            found = Some((v, k + 1));
+                            break;
+                        }
+                    }
+                    Part::Glob(_) | Part::Param(..) | Part::Single(_) | Part::Double(_) => {}
+                    _ => return None,
+                }
+            }
+            found?
+        }
+    } else {
+        return None;
+    };
+    let mut parts: Vec<Part> = Vec::new();
+    if let Some(user) = after.strip_prefix('~') {
+        let end = user.find(['/', ':']).unwrap_or(user.len());
+        parts.push(Part::Tilde(user[..end].to_owned()));
+        if end < user.len() {
+            parts.push(Part::Lit(user[end..].to_owned()));
+        }
+    } else if !after.is_empty() {
+        parts.push(Part::Lit(after));
+    }
+    parts.extend(w.parts[at..].iter().cloned());
+    let raw = w.raw.split_once('=').map_or("", |(_, v)| v).to_owned();
+    Some((
+        name.to_owned(),
+        Word {
+            parts,
+            brace: w.brace,
+            raw,
+        },
+    ))
+}
+
+/// The text after `]=` or `]+=` in `t`.
+fn after_subscript(t: &str) -> Option<String> {
+    let k = t.find(']')?;
+    let r = &t[k + 1..];
+    r.strip_prefix("+=")
+        .or_else(|| r.strip_prefix('='))
+        .map(str::to_owned)
+}
+
+/// The parts of an unquoted heredoc body: parameters and substitutions
+/// expand; `\` escapes only `$`, backquote, `\` and newline.
+fn expand_doc(body: &str, depth: usize) -> R<Vec<Part>> {
+    let mut p = Parser {
+        s: body.chars().collect(),
+        i: 0,
+        pending: Vec::new(),
+        depth,
+    };
+    let mut parts = Vec::new();
+    let mut lit = String::new();
+    while let Some(c) = p.peek() {
+        match c {
+            '\\' => {
+                p.i += 1;
+                match p.peek() {
+                    Some('\n') => p.i += 1,
+                    Some(n @ ('$' | '`' | '\\')) => {
+                        lit.push(n);
+                        p.i += 1;
+                    }
+                    _ => lit.push('\\'),
+                }
+            }
+            '$' => match p.dollar(true)? {
+                Part::Lit(t) => lit.push_str(&t),
+                other => {
+                    if !lit.is_empty() {
+                        parts.push(Part::Lit(std::mem::take(&mut lit)));
+                    }
+                    parts.push(other);
+                }
+            },
+            '`' => {
+                p.i += 1;
+                let s = p.backtick(false)?;
+                if !lit.is_empty() {
+                    parts.push(Part::Lit(std::mem::take(&mut lit)));
+                }
+                parts.push(Part::Backtick(s));
+            }
+            _ => {
+                lit.push(c);
+                p.i += 1;
+            }
+        }
+    }
+    if !lit.is_empty() {
+        parts.push(Part::Lit(lit));
+    }
+    Ok(parts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn words(src: &str) -> Vec<Vec<String>> {
-        parse(src).into_iter().map(|c| c.words).collect()
+    /// The literal words of every simple command, in order (nested
+    /// substitutions after the command that holds them).
+    fn words(src: &str) -> Vec<Vec<Option<String>>> {
+        let mut out = Vec::new();
+        walk(&parse(src).unwrap(), &mut out);
+        out
     }
 
-    #[test]
-    fn splits_lists_pipes_and_quotes() {
-        assert_eq!(
-            words("cd x && git commit -m 'a b' ; echo \"c d\" | tee f"),
-            vec![
-                vec!["cd", "x"],
-                vec!["git", "commit", "-m", "a b"],
-                vec!["echo", "c d"],
-                vec!["tee", "f"],
-            ]
-        );
-    }
-
-    #[test]
-    fn substitutions_and_subshells_are_commands() {
-        let w = words("echo $(git commit -n) `git push -n` (git am -n) <(git status)");
-        assert!(w.contains(&vec!["git".into(), "commit".into(), "-n".into()]));
-        assert!(w.contains(&vec!["git".into(), "push".into(), "-n".into()]));
-        assert!(w.contains(&vec!["git".into(), "am".into(), "-n".into()]));
-        assert!(w.contains(&vec!["git".into(), "status".into()]));
-        let w = words("echo \"$(git commit -n)\"");
-        assert!(w.contains(&vec!["git".into(), "commit".into(), "-n".into()]));
-    }
-
-    #[test]
-    fn redirections_assignments_and_heredocs() {
-        let cmds = parse(
-            "A=1 B=2 git log >out.txt 2>&1\ncat <<EOF > f\ngit commit -n\nEOF\necho done 2> e &> both",
-        );
-        assert_eq!(cmds[0].assignments, vec!["A=1", "B=2"]);
-        assert_eq!(cmds[0].words, vec!["git", "log"]);
-        assert_eq!(
-            cmds[0].redirects,
-            vec![
-                Redirect {
-                    op: ">".into(),
-                    target: "out.txt".into()
-                },
-                Redirect {
-                    op: ">&".into(),
-                    target: "1".into()
+    fn walk(s: &Script, out: &mut Vec<Vec<Option<String>>>) {
+        for ao in &s.items {
+            for p in std::iter::once(&ao.first).chain(ao.rest.iter().map(|(_, p)| p)) {
+                for c in &p.cmds {
+                    match &c.kind {
+                        Kind::Simple(sc) => {
+                            out.push(sc.words.iter().map(Word::literal).collect());
+                            for w in &sc.words {
+                                for sub in w.scripts() {
+                                    walk(sub, out);
+                                }
+                            }
+                        }
+                        Kind::Subshell(b) | Kind::Group(b) => walk(b, out),
+                        Kind::If { arms, other } => {
+                            for (c, b) in arms {
+                                walk(c, out);
+                                walk(b, out);
+                            }
+                            if let Some(o) = other {
+                                walk(o, out);
+                            }
+                        }
+                        Kind::Case { arms, .. } => {
+                            for (_, b) in arms {
+                                walk(b, out);
+                            }
+                        }
+                        Kind::Func { body, .. } => {
+                            if let Kind::Group(b) = &body.kind {
+                                walk(b, out);
+                            }
+                        }
+                        Kind::Loop { cond, body } => {
+                            walk(cond, out);
+                            walk(body, out);
+                        }
+                        Kind::For { body, .. } => walk(body, out),
+                        _ => {}
+                    }
                 }
+            }
+        }
+    }
+
+    fn lit(v: &[&str]) -> Vec<Option<String>> {
+        v.iter().map(|s| Some((*s).to_owned())).collect()
+    }
+
+    #[test]
+    fn lists_pipes_quotes_and_escapes() {
+        assert_eq!(
+            words("cd x && git commit -m 'a b' ; echo \"c d\" | tee f\ngit com\\\nmit"),
+            vec![
+                lit(&["cd", "x"]),
+                lit(&["git", "commit", "-m", "a b"]),
+                lit(&["echo", "c d"]),
+                lit(&["tee", "f"]),
+                lit(&["git", "commit"]),
             ]
         );
-        assert!(cmds[0].redirects[0].writes_file());
-        assert!(!cmds[0].redirects[1].writes_file());
-        assert_eq!(cmds[1].words, vec!["cat"]);
-        // The heredoc body is not a command.
-        assert_eq!(cmds[2].words, vec!["echo", "done"]);
-        assert_eq!(cmds[2].redirects.len(), 2);
-        assert!(cmds[2].redirects.iter().all(Redirect::writes_file));
-    }
-
-    #[test]
-    fn escapes_comments_and_unterminated_input() {
         assert_eq!(
-            words("git com\\\nmit # a comment"),
-            vec![vec!["git", "commit"]]
+            words("git commit --no-\"verify\" '-n' --no-ver\\ify -\"n\""),
+            vec![lit(&[
+                "git",
+                "commit",
+                "--no-verify",
+                "-n",
+                "--no-verify",
+                "-n"
+            ])]
         );
-        assert_eq!(
-            words("echo 'unterminated"),
-            vec![vec!["echo", "unterminated"]]
-        );
-        assert_eq!(words("echo $'a\\'b'"), vec![vec!["echo", "a'b"]]);
         assert!(words("").is_empty());
-        assert!(is_assignment("X_1=2") && !is_assignment("1X=2") && !is_assignment("--a=b"));
-        assert!(is_assignment("P+=x") && !is_assignment("+=x"));
+        assert!(words("# only a comment\n").is_empty());
+        assert_eq!(words("echo a#b # c"), vec![lit(&["echo", "a#b"])]);
     }
 
-    /// ANSI-C quoting (`$'...'`) decodes as bash does, so a word spelled
-    /// with escapes is the word the command gets (S1, S2).
     #[test]
-    fn ansi_c_quotes_decode_as_bash_does() {
-        for (src, want) in [
-            (r"$'\x2d-no-verify'", "--no-verify"),
-            (r"$'\055-no-verify'", "--no-verify"),
-            (r"$'\x2dn'", "-n"),
-            (r"$'-\U0000002dno-v'", "--no-v"),
-            (r"$'\x47IT_CONFIG_COUNT=0'", "GIT_CONFIG_COUNT=0"),
-            (r#"$'a\tb\nc\\d\'e\"f\?'"#, "a\tb\nc\\d'e\"f?"),
-            (r"$'\a\b\e\E\f\r\v'", "\x07\x08\x1b\x1b\x0c\r\x0b"),
-            (r"$'\cA\c['", "\x01\x1b"),
-            // Unknown escapes and escapes without digits keep the
-            // backslash.
-            (r"$'\z\x\u'", r"\z\x\u"),
-            // Octal takes at most three digits, hex at most two.
-            (r"$'\1011\x414'", "A1A4"),
-            // A NUL ends the string; the rest of the quote is dropped.
-            (r"$'ab\x00cd'x", "abx"),
-            // Glued to other quoting.
-            (r"e$'\x6e'v", "env"),
-            // `$"..."` is a double-quoted string.
-            (r#"$"--no-verify""#, "--no-verify"),
+    fn expansions_are_not_literal_g1() {
+        for src in [
+            "${x}t commit",
+            "$G commit",
+            "$(echo git) commit",
+            "`echo git` commit",
+            "$'\\x67it' commit",
+            "g*t commit",
+            "gi? commit",
+            "g[i]t commit",
+            "{git,} commit",
+            "$((1)) x",
+            "~user/bin/git commit",
         ] {
-            assert_eq!(
-                words(&format!("git {src}")),
-                vec![vec!["git", want]],
-                "{src}"
-            );
+            let w = words(src);
+            assert_eq!(w[0][0], None, "{src}");
         }
-    }
-
-    /// `\c` reads as bash 5 reads it: bash finds the end of `$'...'`
-    /// first (a backslash escapes the next character), so `\c\\` is one
-    /// control character and the quote after it closes the string; `\cx`
-    /// is toupper(x) & 0x1f, `\c?` is 0x7f, and a `\c` at the end stays.
-    #[test]
-    fn ansi_c_control_escapes_match_bash() {
+        // Quotes and escapes give literal words; a lone `[` is a word.
         assert_eq!(
-            words(r"echo $'\c\\' ; echo next"),
-            vec![vec!["echo", "\x1c"], vec!["echo", "next"]]
+            words("\"git\" \\c'o'mmit [ -f x ]")[0][0].as_deref(),
+            Some("git")
         );
-        for (src, want) in [
-            (r"$'\c\\x'", "\x1cx"),
-            (r"$'\c\x'", "\x1cx"),
-            (r"$'\c\'a'", "\x1c'a"),
-            (r"$'\c\\\\'", "\x1c\\"),
-            (r"$'\c'", r"\c"),
-            (r"$'\ca\cA\c?\c[\c-'", "\x01\x01\x7f\x1b\r"),
-            (r"$'a\cb'", "a\x02"),
+        assert_eq!(words("[ -f x ]"), vec![lit(&["[", "-f", "x", "]"])]);
+        assert_eq!(
+            words("find . -exec rm {} +"),
+            vec![lit(&["find", ".", "-exec", "rm", "{}", "+"])]
+        );
+    }
+
+    /// `$'...'` ends where bash ends it: a backslash escapes the next
+    /// character, so `\c\\` stays inside and the next quote closes.
+    #[test]
+    fn ansi_c_ends_as_bash_ends_it() {
+        let w = words(r"echo $'\c\\' ; git commit -n");
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0][1], None);
+        assert_eq!(w[1], lit(&["git", "commit", "-n"]));
+    }
+
+    /// Substitutions are parsed in place: a heredoc or a quote inside
+    /// `$(...)` does not end it early, and the commands inside are seen.
+    #[test]
+    fn substitutions_are_parsed_in_place() {
+        let src = "gh pr create --body \"$(cat <<'EOF'\n## Summary\n- don't (break\nEOF\n)\" && git status";
+        let w = words(src);
+        assert_eq!(w[0][0].as_deref(), Some("gh"));
+        assert_eq!(w[0][4].as_deref(), Some("## Summary\n- don't (break"));
+        assert!(w.contains(&lit(&["cat"])));
+        assert!(w.contains(&lit(&["git", "status"])));
+        let w = words("echo $(git commit -n) `git push -n` <(git am -n) \"${x:-$(git status)}\"");
+        for want in [
+            lit(&["git", "commit", "-n"]),
+            lit(&["git", "push", "-n"]),
+            lit(&["git", "am", "-n"]),
+            lit(&["git", "status"]),
         ] {
-            assert_eq!(
-                words(&format!("git {src}")),
-                vec![vec!["git", want]],
-                "{src}"
+            assert!(w.contains(&want), "{want:?} in {w:?}");
+        }
+    }
+
+    /// The `"$(cat <<'EOF' ... EOF)"` message idiom is literal inside
+    /// double quotes only.
+    #[test]
+    fn the_heredoc_message_idiom_is_literal_in_double_quotes() {
+        let w = words("git commit -m \"$(cat <<'EOF'\nSubject\n\nBody\nEOF\n)\"");
+        assert_eq!(w[0][3].as_deref(), Some("Subject\n\nBody"));
+        let w = words("git commit -m $(cat <<'EOF'\nx --no-verify\nEOF\n)");
+        assert_eq!(w[0][3], None);
+        let w = words("git commit -m \"$(cat <<EOF\n$HOME\nEOF\n)\"");
+        assert_eq!(w[0][3], None);
+        let w = words("git commit -m \"$(cat <<EOF\nplain\nEOF\n)\"");
+        assert_eq!(w[0][3].as_deref(), Some("plain"));
+    }
+
+    #[test]
+    fn heredocs_assignments_and_redirections() {
+        let s =
+            parse("A=1 B=\"x y\" git log >out 2>&1 <<-'E'\n\tbody $x\n\tE\necho {fd}>f").unwrap();
+        let Kind::Simple(sc) = &s.items[0].first.cmds[0].kind else {
+            panic!()
+        };
+        assert_eq!(sc.assigns[0].name, "A");
+        assert_eq!(sc.assigns[1].value[0].literal().as_deref(), Some("x y"));
+        let r = &s.items[0].first.cmds[0].redirs;
+        assert_eq!(r.len(), 3);
+        assert!(r[0].writes_file() && !r[1].writes_file());
+        let doc = r[2].doc.as_ref().unwrap().borrow();
+        assert!(doc.quoted);
+        assert_eq!(doc.body, "body $x\n");
+        let r = &s.items[1].first.cmds[0].redirs;
+        assert_eq!(r[0].var.as_deref(), Some("fd"));
+        // Unquoted heredoc bodies expand: their substitutions are commands.
+        let s = parse("cat <<EOF\n$(git commit -n)\nEOF").unwrap();
+        let doc = s.items[0].first.cmds[0].redirs[0].doc.clone().unwrap();
+        assert!(matches!(doc.borrow().parts[0], Part::CmdSub(_)));
+        assert!(split_assign(&parse_word("X[1]=2")).is_some());
+        assert!(split_assign(&parse_word("X+=2")).is_some());
+        assert!(split_assign(&parse_word("\"X\"=2")).is_none());
+        assert!(split_assign(&parse_word("--a=b")).is_none());
+    }
+
+    fn parse_word(src: &str) -> Word {
+        let mut p = Parser {
+            s: src.chars().collect(),
+            i: 0,
+            pending: Vec::new(),
+            depth: 0,
+        };
+        p.word().unwrap()
+    }
+
+    #[test]
+    fn compound_commands() {
+        let w = words(
+            "for f in a b; do git -C \"$f\" status; done\nif x; then y; elif z; then w; else v; fi\nwhile read l; do echo; done < f\ncase $x in a|b) one;; *) two;; esac\nf() { g; }\n[[ $x == y && -n $(h) ]]\n(( i++ ))\n{ k; } > o",
+        );
+        assert!(w.contains(&vec![
+            Some("git".into()),
+            Some("-C".into()),
+            None,
+            Some("status".into())
+        ]));
+        for want in ["x", "y", "z", "w", "v", "read", "echo", "k"] {
+            assert!(
+                w.iter().any(|c| c.first() == Some(&Some(want.to_owned()))),
+                "{want}"
             );
         }
     }
 
-    /// A command after `|` or `|&` reads a pipe; after `||` it does not.
-    /// Every command of a piped subshell reads the pipe.
     #[test]
-    fn piped_commands_are_marked() {
-        let piped: Vec<bool> = parse("a | b || c |& d ; e")
-            .iter()
-            .map(|c| c.piped)
-            .collect();
-        assert_eq!(piped, vec![false, true, false, true, false]);
-        let piped: Vec<bool> = parse("a | (b; c) && d").iter().map(|c| c.piped).collect();
-        assert_eq!(piped, vec![false, true, true, false]);
+    fn errors_fail_closed() {
+        for src in [
+            "echo 'unterminated",
+            "echo \"unterminated",
+            "echo $(unterminated",
+            "coproc x",
+            "echo a(b)",
+            "if x; then y",
+            "cat >",
+            "echo `x",
+            "fi",
+        ] {
+            assert!(parse(src).is_err(), "{src}");
+        }
+    }
+
+    #[test]
+    fn brace_expansion_is_detected() {
+        for (src, want) in [
+            ("{a,b}", true),
+            ("x{1..3}", true),
+            ("{}", false),
+            ("{a}", false),
+            ("'{a,b}'", false),
+            ("\\{a,b}", false),
+            ("a,b", false),
+        ] {
+            assert_eq!(parse_word(src).brace, want, "{src}");
+        }
     }
 }

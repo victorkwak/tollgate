@@ -92,12 +92,21 @@ fn ask_rules_return_an_ask_decision_t16_r26() {
         repo.join("tollgate.toml"),
         repo.join(".config/nextest.toml"),
         a.sb.home.join(".claude/settings.json"),
-        repo.join(".git/config"),
+        repo.join(".git/info/exclude"),
         a.sb.root().join("config/tollgate/config.toml"),
     ] {
         let (code, out, err) = a.write(file.to_str().unwrap());
         assert_eq!(code, Some(0), "{}: {err}", file.display());
         assert!(ask(&out), "{}: {out}", file.display());
+    }
+    // G7: refs, remote config and hooks under .git deny.
+    for file in [
+        repo.join(".git/config"),
+        repo.join(".git/refs/heads/main"),
+        repo.join(".git/hooks/pre-commit"),
+    ] {
+        let (code, _, err) = a.write(file.to_str().unwrap());
+        assert_eq!(code, Some(2), "{}: {err}", file.display());
     }
     let (code, _, err) = a.write(
         a.sb.root()

@@ -1,4 +1,4 @@
-//! Security regression suite (S1-S20): one test per bypass, each run the
+//! Security regression suite (S1-S29): one test per bypass, each run the
 //! way a Claude Code session runs git.
 //!
 //! The lab: the binary from this build installed by `tollgate install
@@ -569,9 +569,7 @@ fn s3_hooks_run_for_any_way_git_is_started() {
         "env git commit -m env".to_owned(),
         "command git commit -m command".to_owned(),
         "(git commit -m subshell)".to_owned(),
-        "echo x | xargs git commit -m".to_owned(),
         "nohup git commit -m nohup".to_owned(),
-        "$(command -v git) commit -m which".to_owned(),
         format!("python3 {}", py.display()),
     ] {
         let s = lab.refused(&cmd);
@@ -581,6 +579,27 @@ fn s3_hooks_run_for_any_way_git_is_started() {
             "{cmd}: the hook did not run: {s:?}"
         );
     }
+    // The closed grammar denies these in the session (G1, G2a); run
+    // anyway (a script file), the hooks still gate them.
+    for cmd in [
+        "echo x | xargs git commit -m",
+        "$(command -v git) commit -m which",
+    ] {
+        assert!(lab.refused(cmd).denied(), "{cmd}");
+        let before = lab.refs();
+        let out = lab
+            .cmd("bash", &lab.repo)
+            .args(["-c", cmd])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && text.contains("tollgate: DENIED pre-commit refs/heads/main"),
+            "{cmd}: the hook did not run: {text}"
+        );
+        assert_eq!(lab.refs(), before, "{cmd}: a ref moved");
+    }
+    lab.assert_no_bad_pass();
     assert_eq!(lab.sb().jobs().len(), 1, "one job; the rest hit its fail");
 }
 
@@ -1549,9 +1568,16 @@ fn s20_a_fake_ssh_or_a_global_rewrite_never_answers_for_the_trusted_server() {
         assert!(lab.refused(&cmd).denied(), "{cmd}");
     }
     lab.stage_bad_file("PATH");
+    // G4: only listed variables go in front of a gated git command, so the
+    // guard denies a PATH prefix; set anyway (a script file), the fake ssh
+    // first on PATH still does not answer.
     let cmd = format!("PATH={}:$PATH git commit -m bad", forger_dir.display());
-    let s = lab.refused(&cmd);
-    main_policy_denies(s.code(), s.out(), &cmd);
+    assert!(lab.refused(&cmd).denied(), "{cmd}");
+    let path = format!("{}:{}", forger_dir.display(), lab.a.path);
+    let before = lab.refs();
+    let r = lab.direct_with(&["commit", "-m", "bad"], &[("PATH", &path)]);
+    main_policy_denies(r.code, &r.out, &cmd);
+    assert_eq!(lab.refs(), before, "PATH: a ref moved");
 
     // A global core.sshCommand: the guard asks; set anyway, tollgate does
     // not read it.
@@ -1952,4 +1978,487 @@ fn s36_the_inline_cap_rewrite_never_drops_checked_text() {
         };
         assert_eq!(c, format!("export TOLLGATE_INLINE_CAP=540; {cmd}"));
     }
+}
+
+// ---- The closed grammar of the guard (G1-G8), S21-S29 -------------------
+
+/// `cmds` as owned strings.
+fn owned(cmds: &[&str]) -> Vec<String> {
+    cmds.iter().map(|c| (*c).to_owned()).collect()
+}
+
+/// S21 (G1, item 40): a command name bash builds at run time (a variable,
+/// a substitution, ANSI-C quoting, a glob, brace expansion) is denied in
+/// every simple command, so no spelling of git escapes the rules.
+#[test]
+fn s21_command_names_bash_builds_at_run_time_are_denied() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    let bad = lab.not_denied(&owned(&[
+        "G=git; $G commit -n -m x",
+        "x=gi; ${x}t commit -n -m x",
+        "G=git; \"$G\" commit -n -m x",
+        "$(command -v git) commit -n -m x",
+        "`command -v git` commit --no-verify -m x",
+        "$'\\x67it' commit -n -m x",
+        "/usr/bin/g?t commit -n -m x",
+        "{git,} commit -n -m x",
+        "echo $(G=git; $G commit -n -m x)",
+    ]));
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// S22 (G2a, item 40): xargs, find -exec and parallel take arguments from
+/// elsewhere, so they may not run a gated git command, tollgate, a shell
+/// or an interpreter; their safe uses still run.
+#[test]
+fn s22_xargs_find_and_parallel_cannot_run_gated_git() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    let bad = lab.not_denied(&owned(&[
+        "echo commit | xargs git",
+        "printf -- '-n\\n-m\\nx\\n' | xargs git commit",
+        "echo x | xargs git commit -n -m",
+        "echo x | xargs env git commit -n -m",
+        "echo x | xargs -I{} sh -c 'git commit -n -m {}'",
+        "find . -maxdepth 0 -exec git commit -n -m x \\;",
+        "find . -maxdepth 0 -exec bash -c 'git commit -n -m x' \\;",
+        "parallel git commit -n -m ::: x",
+    ]));
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    std::fs::write(lab.repo.join("extra.txt"), "1\n").unwrap();
+    let s = lab.session("printf 'extra.txt\\n' | xargs git add");
+    assert_eq!(s.code(), Some(0), "{s:?}");
+}
+
+/// S23 (G2b, item 20): launchers that leave the session's environment or
+/// machine may not run git, tollgate, a shell or an interpreter; other
+/// launches stay allowed.
+#[test]
+fn s23_launchers_cannot_run_git_tollgate_or_a_shell() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    let bad = lab.not_denied(&owned(&[
+        "sudo git commit -n -m x",
+        "su -c 'git commit -n -m x' nobody",
+        "script -qc 'git commit -n -m x' /dev/null",
+        "setpriv git commit -n -m x",
+        "systemd-run --user --pipe git commit -n -m x",
+        "ssh localhost 'git commit -n -m x'",
+        "docker exec c git commit -m x",
+        "tmux send-keys -t s 'git commit -n -m x' Enter",
+        "env -i PATH=/usr/bin git commit -m x",
+        "exec -c git commit -m x",
+        "script -q /dev/null",
+        "at now <<< 'git commit -n -m x'",
+    ]));
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    for cmd in [
+        "ssh prodhost 'journalctl -u app --since \"1 hour ago\"'",
+        "docker exec pg psql -U postgres -c 'select 1'",
+        "docker ps",
+    ] {
+        assert!(matches!(lab.guard(cmd), Guarded::Allowed(_)), "{cmd}");
+    }
+}
+
+/// S24 (G3): code in arguments (`sh -c`, `eval`) and script files are
+/// checked as if typed; code the guard cannot read (a variable, a process
+/// substitution, a script written in the same call, one nested in a
+/// script) is denied. A clean script runs, and the hook gates its commit.
+#[test]
+fn s24_code_in_arguments_and_script_files_is_checked() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    let root = lab.root();
+    write_exe(
+        &root.join("bad.sh"),
+        "#!/bin/sh\ngit commit --no-verify -m bad\n",
+    );
+    write_exe(
+        &root.join("ok.sh"),
+        "#!/bin/sh\ngit commit -m from-script\n",
+    );
+    write_exe(
+        &root.join("nested.sh"),
+        &format!("#!/bin/sh\nsh {}\n", root.join("ok.sh").display()),
+    );
+    let bad_sh = root.join("bad.sh").display().to_string();
+    let bad = lab.not_denied(&[
+        "bash -c 'git commit -n -m x'".to_owned(),
+        "sh -c 'cd . && git commit --no-verify -m x'".to_owned(),
+        "eval 'git commit -n -m x'".to_owned(),
+        "C='git commit -n -m x'; eval \"$C\"".to_owned(),
+        "bash -c \"$(printf 'git commit -n -m x')\"".to_owned(),
+        "bash <(printf 'git commit -n -m x')".to_owned(),
+        "source <(printf 'git commit -n -m x')".to_owned(),
+        format!("bash {bad_sh}"),
+        bad_sh.clone(),
+        format!("source {bad_sh}"),
+        format!("sh {}", root.join("nested.sh").display()),
+        "printf 'git commit -n -m x\\n' > w.sh && sh w.sh".to_owned(),
+        "trap 'git commit -n -m x' EXIT".to_owned(),
+    ]);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    let s = lab.refused(&format!("sh {}", root.join("ok.sh").display()));
+    assert!(s.out().contains("DENIED pre-commit"), "{s:?}");
+}
+
+/// S25 (G3, item 31): a program on stdin: a literal heredoc or
+/// here-string to a shell is parsed and checked; a pipe or file into a
+/// shell is denied; interpreter code with a process call is denied, other
+/// interpreter code runs.
+#[test]
+fn s25_programs_on_stdin_and_interpreter_code_are_checked() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    std::fs::write(lab.root().join("cmds.sh"), "git commit -m x\n").unwrap();
+    let cmds_sh = lab.root().join("cmds.sh").display().to_string();
+    let bad = lab.not_denied(&[
+        "sh <<'EOF'\ngit commit -n -m x\nEOF".to_owned(),
+        "bash <<< 'git commit --no-verify -m x'".to_owned(),
+        "bash <<EOF\ngit commit $(printf -- -n) -m x\nEOF".to_owned(),
+        "echo 'git commit -m x' | bash".to_owned(),
+        format!("bash < {cmds_sh}"),
+        "python3 -c 'import subprocess; subprocess.run([\"git\",\"commit\",\"-n\",\"-m\",\"x\"])'"
+            .to_owned(),
+        "perl -e 'system(\"git commit -n -m x\")'".to_owned(),
+        "python3 - <<'EOF'\nimport os\nos.system('git commit -n -m x')\nEOF".to_owned(),
+        "awk 'BEGIN { system(\"git commit -n -m x\") }'".to_owned(),
+        "git ls-files | python3".to_owned(),
+    ]);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    let s = lab.refused("bash <<'EOF'\ngit commit -m heredoc\nEOF");
+    assert!(s.out().contains("DENIED pre-commit"), "{s:?}");
+    let s = lab.session("python3 -c 'import json; print(json.dumps({\"ok\": 1}))'");
+    assert_eq!(s.code(), Some(0), "{s:?}");
+}
+
+/// S26 (G4, items 13b and 42): gated git commands use the closed shape.
+/// Variables, `-c` keys and global options outside the lists, a word bash
+/// builds at run time, an unknown cwd and code-running options are
+/// denied; a message that names --no-verify is not a flag, so that commit
+/// reaches the hook, which gates it.
+#[test]
+fn s26_gated_git_uses_the_closed_shape() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    let bad = lab.not_denied(&owned(&[
+        "PATH=/tmp:$PATH git commit -m x",
+        "LD_PRELOAD= git commit -m x",
+        "GIT_TRACE=1 git commit -m x",
+        "git --git-dir=.git commit -m x",
+        "git --work-tree=. commit -m x",
+        "git -c user.signingkey=x commit -m x",
+        "git -c core.hooksPath=/dev/null commit -m x",
+        "git -C \"$PWD\" commit -m x",
+        "cd \"$X\" && git commit -m x",
+        "cd -- \"$X\" && git commit -m x",
+        "git commit -m x -- *",
+        "git commit -m x $(printf -- --no-verify)",
+        "git commit --no-ve -m x",
+        "git commit -m x --no-verify=",
+        "git push --receive-pack=/tmp/x origin main",
+        "GIT_EDITOR='git commit -n -m y' git commit --amend",
+        "git ci -m x",
+    ]));
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    for cmd in [
+        "git commit -m \"docs: mention --no-verify in README\"",
+        "git commit -m 'Fix env' -m 'Names GIT_CONFIG_COUNT and core.hooksPath'",
+        "git commit -m \"$(cat <<'EOF'\nSubject --no-verify\n\nCo-Authored-By: Name <noreply@example.com>\nEOF\n)\"",
+        "GIT_AUTHOR_NAME=x LC_ALL=C git -c user.email=y commit -m x",
+    ] {
+        let s = lab.refused(cmd);
+        assert!(s.out().contains("DENIED pre-commit"), "{cmd}: {s:?}");
+    }
+}
+
+/// S27 (G5, G6, item 12, X2): sensitive variables are denied in every
+/// write position (each form below would change the injection or the
+/// transport for the git that follows), and a client inline-cap prefix
+/// hides nothing after it.
+#[test]
+fn s27_variable_writes_and_the_inline_cap() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    let bad = lab.not_denied(&owned(&[
+        "TOLLGATE_INLINE_CAP=1 git commit --no-verify -m x; ls",
+        "export TOLLGATE_INLINE_CAP=540; git commit --no-verify -m x; ls",
+        "export TOLLGATE_INLINE_CAP=1; git commit -m x",
+        "printf -v GIT_CONFIG_COUNT 0; git commit -m x",
+        "read GIT_CONFIG_COUNT <<< 0; git commit -m x",
+        "mapfile -t GIT_CONFIG_COUNT <<< 0; git commit -m x",
+        "declare -n r=GIT_CONFIG_COUNT; r=0; git commit -m x",
+        "for GIT_CONFIG_COUNT in 0; do git commit -m x; done",
+        "(( GIT_CONFIG_COUNT = 0 )); git commit -m x",
+        ": ${GIT_CONFIG_KEY_0:=x}; git commit -m x",
+        "export -n GIT_CONFIG_COUNT; git commit -m x",
+        "export HOME=/tmp; git commit -m x",
+        "printf -v GIT_SSH_COMMAND /tmp/f; git push origin main",
+    ]));
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    // The guard's own prefix goes in front of the command as it was.
+    let Guarded::Allowed(c) = lab.guard("TOLLGATE_INLINE_CAP=1 git commit -m x; ls") else {
+        panic!("a lower client cap in front of git is allowed (G6)");
+    };
+    assert_eq!(
+        c,
+        "export TOLLGATE_INLINE_CAP=540; TOLLGATE_INLINE_CAP=1 git commit -m x; ls"
+    );
+}
+
+/// S28 (G7, items 2 and 22, review R4): remote identity changes ask; ref
+/// writes into refs/remotes/* and moves of main deny in every form, through
+/// git and through files.
+#[test]
+fn s28_remote_identity_and_ref_writes() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    let fake = lab.root().join("fake.git");
+    for cmd in [
+        format!("git remote set-url origin {}", fake.display()),
+        format!("git remote add evil {}", fake.display()),
+        format!("git config remote.origin.url {}", fake.display()),
+        "git config --remove-section remote.origin".to_owned(),
+        "git remote rename origin old".to_owned(),
+    ] {
+        assert!(matches!(lab.guard(&cmd), Guarded::Asked(_)), "{cmd}");
+    }
+    lab.plain(&["checkout", "-q", "-b", "feat"]);
+    lab.stage_code_change("feat");
+    lab.plain(&["commit", "-q", "--no-verify", "-m", "feat"]);
+    let bad = lab.not_denied(&owned(&[
+        "git update-ref refs/remotes/origin/main feat",
+        "git update-ref --stdin <<'EOF'\nupdate refs/remotes/origin/main feat\nEOF",
+        "printf 'update refs/heads/main feat\\n' | git update-ref --stdin",
+        "git fetch . feat:refs/remotes/origin/main",
+        "git update-ref refs/heads/main feat",
+        "git branch -f main feat",
+        "git branch -C feat main",
+        "git push . feat:main",
+        "git fetch . feat:main",
+        "git checkout -B main feat",
+        "git rev-parse feat > .git/refs/heads/main",
+        "git rev-parse feat | tee .git/refs/remotes/origin/main",
+        "cp .git/refs/heads/feat .git/refs/heads/main",
+        "printf '[remote \"origin\"]\\n\\turl = /tmp/x\\n' >> .git/config",
+    ]));
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    let write = serde_json::json!({
+        "tool_name": "Write",
+        "cwd": lab.repo,
+        "tool_input": {"file_path": lab.repo.join(".git/refs/heads/main"), "content": "x"},
+    });
+    assert!(matches!(lab.guard_json(&write), Guarded::Denied(_)));
+    let s = lab.session("git branch -f other feat");
+    assert_eq!(s.code(), Some(0), "{s:?}");
+}
+
+/// S29 (G8, item 15): cwd tracking follows cd, pushd and popd; after a
+/// change the guard cannot follow, relative writes deny; symlinks into
+/// tollgate's dirs do not hide them.
+#[test]
+fn s29_cwd_tracking_protects_tollgate_dirs() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    let state = lab.sb().state();
+    let sentinel = state.join("results/00/sentinel.json");
+    std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+    std::fs::write(&sentinel, "{}").unwrap();
+    let s = state.display().to_string();
+    let parent = state.parent().unwrap().display().to_string();
+    let link = lab.root().join("lnk");
+    std::os::unix::fs::symlink(&state, &link).unwrap();
+    for cmd in [
+        format!("cd {s} && rm -rf results"),
+        format!("cd -- {s} && rm -rf results"),
+        format!("pushd {s} && rm -rf results"),
+        format!("cd {s}; cd /tmp; cd - && rm -rf results"),
+        format!("D={s}; cd \"$(echo $D)\" && rm -rf results"),
+        format!("cd {parent}/x/.. && rm -rf tollgate/results"),
+        format!("rm -rf {}/results", link.display()),
+        format!("cd {} && rm -f results/00/sentinel.json", link.display()),
+        format!("ln -sfn {s} here && rm -rf here/results"),
+        "cd \"$X\" && rm -rf results".to_owned(),
+    ] {
+        let r = lab.refused(&cmd);
+        assert!(r.denied(), "{cmd}: {r:?}");
+        assert!(sentinel.exists(), "{cmd}: the sentinel is gone");
+    }
+    let s2 = lab.session(&format!("cd {s} && ls results"));
+    assert_eq!(s2.code(), Some(0), "{s2:?}");
+}
+
+/// S37 (G1, G3): `break`, `continue` and a `return` from a sourced file
+/// skip the rest of a loop body or file, so the values at the jump reach
+/// the code after it. The walk follows those jumps: a name set to git
+/// just before one stays unknown after the loop. A program written earlier
+/// in the call runs only when a literal heredoc wrote it whole, once, with
+/// the real `cat`, and its text passes the same checks as inline code.
+#[test]
+fn s37_jumps_and_programs_written_in_the_call_are_followed() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    let root = lab.root();
+    std::fs::write(root.join("ret.sh"), "G=git\n[ -d / ] && return\nG=echo\n").unwrap();
+    let ret = root.join("ret.sh").display().to_string();
+    let py = root.join("w.py").display().to_string();
+    let bad = lab.not_denied(&[
+        "G=echo; for i in 1 2; do G=git; [ -d / ] && continue; G=echo; done; $G commit -n -m x"
+            .to_owned(),
+        "G=echo; for i in 1 2; do G=git; [ -d / ] && break; G=echo; done; $G commit -n -m x"
+            .to_owned(),
+        "G=echo; while :; do G=git; [ -d / ] && break; G=echo; break; done; $G commit -n -m x"
+            .to_owned(),
+        "G=echo; until false; do G=git; break; G=echo; done; $G commit -n -m x".to_owned(),
+        "G=echo; for a in 1; do for b in 1; do G=git; break 2; done; G=echo; done; $G commit -n -m x"
+            .to_owned(),
+        "G=echo; for a in 1; do for b in 1; do G=git; continue 2; done; G=echo; done; $G commit -n -m x"
+            .to_owned(),
+        format!("G=echo; . {ret}; $G commit -n -m x"),
+        format!("G=echo; source {ret}; $G commit -n -m x"),
+        format!(
+            "printf 'import subprocess\\nsubprocess.run([\"git\",\"commit\",\"-n\",\"-m\",\"x\"])\\n' > {py}; python3 {py}"
+        ),
+        format!(
+            "cat > {py} <<'EOF'\nimport os\nos.system('git commit -n -m x')\nEOF\npython3 -I {py}"
+        ),
+        // Two writes: the guard cannot tell which text runs.
+        format!(
+            "if [ -d / ]; then cat > {py} <<'A'\nimport os\nos.system('git commit -n -m x')\nA\nelse cat > {py} <<'B'\nprint(1)\nB\nfi; python3 {py}"
+        ),
+        format!(
+            "cat > {py} <<'EOF'\nprint(1)\nEOF\nprintf 'import os\\nos.system(\"git commit -n -m x\")\\n' >> {py}; python3 {py}"
+        ),
+        "cat > w.sh <<'EOF'\ngit commit -n -m x\nEOF\nbash w.sh".to_owned(),
+        "cat > w.sh <<'EOF'\ngit commit -n -m x\nEOF\nchmod +x w.sh && ./w.sh".to_owned(),
+        // A dir written first: what is in it is unknown.
+        "mkdir -p d && printf 'import os\\nos.system(\"git commit -n -m x\")\\n' > d/w.py; cp -r d e && python3 e/w.py"
+            .to_owned(),
+        // A `cat` other than the real one.
+        format!(
+            "mkdir -p b && cat > b/cat <<'EOF'\n#!/bin/sh\necho 'import os; os.system(\"git commit -n -m x\")'\nEOF\nchmod +x b/cat && export PATH=$PWD/b:$PATH; cat > {py} <<'EOF'\nprint(1)\nEOF\npython3 {py}"
+        ),
+        format!(
+            "cat() {{ printf 'import os\\nos.system(\"git commit -n -m x\")\\n'; }}; cat > {py} <<'EOF'\nprint(1)\nEOF\npython3 {py}"
+        ),
+    ]);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    // A loop without jumps keeps what it knows.
+    let s = lab.session("G=echo; for i in 1 2; do G=echo; done; $G ok");
+    assert_eq!(s.code(), Some(0), "{s:?}");
+    // A program a literal heredoc wrote runs, checked as that text.
+    for cmd in [
+        format!("cat > {py} <<'EOF'\nprint('ok')\nEOF\npython3 {py}"),
+        "cat > ok.sh <<'EOF'\necho ok\nEOF\nchmod +x ok.sh && ./ok.sh && bash ok.sh".to_owned(),
+    ] {
+        let s = lab.session(&cmd);
+        assert_eq!(s.code(), Some(0), "{cmd}: {s:?}");
+    }
+}
+
+/// S38 (G3, G7): programs whose own arguments run commands or write files:
+/// sed's `e` command and `e` flag, sed `w` into git's refs, tar's
+/// program options, `rg --pre`, `less +!`, an editor's command options.
+/// Plain edits with sed still run.
+#[test]
+fn s38_program_arguments_that_run_commands_are_denied() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    let f = lab.root().join("f.sh");
+    write_exe(
+        &f,
+        "#!/bin/sh\ngit commit -n -m x >/dev/null 2>&1\ncat \"$1\"\n",
+    );
+    let f = f.display().to_string();
+    let bad = lab.not_denied(&[
+        "echo x | sed '1e git commit -n -m x'".to_owned(),
+        "echo x | sed 's/x/git commit -n -m x/e'".to_owned(),
+        "echo x | sed -n --e='1e git commit -n -m x' -e p".to_owned(),
+        "echo x | sed -ne '1e git commit -n -m x'".to_owned(),
+        "git rev-parse HEAD~0 | sed 'w .git/refs/heads/evil'".to_owned(),
+        "tar -cf /dev/null --to-command='git commit -n -m x' .".to_owned(),
+        "tar -cf /dev/null --checkpoint=1 --checkpoint-act=exec='git commit -n -m x' .".to_owned(),
+        format!("rg --pre {f} x ."),
+        "less +'!git commit -n -m x' bad".to_owned(),
+        "vim -es -c '!git commit -n -m x' -c q bad".to_owned(),
+        "S='1e git commit -n -m x'; echo x | sed \"$S\"".to_owned(),
+        "for s in p '1e git commit -n -m x'; do echo x | sed \"$s\"; done".to_owned(),
+        "LESSOPEN='|git commit -n -m x >/dev/null; cat %s' less bad".to_owned(),
+    ]);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    let s = lab.session("printf 'a\\n' > t.txt && sed -i 's/a/b/' t.txt && sed -n '1p' t.txt");
+    assert_eq!(s.code(), Some(0), "{s:?}");
+}
+
+/// S39 (G3): bash evaluates a variable's value as an arithmetic
+/// expression wherever its name is used in one (`$((x))`, `(( x ))`,
+/// `[[ $x -eq 1 ]]`, `let`, `declare -i`, array subscripts, substring
+/// offsets), and a value like `a[$(cmd)]` runs `cmd`. Arithmetic may read
+/// only names whose value is a number (set by arithmetic, a literal, or a
+/// command that prints only numbers) or the session's own. Prompt
+/// expansion (`PS4` under `set -x`, `${x@P}`) runs substitutions as well.
+#[test]
+fn s39_arithmetic_never_runs_code_from_a_value() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    let x = "x=$(printf 'a[$(git commit -n -m x >&2)]')";
+    let bad = lab.not_denied(&[
+        format!("{x}; echo $((x+1))"),
+        format!("{x}; (( x )) || true"),
+        format!("{x}; [[ $x -eq 1 ]] || true"),
+        format!("{x}; declare -i y=x"),
+        format!("{x}; echo ${{a[x]}}"),
+        format!("{x}; s=abc; echo ${{s:x}}"),
+        format!("{x}; let y=x"),
+        format!("{x}; a[x]=1"),
+        format!("{x}; y=x; echo $((y))"),
+        format!("{x}; for ((i=x; i<1; i++)); do :; done"),
+        "read x <<< 'a[$(git commit -n -m x >&2)]'; echo $((x))".to_owned(),
+        "v=$(printf 'a[$(git commit -n -m x >&2)]'); let \"$v\"".to_owned(),
+        "[[ 'a[$(git commit -n -m x >&2)]' -eq 1 ]] || true".to_owned(),
+        "echo $(( $(printf 'a[$(git commit -n -m x >&2)]') ))".to_owned(),
+        "f(){ echo $(( $1 + 1 )); }; f 'a[$(git commit -n -m x >&2)]'".to_owned(),
+        // Prompt expansion runs command substitutions too.
+        "PS4='$(git commit -n -m x >&2)'; set -x; true".to_owned(),
+        "export PS4='$(git commit -n -m x >&2)'; bash -xc true".to_owned(),
+        "x='$(git commit -n -m x >&2)'; echo ${x@P}".to_owned(),
+    ]);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    for cmd in [
+        "i=0; while [ $i -lt 3 ]; do i=$((i+1)); done; echo $i",
+        "for ((i=0; i<3; i++)); do echo $((i*2)); done",
+        "n=$(git rev-list --count HEAD); echo $((n+1))",
+        "start=$(date +%s); echo $(( $(date +%s) - start ))",
+        "for i in $(seq 1 3); do echo $((i*15)); done",
+    ] {
+        let s = lab.session(cmd);
+        assert_eq!(s.code(), Some(0), "{cmd}: {s:?}");
+    }
+}
+
+/// S40 (G3): interpreter code that reaches a process call without naming
+/// one: Python's object graph (`__subclasses__`, `__globals__`), code
+/// built from strings (`eval`, `Function`, a constructor), a module name
+/// built at run time (`require(x)`), Ruby's `send`, PHP variable
+/// functions, Perl symbolic calls, Lua `load`.
+#[test]
+fn s40_interpreter_code_cannot_reach_a_process_call_by_a_string() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    let bad = lab.not_denied(&owned(&[
+        "python3 - <<'EOF'\nfor c in ().__class__.__base__.__subclasses__():\n    if c.__name__ == '_wrap_close':\n        c.__init__.__globals__['sys' + 'tem']('git commit -n -m x')\nEOF",
+        "python3 -c \"import sys; sys._getframe().f_globals['__builtins__']\"",
+        "node -e \"require('child_' + 'process')['exec' + 'Sync']('git commit -n -m x')\"",
+        "node -e \"eval('require(\\\"child_\\\" + \\\"process\\\")')\"",
+        "node -e \"''.constructor.constructor('return process')().mainModule\"",
+        "node -e \"const m = 'child_' + 'process'; import(m)\"",
+        "ruby -e \"Kernel.send(('sys' + 'tem').to_sym, 'git commit -n -m x')\"",
+        "perl -e '&{\"CORE::sys\" . \"tem\"}(\"git commit -n -m x\")'",
+        "perl -e 'eval \"sys\" . \"tem q(git commit -n -m x)\"'",
+        "lua -e \"load('os.exe' .. 'cute(\\\"git commit -n -m x\\\")')()\"",
+        "php -r '$f = \"sys\" . \"tem\"; $f(\"git commit -n -m x\");'",
+    ]));
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    let s = lab.session("python3 -c 'import json; print(json.dumps([1]))' && node -e 'console.log(require(\"path\").join(\"a\", \"b\"))'");
+    assert_eq!(s.code(), Some(0), "{s:?}");
 }
