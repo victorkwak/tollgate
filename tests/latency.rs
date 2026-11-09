@@ -271,6 +271,38 @@ fn the_guard_reads_push_and_fetch_targets_in_under_10_ms_l19_item22() {
     );
 }
 
+/// Item 21/20 (review G2): shell, interpreter and wrapper words of a
+/// program the guard does not know are walked as the command it may run
+/// (a `PATH` lookup for a script name, once per word list, at most 4
+/// programs deep); the guard stays in budget, also for 100 such words
+/// (a walk per word would be exponential in their number).
+#[test]
+fn the_guard_walks_words_of_unknown_programs_in_under_10_ms_l19_item21_20() {
+    let meter = CpuMeter::new();
+    let a = Armed::new();
+    let many = format!("frobnicate {}-c 'print(1)'", "python3 ".repeat(100));
+    for (what, command, code) in [
+        (
+            "guard on words of unknown programs",
+            "cargo test bash -- --nocapture && frobnicate sh -c 'git status && echo hi' && pytest -k sh tests/ && prlimit -n4096 cargo build".to_owned(),
+            Some(0),
+        ),
+        ("guard on 100 interpreter words", many, Some(2)),
+    ] {
+        let input = serde_json::json!({
+            "cwd": a.sb.root(),
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        })
+        .to_string();
+        let t = p95(&meter, 3, 100, || {
+            let (c, _, err) = a.guard_raw(&input, &[]);
+            assert_eq!(c, code, "{err}");
+        });
+        within_budget(what, t, Duration::from_millis(10));
+    }
+}
+
 /// Detection runs on the `pre-commit` path when the policy commit has no
 /// `tollgate.toml` (one `git cat-file` per TypeScript root, R65). A
 /// docs-only commit next to detected Bun and Python roots stays in the

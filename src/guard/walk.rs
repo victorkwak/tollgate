@@ -41,6 +41,11 @@ const MAX_SCRIPT: u64 = 1 << 20;
 /// How deep code in arguments may nest (`sh -c` in `eval` in ...).
 const MAX_CODE_DEPTH: usize = 8;
 
+/// How many commands may run one another (`nice nice ... git`, item
+/// 21/20): a deeper chain would overflow the guard's stack, and a guard
+/// that dies is no answer.
+const MAX_RUN_DEPTH: usize = 64;
+
 /// Ways through an `&&`/`||` list followed one by one before they are
 /// merged into one.
 const MAX_WAYS: usize = 4;
@@ -284,6 +289,12 @@ pub struct Walker<'a> {
     /// How many runners ([`runners`]) the command being walked runs
     /// under: git, tollgate and shells may not run there (item 40).
     pub(super) runner_depth: usize,
+    /// G2 (item 21/20, review G2): the programs the guard does not know
+    /// whose words are being walked as a command they may run, innermost
+    /// last. git under one may run with another environment.
+    pub(super) foreign: Vec<String>,
+    /// Commands in the chain now being walked ([`MAX_RUN_DEPTH`]).
+    run_depth: usize,
 }
 
 /// R25/R26/R28 for a Bash command.
@@ -342,6 +353,8 @@ impl<'a> Walker<'a> {
             returns: Vec::new(),
             unrolled_walks: 0,
             runner_depth: 0,
+            foreign: Vec::new(),
+            run_depth: 0,
         }
     }
 
@@ -1285,7 +1298,7 @@ impl<'a> Walker<'a> {
 
     /// The class of command `name`: a path word goes by the basename of
     /// what it resolves to (a link named `g` to git is git).
-    fn class_of(&self, name: &str) -> (String, Class) {
+    pub(super) fn class_of(&self, name: &str) -> (String, Class) {
         let mut base = basename(name).to_owned();
         if name.contains('/')
             && let Some(p) = self.abs_path(name)
@@ -1300,6 +1313,26 @@ impl<'a> Walker<'a> {
 
     /// Runs `argv` (its name `name`, literal) with `env`.
     pub(super) fn run(
+        &mut self,
+        argv: &[Word],
+        name: &str,
+        env: Vec<EnvSet>,
+        f: &Frame,
+        via: Via,
+        certain: bool,
+    ) -> W {
+        if self.run_depth >= MAX_RUN_DEPTH {
+            return Err(format!(
+                "`{name}` is run by more than {MAX_RUN_DEPTH} commands in a chain; too deep to check (G2)"
+            ));
+        }
+        self.run_depth += 1;
+        let r = self.run_command(argv, name, env, f, via, certain);
+        self.run_depth -= 1;
+        r
+    }
+
+    fn run_command(
         &mut self,
         argv: &[Word],
         name: &str,
@@ -1337,14 +1370,33 @@ impl<'a> Walker<'a> {
                 .strip_prefix("git-")
                 .is_some_and(|s| super::git::KNOWN.contains(&s));
         let tollgate = is_tollgate(self.ctx, name) || base == "tollgate";
+        // A shell word of a program the guard does not know may be data
+        // (`uv run pytest -k bash tests/`): it runs nothing when it gets
+        // no code and its one script is not there (item 21/20).
+        let inert_word = !self.foreign.is_empty()
+            && matches!(class, Class::Shell(_) | Class::Opaque(_))
+            && match argv.get(1..).unwrap_or_default() {
+                [] => self.stdin(f) == Feed::Tty,
+                [w] => w
+                    .literal_home(&self.home)
+                    .filter(|a| !a.starts_with(['-', '+']))
+                    .is_some_and(|a| self.runs_nothing(&a, &env)),
+                _ => false,
+            };
         if self.runner_depth > 0
-            && (gitish || tollgate || matches!(class, Class::Shell(_) | Class::Busybox))
+            && !inert_word
+            && (gitish
+                || tollgate
+                || matches!(class, Class::Shell(_) | Class::Opaque(_) | Class::Busybox))
         {
             return Err(format!(
                 "`{name}` under a runner (uv run, npx, strace, ...): the runner may find another program by that name, or trace or detach it; run it directly in the session (G2, item 40)"
             ));
         }
         if gitish {
+            if let Some(prog) = self.foreign.last().cloned() {
+                return self.foreign_git(&prog, argv, env, f, via);
+            }
             return self.git(argv, env, f, via);
         }
         if tollgate {
@@ -1360,6 +1412,7 @@ impl<'a> Walker<'a> {
             Class::Wrapper(w) => self.wrapper(w, argv, env, f, via, certain),
             Class::Launcher(l) => self.launcher(l, argv, env, f, via),
             Class::Shell(sh) => self.shell(sh, argv, env, f, via),
+            Class::Opaque(o) => self.opaque(o, argv, env, f, via),
             Class::Eval => {
                 self.no_elsewhere(via, "eval")?;
                 self.env_check(&env, Target::Code)?;
@@ -1964,7 +2017,7 @@ impl<'a> Walker<'a> {
 
     /// G2b: `what` runs `args` elsewhere or with another environment: no
     /// git, tollgate, shell or interpreter in them, all literal.
-    fn launch_tokens(&self, what: &str, args: &[Word]) -> W {
+    pub(super) fn launch_tokens(&self, what: &str, args: &[Word]) -> W {
         for w in args {
             let Some(t) = w.literal_home(&self.home) else {
                 return Err(format!(
@@ -2207,6 +2260,34 @@ impl<'a> Walker<'a> {
 
     // ---- G3: shells, scripts, interpreters --------------------------------
 
+    /// G3 (item 21/20, review G2): a shell or script host whose language
+    /// the guard does not read may run any command from its code, so it
+    /// runs only to print its version or help, interactively on the
+    /// session's stdin, or (`osascript`) with notification and dialog code.
+    fn opaque(&mut self, o: &str, argv: &[Word], env: Vec<EnvSet>, f: &Frame, via: Via) -> W {
+        self.no_elsewhere(via, o)?;
+        self.env_check(&env, Target::Code)?;
+        let lits = self.lits(&argv[1..]);
+        match lits.as_slice() {
+            [] if self.stdin(f) == Feed::Tty => return Ok(()),
+            [Some(a)]
+                if matches!(
+                    a.as_str(),
+                    "--version" | "-version" | "-v" | "-V" | "--help" | "-help" | "-h"
+                ) =>
+            {
+                return Ok(());
+            }
+            _ => {}
+        }
+        if o == "osascript" {
+            return osascript_ok(&lits);
+        }
+        Err(format!(
+            "{o} runs code in a language the guard does not read, and that code may run git or tollgate; run the commands in bash directly (G3, item 21/20)"
+        ))
+    }
+
     fn shell(&mut self, sh: &str, argv: &[Word], env: Vec<EnvSet>, f: &Frame, via: Via) -> W {
         self.no_elsewhere(via, sh)?;
         self.env_check(&env, Target::Code)?;
@@ -2349,6 +2430,12 @@ impl<'a> Walker<'a> {
                 "{who} reads its script from {text}, which the guard cannot read (G3)"
             ));
         }
+        // Item 21/20: under a program the guard does not know, a shell
+        // word may be data (`cargo test bash -- --nocapture`). A script
+        // that is not there, is a dir, and is not on the PATH runs nothing.
+        if !self.foreign.is_empty() && self.runs_nothing(&text, &env) {
+            return Ok(());
+        }
         let path = if text.contains('/') {
             self.abs_path(&text)
         } else {
@@ -2373,8 +2460,61 @@ impl<'a> Walker<'a> {
         self.read_and_walk(&path, child, &frame)
     }
 
+    /// True when a shell given script `text` finds nothing to run (item
+    /// 21/20): not a file or written in this command, and, for a bare
+    /// name, on no dir of the session's `PATH`, which this command does
+    /// not change.
+    fn runs_nothing(&self, text: &str, env: &[EnvSet]) -> bool {
+        let Some(p) = self.abs_path(text) else {
+            return false;
+        };
+        if self.was_written(&p) || p.is_file() || p.is_symlink() {
+            return false;
+        }
+        if text.contains('/') {
+            return true;
+        }
+        if self.scope.opaque
+            || self.scope.vars.contains_key("PATH")
+            || env.iter().any(|e| e.name == "PATH")
+        {
+            return false;
+        }
+        let Some(path) = std::env::var_os("PATH") else {
+            return false;
+        };
+        // The session's shell may add dirs its profile sets: the usual
+        // ones count too.
+        let home = PathBuf::from(&self.home);
+        let usual = [
+            home.join(".local/bin"),
+            home.join("bin"),
+            home.join(".cargo/bin"),
+            home.join(".bun/bin"),
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/usr/local/sbin"),
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+            PathBuf::from("/usr/sbin"),
+            PathBuf::from("/sbin"),
+        ];
+        !std::env::split_paths(&path).chain(usual).any(|d| {
+            let c = if d.as_os_str().is_empty() {
+                self.abs_path(".").map(|d| d.join(text))
+            } else if d.is_absolute() {
+                Some(d.join(text))
+            } else {
+                None
+            };
+            // A relative dir resolves against a cwd the guard may not
+            // follow: count it as a match.
+            c.is_none_or(|c| c.exists() || c.is_symlink())
+        })
+    }
+
     /// True when this command writes `p`, or a dir above it, before now.
-    fn was_written(&self, p: &Path) -> bool {
+    pub(super) fn was_written(&self, p: &Path) -> bool {
         self.written.iter().any(|w| p.starts_with(w))
     }
 
@@ -2488,7 +2628,10 @@ impl<'a> Walker<'a> {
             Some(prog) if prog == "git" || prog == "tollgate" => Err(format!(
                 "{name} runs {prog} as its interpreter; the guard does not allow it (G3)"
             )),
-            Some(prog) if !cmds::SHELLS.contains(&prog) => {
+            Some(prog) if matches!(cmds::classify(prog), Class::Opaque(_)) => Err(format!(
+                "{name} runs {prog} as its interpreter, a language the guard does not read (G3, item 21/20)"
+            )),
+            Some(prog) if !matches!(cmds::classify(prog), Class::Shell(_)) => {
                 self.other(name, base, argv, &env, f, via)
             }
             // A shell script, or text with no `#!` (bash runs it as one).
@@ -3637,6 +3780,75 @@ fn shebang(head: &[u8]) -> Option<String> {
             .unwrap_or_default();
     }
     Some(prog)
+}
+
+/// `osascript` (G3, item 21/20, review G2): only `-e CODE` pairs whose
+/// every line displays a notification, dialog or alert, beeps or speaks,
+/// and that name nothing that runs or drives another program (`do shell
+/// script`, `tell`, `run`, `activate`, `keystroke`, raw `«event»` codes,
+/// ...). Script files, stdin, `-l` (JavaScript, with its ObjC bridge) and
+/// every other option deny.
+fn osascript_ok(lits: &[Option<String>]) -> W {
+    const LINES: &[&str] = &[
+        "display notification",
+        "display dialog",
+        "display alert",
+        "beep",
+        "say",
+    ];
+    const NAMES: &[&str] = &[
+        "shell",
+        "script",
+        "tell",
+        "run",
+        "launch",
+        "open",
+        "activate",
+        "keystroke",
+        "key ",
+        "system",
+        "terminal",
+        "iterm",
+        "load",
+        "osax",
+        "event",
+        "application",
+        "app ",
+        "\u{ab}",
+        "\u{bb}",
+        "<<",
+        ">>",
+        "using terms",
+        "do ",
+        "path to",
+        "posix",
+    ];
+    let deny = |why: &str| {
+        Err(format!(
+            "osascript {why}; it runs only -e code that shows a notification, a dialog or an alert, beeps or speaks (G3, item 21/20)"
+        ))
+    };
+    if lits.is_empty() || !lits.len().is_multiple_of(2) {
+        return deny("without -e code pairs");
+    }
+    for pair in lits.chunks(2) {
+        let (Some(opt), Some(code)) = (pair[0].as_deref(), pair[1].as_deref()) else {
+            return deny("with a word bash builds at run time");
+        };
+        if opt != "-e" {
+            return deny(&format!("with {opt}"));
+        }
+        let c = code.to_lowercase();
+        if let Some(n) = NAMES.iter().find(|n| c.contains(**n)) {
+            return deny(&format!("code with `{}`", n.trim()));
+        }
+        for line in c.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if !LINES.iter().any(|p| line.starts_with(p)) {
+                return deny(&format!("code `{line}`"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// zsh, fish and csh read some text differently from bash (`=cmd`, fish

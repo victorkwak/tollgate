@@ -3,7 +3,8 @@
 //! change what that command finds or how it runs: tracers (`strace`,
 //! `ltrace`, `valgrind`, `perf stat|record|trace`, `catchsegv`), output
 //! and session helpers (`chronic`, `xvfb-run`, `systemd-inhibit`,
-//! `systemd-cat`) and package runners, which put a project's tool dir
+//! `systemd-cat`, `prlimit`, `cgexec`, macOS `caffeinate`, `arch` and
+//! `xcrun`) and package runners, which put a project's tool dir
 //! first on `PATH` (`uv run`, `uvx`, `npx`, `npm exec`, `pnpm exec|dlx`,
 //! `yarn exec|dlx`, `bunx`, `bun x`).
 //!
@@ -57,6 +58,11 @@ const NAMES: &[&str] = &[
     "xvfb-run",
     "systemd-inhibit",
     "systemd-cat",
+    "prlimit",
+    "cgexec",
+    "caffeinate",
+    "arch",
+    "xcrun",
     "uv",
     "uvx",
     "npx",
@@ -88,6 +94,11 @@ pub fn launch(base: &str, lits: &[Option<String>]) -> Option<Launch> {
         "xvfb-run" => Some(walk(&XVFB_RUN, lits, 1)),
         "systemd-inhibit" => Some(walk(&SYSTEMD_INHIBIT, lits, 1)),
         "systemd-cat" => Some(walk(&SYSTEMD_CAT, lits, 1)),
+        "prlimit" => Some(walk(&PRLIMIT, lits, 1)),
+        "cgexec" => Some(walk(&CGEXEC, lits, 1)),
+        "caffeinate" => Some(walk(&CAFFEINATE, lits, 1)),
+        "arch" => Some(arch(lits)),
+        "xcrun" => xcrun(lits),
         "perf" => match lits.get(1).cloned().flatten().as_deref() {
             Some("stat" | "record" | "trace") => Some(walk(&PERF, lits, 2)),
             Some(s) if s.starts_with('-') => Some(Launch::Strict { from: 1 }),
@@ -177,6 +188,70 @@ fn valgrind(lits: &[Option<String>]) -> Launch {
         prefix: &[],
         moved: false,
     }
+}
+
+/// macOS `arch [-32|-64] [-ARCH | -arch ARCH]... [-c] [-d NAME]...
+/// [-e NAME=VALUE]... PROG ARGS` (item 21/20, review G2): `-e` sets a
+/// variable the guard does not check. Linux's `arch` runs nothing; its
+/// `--help` and `--version` hold the words to the launcher rule.
+fn arch(lits: &[Option<String>]) -> Launch {
+    const ARCHS: &[&str] = &[
+        "-32", "-64", "-i386", "-x86_64", "-x86_64h", "-arm64", "-arm64e", "-ppc", "-ppc64",
+    ];
+    let mut i = 1;
+    while let Some(w) = lits.get(i) {
+        let Some(a) = w.as_deref() else {
+            return Launch::Strict { from: 1 };
+        };
+        match a {
+            "-arch" | "-d" => i += 2,
+            "-e" => {
+                return Launch::Deny(
+                    "arch -e: sets variables for the command that the guard does not check (G2, G5)"
+                        .into(),
+                );
+            }
+            "-c" | "-h" => i += 1,
+            a if ARCHS.contains(&a) => i += 1,
+            a if a.starts_with('-') => return Launch::Strict { from: 1 },
+            _ => break,
+        }
+    }
+    Launch::Walk {
+        at: i,
+        prefix: &[],
+        moved: false,
+    }
+}
+
+/// macOS `xcrun [opts] TOOL ARGS` (item 21/20, review G2): it finds TOOL
+/// in the developer dir, so another program by that name may run. Its
+/// options take one or two dashes; `--find` and `--show-*` print only.
+fn xcrun(lits: &[Option<String>]) -> Option<Launch> {
+    let mut i = 1;
+    while let Some(w) = lits.get(i) {
+        let Some(a) = w.as_deref() else {
+            return Some(Launch::Strict { from: 1 });
+        };
+        let o = a
+            .strip_prefix('-')
+            .filter(|o| o.starts_with('-'))
+            .unwrap_or(a);
+        match o {
+            "-sdk" | "-toolchain" => i += 2,
+            "-h" | "-help" | "-version" | "-v" | "-verbose" | "-l" | "-log" | "-n"
+            | "-no-cache" | "-k" | "-kill-cache" | "-r" | "-run" => i += 1,
+            "-f" | "-find" => return None,
+            o if o.starts_with("-show-") => return None,
+            o if o.starts_with('-') => return Some(Launch::Strict { from: 1 }),
+            _ => break,
+        }
+    }
+    Some(Launch::Walk {
+        at: i,
+        prefix: &[],
+        moved: false,
+    })
 }
 
 /// `uv [opts] run [opts] CMD` and `uv [opts] tool run [opts] CMD`.
@@ -355,6 +430,49 @@ const SYSTEMD_INHIBIT: Opts = Opts {
     short_flags: "h",
     long_flags: &["list", "no-pager", "no-legend", "help", "version"],
     long_val: &["what", "who", "why", "mode"],
+    ..NONE
+};
+
+/// util-linux `prlimit`: the resource options take an optional value,
+/// glued (`-n1024`) or after `=` (`--nofile=1024`).
+const PRLIMIT: Opts = Opts {
+    short_flags: "hV",
+    short_val: "po",
+    short_opt: "cdefilmnqrstuvxy",
+    long_flags: &["noheadings", "raw", "verbose", "help", "version"],
+    long_val: &["pid", "output"],
+    long_opt: &[
+        "core",
+        "data",
+        "nice",
+        "fsize",
+        "sigpending",
+        "memlock",
+        "rss",
+        "nofile",
+        "msgqueue",
+        "rtprio",
+        "stack",
+        "cpu",
+        "nproc",
+        "as",
+        "locks",
+        "rttime",
+    ],
+};
+
+/// libcgroup `cgexec [-g CONTROLLERS:PATH]... [--sticky] CMD`.
+const CGEXEC: Opts = Opts {
+    short_flags: "hb",
+    short_val: "g",
+    long_flags: &["sticky", "help"],
+    ..NONE
+};
+
+/// macOS `caffeinate [-dimsu] [-t SECS] [-w PID] [CMD]`.
+const CAFFEINATE: Opts = Opts {
+    short_flags: "dimsu",
+    short_val: "tw",
     ..NONE
 };
 

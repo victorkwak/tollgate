@@ -3426,3 +3426,202 @@ fn s49_bash_writes_of_session_settings_and_global_git_config_are_never_silent() 
         assert!(matches!(g, Guarded::Allowed(_)), "{cmd}: {g:?}");
     }
 }
+
+/// S50 (G2, G3, item 21/20, review G2): a program the guard does not know
+/// may run its words as a command, with another environment. A shell,
+/// script host, interpreter, wrapper or runner word in them is walked as
+/// that command, where git with a gated subcommand denies at any depth
+/// (`frobnicate sh -c 'git commit -m x'`); a launcher word holds the rest
+/// to the launcher rule; a word bash builds, or a path the call writes
+/// first, before a code option (`-c`, `-e`) denies. prlimit, cgexec,
+/// caffeinate, arch and xcrun are runners, launchctl and sandbox-exec
+/// launchers; versioned shell names (`bash5.2`, `ksh93`) are shells, and
+/// shells and script hosts whose language the guard does not read (`nu`,
+/// `pwsh`, `xonsh`, `osascript`, ...) run no code, except osascript
+/// notifications. Chains of commands are bounded (the guard died on a
+/// 20000-deep `nice` chain). Only the guard runs here.
+#[test]
+fn s50_unknown_launchers_never_run_git_tollgate_or_a_shell_unwalked() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    // A link to a shell under a name the guard does not know.
+    std::os::unix::fs::symlink("/bin/sh", lab.repo.join("mysh")).unwrap();
+    // Scripts a shell word may run: in the cwd, and on a usual PATH dir
+    // of the session's shell.
+    std::fs::write(lab.repo.join("s50.sh"), "git commit -n -m x\n").unwrap();
+    let bin = lab.sb().home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("s50-on-path"), "git commit -n -m x\n").unwrap();
+    // A script for a shell whose language the guard does not read.
+    let nu = lab.repo.join("s50.nu");
+    std::fs::write(&nu, "#!/usr/bin/env nu\n^git commit -n -m x\n").unwrap();
+    std::fs::set_permissions(&nu, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let deep = format!("{}ls", "frobnicate nice ".repeat(10));
+    // A chain deeper than the guard's stack: the guard died (a signal, no
+    // answer) before MAX_RUN_DEPTH.
+    let chain = format!("{}git commit -n -m x", "nice ".repeat(20000));
+    let many = format!(
+        "frobnicate {}-c 'git commit -n -m x'",
+        "python3 ".repeat(400)
+    );
+    let not_denied = |cmds: &[&str]| -> Vec<String> {
+        cmds.iter()
+            .filter_map(|c| match lab.guard(c) {
+                Guarded::Denied(_) => None,
+                g => Some(format!("{c}  => {g:?}")),
+            })
+            .collect()
+    };
+    let bad = not_denied(&[
+        // The review's commands.
+        "prlimit git commit -n -m x",
+        "ssh-agent sh -c 'git commit -n -m x'",
+        "dbus-run-session -- bash -c 'git commit -n -m x'",
+        "systemd-inhibit git commit -n -m x",
+        "prlimit tollgate remotes forget",
+        "xcrun git commit -n -m x",
+        "caffeinate -i git commit -n -m x",
+        "osascript -e 'do shell script \"git commit -n -m x\"'",
+        "launchctl submit -l x -- git commit -n -m x",
+        "sandbox-exec -n no-network git commit -n -m x",
+        "arch -arm64 git commit -n -m x",
+        "strace -f sh -c 'git commit -n -m x'",
+        "ltrace bash -c 'git commit -n -m x'",
+        "valgrind sh -c 'git commit -n -m x'",
+        "perf stat -- sh -c 'git commit -n -m x'",
+        "cgexec -g cpu:x git commit -n -m x",
+        "xvfb-run sh -c 'git commit -n -m x'",
+        "hyperfine 'sh -c \"git commit -n -m x\"'",
+        "rlwrap sh -c 'git commit -n -m x'",
+        // Shells the guard did not list.
+        "nu -c 'git commit -n -m x'",
+        "pwsh -c 'git commit -n -m x'",
+        "elvish -c 'git commit -n -m x'",
+        "xonsh -c 'git commit -n -m x'",
+        "ksh93 -c 'git commit -n -m x'",
+        "rc -c 'git commit -n -m x'",
+        "bash5.2 -c 'git commit -n -m x'",
+        "zsh-5.9 -c 'git commit -n -m x'",
+        "/usr/bin/bash5.2 -c 'git commit -n -m x'",
+        // Unknown programs in front of a shell, an interpreter or script.
+        "prlimit sh -c 'git commit -n -m x'",
+        "prlimit --nofile=1024 bash -c 'git commit -n -m x'",
+        "prlimit /bin/sh -c 'git commit -n -m x'",
+        "frobnicate sh -c 'git commit -n -m x'",
+        "frobnicate nu -c 'git commit -n -m x'",
+        "frobnicate python3 -c 'import os; os.system(\"git commit -n -m x\")'",
+        "frobnicate script -qc 'git commit -n -m x' /dev/null",
+        "frobnicate --shell=bash -c 'git commit -n -m x'",
+        "systemd-inhibit sh -c 'tollgate remotes forget'",
+        "caffeinate -i sh -c 'git commit -n -m x'",
+        "xcrun sh -c 'git commit -n -m x'",
+        "arch -x86_64 /bin/zsh -c 'git commit -n -m x'",
+        // Spellings: case, quoting, option values, paths, links.
+        "frobnicate SH -c 'git commit -n -m x'",
+        "frobnicate Bash5.2 -c 'git commit -n -m x'",
+        "frobnicate GIT commit -n -m x",
+        "frobnicate 's'h -c 'git commit -n -m x'",
+        "frobnicate \\sh -c 'git commit -n -m x'",
+        "frobnicate --with=sh -c 'git commit -n -m x'",
+        "frobnicate ./mysh -c 'git commit -n -m x'",
+        "ln -s /bin/sh /tmp/s50sh && frobnicate /tmp/s50sh -c 'git commit -n -m x'",
+        "frobnicate $S -c 'git commit -n -m x'",
+        "frobnicate \"$S\" -lc 'git commit -n -m x'",
+        "frobnicate ${P} -e 'system(\"git commit -n -m x\")'",
+        "frobnicate sh -c 'env -i git commit -m x'",
+        "frobnicate sh -c 'git commit -m x'",
+        "frobnicate sh -c 'cd /tmp && git push -f origin main'",
+        "frobnicate sh -c 'tollgate remotes forget'",
+        "frobnicate sh -c 'frob2 git commit -m x'",
+        "frobnicate bash -c 'git -C . commit -n -m x'",
+        "frobnicate env -S 'git commit -n -m x'",
+        "frobnicate nice sh -c 'git commit -n -m x'",
+        "frobnicate tmux send-keys 'git commit -n -m x' Enter",
+        "frobnicate busybox sh -c 'git commit -n -m x'",
+        "printf 'git commit -n -m x\\n' | frobnicate sh",
+        "frobnicate sh < cmds.txt",
+        "frobnicate osascript -e 'do shell script \"git commit -n -m x\"'",
+        // Script hosts and their spellings.
+        "osascript -e 'tell application \"Terminal\" to do script \"git commit -n -m x\"'",
+        "osascript -e 'display notification (do shell script \"git commit -n -m x\")'",
+        "osascript -e 'run script \"git\"'",
+        "osascript -l JavaScript -e 'Application(\"Terminal\").doScript(\"git commit -n\")'",
+        "osascript x.scpt",
+        "printf 'do shell script \"git commit -n -m x\"' | osascript",
+        "osascript -e 'display dialog \"x\"' -e 'tell app \"System Events\" to keystroke \"x\"'",
+        "printf 'git commit -n -m x' | nu",
+        "pwsh -File x.ps1",
+        "tclsh x.tcl",
+        "expect -c 'spawn git commit -n -m x'",
+        "./s50.nu",
+        // Launchers and runners added by this item.
+        "launchctl asuser 501 git commit -n -m x",
+        "launchctl submit -l x -- sh -c 'echo hi'",
+        "sandbox-exec -p '(version 1)(allow default)' sh -c 'echo hi'",
+        "prlimit sh -c 'echo hi'",
+        "caffeinate -i bash -c 'echo hi'",
+        "xcrun sh -c 'echo hi'",
+        "arch -arm64 sh -c 'echo hi'",
+        "arch -e GIT_CONFIG_COUNT=0 cargo test",
+        "cgexec -g cpu:x sh -c 'echo hi'",
+        "prlimit --bogus git status",
+        "xcrun --bogus sh",
+        "frobnicate bash s50.sh",
+        "frobnicate bash ./s50.sh",
+        "frobnicate bash s50-on-path",
+        "S=s50.sh; frobnicate bash $S",
+        "frobnicate bash -- s50.sh",
+        "uv run frobnicate sh -c 'echo hi'",
+        "uv run frobnicate bash s50.sh",
+        "npx frobnicate sh -c 'git status'",
+        "printf 'git commit -n -m x' | uv run frobnicate sh",
+        deep.as_str(),
+        many.as_str(),
+        chain.as_str(),
+    ]);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    for cmd in [
+        "prlimit --nofile=4096 cargo test",
+        "systemd-inhibit --why=bench cargo bench",
+        "caffeinate -i cargo build",
+        "xcrun simctl list",
+        "arch -arm64 cargo build",
+        "frobnicate --verbose build",
+        "echo bash is fine",
+        "grep -rn 'sh -c' src",
+        "pacman -Qi bash zsh",
+        "printf '%s\\n' sh",
+        "ls -l /bin/sh /bin/bash",
+        "cp /bin/true /tmp/s50/cargo",
+        "pkill -f tmux",
+        "frobnicate sh -c 'echo hi'",
+        "frobnicate python3 -c 'print(1)'",
+        "frobnicate sh -c 'git status'",
+        "frobnicate \"$X\" build",
+        "uv python install 3.12",
+        "cargo add time",
+        "cargo test env",
+        "osascript -e 'display notification \"build done\" with title \"cargo\"'",
+        "osascript -e 'beep'",
+        "nu --version",
+        "nu",
+        "pwsh -v",
+        "xcrun --show-sdk-path",
+        "xcrun -f git",
+        "xcrun --sdk iphonesimulator simctl list",
+        "caffeinate -dims -t 60 cargo test",
+        "arch",
+        "prlimit --pid 1",
+        "prlimit -n4096 cargo build",
+        "cgexec -g cpu:x cargo build",
+        "launchctl list",
+        // A shell word that is data: what it would run is not there.
+        "cargo test bash -- --nocapture",
+        "pytest -k bash tests/",
+        "frobnicate bash no-such-script-s50",
+        "uv run pytest -k bash tests/",
+        "uv run pytest -k sh",
+    ] {
+        let g = lab.guard(cmd);
+        assert!(matches!(g, Guarded::Allowed(_)), "{cmd}: {g:?}");
+    }
+}

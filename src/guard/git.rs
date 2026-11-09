@@ -1748,8 +1748,34 @@ impl Walker<'_> {
                 .find(|v| GATED.contains(&v.as_str()))
                 .cloned()
         };
+        // Item 21/20: an option that gives a shell or an interpreter its
+        // code (`-c`, `-lc`, `-e`, `--command`, `--eval`).
+        let code_opt_after = |i: usize| {
+            values[i + 1..]
+                .iter()
+                .flatten()
+                .find(|v| {
+                    let short = v.strip_prefix('-').filter(|o| {
+                        !o.is_empty()
+                            && !o.starts_with('-')
+                            && o.chars().all(|c| c.is_ascii_alphabetic())
+                    });
+                    short.is_some_and(|o| o.ends_with('c') || o == "e")
+                        || ["--command", "--eval", "--execute"]
+                            .iter()
+                            .any(|l| v.as_str() == *l || v.starts_with(&format!("{l}=")))
+                })
+                .cloned()
+        };
+        let mut walked = false;
         for i in 1..argv.len() {
             let Some(word) = values[i].as_deref() else {
+                if let Some(c) = code_opt_after(i) {
+                    return Err(format!(
+                        "`{}` before `{c}`: a word bash builds at run time may be a shell or an interpreter, and `{}` may run it with that code; write the words literally (G1, G2, item 21/20)",
+                        argv[i].raw, argv[0].raw
+                    ));
+                }
                 if let Some(g) = gated_after(i) {
                     return Err(format!(
                         "`{}` before `{g}`: a word bash builds at run time may be git, and `{}` may run it; write the words literally, or run git directly (G1, G2, item 40)",
@@ -1763,7 +1789,9 @@ impl Walker<'_> {
                 Some((o, v)) if o.starts_with('-') => v,
                 _ => word,
             };
-            let base = basename(w);
+            // Lowercase: a case-insensitive file system (macOS) runs `GIT` as git.
+            let lower = basename(w).to_ascii_lowercase();
+            let base = lower.as_str();
             if via == Via::Elsewhere
                 && (base == "git"
                     || base.starts_with("git-")
@@ -1822,11 +1850,157 @@ impl Walker<'_> {
                         argv[0].raw
                     ));
                 }
+                continue;
+            }
+            // Item 21/20 (review G2): a word naming a program that runs
+            // code or a command (a shell, a script host, an interpreter,
+            // busybox, a wrapper, a runner) may be run with the words
+            // after it. They are walked as that command, with git at any
+            // depth under it held as above (`Self::foreign_git`). A
+            // launcher's words are held to the launcher rule.
+            // Once per word list: the walk reads the words after it, and
+            // a walk per word would be exponential in their number.
+            if walked || DATA_ONLY.contains(&basename(&argv[0].raw)) {
+                continue;
+            }
+            // A path is the program it names: a link to a shell is a shell.
+            // One this command writes first is not known yet.
+            if w.contains('/')
+                && self.abs_path(w).is_none_or(|p| self.was_written(&p))
+                && let Some(c) = code_opt_after(i)
+            {
+                return Err(format!(
+                    "`{w}` before `{c}`: a program this command writes first, or after a cd the guard cannot follow, may be a shell, and `{}` may run it with that code; run it in a later call (G2, G3, item 21/20)",
+                    argv[0].raw
+                ));
+            }
+            let real = self.class_of(w).0.to_ascii_lowercase();
+            let walks = match cmds::classify(&real) {
+                cmds::Class::Launcher(l) => {
+                    self.launch_tokens(l, &argv[i + 1..])?;
+                    false
+                }
+                cmds::Class::Shell(_)
+                | cmds::Class::Opaque(_)
+                | cmds::Class::Interp(_)
+                | cmds::Class::Busybox => true,
+                cmds::Class::Wrapper(x) => !matches!(x, "command" | "builtin" | "exec"),
+                _ => super::runners::is_runner(&real),
+            };
+            if walks {
+                walked = true;
+                self.foreign_walk(argv, i, w, env, f, via)?;
             }
         }
         Ok(())
     }
+
+    /// Walks `argv[i..]`, its first word read as `w`, as the command
+    /// `argv[0]` (a program the guard does not know) may run (item 21/20).
+    fn foreign_walk(
+        &mut self,
+        argv: &[Word],
+        i: usize,
+        w: &str,
+        env: &[EnvSet],
+        f: &Frame,
+        via: Via,
+    ) -> W {
+        let mut inner = vec![Word {
+            parts: vec![Part::Lit(w.to_owned())],
+            brace: false,
+            raw: w.to_owned(),
+        }];
+        inner.extend_from_slice(&argv[i + 1..]);
+        if self.foreign.len() >= 4 {
+            return Err(format!(
+                "`{}` runs {w} under {} other programs the guard does not know; too deep to check (G2, item 21/20)",
+                argv[0].raw,
+                self.foreign.len()
+            ));
+        }
+        self.foreign.push(argv[0].raw.clone());
+        let r = self.run(&inner, w, env.to_vec(), f, via, false);
+        self.foreign.pop();
+        r
+    }
+
+    /// git in command position under `prog`, a program the guard does not
+    /// know, at any depth (item 21/20): `prog` may run it with another
+    /// environment, so the hooks may not run. A gated subcommand denies;
+    /// any other git command is checked as typed.
+    pub(super) fn foreign_git(
+        &mut self,
+        prog: &str,
+        argv: &[Word],
+        env: Vec<EnvSet>,
+        f: &Frame,
+        via: Via,
+    ) -> W {
+        let values = self.lits(argv);
+        let globals = parse_globals(argv, &values)?;
+        if let Some((_, sub)) = &globals.sub
+            && GATED.contains(&sub.as_str())
+        {
+            return Err(format!(
+                "`{prog}` may run git {sub} with another environment, and the guard does not follow it there; run git directly in the session (G2, item 21/20)"
+            ));
+        }
+        if globals.sub.is_none() && globals.unknown.is_some() {
+            return Err(format!(
+                "`{prog}` may run git with options the guard cannot read; run git directly in the session (G2, item 21/20)"
+            ));
+        }
+        self.git(argv, env, f, via)
+    }
 }
+
+/// Programs that never run their words as a command (item 21/20): a word
+/// naming a shell or a launcher there is data (`pacman -Qi bash`, `ls -l
+/// /bin/sh`, `pkill tmux`, `cp /bin/bash x`). git and tollgate words are
+/// still read.
+const DATA_ONLY: &[&str] = &[
+    "ls",
+    "stat",
+    "file",
+    "readlink",
+    "realpath",
+    "pgrep",
+    "pkill",
+    "killall",
+    "pidof",
+    "ps",
+    "pacman",
+    "paru",
+    "apt",
+    "apt-get",
+    "dnf",
+    "systemctl",
+    "journalctl",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "du",
+    "chsh",
+    "pactree",
+    "basename",
+    "dirname",
+    "cp",
+    "mv",
+    "ln",
+    "rm",
+    "rmdir",
+    "unlink",
+    "mkdir",
+    "touch",
+    "chmod",
+    "chown",
+    "chgrp",
+    "tee",
+    "truncate",
+    "shred",
+];
 
 /// git's global options (before the subcommand), or a deny.
 fn parse_globals(argv: &[Word], lits: &[Option<String>]) -> Result<Globals, String> {

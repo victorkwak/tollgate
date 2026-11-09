@@ -11,7 +11,11 @@ pub enum Class {
     /// environment.
     Launcher(&'static str),
     /// G3: a shell (`sh -c`, a script file, or a program on stdin).
+    /// A versioned name (`bash5.2`, `ksh93`, `zsh-5.9`) is its shell.
     Shell(&'static str),
+    /// G3 (item 21/20, review G2): a shell or script host whose language
+    /// the guard does not read (`nu`, `pwsh`, `xonsh`, `osascript`, ...).
+    Opaque(&'static str),
     /// G3: `eval`.
     Eval,
     /// G3: `source` and `.`.
@@ -45,6 +49,70 @@ pub enum Lang {
 pub const SHELLS: &[&str] = &[
     "sh", "bash", "rbash", "zsh", "dash", "ksh", "mksh", "ash", "fish", "yash", "csh", "tcsh",
 ];
+
+/// Shells and script hosts whose language the guard does not read (G3,
+/// item 21/20, review G2). Their code may run any command, so they run
+/// only to print their version or help, or interactively on the session's
+/// terminal; `osascript` also runs notification and dialog code.
+pub const OPAQUE: &[&str] = &[
+    "nu",
+    "nushell",
+    "pwsh",
+    "powershell",
+    "elvish",
+    "xonsh",
+    "rc",
+    "es",
+    "ysh",
+    "oil",
+    "murex",
+    "ion",
+    "scsh",
+    "tclsh",
+    "wish",
+    "expect",
+    "osascript",
+];
+
+/// POSIX-family shells the guard reads as bash reads `sh` (G3).
+const POSIX_SHELLS: &[(&str, &str)] = &[
+    ("oksh", "ksh"),
+    ("loksh", "ksh"),
+    ("pdksh", "ksh"),
+    ("lksh", "mksh"),
+    ("posh", "sh"),
+    ("hush", "ash"),
+    ("osh", "sh"),
+    ("bosh", "sh"),
+];
+
+/// The shell `base` names: a [`SHELLS`] entry, one with a version suffix
+/// (`bash5.2`, `ksh93`, `zsh-5.9`) or `-static`, or a POSIX-family shell
+/// under another name.
+#[must_use]
+pub fn shell_of(base: &str) -> Option<&'static str> {
+    if let Some(s) = SHELLS.iter().find(|n| **n == base) {
+        return Some(s);
+    }
+    let stem = |name: &'static str| -> Option<&'static str> {
+        let rest = base.strip_prefix(name)?;
+        let rest = rest.strip_prefix('-').unwrap_or(rest);
+        let versioned = rest == "static"
+            || (rest.starts_with(|c: char| c.is_ascii_digit())
+                && rest.chars().all(|c| c.is_ascii_digit() || c == '.'));
+        versioned.then_some(name)
+    };
+    POSIX_SHELLS
+        .iter()
+        .find(|(n, _)| *n == base)
+        .map(|(_, s)| *s)
+        .or_else(|| {
+            // Longest stem first: `bash5` is bash, not a versioned `ba`.
+            let mut stems: Vec<&'static str> = SHELLS.to_vec();
+            stems.sort_by_key(|s| std::cmp::Reverse(s.len()));
+            stems.into_iter().find_map(stem)
+        })
+}
 
 const WRAPPERS: &[&str] = &[
     "env", "command", "builtin", "exec", "nohup", "timeout", "nice", "ionice", "stdbuf", "time",
@@ -162,6 +230,10 @@ const LAUNCHERS: &[&str] = &[
     "tsp",
     "nq",
     "sem",
+    // macOS (item 21/20, review G2): launchd runs a job with its own
+    // environment; a sandbox profile changes what the command sees.
+    "launchctl",
+    "sandbox-exec",
 ];
 
 const VAR_WRITERS: &[&str] = &[
@@ -188,8 +260,11 @@ pub fn classify(base: &str) -> Class {
     if let Some(l) = LAUNCHERS.iter().find(|n| **n == base) {
         return Class::Launcher(l);
     }
-    if let Some(s) = SHELLS.iter().find(|n| **n == base) {
+    if let Some(s) = shell_of(base) {
         return Class::Shell(s);
+    }
+    if let Some(o) = OPAQUE.iter().find(|n| **n == base) {
+        return Class::Opaque(o);
     }
     if let Some(v) = VAR_WRITERS.iter().find(|n| **n == base) {
         return Class::VarWrite(v);
@@ -485,7 +560,7 @@ pub fn forbidden(token: &str, git_known: &[&str]) -> Option<&'static str> {
     if base.eq_ignore_ascii_case("tollgate") {
         return Some("tollgate");
     }
-    if SHELLS.contains(&base) || base == "busybox" {
+    if shell_of(base).is_some() || OPAQUE.contains(&base) || base == "busybox" {
         return Some("a shell");
     }
     if interp(base).is_some() {
@@ -1284,6 +1359,44 @@ mod tests {
 
     fn lits(v: &[&str]) -> Vec<Option<String>> {
         v.iter().map(|s| Some((*s).to_owned())).collect()
+    }
+
+    /// Item 21/20 (review G2): versioned and other-named shells are
+    /// shells; names that only start like one are not.
+    #[test]
+    fn shell_names_item21_20() {
+        for (name, shell) in [
+            ("sh", "sh"),
+            ("bash5.2", "bash"),
+            ("bash-5.2", "bash"),
+            ("bash-static", "bash"),
+            ("ksh93", "ksh"),
+            ("zsh-5.9", "zsh"),
+            ("mksh", "mksh"),
+            ("oksh", "ksh"),
+            ("posh", "sh"),
+            ("dash0.5.12", "dash"),
+        ] {
+            assert_eq!(shell_of(name), Some(shell), "{name}");
+            assert_eq!(classify(name), Class::Shell(shell), "{name}");
+        }
+        for name in [
+            "ssh",
+            "shred",
+            "sha256sum",
+            "fish-lsp",
+            "fish_indent",
+            "bashrc",
+            "zshdb",
+            "shx",
+        ] {
+            assert_eq!(shell_of(name), None, "{name}");
+        }
+        for name in ["nu", "pwsh", "xonsh", "elvish", "rc", "osascript", "tclsh"] {
+            assert_eq!(classify(name), Class::Opaque(name), "{name}");
+            assert_eq!(forbidden(name, &[]), Some("a shell"), "{name}");
+        }
+        assert_eq!(forbidden("/usr/bin/bash5.2", &[]), Some("a shell"));
     }
 
     #[test]
