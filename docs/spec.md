@@ -263,6 +263,7 @@ Reason: APFS is case-insensitive by default; `MAIN` and `main` are one loose ref
 
 R28. Bash timeout rewrite. For a Bash command that runs `git commit|merge|rebase|cherry-pick|revert|am|pull|push|reset` or `tollgate check|wait|merge`, the guard returns `updatedInput` with the same input plus `timeout: 600000` (when absent or lower) and the command prefixed with `TOLLGATE_INLINE_CAP=540 `. A hook uses inline budget = min(`budget.inline` from config, `TOLLGATE_INLINE_CAP` seconds when present, else 100 s).
 Reason: the Bash default timeout is 120 s and the maximum 600 s (documented). A hook that waits longer than the Bash timeout leaves a backgrounded `git commit` holding `index.lock` while the agent retries (critique). An agent cannot abuse the env value: it only shortens or, bounded by config, lengthens the wait. UNVERIFIED that `updatedInput` may change `timeout`; if not, the default 100 s stands.
+Note (item 12): the prefix goes in front of the command exactly as the guard checked it; the guard never removes or changes client text. A command that already starts with `export TOLLGATE_INLINE_CAP=` is denied. Reason: the first version cut a client prefix at its first `; ` after the check, so `export TOLLGATE_INLINE_CAP="; git commit -n -m x; #"; git commit -m y` (checked as one quoted value, then `git commit -m y`) ran `git commit -n`.
 
 ### 4.4 Ledger and tamper detection
 

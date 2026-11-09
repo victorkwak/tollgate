@@ -1919,3 +1919,37 @@ fn s35_a_query_or_fragment_before_the_at_never_trusts_the_host_after_it() {
         lab.plain(&["config", "--unset", &key]);
     }
 }
+
+/// S36 (item 12): the guard checks the command as it came and Bash runs
+/// the whole of it, so the rewrite never drops client text. A client
+/// `export TOLLGATE_INLINE_CAP=...; ` prefix whose value is a quote that
+/// hides a second command used to be cut at its first `; ` after the
+/// check, which turned the hidden text into a command. Input that
+/// already starts with the guard's prefix is denied; any other command
+/// gets the prefix in front of its exact text.
+#[test]
+fn s36_the_inline_cap_rewrite_never_drops_checked_text() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    let state = lab.sb().state();
+    let bad = lab.not_denied(&[
+        "export TOLLGATE_INLINE_CAP=\"; git commit -n -m x; #\"; git commit -m y".to_owned(),
+        format!(
+            "export TOLLGATE_INLINE_CAP=\"; rm -rf {}; #\"; git commit -m y",
+            state.display()
+        ),
+        "export TOLLGATE_INLINE_CAP=540; git commit -m y".to_owned(),
+        "  export TOLLGATE_INLINE_CAP=1; git push".to_owned(),
+    ]);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    assert!(state.is_dir(), "the state dir is gone");
+    for cmd in [
+        "git commit -m \"a; b\"",
+        "cd . && git commit -m 'x; #' # \"; git commit -n",
+    ] {
+        let Guarded::Allowed(c) = lab.guard(cmd) else {
+            panic!("{cmd}: not allowed");
+        };
+        assert_eq!(c, format!("export TOLLGATE_INLINE_CAP=540; {cmd}"));
+    }
+}

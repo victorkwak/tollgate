@@ -18,7 +18,9 @@
 //! R28 as changed by L17: for a command that runs a waiting git command or
 //! `tollgate check|wait|merge`, `updatedInput` raises `timeout` to 600000
 //! and prefixes `export TOLLGATE_INLINE_CAP=<n>; ` (540, or the `fast`
-//! budget for `run_in_background`). `export` instead of a bare assignment,
+//! budget for `run_in_background`) to the command exactly as it was
+//! checked; input that already starts with that prefix is denied (item
+//! 12). `export` instead of a bare assignment,
 //! so the cap reaches git also after `cd x &&` or in a pipeline. The output
 //! carries no `permissionDecision` for a plain rewrite, so Claude Code's own
 //! permission rules still decide (UNVERIFIED that Claude Code applies
@@ -112,6 +114,14 @@ pub fn guard(env: &EnvSnapshot, input: &[u8], exe: &Path, process_cwd: &Path) ->
                     "tollgate: gate not armed ({reason}); run: tollgate install"
                 ));
             }
+            // Item 12: the rewrite puts its prefix in front of the exact
+            // checked text and never removes any, so a command that
+            // already starts with it is a client imitating the guard.
+            if command.trim_start().starts_with(CAP_PREFIX) {
+                return Answer::deny(format!(
+                    "tollgate guard: denied: the command starts with `{CAP_PREFIX}`, which only the guard adds; send the command without it"
+                ));
+            }
             let ruling = rules::bash_ruling(&ctx, command);
             if let Ruling::Deny(why) = &ruling {
                 return Answer::deny(format!("tollgate guard: denied: {why}"));
@@ -162,7 +172,9 @@ fn respond(ruling: &Ruling, updated: Option<Value>) -> Answer {
     }
 }
 
-/// R28/L17: the same input with the timeout raised and the cap exported.
+/// R28/L17: the same input with the timeout raised and the cap exported
+/// in front of the command exactly as it was checked (item 12: client text
+/// is never removed or changed).
 fn rewrite(dirs: &Dirs, input: &serde_json::Map<String, Value>, command: &str) -> Value {
     let background = input.get("run_in_background").and_then(Value::as_bool) == Some(true);
     let cap = if background {
@@ -172,14 +184,10 @@ fn rewrite(dirs: &Dirs, input: &serde_json::Map<String, Value>, command: &str) -
     } else {
         crate::config::host::FOREGROUND_INLINE_CAP.as_secs()
     };
-    let bare = match command.strip_prefix(CAP_PREFIX) {
-        Some(rest) => rest.split_once("; ").map_or(rest, |(_, c)| c),
-        None => command,
-    };
     let mut out = input.clone();
     out.insert(
         "command".into(),
-        json!(format!("{CAP_PREFIX}{cap}; {bare}")),
+        json!(format!("{CAP_PREFIX}{cap}; {command}")),
     );
     let timeout = input.get("timeout").and_then(Value::as_u64).unwrap_or(0);
     if timeout < BASH_TIMEOUT_MS {
@@ -383,11 +391,7 @@ mod tests {
         );
         assert_eq!(out["timeout"], BASH_TIMEOUT_MS);
         let bg = json!({"command": "git push", "run_in_background": true, "timeout": 900_000});
-        let out = rewrite(
-            &dirs,
-            bg.as_object().unwrap(),
-            "export TOLLGATE_INLINE_CAP=540; git push",
-        );
+        let out = rewrite(&dirs, bg.as_object().unwrap(), "git push");
         assert_eq!(out["command"], "export TOLLGATE_INLINE_CAP=1200; git push");
         assert_eq!(out["timeout"], 900_000);
     }
