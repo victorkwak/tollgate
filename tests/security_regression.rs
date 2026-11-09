@@ -3291,3 +3291,138 @@ fn s47_programs_that_run_their_arguments_are_followed() {
         assert!(matches!(g, Guarded::Allowed(_)), "{cmd}: {g:?}");
     }
 }
+
+/// S49 (R26, item 21, review of item 21): the Claude Code settings file
+/// registers the guard and the hook injection (`GIT_CONFIG_*`) for every
+/// later session, and git's global config files hold program keys every
+/// later git command runs. A Bash write of either is never silent: the
+/// settings files ask, as Write/Edit of them does (R26), in every way a
+/// command writes, moves, links or removes a file, through a symlinked
+/// dir, after a cd, and from interpreter code that names the file. git's
+/// global config files deny (G7); `git config` writes of a program key to
+/// a global, system or other outside file ask, and deny when the value
+/// runs a gated git command. Only the guard runs here.
+#[test]
+fn s49_bash_writes_of_session_settings_and_global_git_config_are_never_silent() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    let home = lab.sb().home.clone();
+    let root = lab.root();
+    let h = home.display().to_string();
+    let r = root.display().to_string();
+    std::fs::create_dir_all(root.join("evil/.claude")).unwrap();
+    std::fs::write(root.join("evil/.claude/settings.json"), "{}\n").unwrap();
+    std::fs::write(root.join("evil/settings.json"), "{}\n").unwrap();
+    std::os::unix::fs::symlink(home.join(".claude"), root.join("cl")).unwrap();
+    let silent = |cmds: &[String]| -> Vec<String> {
+        cmds.iter()
+            .filter_map(|c| match lab.guard(c) {
+                Guarded::Allowed(_) => Some(format!("{c}  => allowed")),
+                _ => None,
+            })
+            .collect()
+    };
+    let settings = [
+        "printf '{}' > ~/.claude/settings.json".to_owned(),
+        "printf '{}' > ~/.claude/settings.local.json".to_owned(),
+        "echo '{}' >> $HOME/.claude/settings.json".to_owned(),
+        "echo '{}' | tee ~/.claude/settings.json >/dev/null".to_owned(),
+        "echo '{}' | tee -a ~/.claude/settings.json".to_owned(),
+        "cp /dev/null ~/.claude/settings.json".to_owned(),
+        format!("cp {r}/evil/settings.json ~/.claude/"),
+        format!("cp {r}/evil/settings.json ~/.claude"),
+        format!("cp -t ~/.claude {r}/evil/settings.json"),
+        format!("cp -r {r}/evil/. ~"),
+        format!("cp -r {r}/evil/.claude ~/"),
+        format!("rsync -a {r}/evil/ ~/"),
+        "mv ~/.claude/settings.json ~/.claude/settings.bak".to_owned(),
+        format!("mv {r}/evil/settings.json ~/.claude/settings.json"),
+        "mv ~/.claude ~/.claude-old".to_owned(),
+        "rm ~/.claude/settings.json".to_owned(),
+        "rm -rf ~/.claude".to_owned(),
+        "unlink ~/.claude/settings.json".to_owned(),
+        "sed -i 's/hooks/x/' ~/.claude/settings.json".to_owned(),
+        "perl -pi -e 's/hooks/x/' ~/.claude/settings.json".to_owned(),
+        "ruby -pi -e 'sub(/hooks/, \"x\")' ~/.claude/settings.json".to_owned(),
+        "gawk -i inplace '{print}' ~/.claude/settings.json".to_owned(),
+        "awk --include=inplace -v x=1 '{print}' ~/.claude/settings.json".to_owned(),
+        "git config --file ~/.claude/settings.json a.b c".to_owned(),
+        "chmod 000 ~/.claude/settings.json".to_owned(),
+        "ln -sf /dev/null ~/.claude/settings.json".to_owned(),
+        format!("ln -sfn {r}/evil/.claude ~/.claude"),
+        "truncate -s 0 ~/.claude/settings.json".to_owned(),
+        "install -m 600 /dev/null ~/.claude/settings.json".to_owned(),
+        format!("dd if=/dev/null of={h}/.claude/settings.json"),
+        "cd ~/.claude && printf '{}' > settings.json".to_owned(),
+        "cd ~ && printf '{}' > .claude/../.claude/settings.json".to_owned(),
+        format!("printf '{{}}' > {r}/cl/settings.json"),
+        "exec 3> ~/.claude/settings.json".to_owned(),
+        "printf '{}' > .claude/settings.local.json".to_owned(),
+        "printf '{}' > .claude/settings.json".to_owned(),
+        format!("python3 -c \"open('{h}/.claude/settings.json', 'w').write('{{}}')\""),
+        "python3 - <<'EOF'\nimport os\nopen(os.path.expanduser('~/.claude/settings.json'), 'w').write('{}')\nEOF".to_owned(),
+        "node -e \"require('fs').writeFileSync(require('os').homedir() + '/.claude/settings.local.json', '{}')\"".to_owned(),
+    ];
+    let mut bad = silent(&settings);
+    // A plain write asks, as Write/Edit of the file does (R26).
+    for c in [&settings[0], &settings[1], &settings[17]] {
+        match lab.guard(c) {
+            Guarded::Asked(_) => {}
+            g => bad.push(format!("{c}  => not an ask: {g:?}")),
+        }
+    }
+    let p = format!("git -C {} commit -n -q -m x", lab.repo.display());
+    let git = [
+        "printf '[diff]\\n\\texternal = x\\n' >> ~/.gitconfig".to_owned(),
+        "mkdir -p ~/.config/git && printf '[core]\\n\\tpager = x\\n' > ~/.config/git/config"
+            .to_owned(),
+        format!("cp {r}/evil/settings.json ~/.gitconfig"),
+        format!("ln -sf {r}/evil/settings.json ~/.gitconfig"),
+        format!("git config --global diff.external '{p} #'"),
+        format!("git config --global core.pager '{p}; cat #'"),
+        format!("git config set --global diff.external '{p} #'"),
+        format!("git config --file ~/.gitconfig diff.external '{p} #'"),
+        format!("git config -f {h}/.config/git/config core.editor '{p} #'"),
+        format!("git config --system diff.external '{p} #'"),
+        format!("git config --global credential.helper '!{p}; true #'"),
+        "git config --global core.pager less".to_owned(),
+        "git config --global diff.external /usr/bin/true".to_owned(),
+        format!("git config --global core.editor {r}/ed.sh"),
+        "git config --global gpg.program gpg2".to_owned(),
+        "git config --global include.path /tmp/x".to_owned(),
+        "git config --global alias.c 'commit -n'".to_owned(),
+    ];
+    bad.extend(silent(&git));
+    // A value that runs a gated git command denies, wherever it goes.
+    for c in &git[4..11] {
+        match lab.guard(c) {
+            Guarded::Denied(_) => {}
+            g => bad.push(format!("{c}  => not denied: {g:?}")),
+        }
+    }
+    // A settings file that links to a dotfiles copy: that copy too.
+    let dot = root.join("dot/claude-settings.json");
+    std::fs::create_dir_all(dot.parent().unwrap()).unwrap();
+    std::fs::rename(home.join(".claude/settings.json"), &dot).unwrap();
+    std::os::unix::fs::symlink(&dot, home.join(".claude/settings.json")).unwrap();
+    bad.extend(silent(&[format!("printf '{{}}' > {}", dot.display())]));
+    std::fs::remove_file(home.join(".claude/settings.json")).unwrap();
+    std::fs::rename(&dot, home.join(".claude/settings.json")).unwrap();
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    // Reads, and writes of other files, stay open.
+    for cmd in [
+        "cat ~/.claude/settings.json".to_owned(),
+        "jq .hooks ~/.claude/settings.json".to_owned(),
+        "grep -n hooks ~/.claude/settings.json .claude/settings.local.json".to_owned(),
+        "cp ~/.claude/settings.json /tmp/settings-backup.json".to_owned(),
+        "printf x > ~/.claude/notes.md".to_owned(),
+        "mkdir -p .claude && printf x > .claude/commands.md".to_owned(),
+        "python3 -c 'import json; print(json.load(open(\"package.json\")))'".to_owned(),
+        "git config --global user.name 'V K'".to_owned(),
+        "git config --global --get diff.external".to_owned(),
+        "git config --global --list".to_owned(),
+        "printf x > settings.json".to_owned(),
+    ] {
+        let g = lab.guard(&cmd);
+        assert!(matches!(g, Guarded::Allowed(_)), "{cmd}: {g:?}");
+    }
+}

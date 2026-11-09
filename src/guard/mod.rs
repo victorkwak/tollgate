@@ -258,8 +258,9 @@ fn context(
         vars.push((var.into(), v));
     }
     // Session values the rules may expand in paths, and CDPATH, which
-    // makes a relative `cd` unpredictable (G8).
-    for var in ["TMPDIR", "CDPATH", "USER", "LOGNAME"] {
+    // makes a relative `cd` unpredictable (G8). CLAUDE_CONFIG_DIR picks
+    // the user settings dir (R26).
+    for var in ["TMPDIR", "CDPATH", "USER", "LOGNAME", "CLAUDE_CONFIG_DIR"] {
         if let Some(v) = env.get_str(var) {
             vars.push((var.into(), v.to_owned()));
         }

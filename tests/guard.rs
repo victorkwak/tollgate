@@ -37,6 +37,11 @@ fn deny_patterns_exit_2_and_reads_stay_open_t15_r23_r25() {
         // HOME and XDG decide where tollgate finds its config (R8).
         "HOME=/tmp/x git commit -m x".to_owned(),
         "XDG_CONFIG_HOME=/tmp/c git commit -m x".to_owned(),
+        // In-place edits and git config --file write the file (R25).
+        "perl -pi -e 's/a/b/' $XDG_STATE_HOME/tollgate/x".to_owned(),
+        "gawk -i inplace 1 $XDG_STATE_HOME/tollgate/x".to_owned(),
+        "git config --file $XDG_STATE_HOME/tollgate/x a.b c".to_owned(),
+        "git config --file \"$F\" a.b c".to_owned(),
     ] {
         let (code, out, err) = a.bash(&cmd);
         assert_eq!(code, Some(2), "{cmd}: {out}{err}");

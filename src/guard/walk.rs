@@ -2518,9 +2518,20 @@ impl<'a> Walker<'a> {
         let values: Vec<Option<String>> = argv.iter().map(|w| self.arg_value(w)).collect();
         self.foreign_args(argv, &values, &env, f, via)?;
         let lits = self.lits(argv);
+        // In-place edits write the files they read: `perl -pi`, `ruby
+        // -pi`, `gawk -i inplace` (R25, R26, G7).
+        let in_place = match lang {
+            Lang::Perl | Lang::Ruby => write_targets("perl", argv, &lits),
+            Lang::Awk => awk_in_place(argv, &lits),
+            _ => Vec::new(),
+        };
+        for (w, removal) in in_place {
+            self.write_target(&w, removal, base)?;
+        }
         let prog = interp_program(lang, &lits, argv)?;
         match prog {
             Program::Inline(code) => {
+                self.config_names(base, &code);
                 if let Some(why) = cmds::spawns(lang, &code) {
                     return Err(format!(
                         "{base} inline code with {why}, which can start git or a shell where the guard cannot see it; put the code in a file or drop the process call (G3)"
@@ -2532,12 +2543,15 @@ impl<'a> Walker<'a> {
             Program::None => Ok(()),
             Program::Stdin => match self.stdin(f) {
                 Feed::Tty => Ok(()),
-                Feed::Doc(Some(body)) => match cmds::spawns(lang, &body) {
-                    Some(why) => Err(format!(
-                        "{base} reads a program with {why} from a heredoc; the guard does not allow process calls there (G3)"
-                    )),
-                    None => Ok(()),
-                },
+                Feed::Doc(Some(body)) => {
+                    self.config_names(base, &body);
+                    match cmds::spawns(lang, &body) {
+                        Some(why) => Err(format!(
+                            "{base} reads a program with {why} from a heredoc; the guard does not allow process calls there (G3)"
+                        )),
+                        None => Ok(()),
+                    }
+                }
                 _ => Err(format!(
                     "{base} reads its program from a pipe or a file the guard cannot read (G3)"
                 )),
@@ -2545,11 +2559,36 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// R26, G7 (item 21 review): interpreter code the guard reads that
+    /// names Claude Code settings or git's global config may write them,
+    /// and the guard does not follow file calls in code: a person
+    /// decides. A raw-text match, so a read asks too.
+    fn config_names(&mut self, base: &str, code: &str) {
+        let c = code.to_lowercase();
+        let names = if c.contains(".claude") && c.contains("settings") {
+            Some("Claude Code settings")
+        } else if c.contains("claude_config_dir") {
+            Some("the Claude Code settings dir")
+        } else if c.contains("gitconfig")
+            || c.contains("git/config")
+            || c.contains("git_config_global")
+        {
+            Some("git's global config")
+        } else {
+            None
+        };
+        if let Some(what) = names {
+            self.ask(format!(
+                "{base} code names {what}, which it may write; those files decide what every later session and git command runs, so a person decides (R26, G7)"
+            ));
+        }
+    }
+
     /// G3: an interpreter runs its program file unread, so the file may
     /// not be one this command writes first (the guard would never see
     /// what runs). A path the guard cannot resolve counts as one when the
     /// command writes any file before it.
-    fn program_files(&self, lang: Lang, base: &str, argv: &[Word], files: &[ProgArg]) -> W {
+    fn program_files(&mut self, lang: Lang, base: &str, argv: &[Word], files: &[ProgArg]) -> W {
         for f in files {
             let text = match f {
                 ProgArg::Text(t) => Some(t.clone()),
@@ -2563,13 +2602,14 @@ impl<'a> Walker<'a> {
                 Some(p) if self.was_written(&p) => {
                     // Written whole from a literal heredoc: checked as
                     // inline code.
-                    let code = self.known.get(&p).ok_or_else(|| {
+                    let code = self.known.get(&p).cloned().ok_or_else(|| {
                         format!(
                             "{base} runs {}, which this command writes first; the guard reads such a program only when cat > FILE <<'EOF' writes it whole, so write it that way or run it in a later call (G3)",
                             p.display()
                         )
                     })?;
-                    if let Some(why) = cmds::spawns(lang, code) {
+                    self.config_names(base, &code);
+                    if let Some(why) = cmds::spawns(lang, &code) {
                         return Err(format!(
                             "{base} runs {} with {why}, written earlier in this command, which can start git or a shell where the guard cannot see it; drop the process call or run it in a later call (G3)",
                             p.display()
@@ -2917,6 +2957,20 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// `text` as an absolute path with `.` and `..` applied but no
+    /// symlink resolved; `None` when it is relative and the cwd is
+    /// unknown.
+    fn lexical_path(&self, text: &str) -> Option<PathBuf> {
+        let p = Path::new(text);
+        if p.is_absolute() {
+            return Some(paths::lexical(Path::new("/"), p));
+        }
+        match &self.scope.cwd {
+            Cwd::Known(c) => Some(paths::lexical(c, p)),
+            Cwd::Unknown => None,
+        }
+    }
+
     /// R25, G7, G8: a file the command writes or removes.
     pub(super) fn write_target(&mut self, w: &Word, removal: bool, how: &str) -> W {
         let Some(text) = self.resolve(w) else {
@@ -2941,6 +2995,18 @@ impl<'a> Walker<'a> {
                 "{how} writes into {what} ({}); refs, remote config and hooks change only through git commands the guard checks (G7)",
                 p.display()
             ));
+        }
+        // R26: Claude Code settings register the guard and the hook
+        // injection; a write, move, link, mode change or removal of them
+        // asks, as Write/Edit does. The path as spelled counts too: a
+        // link to the settings dir resolves away from its name.
+        if !matches!(how, "touch" | "mkdir" | "setfattr")
+            && let Some(s) = paths::claude_settings(self.ctx, &p).or_else(|| {
+                self.lexical_path(&text)
+                    .and_then(|l| paths::claude_settings(self.ctx, &l))
+            })
+        {
+            self.ask(paths::settings_write_reason(how, &s));
         }
         // Item 35, review note 12: a tool the job PATH finds, a toolchain,
         // registry source or host tool config changes what every later
@@ -3779,6 +3845,57 @@ fn write_targets(base: &str, argv: &[Word], lits: &[Option<String>]) -> Vec<(Wor
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// `gawk -i inplace` (also `-iinplace`, `--include[=]inplace`, the
+/// `.awk` file name) writes every file operand (R25, R26, G7). The
+/// program is the first operand unless `-f`, `-e` or their long forms
+/// give it; `name=value` operands are assignments.
+fn awk_in_place(argv: &[Word], lits: &[Option<String>]) -> Vec<(Word, bool)> {
+    let args = &argv[1..];
+    let la = &lits[1..];
+    let is_inplace = |v: &str| v == "inplace" || v == "inplace.awk";
+    let mut in_place = false;
+    let mut prog_given = false;
+    for (k, a) in la.iter().enumerate() {
+        let Some(a) = a.as_deref() else { continue };
+        let next = la.get(k + 1).cloned().flatten().unwrap_or_default();
+        in_place |= ((a == "-i" || a == "--include") && is_inplace(&next))
+            || a.strip_prefix("-i").is_some_and(is_inplace)
+            || a.strip_prefix("--include=").is_some_and(is_inplace);
+        prog_given |= matches!(a, "-f" | "-e" | "--file" | "--source")
+            || a.starts_with("--file=")
+            || a.starts_with("--source=")
+            || (a.starts_with("-f") || a.starts_with("-e")) && a.len() > 2 && !a.starts_with("--");
+    }
+    if !in_place {
+        return Vec::new();
+    }
+    let (pos, _) = positionals(
+        args,
+        la,
+        "fvFilEe",
+        &[
+            "--file",
+            "--assign",
+            "--field-separator",
+            "--include",
+            "--load",
+            "--source",
+            "--exec",
+        ],
+    );
+    pos.into_iter()
+        .skip(usize::from(!prog_given))
+        .filter(|w| {
+            !w.literal().is_some_and(|l| {
+                l.split_once('=').is_some_and(|(n, _)| {
+                    !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                })
+            })
+        })
+        .map(|w| (w.clone(), false))
+        .collect()
 }
 
 /// A program file an interpreter may run.

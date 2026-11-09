@@ -1439,6 +1439,39 @@ impl Walker<'_> {
         Ok(())
     }
 
+    /// `git config --file FILE` writes FILE as git config text: R25 for
+    /// tollgate's dirs, R26 for Claude Code settings, item 35 for tool
+    /// paths. The keys it sets are checked as for any config file.
+    fn config_file(&mut self, file: &str, dir: Option<&Path>) -> W {
+        let spelled = if Path::new(file).is_absolute() {
+            Some(super::paths::lexical(Path::new("/"), Path::new(file)))
+        } else {
+            dir.map(|d| super::paths::lexical(d, Path::new(file)))
+        };
+        let Some(spelled) = spelled else {
+            return Err(format!(
+                "git config --file {file}, a relative path after a cd the guard cannot follow; use an absolute path (G8)"
+            ));
+        };
+        let p = super::paths::canon(&spelled);
+        if let Some(d) = super::paths::tollgate_dir(self.ctx, &p, false) {
+            return Err(format!(
+                "git config --file writes to tollgate's dir {} (R25)",
+                d.display()
+            ));
+        }
+        if let Some(s) = super::paths::claude_settings(self.ctx, &p)
+            .or_else(|| super::paths::claude_settings(self.ctx, &spelled))
+        {
+            self.ask(super::paths::settings_write_reason("git config --file", &s));
+        }
+        if let Some(t) = super::paths::tool_path(self.ctx, &p) {
+            let why = super::paths::tool_write_reason("git config --file", &p, t);
+            self.ask(why);
+        }
+        Ok(())
+    }
+
     /// Subcommands that are not gated: G7 ref and remote writes, R25 and
     /// R26.
     fn plain_git(
@@ -1515,10 +1548,32 @@ impl Walker<'_> {
                 Ok(())
             }
             "config" => {
-                if let Some(why) = config_write(lits) {
+                let Some(cw) = config_write(lits) else {
+                    return Ok(());
+                };
+                if let Some(why) = cw.ask {
                     self.ask(why);
                 }
-                Ok(())
+                // A value git runs is read as code, as with `git -c`: in
+                // a config file it runs on every later git command
+                // (item 21 review).
+                if let (Some(key), Some(v)) = (&cw.key, &cw.value)
+                    && let KeyClass::Runs(how) = key_class(key)
+                {
+                    let what = format!("git config {key}");
+                    let code =
+                        value_code(how, v).map_err(|e| format!("{what}: {e} (G3, item 21)"))?;
+                    if let Some(code) = code {
+                        self.program_code(&code, &what)?;
+                    }
+                }
+                match cw.file {
+                    Some(Some(file)) => self.config_file(&file, dir),
+                    Some(None) => Err(
+                        "git config --file with a path bash builds at run time; give the path literally (R26, G8)".into(),
+                    ),
+                    None => Ok(()),
+                }
             }
             "submodule" | "bisect" => {
                 let verb = if sub == "submodule" { "foreach" } else { "run" };
@@ -1871,8 +1926,18 @@ fn parse_globals(argv: &[Word], lits: &[Option<String>]) -> Result<Globals, Stri
     Ok(g)
 }
 
-/// R26, G7: a `git config` call that writes a key that asks.
-fn config_write(lits: &[Option<String>]) -> Option<String> {
+/// A `git config` call that writes: the R26/G7 ask reason, the key and
+/// value it sets, and the file it names (`--file`).
+#[derive(Default)]
+struct ConfigWrite {
+    ask: Option<String>,
+    key: Option<String>,
+    value: Option<String>,
+    file: Option<Option<String>>,
+}
+
+/// R26, G7: a `git config` call that writes; `None` when it only reads.
+fn config_write(lits: &[Option<String>]) -> Option<ConfigWrite> {
     const WRITE_SUBS: &[&str] = &["set", "unset", "rename-section", "remove-section", "edit"];
     const WRITE_FLAGS: &[&str] = &[
         "--add",
@@ -1906,6 +1971,7 @@ fn config_write(lits: &[Option<String>]) -> Option<String> {
     let mut positionals: Vec<Option<&str>> = Vec::new();
     let mut write = false;
     let mut read = false;
+    let mut file: Option<Option<String>> = None;
     let mut i = 0;
     while i < lits.len() {
         let a = lits[i].as_deref();
@@ -1915,7 +1981,17 @@ fn config_write(lits: &[Option<String>]) -> Option<String> {
             continue;
         };
         if WITH_VALUE.contains(&a) {
+            if a == "--file" || a == "-f" {
+                file = Some(lits.get(i).cloned().flatten());
+            }
             i += 1;
+            continue;
+        }
+        if let Some(f) = a
+            .strip_prefix("--file=")
+            .or_else(|| a.strip_prefix("-f").filter(|f| !f.is_empty()))
+        {
+            file = Some(Some(f.to_owned()));
             continue;
         }
         if WRITE_FLAGS.contains(&a) {
@@ -1940,14 +2016,22 @@ fn config_write(lits: &[Option<String>]) -> Option<String> {
         .flatten()
         .any(|a| a == "edit" || a == "--edit" || a == "-e")
     {
-        return Some("git config --edit can change core.hooksPath and remotes (R26)".into());
+        return Some(ConfigWrite {
+            ask: Some("git config --edit can change core.hooksPath and remotes (R26)".into()),
+            file,
+            ..ConfigWrite::default()
+        });
     }
     let write = write || (!read && positionals.len() >= 2);
     if !write {
         return None;
     }
     let Some(key) = positionals.first().copied().flatten() else {
-        return Some("git config writes a key bash builds at run time (R26, G7)".into());
+        return Some(ConfigWrite {
+            ask: Some("git config writes a key bash builds at run time (R26, G7)".into()),
+            file,
+            ..ConfigWrite::default()
+        });
     };
     let k = key.to_lowercase();
     let asks = k.starts_with("core.hooks")
@@ -1962,7 +2046,12 @@ fn config_write(lits: &[Option<String>]) -> Option<String> {
             KeyClass::Ask(_) | KeyClass::Deny(_) | KeyClass::Runs(_)
         )
         || (k.starts_with("remote.") && k.matches('.').count() == 1);
-    asks.then(|| format!("git config writes {key} (R26, G7)"))
+    Some(ConfigWrite {
+        ask: asks.then(|| format!("git config writes {key} (R26, G7)")),
+        key: Some(key.to_owned()),
+        value: positionals.get(1).copied().flatten().map(str::to_owned),
+        file,
+    })
 }
 
 /// One way git may read the words of a push, fetch or pull: the

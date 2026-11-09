@@ -118,11 +118,13 @@ pub fn git_internal(path: &Path) -> Option<&'static str> {
     })
 }
 
-/// Item 21: git's global config files (`~/.gitconfig`,
-/// `$XDG_CONFIG_HOME/git/config`), which every git command reads and
-/// whose program keys it runs, when a write of `path` replaces one: the
-/// file itself, or a dir above it inside the home dir (`mv x
-/// ~/.config/git`). The file's name.
+/// Item 21: git's global and system config files (`~/.gitconfig`,
+/// `$XDG_CONFIG_HOME/git/config` and `~/.config/git/config`, which a
+/// session without `XDG_CONFIG_HOME` reads, `$GIT_CONFIG_GLOBAL`,
+/// `/etc/gitconfig`, `$GIT_CONFIG_SYSTEM`), which every git command reads
+/// and whose program keys it runs, when a write of `path` replaces one:
+/// the file itself, the file it links to, or a dir above it inside the
+/// home dir (`mv x ~/.config/git`). The file's name.
 #[must_use]
 pub fn git_global_config(ctx: &Context, path: &Path) -> Option<PathBuf> {
     let xdg = ctx
@@ -131,12 +133,88 @@ pub fn git_global_config(ctx: &Context, path: &Path) -> Option<PathBuf> {
         .map_or_else(|| ctx.home.join(".config"), PathBuf::from);
     let home = lower(&canon(&ctx.home));
     let p = lower(path);
-    [ctx.home.join(".gitconfig"), xdg.join("git/config")]
-        .into_iter()
-        .find(|f| {
-            let f = lower(&canon(f));
-            p == f || (f.starts_with(&format!("{p}/")) && p.starts_with(&format!("{home}/")))
+    let mut files = vec![
+        ctx.home.join(".gitconfig"),
+        xdg.join("git/config"),
+        ctx.home.join(".config/git/config"),
+        PathBuf::from("/etc/gitconfig"),
+    ];
+    for v in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"] {
+        if let Some(f) = ctx.git_env.get_str(v).filter(|f| f.starts_with('/')) {
+            files.push(PathBuf::from(f));
+        }
+    }
+    files.into_iter().find(|f| {
+        [lower(f), lower(&canon(f))].iter().any(|f| {
+            p == *f || (f.starts_with(&format!("{p}/")) && p.starts_with(&format!("{home}/")))
         })
+    })
+}
+
+/// R26 (item 21 review): the Claude Code settings a write of `path`
+/// changes. The user settings file registers the guard and the hook
+/// injection (`GIT_CONFIG_*`) for every later session; a project's
+/// settings can set the session environment too. Matches, case-insensitively:
+/// a `settings*.json` file in a dir named `.claude` or in the user
+/// settings dir (`~/.claude`, `$CLAUDE_CONFIG_DIR`, each as spelled and
+/// resolved); the file a user settings file links to; a dir named
+/// `.claude` itself or a user settings dir (a copy into it, a move, link
+/// or removal of it); a dir that holds a user settings dir (`cp -r x/.
+/// ~`, `rm -rf ~`). `path` is absolute, as spelled or canonical. The
+/// matched path.
+#[must_use]
+pub fn claude_settings(ctx: &Context, path: &Path) -> Option<PathBuf> {
+    let is_settings = |n: &str| {
+        n.starts_with("settings")
+            && std::path::Path::new(n)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+    };
+    let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase());
+    let parent = path.parent().map(lower);
+    let parent_name = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().to_lowercase());
+    if name.as_deref().is_some_and(is_settings) && parent_name.as_deref() == Some(".claude") {
+        return Some(path.to_owned());
+    }
+    if name.as_deref() == Some(".claude") {
+        return Some(path.to_owned());
+    }
+    let p = lower(path);
+    let mut user = vec![ctx.home.join(".claude")];
+    if let Some(d) = ctx.var("CLAUDE_CONFIG_DIR").filter(|d| d.starts_with('/')) {
+        user.push(PathBuf::from(d));
+    }
+    for d in user {
+        for dir in [d.clone(), canon(&d)] {
+            let dl = lower(&dir);
+            let in_dir = parent.as_deref() == Some(dl.as_str());
+            if (in_dir && name.as_deref().is_some_and(is_settings))
+                || p == dl
+                || dl.starts_with(&format!("{}/", p.trim_end_matches('/')))
+            {
+                return Some(path.to_owned());
+            }
+        }
+        for f in ["settings.json", "settings.local.json"] {
+            if p == lower(&canon(&d.join(f))) {
+                return Some(path.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// The ask reason for a write of `path` that changes Claude Code
+/// settings (R26).
+#[must_use]
+pub fn settings_write_reason(how: &str, path: &Path) -> String {
+    format!(
+        "{how} changes Claude Code settings at {}, which register the guard and the hook injection for every later session; a person decides (R26)",
+        path.display()
+    )
 }
 
 /// Item 35, review note 12: the tool path ([`Context::tool_paths`]: a dir

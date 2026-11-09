@@ -206,15 +206,13 @@ pub fn file_ruling(ctx: &Context, file: &str) -> Ruling {
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
-    let file_name = comps.last().cloned().unwrap_or_default();
-    if comps.len() >= 2
-        && comps[comps.len() - 2] == ".claude"
-        && file_name.starts_with("settings")
-        && file_name.ends_with(".json")
+    let spelled = paths::lexical(&ctx.cwd, Path::new(&expand_home(ctx, file)));
+    if let Some(s) =
+        paths::claude_settings(ctx, &p).or_else(|| paths::claude_settings(ctx, &spelled))
     {
         return Ruling::Ask(format!(
             "edit of Claude Code settings {} (R26)",
-            p.display()
+            s.display()
         ));
     }
     if comps.iter().any(|c| c == ".git") {

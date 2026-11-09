@@ -802,14 +802,27 @@ fn item_21_program_values_are_code_on_every_command() {
         "git -c x.r=/w/repo for-each-repo --config=x.r commit -n -m x",
         "git send-email --to-cmd='git commit -n #' x.patch",
         "git instaweb --httpd='git commit -n'",
+        // A value written to a config file is code as well (item 21
+        // review): it runs on every later git command.
+        "git config diff.external 'git commit -n #'",
+        "git config --global core.pager 'git commit -n; cat #'",
+        "git config set --global credential.helper '!git commit -n #'",
+        "git config --file /h/.gitconfig core.editor 'git commit -n #'",
+        "git config -f/h/.gitconfig core.editor 'git commit -n #'",
+        "git config --system diff.external 'git commit -n #'",
+        "git config core.askpass /tmp/missing-askpass",
+        "git config protocol.ext.allow always",
+        "git config --file \"$F\" a.b c",
+        "git config --file /h/.local/state/tollgate/x a.b c",
     ]);
     asked(&[
-        "git config diff.external 'git commit -n #'",
+        "git config diff.external difft",
         "git config --global credential.helper '!x'",
-        "git config core.askpass /tmp/x",
+        "git config core.askpass /usr/bin/true",
         "git config pager.log x",
         "git config hook.x.command y",
-        "git config protocol.ext.allow always",
+        "git config protocol.ext.allow never",
+        "git config --file /h/.claude/settings.json a.b c",
         "git clone -c diff.external=x /tmp/x y",
     ]);
     allowed(&[
@@ -1713,4 +1726,62 @@ fn item_22_local_repo_in_every_spelling() {
     .unwrap();
     denied_in(&c, &["git push origin main", "git push", "git push origin"]);
     allowed_in(&c, &["git push origin feat", "git push origin feat:other"]);
+}
+
+/// Item 21 review (R26): Bash writes of Claude Code settings ask, as
+/// Write/Edit does, in the user dir (`~/.claude`, `$CLAUDE_CONFIG_DIR`)
+/// and in a project's `.claude`; globs and braces there deny (G8).
+#[test]
+fn item_21_review_settings_writes_ask_r26() {
+    let mut c = ctx();
+    c.vars.push(("CLAUDE_CONFIG_DIR".into(), "/cfg".into()));
+    for cmd in [
+        "printf x > /cfg/settings.json",
+        "printf x > $CLAUDE_CONFIG_DIR/settings.local.json",
+        "rm -rf /cfg",
+        "cp -r x/. /cfg",
+        "mv /cfg /x",
+        "printf x > /h/.claude/settings.local.json",
+        "printf x > ~/.CLAUDE/Settings.JSON",
+        "printf x > /w/repo/.claude/settings.json",
+        "cd sub/.. && printf x > .claude/settings.local.json",
+        "mv /h/.claude /tmp/c",
+        "cd /h && cp -r /tmp/x/. .",
+        "chmod 000 /h/.claude/settings.json",
+        "git config --file .claude/settings.json a.b c",
+        "git -C /h config --file .claude/settings.json a.b c",
+    ] {
+        assert!(
+            matches!(bash_ruling(&c, cmd), Ruling::Ask(_)),
+            "not asked: {cmd:?} -> {:?}",
+            bash_ruling(&c, cmd)
+        );
+    }
+    for f in [
+        "/cfg/settings.json",
+        "/cfg/settings.local.json",
+        ".claude/settings.local.json",
+        "~/.claude/settings.json",
+    ] {
+        assert!(matches!(file_ruling(&c, f), Ruling::Ask(_)), "{f}");
+    }
+    denied_in(
+        &c,
+        &[
+            "printf x > ~/.claude/setting?.json",
+            "cp x ~/.claude/{settings,a}.json",
+            "rm ~/.claude/*",
+        ],
+    );
+    allowed_in(
+        &c,
+        &[
+            "printf x > /cfg/notes.md",
+            "cat /cfg/settings.json /h/.claude/settings.json",
+            "mkdir -p /w/repo/.claude /cfg",
+            "touch /h/.claude/settings.json",
+            "printf x > /w/repo/settings.json",
+            "printf x > /w/repo/.claude/commands.md",
+        ],
+    );
 }
