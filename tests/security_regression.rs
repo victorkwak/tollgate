@@ -1813,3 +1813,66 @@ fn s30_a_look_alike_remote_path_is_never_trusted() {
     assert!(lab.refs_in(&evil).contains("refs/heads/main"));
     assert!(!lab.refs_in(&evil).contains("refs/heads/feat"));
 }
+
+/// S34 (item 33, R4): with its trusted remote gone, a repo never falls
+/// back to the local `main` as the policy anchor, which a script file can
+/// move. The attack: after a gated commit recorded `origin` as trusted, a
+/// script removes `origin` (or points it at another repo, or breaks the
+/// record) and moves the local `main` to a commit with a weaker policy; a
+/// bad commit on a branch from it must still be refused, with a message
+/// that names the lost remote.
+#[test]
+fn s34_a_lost_trusted_remote_never_makes_local_main_the_anchor() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    let root = lab.root();
+    let bare = lab.bare.to_str().unwrap().to_owned();
+    // A gated commit: tollgate records origin as trusted for this repo.
+    std::fs::write(lab.repo.join("ok.txt"), "1\n").unwrap();
+    lab.plain(&["add", "ok.txt"]);
+    let s = lab.session("git commit -q -m ok");
+    assert_eq!(s.code(), Some(0), "{s:?}");
+    // The local main gets a policy with no checks (a script file).
+    std::fs::write(lab.repo.join("tollgate.toml"), WEAK_POLICY).unwrap();
+    lab.plain(&["commit", "-q", "--no-verify", "-am", "weaken"]);
+    let weak = lab.head();
+    lab.plain(&["checkout", "-q", "-b", "feat"]);
+    let attack = |label: &str| {
+        lab.stage_bad_file(label);
+        let s = lab.refused("git commit -m bad");
+        assert!(
+            s.out().contains("DENIED pre-commit") && s.out().contains("item 33"),
+            "{label}: {s:?}"
+        );
+        assert!(s.out().contains(&bare), "{label}: {s:?}");
+        lab.plain(&["rm", "-q", "--cached", "bad"]);
+        std::fs::remove_file(lab.repo.join("bad")).unwrap();
+    };
+    // 1. origin removed.
+    lab.plain(&["remote", "remove", "origin"]);
+    attack("removed");
+    // 2. origin back, but on another repo that holds the weak main.
+    let other = root.join("other.git");
+    lab.plain_in(&root, &["init", "-q", "--bare", other.to_str().unwrap()]);
+    lab.plain(&[
+        "push",
+        "-q",
+        other.to_str().unwrap(),
+        &format!("{weak}:refs/heads/main"),
+    ]);
+    lab.plain(&["remote", "add", "origin", other.to_str().unwrap()]);
+    lab.plain(&["fetch", "-q", "origin"]);
+    attack("set to another repo");
+    // 3. the same with the record broken (not JSON): still refused.
+    let records = lab.sb().state().join("trusted-remotes");
+    for e in std::fs::read_dir(&records).unwrap().flatten() {
+        if e.path().extension().is_some_and(|x| x == "json") {
+            std::fs::write(e.path(), "{not json").unwrap();
+        }
+    }
+    lab.stage_bad_file("broken record");
+    let s = lab.refused("git commit -m bad");
+    assert!(
+        s.out().contains("DENIED pre-commit") && s.out().contains("item 33"),
+        "broken record: {s:?}"
+    );
+}

@@ -310,3 +310,36 @@ fn docs_only_pre_commit_with_detected_roots_stays_in_budget_l19_r61_r65() {
         );
     }
 }
+
+/// Item 33: with a trusted remote, every `Gate::open` reads the record of
+/// the repo's trusted remotes (one small file; a lock and a write only
+/// when a remote is new). A `pre-commit` cache hit stays in its budget.
+#[test]
+fn pre_commit_cache_hit_with_a_trusted_remote_l19_item33() {
+    let meter = CpuMeter::new();
+    let sb = Sandbox::new();
+    let url = sb.root().join("remotes/trusted.git");
+    sb.scoped_host(&format!("trusted_paths = [\"{}\"]", url.display()));
+    let repo = repo_with(&sb, "r", PASS);
+    sb.git(&sb.root(), &["init", "-q", "--bare", url.to_str().unwrap()]);
+    sb.git(&repo, &["remote", "add", "origin", url.to_str().unwrap()]);
+    sb.git(&repo, &["push", "-q", "origin", "main"]);
+    sb.git(&repo, &["fetch", "-q", "origin"]);
+    stage(&sb, &repo, "a.txt", "1\n");
+    let first = sb.run_hook(&repo, "pre-commit", &[]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(sb.state().join("trusted-remotes").is_dir());
+    let t = p95(&meter, 3, 20, || {
+        let o = sb.run_hook(&repo, "pre-commit", &[]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    });
+    within_budget(
+        "pre-commit cache hit (trusted remote)",
+        t,
+        Duration::from_millis(200),
+    );
+}

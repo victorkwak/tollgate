@@ -231,6 +231,11 @@ fn anchors(
         .iter()
         .filter(|n| crate::config::repo::valid_anchor(n))
         .collect();
+    // Item 33: a trusted remote this repo had is gone, or its record is
+    // unusable: never fall back to local refs.
+    if let Some(why) = remotes.record_denial() {
+        return Err(PolicyError::NoAnchor(why));
+    }
     if !remotes.is_empty() {
         let pairs: Vec<(&crate::remote_refs::TrustedRemote, &String)> = remotes
             .remotes()

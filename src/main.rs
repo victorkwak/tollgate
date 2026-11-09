@@ -97,6 +97,9 @@ fn run() -> u8 {
         Command::Flaky { days } => cli::flaky(&ctx, days),
         Command::RunJob { job, lock_fd } => cli::run_job(&ctx, &job, lock_fd),
         Command::Merge { branch } => tollgate::merge::merge(&ctx, &branch),
+        Command::Remotes {
+            action: RemotesAction::Forget { repo },
+        } => cli::remotes_forget(&ctx, repo.as_deref()),
         Command::Install { yes } => tollgate::install::install(&ctx, yes),
         Command::Uninstall { yes } => tollgate::install::uninstall(&ctx, yes),
         Command::Doctor { repo, injection } => tollgate::install::doctor::doctor(
@@ -330,6 +333,11 @@ enum Command {
         #[arg(long, required = true)]
         gitlab: bool,
     },
+    /// The recorded trusted remotes of a repo (item 33).
+    Remotes {
+        #[command(subcommand)]
+        action: RemotesAction,
+    },
     /// Record a Python baseline (TTY only) (R94).
     Baseline {
         #[command(subcommand)]
@@ -491,6 +499,16 @@ enum ConfigAction {
     Init {
         #[arg(long)]
         nextest: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RemotesAction {
+    /// Forget the trusted remotes recorded for a repo, accepting that one
+    /// is gone (TTY only).
+    Forget {
+        /// The repo (default: the current dir).
+        repo: Option<PathBuf>,
     },
 }
 

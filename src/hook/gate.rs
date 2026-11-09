@@ -79,7 +79,8 @@ impl<'a> Gate<'a> {
         let git = Git::scrubbed(env, layout.hooks_cwd());
         let scope = CompiledScope::new(&host.config.scope, &dirs)?;
         let trust = plan::remote_trust(&git, &scope).map_err(|e| e.to_string())?;
-        let remote_refs = plan::remote_refs(&dirs, env, &host.config.job, &trust);
+        let remote_refs =
+            plan::remote_refs(&dirs, env, &host.config.job, &trust, &layout.repo_key());
         Ok(Self {
             hook,
             env,
@@ -96,11 +97,15 @@ impl<'a> Gate<'a> {
         })
     }
 
-    /// L4: the repo is in scope by its path or a trusted remote.
+    /// L4: the repo is in scope by its path or a trusted remote. Item 33:
+    /// a repo whose recorded trusted remote is gone (or whose record is
+    /// unusable) stays in scope, so its gate denies: removing the remote
+    /// that put it in scope must not take it out of the gate.
     #[must_use]
     pub fn in_scope(&self) -> bool {
         self.scope
             .contains(&self.layout.repo_dir(), &self.remote_urls)
+            || self.remote_refs.record_denial().is_some()
     }
 
     /// The ref rules of the policy that applies to new commit `tip` on

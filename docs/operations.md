@@ -108,6 +108,13 @@ The policy commit comes from a trusted remote's `main` (or `master`) only with a
 
 A trusted remote is one whose fetch URL a `scope.remotes` pattern names exactly: `https://`, `ssh://` or `git@host:path`, the exact host, and the path segment by segment, where `*` never crosses `/` (item 34). The same patterns match loosely for scope and push gating, so a look-alike URL (`/tmp/x/gitlab.com/you/r.git`, `https://evil.example/gitlab.com/you/r`) is gated but never trusted. A local mirror is trusted only by its exact path in `scope.trusted_paths`.
 
+Once a repo had a trusted remote, tollgate remembers it (item 33). If that remote is later removed, renamed to another URL, or no longer trusted by `scope.remotes`, commits and pushes in the repo are denied with a message that names it, instead of taking the policy from the local `main`, which anything in the repo can move. Put the remote back (`git remote add` or `git remote set-url` with the URL in the message), or accept the change from your own terminal:
+
+```sh
+cd <repo>
+tollgate remotes forget    # lists what is recorded, asks [y/N]
+```
+
 That query runs in its own environment, so nothing an agent sets for one git command picks who answers: no repo, global or system git config, no `GIT_*` or proxy variable from the shell, and `ssh -o BatchMode=yes` found on `[job] path_prepend` and then `/usr/local/bin:/usr/bin:/bin`, never on the agent's `PATH`. It keeps your `credential.*` git settings and `SSH_AUTH_SOCK`. So an ssh remote needs a key the ssh agent holds (or one without a passphrase) and a known host key, and an https remote needs a credential helper; `http.*` settings such as a proxy or a CA file do not apply. The guard also denies `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_SSH_VARIANT`, `GIT_PROXY_COMMAND` and `GIT_EXEC_PATH` for git and tollgate, and asks before `git config` writes `core.sshCommand`, `core.gitProxy`, `ssh.*` or `url.*`.
 
 A branch can still change its own code, tests, `package.json` scripts, `tsconfig.json`, `biome.json`, and the tool sections of `pyproject.toml`. Those changes are visible in review and in the diff, and the full check at merge runs on them as they are.

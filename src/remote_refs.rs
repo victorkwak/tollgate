@@ -248,6 +248,8 @@ impl Site {
 #[derive(Debug)]
 pub struct RemoteRefs {
     remotes: Vec<TrustedRemote>,
+    /// The record of the repo's trusted remotes (item 33).
+    record: Option<crate::remote_record::Checked>,
     site: Option<Site>,
     /// The store as last read or written.
     store: Mutex<Option<Store>>,
@@ -261,6 +263,7 @@ impl RemoteRefs {
     pub fn none() -> Self {
         Self {
             remotes: Vec::new(),
+            record: None,
             site: None,
             store: Mutex::new(None),
             asked: Mutex::new(BTreeMap::new()),
@@ -281,6 +284,7 @@ impl RemoteRefs {
         let state = dirs.state_dir();
         Self {
             remotes,
+            record: None,
             site: Some(Site {
                 file: dirs.remote_refs_file(),
                 neutral: state.join("neutral"),
@@ -302,6 +306,21 @@ impl RemoteRefs {
     #[must_use]
     pub fn remotes(&self) -> &[TrustedRemote] {
         &self.remotes
+    }
+
+    /// Item 33: checks and updates the record of the trusted remotes of
+    /// the repo whose key is `repo` ([`crate::remote_record`]).
+    #[must_use]
+    pub fn with_record(mut self, dirs: &Dirs, repo: &crate::ids::RepoKey) -> Self {
+        self.record = Some(crate::remote_record::check(dirs, repo, &self.remotes));
+        self
+    }
+
+    /// Item 33: why the policy must deny (no anchor, never local refs):
+    /// a recorded trusted remote is gone, or the record is unusable.
+    #[must_use]
+    pub fn record_denial(&self) -> Option<String> {
+        self.record.as_ref()?.deny_message()
     }
 
     /// The trusted remote named `name`.

@@ -238,3 +238,79 @@ pub fn local_path(url: &str) -> Option<PathBuf> {
     }
     std::fs::canonicalize(p).ok()
 }
+
+/// Item 33: the identity of a remote URL, for comparing a URL recorded
+/// earlier with the URLs a repo has now. A parsed URL gives its scheme,
+/// lowercase host, port and path segments, the last without `.git`
+/// (`git@gitlab.com:g/r.git` and `ssh://gitlab.com/g/r` are one; https and
+/// ssh are not). Anything else (a local path, `file://`) gives its path
+/// without `file://`, made lexically normal (no `.` parts, no repeated or
+/// trailing `/`; `..` stays), without reading the file system.
+#[must_use]
+pub fn url_identity(url: &str) -> String {
+    if let Some(u) = parse_url(url) {
+        let scheme = match u.scheme {
+            Scheme::Https => "https",
+            Scheme::Ssh => "ssh",
+        };
+        let port = u.port.map(|p| format!(":{p}")).unwrap_or_default();
+        let mut path = u.path;
+        if let Some(last) = path.last_mut()
+            && let Some(s) = last.strip_suffix(".git")
+            && !s.is_empty()
+        {
+            *last = s.to_owned();
+        }
+        return format!("{scheme}://{}{port}/{}", u.host, path.join("/"));
+    }
+    let p = url.strip_prefix("file://").unwrap_or(url);
+    let normal: PathBuf = Path::new(p)
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+    format!("local:{}", normal.display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Item 33: the same server and repo in another spelling is one
+    /// identity; another scheme, port, host or repo is not.
+    #[test]
+    fn url_identity_is_the_parsed_server_and_path_item33() {
+        let id = url_identity;
+        let r = id("https://gitlab.com/victorkwak/r.git");
+        for same in [
+            "https://GitLab.com/victorkwak/r",
+            "HTTPS://user@gitlab.com/victorkwak/r.git/",
+        ] {
+            assert_eq!(id(same), r, "{same}");
+        }
+        for other in [
+            "ssh://gitlab.com/victorkwak/r.git",
+            "https://gitlab.com:8443/victorkwak/r.git",
+            "https://gitlab.com.evil.example/victorkwak/r.git",
+            "https://gitlab.com/victorkwak/R.git",
+            "https://gitlab.com/victorkwak/r.git.git",
+            "https://evil.example/gitlab.com/victorkwak/r.git",
+            "/tmp/gitlab.com/victorkwak/r.git",
+        ] {
+            assert_ne!(id(other), r, "{other}");
+        }
+        let s = id("git@gitlab.com:victorkwak/r.git");
+        assert_eq!(id("ssh://git@gitlab.com/victorkwak/r"), s);
+        assert_eq!(id("git+ssh://gitlab.com/victorkwak/r.git"), s);
+        let l = id("/srv/mirror/r.git");
+        for same in ["file:///srv/mirror/r.git", "/srv//mirror/./r.git/"] {
+            assert_eq!(id(same), l, "{same}");
+        }
+        for other in [
+            "/srv/mirror/r",
+            "/srv/x/../mirror/r.git",
+            "srv/mirror/r.git",
+        ] {
+            assert_ne!(id(other), l, "{other}");
+        }
+    }
+}

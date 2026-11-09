@@ -389,6 +389,99 @@ fn push_tiers_tags_and_deletions_t13_r20_r22() {
     assert_eq!(tiers_of_jobs(&sb).last().map(String::as_str), Some("full"));
 }
 
+/// Item 33 (R4): once a repo had a trusted remote, losing it (removed, or
+/// its URL changed to one that is not trusted) denies: anchors never fall
+/// back to the local `main`, which an agent can move. A rename keeps the
+/// URL and stays trusted; deleting the record (from your own terminal)
+/// accepts the change.
+#[test]
+fn a_lost_trusted_remote_denies_instead_of_local_anchors_item33() {
+    let sb = Sandbox::new();
+    let (repo, bare) = trusted_repo(&sb, PASS);
+    let commit = |name: &str| {
+        stage(&sb, &repo, &format!("{name}.txt"), "1\n");
+        sb.hooked(&repo, &["commit", "-m", name])
+    };
+    // A gated commit records origin as trusted for this repo.
+    let r = commit("a");
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    // Renamed: same URL, still trusted.
+    sb.git(&repo, &["remote", "rename", "origin", "upstream"]);
+    sb.git(&repo, &["fetch", "-q", "upstream"]);
+    let r = commit("b");
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    // Its URL changed to a repo that is not trusted.
+    let other = sb.root().join("other.git");
+    sb.git(
+        &sb.root(),
+        &["init", "-q", "--bare", other.to_str().unwrap()],
+    );
+    sb.git(
+        &repo,
+        &["remote", "set-url", "upstream", other.to_str().unwrap()],
+    );
+    let r = commit("c");
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("item 33") && r.out.contains(bare.to_str().unwrap()),
+        "{}",
+        r.out
+    );
+    // Removed: the same.
+    sb.git(&repo, &["remote", "remove", "upstream"]);
+    let r = commit("c");
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(r.out.contains("item 33"), "{}", r.out);
+    // Back with its URL: allowed again.
+    sb.git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    sb.git(&repo, &["fetch", "-q", "origin"]);
+    let r = commit("c");
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    // Removed again; `tollgate remotes forget` accepts it, at a terminal
+    // only: without one (an agent's Bash) it refuses and nothing changes.
+    sb.git(&repo, &["remote", "remove", "origin"]);
+    let r = sb.tollgate(&repo, &["remotes", "forget"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(r.out.contains("interactive terminal"), "{}", r.out);
+    let r = commit("d");
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    // At a terminal (util-linux `script` gives one): "n" keeps the
+    // record, "y" removes it and local anchors count again.
+    if cfg!(target_os = "linux") && Path::new("/usr/bin/script").exists() {
+        let at_terminal = |answer: &str| {
+            let mut cmd = std::process::Command::new("/usr/bin/script");
+            cmd.env_clear()
+                .current_dir(&repo)
+                .args([
+                    "-qec",
+                    &format!("{} remotes forget", support::BIN),
+                    "/dev/null",
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            for (k, v) in sb.env().iter() {
+                cmd.env(k, v);
+            }
+            let mut child = cmd.spawn().unwrap();
+            std::io::Write::write_all(child.stdin.as_mut().unwrap(), answer.as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+            )
+        };
+        let (code, out) = at_terminal("n\n");
+        assert_eq!(code, Some(2), "{out}");
+        assert!(out.contains(bare.to_str().unwrap()), "{out}");
+        assert_eq!(commit("d").code, Some(1));
+        let (code, out) = at_terminal("y\n");
+        assert_eq!(code, Some(0), "{out}");
+        let r = commit("d");
+        assert_eq!(r.code, Some(0), "{}", r.out);
+    }
+}
+
 #[test]
 fn a_full_miss_is_allowed_for_the_trusted_remote_tip_r14() {
     let sb = Sandbox::new();

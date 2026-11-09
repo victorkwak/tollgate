@@ -113,6 +113,10 @@ const DENY_SUBSTRINGS: &[(&str, &str)] = &[
         "tollgate baseline record",
         "baseline record needs Victor's terminal (R94)",
     ),
+    (
+        "tollgate remotes forget",
+        "forgetting a lost trusted remote needs Victor's terminal (item 33)",
+    ),
     // L10: the test switch of `install --yes` is not for sessions.
     (
         "tollgate_test_install",
@@ -1519,6 +1523,9 @@ mod tests {
             "tollgate waive --tree x",
             "tollgate policy approve HEAD",
             "tollgate baseline record pyright",
+            "tollgate remotes forget",
+            "script -qec \"tollgate  remotes forget ~/Repos/x\" /dev/null",
+            "TOLLGATE remotes  FORGET .",
             "tee > ~/.local/state/tollgate/results/aa/x.json",
             "echo x > $HOME/.local/state/tollgate/x",
             "echo x >> ${XDG_STATE_HOME}/tollgate/x",
