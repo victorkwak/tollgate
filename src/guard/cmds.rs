@@ -312,6 +312,78 @@ pub fn interp(base: &str) -> Option<Lang> {
     }
 }
 
+/// G1, G5 (review G5 PATH): bash builtins and keywords that can start a
+/// simple command. bash runs them without a PATH search, so a PATH the
+/// command changes does not change what they run (`enable -n`, which
+/// turns one off, denies).
+#[must_use]
+pub fn bash_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "." | ":"
+            | "["
+            | "alias"
+            | "bg"
+            | "bind"
+            | "break"
+            | "builtin"
+            | "caller"
+            | "cd"
+            | "command"
+            | "compgen"
+            | "complete"
+            | "compopt"
+            | "continue"
+            | "declare"
+            | "dirs"
+            | "disown"
+            | "echo"
+            | "enable"
+            | "eval"
+            | "exec"
+            | "exit"
+            | "export"
+            | "false"
+            | "fc"
+            | "fg"
+            | "getopts"
+            | "hash"
+            | "help"
+            | "history"
+            | "jobs"
+            | "kill"
+            | "let"
+            | "local"
+            | "logout"
+            | "mapfile"
+            | "popd"
+            | "printf"
+            | "pushd"
+            | "pwd"
+            | "read"
+            | "readarray"
+            | "readonly"
+            | "return"
+            | "set"
+            | "shift"
+            | "shopt"
+            | "source"
+            | "suspend"
+            | "test"
+            | "time"
+            | "times"
+            | "trap"
+            | "true"
+            | "type"
+            | "typeset"
+            | "ulimit"
+            | "umask"
+            | "unalias"
+            | "unset"
+            | "wait"
+    )
+}
+
 /// Names a function must not take: it would change what the guard thinks
 /// a command does.
 #[must_use]

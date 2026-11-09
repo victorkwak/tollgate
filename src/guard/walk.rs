@@ -151,8 +151,23 @@ pub enum Target {
     Other,
 }
 
+/// G1, G5 (review G5 PATH): the PATH bash searches for a bare command
+/// name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathVal {
+    /// The session's PATH: the command has not changed it.
+    Session,
+    /// Dirs in search order as written (`~` and relative dirs resolve at
+    /// the search); `None` is where the session's PATH is spliced in.
+    Known(Vec<Option<String>>),
+    /// A value bash builds at run time, or one the guard cannot follow.
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Scope {
+    /// The PATH bare command names are found on.
+    path: PathVal,
     cwd: Cwd,
     oldpwd: Cwd,
     stack: Vec<Cwd>,
@@ -202,6 +217,26 @@ impl Scope {
             if a != b || (a.is_none() && other.opaque) || (b.is_none() && self.opaque) {
                 self.vars.insert(k, None);
             }
+        }
+        // Either PATH may hold: a name is looked up in the dirs of both
+        // (every dir is checked, not only the first match).
+        if self.path != other.path {
+            let segs = |p: &PathVal| match p {
+                PathVal::Session => Some(vec![None]),
+                PathVal::Known(k) => Some(k.clone()),
+                PathVal::Unknown => None,
+            };
+            self.path = match (segs(&self.path), segs(&other.path)) {
+                (Some(mut a), Some(b)) => {
+                    for s in b {
+                        if !a.contains(&s) {
+                            a.push(s);
+                        }
+                    }
+                    PathVal::Known(a)
+                }
+                _ => PathVal::Unknown,
+            };
         }
         self.opaque |= other.opaque;
         self.funcs.extend(other.funcs.iter().cloned());
@@ -337,6 +372,21 @@ pub struct Walker<'a> {
     /// from a tail of them in that cwd needs no second check (code text in
     /// them is new words, and is checked).
     checked_tails: Vec<(Cwd, Vec<String>)>,
+    /// G1, G5 (review G5 PATH): bare command names looked up so far.
+    path_lookups: usize,
+    /// Writes of PATH walked so far, in any code.
+    path_writes: usize,
+    /// PATH changes where the walk does not see it: a nameref targets it,
+    /// or a trap that runs between commands writes it.
+    path_hidden: bool,
+    /// Functions whose bodies run commands by name, with the PATH their
+    /// bodies were checked with: a call with another PATH denies.
+    func_paths: HashMap<String, PathVal>,
+    /// Functions whose bodies write PATH.
+    path_funcs: BTreeSet<String>,
+    /// A trap that runs between commands runs commands by name: PATH may
+    /// not change after it is set.
+    trap_lookups: bool,
 }
 
 /// R25/R26/R28 for a Bash command.
@@ -369,6 +419,7 @@ impl<'a> Walker<'a> {
             ctx,
             home: ctx.home.to_string_lossy().into_owned(),
             scope: Scope {
+                path: PathVal::Session,
                 cwd: Cwd::Known(paths::canon(&ctx.cwd)),
                 oldpwd: Cwd::Unknown,
                 stack: Vec::new(),
@@ -405,6 +456,12 @@ impl<'a> Walker<'a> {
             value_memo: RefCell::new(HashMap::new()),
             dir_memo: RefCell::new(HashMap::new()),
             checked_tails: Vec::new(),
+            path_lookups: 0,
+            path_writes: 0,
+            path_hidden: false,
+            func_paths: HashMap::new(),
+            path_funcs: BTreeSet::new(),
+            trap_lookups: false,
         }
     }
 
@@ -451,6 +508,9 @@ impl<'a> Walker<'a> {
                             sc.stack = vec![Cwd::Unknown; sc.stack.len()];
                         }
                         name => {
+                            if name == "PATH" {
+                                sc.path = PathVal::Unknown;
+                            }
                             sc.vars.insert(name.to_owned(), None);
                             sc.ints.remove(name);
                         }
@@ -817,12 +877,27 @@ impl<'a> Walker<'a> {
             stdin: Feed::Unknown,
             env: Vec::new(),
         };
+        let (lookups, writes) = (self.path_lookups, self.path_writes);
         self.detached(|w| {
             w.isolated(|w| {
                 w.scope.forget();
                 w.command(body, &frame, false)
             })
         })?;
+        // G1, G5 (review G5 PATH): the body found its commands on this
+        // PATH; a call with another one runs what that PATH finds. Kept
+        // over a later definition: another branch may have made this one.
+        if self.path_lookups > lookups {
+            let now = self.path_now();
+            let p = match self.func_paths.get(&n) {
+                Some(old) if *old != now => PathVal::Unknown,
+                _ => now,
+            };
+            self.func_paths.insert(n.clone(), p);
+        }
+        if self.path_writes > writes {
+            self.path_funcs.insert(n.clone());
+        }
         self.scope.funcs.insert(n);
         Ok(())
     }
@@ -1375,7 +1450,14 @@ impl<'a> Walker<'a> {
                     Some(v) if !appends => Written::Value(v),
                     _ => Written::Unknown,
                 };
+                let path =
+                    (a.name == "PATH" && !a.array).then(|| self.path_of(a.value.first(), appends));
                 self.var_set(&a.name, "an assignment", written)?;
+                if let Some(p) = path
+                    && !self.path_hidden
+                {
+                    self.scope.path = p;
+                }
                 let number = !a.array && a.value.first().is_some_and(|v| self.only_numbers(v));
                 self.scope.vars.insert(a.name.clone(), value);
                 if number {
@@ -1410,7 +1492,18 @@ impl<'a> Walker<'a> {
                 raw: a.raw.clone(),
             });
         }
-        self.run(&sc.words, &name, env, &f2, Via::Shell, certain)?;
+        // G1, G5: bash finds the command on a PATH written in front of it.
+        let path = sc.assigns.iter().rev().find(|a| a.name == "PATH").map(|a| {
+            if a.array {
+                PathVal::Unknown
+            } else {
+                let appends = a.raw.starts_with("PATH+=");
+                self.path_of(a.value.first(), appends)
+            }
+        });
+        self.with_path(path, |w| {
+            w.run(&sc.words, &name, env, &f2, Via::Shell, certain)
+        })?;
         self.note_known(sc, redirs, &f2.stdin);
         Ok(())
     }
@@ -1574,6 +1667,20 @@ impl<'a> Walker<'a> {
         via: Via,
         certain: bool,
     ) -> W {
+        // G1, G5 (review G5 PATH): bash finds a bare name that is not a
+        // builtin or a function on PATH; a file found in a dir this
+        // command puts there runs instead of the session's program, and
+        // is checked as what it is.
+        if !name.is_empty()
+            && !name.contains('/')
+            && !cmds::bash_builtin(name)
+            && !self.scope.funcs.contains(name)
+        {
+            self.path_lookups += 1;
+            for hit in self.path_hits(name)? {
+                self.run_command(argv, &hit, env.clone(), f, via, certain)?;
+            }
+        }
         let (base, class) = self.class_of(name);
         if class == Class::Other {
             match name {
@@ -1603,6 +1710,16 @@ impl<'a> Walker<'a> {
                 .strip_prefix("git-")
                 .is_some_and(|s| super::git::KNOWN.contains(&s));
         let tollgate = is_tollgate(self.ctx, name) || base == "tollgate";
+        if name.contains('/')
+            && (gitish || tollgate || class != Class::Other || runners::is_runner(&base))
+        {
+            let strict = gitish
+                || tollgate
+                || matches!(class, Class::Shell(_) | Class::Opaque(_) | Class::Interp(_));
+            if self.shell_script_named(name, &base, strict)? {
+                return self.path_command(name, &base, argv, env, f, via);
+            }
+        }
         // A shell word of a program the guard does not know may be data
         // (`uv run pytest -k bash tests/`): it runs nothing when it gets
         // no code and its one script is not there (item 21/20).
@@ -1803,11 +1920,214 @@ impl<'a> Walker<'a> {
         if cmds::scoped(name).is_some() {
             self.scoped_writes.push((name.to_owned(), how.to_owned()));
         }
+        if name == "PATH" {
+            self.path_write(how, written)?;
+        }
         // Unknown until a caller that knows the value sets it.
         self.scope.vars.insert(name.to_owned(), None);
         self.scope.ints.remove(name);
         self.log.push(name.to_owned());
         Ok(())
+    }
+
+    // ---- PATH (G1, G5, review G5 PATH) ---------------------------------
+
+    /// A write of PATH through `how`: its value is unknown until a caller
+    /// that knows the word sets [`Scope::path`]. `export PATH` and
+    /// `readonly PATH` keep the value; `local PATH` and `declare PATH` in
+    /// a function make an empty one, and `unset PATH` makes bash search
+    /// the cwd.
+    fn path_write(&mut self, how: &str, written: Written<'_>) -> W {
+        if matches!(written, Written::Kept) && matches!(how, "export" | "readonly") {
+            return Ok(());
+        }
+        if self.trap_lookups {
+            return Err(format!(
+                "{how} writes PATH after a trap that runs commands by name was set: the trap would run what the new PATH finds; set PATH before the trap (G1, G5)"
+            ));
+        }
+        if how == "a nameref" {
+            self.path_hidden = true;
+        }
+        self.path_writes += 1;
+        self.scope.path = PathVal::Unknown;
+        Ok(())
+    }
+
+    /// The PATH a bare command name is found on now.
+    fn path_now(&self) -> PathVal {
+        if self.path_hidden {
+            PathVal::Unknown
+        } else {
+            self.scope.path.clone()
+        }
+    }
+
+    /// The PATH an assignment of `w` to PATH gives (`+=` when `appends`):
+    /// `$PATH` and `${PATH}` splice in the PATH that holds now, `~` and
+    /// variables the guard knows expand; anything else is unknown.
+    fn path_of(&self, w: Option<&Word>, appends: bool) -> PathVal {
+        const MARK: &str = "\0PATH\0";
+        let v = match w {
+            None => String::new(),
+            Some(w) => {
+                let lookup = |n: &str| {
+                    if n == "PATH" {
+                        Some(MARK.to_owned())
+                    } else {
+                        self.lookup(n)
+                    }
+                };
+                match w.value(&lookup, Some(&self.home)) {
+                    Some(v) => v,
+                    None => return PathVal::Unknown,
+                }
+            }
+        };
+        let text = if appends { format!("{MARK}{v}") } else { v };
+        let mut segs = Vec::new();
+        for s in text.split(':') {
+            if s == MARK {
+                match self.path_now() {
+                    PathVal::Session => segs.push(None),
+                    PathVal::Known(k) => segs.extend(k),
+                    PathVal::Unknown => return PathVal::Unknown,
+                }
+            } else if s.contains('\0') {
+                return PathVal::Unknown;
+            } else {
+                segs.push(Some(s.to_owned()));
+            }
+        }
+        // A dir again later on PATH finds nothing new.
+        let mut seen = BTreeSet::new();
+        segs.retain(|s| seen.insert(s.clone()));
+        if segs == [None] {
+            PathVal::Session
+        } else {
+            PathVal::Known(segs)
+        }
+    }
+
+    /// The PATH `env` gives its command with assignment `e`.
+    fn env_path(&self, e: &EnvSet) -> PathVal {
+        match &e.value {
+            Some(v) => PathVal::Known(v.split(':').map(|s| Some(s.to_owned())).collect()),
+            None => PathVal::Unknown,
+        }
+    }
+
+    /// Runs `f` with `p` as the PATH, then puts the PATH back unless `f`
+    /// changed it (then it is unknown).
+    fn with_path(&mut self, p: Option<PathVal>, f: impl FnOnce(&mut Self) -> W) -> W {
+        let Some(p) = p else {
+            return f(self);
+        };
+        let saved = std::mem::replace(&mut self.scope.path, p.clone());
+        let r = f(self);
+        self.scope.path = if self.scope.path == p {
+            saved
+        } else {
+            PathVal::Unknown
+        };
+        r
+    }
+
+    /// The files bare command name `name` may run from the dirs this
+    /// command puts on PATH: each is checked as the program it is. A
+    /// file the command writes there counts, and so does a link. The
+    /// session's own dirs are the session's programs.
+    fn path_hits(&self, name: &str) -> Result<Vec<String>, Deny> {
+        let segs = match self.path_now() {
+            PathVal::Session => return Ok(Vec::new()),
+            PathVal::Unknown => {
+                return Err(format!(
+                    "`{name}` after this command sets PATH to a value the guard cannot follow: bash may find any program by that name; give the program's path, or set PATH to dirs written literally (`~`, $HOME, $PWD and $PATH expand) (G1, G5)"
+                ));
+            }
+            PathVal::Known(segs) => segs,
+        };
+        let mut hits: Vec<String> = Vec::new();
+        for dir in segs.iter().flatten() {
+            let dir = if dir.is_empty() { "." } else { dir.as_str() };
+            // bash expands a leading `~` when it searches; a program that
+            // gets the value from `env` does not, and finds a dir `~`.
+            let mut dirs = vec![dir.to_owned()];
+            if let Some(rest) = dir.strip_prefix('~') {
+                if !(rest.is_empty() || rest.starts_with('/')) {
+                    return Err(format!(
+                        "`{name}` after this command puts `{dir}` on PATH, a dir in another user's home; give the program's path (G1, G5)"
+                    ));
+                }
+                dirs.push(format!("{}{rest}", self.home));
+            }
+            for d in dirs {
+                let Some(p) = self.abs_path(&format!("{d}/{name}")) else {
+                    return Err(format!(
+                        "`{name}` with the relative dir `{d}` on PATH, in a cwd the guard cannot follow; give the program's path or an absolute dir (G1, G5, G8)"
+                    ));
+                };
+                if !p.is_dir() && (p.exists() || p.is_symlink() || self.was_written(&p)) {
+                    let p = p.to_string_lossy().into_owned();
+                    if !hits.contains(&p) {
+                        hits.push(p);
+                    }
+                }
+            }
+        }
+        Ok(hits)
+    }
+
+    /// G1, G3 (review G5 PATH): `name` is a path to a text file named
+    /// like a program the guard knows (`./fake/git`, `./fake/bash`): a
+    /// shell script, or text bash runs as one, is read and checked as a
+    /// script, not as that program. A script in another language named
+    /// like git, tollgate, a shell or an interpreter (`strict`) denies;
+    /// other programs may be scripts (`npx`, `parallel`) and keep their
+    /// own checks.
+    fn shell_script_named(&self, name: &str, base: &str, strict: bool) -> Result<bool, Deny> {
+        let Some(p) = self.abs_path(name) else {
+            return Err(format!(
+                "{name} after a cd the guard cannot follow; use an absolute path (G3, G8)"
+            ));
+        };
+        if p.is_dir() {
+            return Ok(false);
+        }
+        let head = if self.was_written(&p) {
+            match self.known.get(&p) {
+                Some(t) => t.as_bytes().iter().take(256).copied().collect(),
+                // path_command denies: the guard cannot see what runs.
+                None => return Ok(true),
+            }
+        } else {
+            match read_head(&p) {
+                Ok(h) => h,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => {
+                    return Err(format!(
+                        "the guard reads {name} before it runs and cannot ({e}); run it in a later call (G3)"
+                    ));
+                }
+            }
+        };
+        if is_binary(&head) {
+            return Ok(false);
+        }
+        match shebang(&head) {
+            None => Ok(true),
+            Some(prog)
+                if prog == "git"
+                    || prog == "tollgate"
+                    || matches!(cmds::classify(&prog), Class::Shell(_) | Class::Opaque(_)) =>
+            {
+                Ok(true)
+            }
+            Some(prog) if strict => Err(format!(
+                "{name} is a `{prog}` script, not the program {base}; run it by its interpreter (G1, G3)"
+            )),
+            Some(_) => Ok(false),
+        }
     }
 
     /// Item 21: program variable `name` (read as `r`) gets value `v`
@@ -2093,6 +2413,7 @@ impl<'a> Walker<'a> {
             i += if consumed_next { 2 } else { 1 };
         }
         // Assignments.
+        let inherited = env.len();
         while i < argv.len() {
             let Some(a) = lits[i].as_deref() else {
                 let (prefix, _) = argv[i].literal_prefix();
@@ -2167,8 +2488,16 @@ impl<'a> Walker<'a> {
             return self.env_check(&env, Target::Other);
         };
         let inner_name = self.command_word(cmd)?;
+        // G1, G5: env finds its command on a PATH it is given.
+        let path = env[inherited..]
+            .iter()
+            .rev()
+            .find(|e| e.name == "PATH")
+            .map(|e| self.env_path(e));
         match chdir {
-            None => self.run(&argv[i..], &inner_name, env, f, via, certain),
+            None => self.with_path(path, |w| {
+                w.run(&argv[i..], &inner_name, env, f, via, certain)
+            }),
             Some(d) => {
                 let dir = self.resolve(&d);
                 self.isolated(|w| {
@@ -2176,6 +2505,9 @@ impl<'a> Walker<'a> {
                         Some(p) => Cwd::Known(p),
                         None => Cwd::Unknown,
                     };
+                    if let Some(p) = path {
+                        w.scope.path = p;
+                    }
                     w.run(&argv[i..], &inner_name, env, f, via, certain)
                 })
             }
@@ -3085,7 +3417,24 @@ impl<'a> Walker<'a> {
                         }
                         _ => Written::Unknown,
                     };
+                    // G1, G5: the PATH bare names are found on from here.
+                    let path =
+                        (name == "PATH" && value.is_some() && !prefix.contains('[')).then(|| {
+                            let v = value.and_then(|w| shell::split_assign(w).map(|(_, v)| v));
+                            match v {
+                                Some(v) => self.path_of(Some(&v), prefix.contains("+=")),
+                                None => PathVal::Unknown,
+                            }
+                        });
                     self.var_set(&name, b, written)?;
+                    if name == "PATH" && nameref {
+                        self.path_hidden = true;
+                    }
+                    if let Some(p) = path
+                        && !self.path_hidden
+                    {
+                        self.scope.path = p;
+                    }
                     if nameref {
                         // `declare -n ref=NAME`: writes through ref reach
                         // NAME, and bash evaluates a subscript in NAME
@@ -3832,10 +4181,23 @@ impl<'a> Walker<'a> {
         if function {
             // A function gets its arguments as `$1`...: it is no reader.
             self.tollgate_dir_words(name, &argv[1..], env, Some(via))?;
+            // G1, G5 (review G5 PATH): its body found its commands on the
+            // PATH that held where it was defined.
+            if let Some(p) = self.func_paths.get(name)
+                && (*p == PathVal::Unknown || *p != self.path_now())
+            {
+                return Err(format!(
+                    "`{name}` runs commands by name, and PATH changed after it was defined: it would run what the new PATH finds; define it after PATH is set (G1, G5)"
+                ));
+            }
             // Checked where it was defined; it may change the cwd and any
             // variable.
             self.scope.forget();
             self.log.push("*".into());
+            if self.path_funcs.contains(name) {
+                self.scope.path = PathVal::Unknown;
+                self.log.push("PATH".into());
+            }
             return Ok(());
         }
         let reader = self.tollgate_reader(name, base, env);
@@ -3889,6 +4251,18 @@ impl<'a> Walker<'a> {
                 }) =>
             {
                 return Err("enable -f loads a builtin the guard does not know (G1)".into());
+            }
+            // Review G5 PATH: a builtin turned off is found on PATH.
+            "enable"
+                if lits[1..]
+                    .iter()
+                    .flatten()
+                    .any(|a| a.starts_with('-') && a.contains('n')) =>
+            {
+                return Err(
+                    "enable -n turns a builtin off, so its name runs a program found on PATH (G1)"
+                        .into(),
+                );
             }
             "trap" => return self.trap(argv, &lits),
             "watch" => return self.launch_tokens("watch", &argv[1..]),
@@ -4048,10 +4422,17 @@ impl<'a> Walker<'a> {
             stdin: Feed::Unknown,
             env: Vec::new(),
         };
+        let (lookups, writes) = (self.path_lookups, self.path_writes);
         self.isolated(|w| {
             w.scope.forget();
             w.code(&code, true, &frame, "trap")
         })?;
+        // G1, G5 (review G5 PATH): the trap finds its commands on the PATH
+        // that holds now, and may change PATH between any two commands.
+        self.trap_lookups |= self.path_lookups > lookups;
+        if self.path_writes > writes {
+            self.path_hidden = true;
+        }
         self.scope.forget();
         self.log.push("*".into());
         Ok(())

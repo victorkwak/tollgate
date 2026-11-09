@@ -3956,3 +3956,112 @@ fn s51_no_program_writes_tollgates_dirs_unlisted() {
     );
     assert!(rec.exists(), "a trusted-remote record is gone");
 }
+
+/// S52 (G1, G5, review G5 PATH): a PATH the call changes decides which
+/// file a bare command name runs. `./fake/git` there is a script that
+/// commits with the hooks skipped, so `PATH=./fake:$PATH; git commit`
+/// ran it while the guard checked the real git. A bare name after a PATH
+/// change is looked up on that PATH: a file found in a dir the call adds
+/// is checked as the program it is (a script is read), and a PATH whose
+/// value bash builds at run time denies bare names. A path to a script
+/// with the name of a program the guard knows is read too. Prepends of
+/// dirs that hold real programs or plain scripts keep working.
+#[test]
+fn s52_a_changed_path_decides_what_a_name_runs() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    let real_git = lab
+        .a
+        .path
+        .split(':')
+        .map(|d| Path::new(d).join("git"))
+        .find(|p| p.is_file())
+        .expect("git on the lab PATH");
+    let g = real_git.display().to_string();
+    let forge = format!("#!/bin/sh\nexec {g} commit -q -m forged -n\n");
+    let fake = lab.repo.join("fake");
+    std::fs::create_dir_all(&fake).unwrap();
+    for name in [
+        "git", "tollgate", "ls", "zzcommit", "bash", "env", "python3", "kill",
+    ] {
+        write_exe(&fake.join(name), &forge);
+    }
+    let f = fake.display().to_string();
+    std::fs::write(lab.repo.join(".git/info/exclude"), "fake/\nreal/\nplain/\n").unwrap();
+    lab.stage_bad_file("path");
+    let bad = lab.not_denied(&[
+        "PATH=./fake:$PATH; git commit -m x".to_owned(),
+        "export PATH=./fake:$PATH; git commit -m x".to_owned(),
+        "declare -x PATH=./fake:$PATH; git commit -m x".to_owned(),
+        "typeset -x PATH=./fake:$PATH; git status".to_owned(),
+        format!("declare -x PATH={f}; git commit -m x"),
+        format!("export PATH={f}; git status"),
+        format!("PATH={f}:$PATH; tollgate status"),
+        "PATH=./fake:$PATH; tollgate status".to_owned(),
+        "PATH=./fake:$PATH; ls".to_owned(),
+        "PATH=$PATH:./fake; zzcommit".to_owned(),
+        "PATH+=:./fake; zzcommit".to_owned(),
+        "PATH=\"./fake:$PATH\"; command git status".to_owned(),
+        "PATH=./fake:$PATH; env git status".to_owned(),
+        "PATH=./fake:$PATH; timeout 5 git status".to_owned(),
+        "PATH=./fake:$PATH; nohup ls >/dev/null".to_owned(),
+        "PATH=./fake:$PATH git status".to_owned(),
+        "PATH=./fake:$PATH ls".to_owned(),
+        "PATH=./fake:$PATH bash -c 'git status'".to_owned(),
+        "PATH=./fake:$PATH bash -c 'ls'".to_owned(),
+        "export PATH=./fake:$PATH; bash -c 'git status'".to_owned(),
+        "export PATH=./fake:$PATH; bash -c ls".to_owned(),
+        "env PATH=./fake:/usr/bin:/bin ls".to_owned(),
+        "env -C fake PATH=.:/usr/bin:/bin ls".to_owned(),
+        "f() { git status; }; PATH=./fake:$PATH; f".to_owned(),
+        "f() { ls; }; PATH=./fake:$PATH f".to_owned(),
+        "trap 'PATH=./fake' DEBUG; PATH=/usr/bin:/bin; git status".to_owned(),
+        "declare -n r=PATH; r=./fake; git status".to_owned(),
+        "enable -n kill; PATH=./fake:$PATH; kill -0 $$".to_owned(),
+        "unset PATH; cd fake && git status".to_owned(),
+        "PATH=./fake:$PATH; (git status)".to_owned(),
+        "PATH=./fake:$PATH; f() { git status; }; f".to_owned(),
+        "cd fake && PATH=$PWD:$PATH && cd .. && git status".to_owned(),
+        "PATH=.:$PATH; cd fake && git status".to_owned(),
+        "cd fake && PATH=; git status".to_owned(),
+        "cd fake && PATH=:/usr/bin; git status".to_owned(),
+        "for PATH in ./fake; do git status; done".to_owned(),
+        "printf -v PATH %s ./fake; git status".to_owned(),
+        "read -r PATH <<< ./fake; git status".to_owned(),
+        "PATH=$(echo ./fake):$PATH; git status".to_owned(),
+        "if true; then PATH=./fake:$PATH; fi; git status".to_owned(),
+        "PATH=./fake:$PATH; python3 -c 'print(1)'".to_owned(),
+        "PATH=./fake:$PATH; bash -c true".to_owned(),
+        "PATH=./fake:$PATH; env true".to_owned(),
+        "PATH=~/../ws/fake:$PATH; git status".to_owned(),
+        // A path to a script with a known program's name is that script.
+        "./fake/git status".to_owned(),
+        format!("{f}/git status"),
+        "./fake/bash -c true".to_owned(),
+        "./fake/env true".to_owned(),
+        "./fake/python3 -c 'print(1)'".to_owned(),
+    ]);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    // Dirs that hold the real programs, plain scripts or nothing by that
+    // name keep working.
+    let real = lab.repo.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real_git, real.join("git")).unwrap();
+    let plain = lab.repo.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    write_exe(&plain.join("hello"), "#!/bin/sh\necho hello\n");
+    let r = real.display().to_string();
+    let p = plain.display().to_string();
+    for cmd in [
+        format!("export PATH=\"{r}:$PATH\"; git status --short"),
+        format!("export PATH=\"{p}:$PATH\"; hello && git status --short"),
+        "export PATH=\"$HOME/.cargo/bin:$PATH\"; ls >/dev/null".to_owned(),
+        "PATH=/usr/bin:/bin ls >/dev/null".to_owned(),
+        // Relative: under a gate job, TMPDIR is in tollgate's state dir,
+        // and an absolute dir would name it in hello's environment (G7).
+        "PATH=./plain:$PATH hello".to_owned(),
+        "export PATH=./plain:$PATH; hello; echo done".to_owned(),
+    ] {
+        let s = lab.session(&cmd);
+        assert_eq!(s.code(), Some(0), "{cmd}: {s:?}");
+    }
+}
