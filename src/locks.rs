@@ -565,8 +565,17 @@ mod tests {
         assert!(!p.exists());
         let owner = LockFile::try_acquire(&p).unwrap().unwrap();
         // The early opener can lock its (removed) file, but that lock is
-        // not on the file the path names: acquire must not accept it.
-        early.try_lock().unwrap();
+        // not on the file the path names: acquire must not accept it. A
+        // test thread that forks now keeps a copy of gc's open file, and its
+        // lock, until its exec closes it: allow that short window.
+        let locked = (0..200).any(|_| {
+            if early.try_lock().is_ok() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            false
+        });
+        assert!(locked, "the removed file stayed locked");
         assert!(!still_at(&early, &p).unwrap());
         assert!(still_at(owner.file(), &p).unwrap());
         assert!(LockFile::try_acquire(&p).unwrap().is_none());

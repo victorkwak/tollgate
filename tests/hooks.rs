@@ -923,6 +923,32 @@ fn the_inline_budget_denies_with_the_job_and_a_retry_command_t19_r32_l17() {
     assert_eq!(sb.jobs().len(), 1);
 }
 
+/// An empty argument is an argument: the retry of `git commit
+/// --allow-empty-message -m ''` keeps the `''`, or the printed command
+/// would take the next flag as the message (L17, item 43).
+#[test]
+fn the_retry_command_keeps_an_empty_argument_l17() {
+    let sb = Sandbox::new();
+    sb.scoped_host("");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"slow\"\nkind = \"command\"\nrun = \"sleep 3\"\n",
+    );
+    stage(&sb, &repo, "a.txt", "1\n");
+    let r = sb.hooked_with(
+        &repo,
+        &["commit", "-m", "", "--allow-empty-message"],
+        &[("TOLLGATE_INLINE_CAP", "1")],
+    );
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    let job = job_id(&r.out);
+    let retry = format!("tollgate wait {job} && git commit -m '' --allow-empty-message");
+    assert!(r.out.contains(&retry), "no {retry:?} in:\n{}", r.out);
+    let w = sb.tollgate(&repo, &["wait", &job, "--timeout", "30s"]);
+    assert_eq!(w.code, Some(0), "{}", w.out);
+}
+
 /// The pid of the hook process `name` under git process `git`.
 fn hook_pid(git: u32, name: &str) -> Option<i32> {
     let table = tollgate::procs::ProcTable::snapshot().ok()?;

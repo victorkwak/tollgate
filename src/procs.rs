@@ -323,15 +323,24 @@ mod platform {
         Ok(out)
     }
 
-    pub(super) fn argv(pid: i32) -> Option<Vec<OsString>> {
-        let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    /// Parses `/proc/<pid>/cmdline`: each argument ends with a NUL, and an
+    /// empty argument is an argument. An empty block (a zombie, a kernel
+    /// thread, or a process inside `execve` before the kernel wrote its
+    /// arguments) is None.
+    pub(super) fn parse_cmdline(bytes: &[u8]) -> Option<Vec<OsString>> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let body = bytes.strip_suffix(&[0]).unwrap_or(bytes);
         Some(
-            bytes
-                .split(|b| *b == 0)
-                .filter(|a| !a.is_empty())
+            body.split(|b| *b == 0)
                 .map(|a| OsStr::from_bytes(a).to_owned())
                 .collect(),
         )
+    }
+
+    pub(super) fn argv(pid: i32) -> Option<Vec<OsString>> {
+        parse_cmdline(&fs::read(format!("/proc/{pid}/cmdline")).ok()?)
     }
 
     pub(super) fn parent_of(pid: i32) -> Option<i32> {
@@ -581,19 +590,51 @@ mod tests {
         assert!(platform::parse_procargs(b"").is_none());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cmdline_blocks_parse() {
+        let parse = |b: &[u8]| platform::parse_cmdline(b);
+        assert_eq!(
+            parse(b"git\0commit\0-m\0\0--allow-empty-message\0").unwrap(),
+            ["git", "commit", "-m", "", "--allow-empty-message"]
+        );
+        // A last argument without its NUL (a process that rewrote its
+        // arguments) is still read.
+        assert_eq!(parse(b"sh\0-c").unwrap(), ["sh", "-c"]);
+        // An empty block is a zombie, a kernel thread, or a process inside
+        // execve before the kernel wrote its arguments: not readable.
+        assert!(parse(b"").is_none());
+    }
+
     #[test]
     fn a_processes_arguments_and_parent_read_back() {
-        let mut child = Command::new("sleep")
-            .arg("30")
+        // `sh` keeps its own arguments while `sleep` runs, and the empty one
+        // is an argument too.
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30; :", "tg-test", "", "y"])
+            .process_group(0)
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
         let pid = child.id().cast_signed();
-        let args = argv(pid).unwrap();
-        assert!(args[0].to_string_lossy().ends_with("sleep"), "{args:?}");
-        assert_eq!(args[1], "30");
+        // On Linux the spawn (a vfork) returns when execve releases the
+        // parent's memory, before the child switches to its new memory: for
+        // a moment the child shows this test's arguments, then none (`argv`
+        // is None), then its own.
+        let end = Instant::now() + Duration::from_secs(5);
+        let args = loop {
+            let a = argv(pid);
+            if let Some(a) = &a
+                && a[0].to_string_lossy().ends_with("sh")
+            {
+                break a.clone();
+            }
+            assert!(Instant::now() < end, "arguments of {pid}: {a:?}");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(args[1..], ["-c", "sleep 30; :", "tg-test", "", "y"]);
         assert_eq!(parent_of(pid), Some(std::process::id().cast_signed()));
-        child.kill().unwrap();
+        signal_group(pid, libc::SIGKILL).unwrap();
         child.wait().unwrap();
         assert!(argv(pid).is_none());
     }
