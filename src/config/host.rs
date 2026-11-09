@@ -620,6 +620,7 @@ pub struct CompiledScope {
     remotes: GlobSet,
     trust: Vec<super::trust::TrustPattern>,
     trusted_paths: Vec<PathBuf>,
+    noncanonical_paths: Vec<(String, PathBuf)>,
     include: GlobSet,
     exclude: GlobSet,
 }
@@ -651,16 +652,42 @@ impl CompiledScope {
                 .iter()
                 .filter_map(|p| super::trust::TrustPattern::parse(p))
                 .collect(),
-            // A trusted path that does not exist trusts nothing.
+            // Item 48: a trusted path that does not exist, or is not its own
+            // canonical path (a symlink part could be moved), trusts nothing.
             trusted_paths: scope
                 .trusted_paths
                 .iter()
-                .filter(|p| p.starts_with('/'))
-                .filter_map(|p| std::fs::canonicalize(p).ok())
+                .filter(|p| !p.starts_with("file:"))
+                .filter_map(|p| super::trust::local_path(p))
+                .collect(),
+            noncanonical_paths: scope
+                .trusted_paths
+                .iter()
+                .filter(|p| !p.starts_with("file:"))
+                .filter(|p| super::trust::local_path(p).is_none())
+                .filter_map(|p| Some((p.clone(), super::trust::canonical_local(p)?)))
                 .collect(),
             include: glob::compile(&scope.include, names)?,
             exclude: glob::compile(&scope.exclude, names)?,
         })
+    }
+
+    /// Item 48: a local remote URL that names a `scope.trusted_paths` dir
+    /// by another spelling (a symlink part, `..`, a trailing `/`), so it
+    /// is not trusted: the canonical path to use instead.
+    #[must_use]
+    pub fn trusted_path_respelled(&self, url: &str) -> Option<PathBuf> {
+        if super::trust::local_path(url).is_some() {
+            return None;
+        }
+        super::trust::canonical_local(url).filter(|c| self.trusted_paths.contains(c))
+    }
+
+    /// Item 48: `scope.trusted_paths` entries that exist but are not their
+    /// canonical path (they trust nothing), with that path.
+    #[must_use]
+    pub fn noncanonical_trusted_paths(&self) -> Vec<(String, PathBuf)> {
+        self.noncanonical_paths.clone()
     }
 
     /// Item 34: `url` is a trusted remote: a parsed https or ssh URL that a
@@ -967,16 +994,91 @@ SQLX_OFFLINE = "true"
         // trusted_paths: the exact canonical path, as a path or file URL.
         assert!(s.remote_trusted(mirror.to_str().unwrap()));
         assert!(s.remote_trusted(&format!("file://{}", mirror.display())));
-        assert!(s.remote_trusted(&format!("{}/", mirror.display())));
         assert!(s.remote_in_scope(mirror.to_str().unwrap()));
         assert!(!s.remote_trusted(home.join("mirror").to_str().unwrap()));
         assert!(!s.remote_trusted(home.join("mirror/r.git/sub").to_str().unwrap()));
-        let linked = home.join("link.git");
-        std::os::unix::fs::symlink(&mirror, &linked).unwrap();
-        assert!(s.remote_trusted(linked.to_str().unwrap()), "canonical");
         // A relative trusted path is a config error.
         let bad = HostConfig::from_toml("[scope]\ntrusted_paths = [\"x/r.git\"]\n").unwrap();
         assert!(!bad.validate().is_ok());
+    }
+
+    /// Item 48: git uses the URL as spelled, so a symlink in it can point
+    /// elsewhere by the time git reads it. A local URL is trusted only
+    /// when it already is the canonical path (no symlink part, `.`, `..`,
+    /// repeated or trailing `/`, `%`), and a `scope.trusted_paths` entry
+    /// counts only when it is canonical itself. The other spellings
+    /// report the canonical path to use.
+    #[test]
+    fn trusted_paths_need_the_canonical_spelling_item48() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let mirror = home.join("mirror/r.git");
+        let other = home.join("other/o.git");
+        std::fs::create_dir_all(&mirror).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let linked = home.join("link.git");
+        std::os::unix::fs::symlink(&mirror, &linked).unwrap();
+        std::os::unix::fs::symlink(home.join("mirror"), home.join("dirlink")).unwrap();
+        std::os::unix::fs::symlink(&other, home.join("olink.git")).unwrap();
+        let dirs = Dirs::from_env(&EnvSnapshot::from_pairs([("HOME", home.as_os_str())])).unwrap();
+        let m = mirror.display();
+        let scope = ScopeConfig {
+            trusted_paths: vec![
+                m.to_string(),
+                // Not canonical: trusts nothing, not even its target.
+                home.join("olink.git").display().to_string(),
+            ],
+            ..ScopeConfig::default()
+        };
+        let s = CompiledScope::new(&scope, &dirs).unwrap();
+        assert!(s.remote_trusted(&m.to_string()));
+        assert!(s.remote_trusted(&format!("file://{m}")));
+        assert_eq!(s.trusted_path_respelled(&m.to_string()), None);
+        for url in [
+            linked.display().to_string(),
+            format!("file://{}", linked.display()),
+            home.join("dirlink/r.git").display().to_string(),
+            format!("{m}/"),
+            format!("file://{m}/"),
+            format!("{}/./mirror/r.git", home.display()),
+            format!("{}/mirror/../mirror/r.git", home.display()),
+            format!("{}//mirror/r.git", home.display()),
+            format!("file:///{m}"),
+        ] {
+            assert!(!s.remote_trusted(&url), "{url} trusted");
+            assert_eq!(
+                s.trusted_path_respelled(&url),
+                Some(mirror.clone()),
+                "{url}"
+            );
+        }
+        // git decodes `%` in a file URL (`%41` is `A`), not in a path; it
+        // runs `FILE://` through a helper on PATH.
+        let pct = home.join("pct%41.git");
+        std::fs::create_dir_all(&pct).unwrap();
+        let scope2 = ScopeConfig {
+            trusted_paths: vec![m.to_string(), pct.display().to_string()],
+            ..ScopeConfig::default()
+        };
+        let s2 = CompiledScope::new(&scope2, &dirs).unwrap();
+        assert!(s2.remote_trusted(&pct.display().to_string()));
+        for url in [
+            format!("file://{}", pct.display()),
+            format!("FILE://{m}"),
+            format!("file://localhost{m}"),
+        ] {
+            assert!(!s2.remote_trusted(&url), "{url} trusted");
+        }
+        for url in [
+            other.display().to_string(),
+            home.join("olink.git").display().to_string(),
+        ] {
+            assert!(!s.remote_trusted(&url), "{url} trusted");
+        }
+        assert_eq!(
+            s.noncanonical_trusted_paths(),
+            vec![(home.join("olink.git").display().to_string(), other.clone())]
+        );
     }
 
     #[test]

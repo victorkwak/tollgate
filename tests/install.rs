@@ -344,6 +344,62 @@ fn doctor_reports_links_settings_injection_and_stale_locks_r39_r97() {
     assert!(!r.out.contains("rm "), "R39: never names rm: {}", r.out);
 }
 
+/// Item 48: a remote that reaches a trusted mirror through a symlink (or
+/// a trailing `/`, `..`) is not trusted, since git reads the spelled path
+/// later; doctor names the canonical path to set. A `scope.trusted_paths`
+/// entry that is not canonical trusts nothing, and doctor names the
+/// canonical path to write instead.
+#[test]
+fn doctor_names_the_canonical_path_of_a_respelled_trusted_mirror_item48() {
+    let e = Env::new("2.1.317");
+    let r = e.run(Path::new(BIN), &["install", "--yes"], &[]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let bin = e.data().join("bin/tollgate");
+    let root = e.sb.root();
+    let mirror = root.join("remotes/m.git");
+    let other = root.join("remotes/o.git");
+    for bare in [&mirror, &other] {
+        std::fs::create_dir_all(bare).unwrap();
+        e.sb.git(bare, &["init", "-q", "--bare"]);
+    }
+    let link = root.join("link.git");
+    let cfg_link = root.join("cfg-link.git");
+    std::os::unix::fs::symlink(&mirror, &link).unwrap();
+    std::os::unix::fs::symlink(&other, &cfg_link).unwrap();
+    e.sb.host_config(&format!(
+        "[scope]\ntrusted_paths = [{:?}, {:?}]\n[verify]\nmin_free = \"1M\"\n",
+        mirror.display().to_string(),
+        cfg_link.display().to_string()
+    ));
+    let repo = e.sb.repo("r");
+    e.sb.git(&repo, &["remote", "add", "origin", link.to_str().unwrap()]);
+    let r = e.run(&bin, &["doctor", "--repo", repo.to_str().unwrap()], &[]);
+    for want in [
+        "warn remotes: no trusted remote".to_owned(),
+        format!(
+            "warn remotes: remote origin: {} reaches the trusted path {} by another spelling",
+            link.display(),
+            mirror.display()
+        ),
+        format!("git remote set-url origin {}", mirror.display()),
+        format!(
+            "warn scope: scope.trusted_paths entry {} is not its canonical path; it trusts nothing. Write {}",
+            cfg_link.display(),
+            other.display()
+        ),
+    ] {
+        assert!(r.out.contains(&want), "no {want:?} in:\n{}", r.out);
+    }
+    // The canonical spelling is trusted and draws no warning.
+    e.sb.git(
+        &repo,
+        &["remote", "set-url", "origin", mirror.to_str().unwrap()],
+    );
+    let r = e.run(&bin, &["doctor", "--repo", repo.to_str().unwrap()], &[]);
+    assert!(r.out.contains("ok   remotes: trusted: origin"), "{}", r.out);
+    assert!(!r.out.contains("another spelling"), "{}", r.out);
+}
+
 #[test]
 fn uninstall_keeps_the_binary_while_the_settings_name_it_r96() {
     let e = Env::new("2.1.317");

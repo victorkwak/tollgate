@@ -558,6 +558,36 @@ fn check_repo(out: &mut Out, ctx: &Ctx, dirs: &Dirs, host: Option<&HostConfig>, 
         }
         // R97: GitLab protection of main per trusted remote.
         if let Ok(scope) = CompiledScope::new(&host.scope, dirs) {
+            // Item 48: trusted paths count only in their canonical spelling.
+            for (entry, canonical) in scope.noncanonical_trusted_paths() {
+                out.line(
+                    Level::Warn,
+                    "scope",
+                    format!(
+                        "scope.trusted_paths entry {entry} is not its canonical path; it trusts nothing. Write {} (item 48)",
+                        canonical.display()
+                    ),
+                );
+            }
+            for r in crate::plan::remote_urls(&git).unwrap_or_default() {
+                let respelled = r
+                    .fetch
+                    .first()
+                    .and_then(|u| scope.trusted_path_respelled(u).map(|c| (u, c)));
+                if let Some((url, canonical)) = respelled {
+                    out.line(
+                        Level::Warn,
+                        "remotes",
+                        format!(
+                            "remote {}: {url} reaches the trusted path {} by another spelling (a symlink, `..` or a trailing /), so it is not trusted (item 48); use the canonical path: git remote set-url {} {}",
+                            r.name,
+                            canonical.display(),
+                            r.name,
+                            canonical.display()
+                        ),
+                    );
+                }
+            }
             let names = match crate::plan::trusted_remotes(&git, &scope) {
                 Ok(n) => n,
                 Err(e) => {

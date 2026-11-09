@@ -15,8 +15,9 @@
 //!   the path matches segment by segment, each a glob in which `*` never
 //!   crosses `/`. The last URL segment also matches without `.git`.
 //! - Local mirrors and test repos: `scope.trusted_paths`, exact canonical
-//!   absolute paths, matched against a local path or `file://` URL after
-//!   canonicalization.
+//!   absolute paths, matched against a local path or `file://` URL that
+//!   already is its canonical path (item 48: git reads the path as
+//!   spelled, later, so a symlink in it could point elsewhere by then).
 
 use std::path::{Path, PathBuf};
 
@@ -252,16 +253,37 @@ fn parse_url_pattern(p: &str) -> Option<(Scheme, String, Option<u16>, String)> {
     Some((scheme, host, port, path.to_owned()))
 }
 
-/// The local path a URL names (`/abs`, `file:///abs`), canonical; `None`
-/// for anything else or a path that does not exist.
+/// The absolute path a local URL spells (`/abs`, `file:///abs`), as git
+/// reads it. `None` for anything else, for a control character, and for
+/// a `file://` URL with an unsafe URL character: git decodes `%` there.
+fn local_spelling(url: &str) -> Option<&str> {
+    let p = match url.strip_prefix("file://") {
+        Some(p) if p.chars().any(unsafe_url_char) => return None,
+        Some(p) => p,
+        None if url.chars().any(char::is_control) => return None,
+        None => url,
+    };
+    p.starts_with('/').then_some(p)
+}
+
+/// The canonical path of the dir a local URL names, however it is
+/// spelled; `None` for anything else or a path that does not exist.
+#[must_use]
+pub fn canonical_local(url: &str) -> Option<PathBuf> {
+    std::fs::canonicalize(local_spelling(url)?).ok()
+}
+
+/// Item 48: the path a local URL names when the URL already spells its
+/// canonical path: no symlink part, no `.` or `..`, no repeated or
+/// trailing `/`. Git reads the path as spelled when it runs, so another
+/// spelling could reach another dir by then (a symlink swapped after this
+/// check); such a URL names nothing trusted. Residual: the same user can
+/// still change the canonical dir itself (X5).
 #[must_use]
 pub fn local_path(url: &str) -> Option<PathBuf> {
-    let p = url.strip_prefix("file://").unwrap_or(url);
-    let p = Path::new(p);
-    if !p.is_absolute() {
-        return None;
-    }
-    std::fs::canonicalize(p).ok()
+    let spelled = local_spelling(url)?;
+    let canonical = std::fs::canonicalize(spelled).ok()?;
+    (canonical.as_os_str() == std::ffi::OsStr::new(spelled)).then_some(canonical)
 }
 
 /// Item 33: the identity of a remote URL, for comparing a URL recorded
