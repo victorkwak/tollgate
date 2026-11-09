@@ -1876,3 +1876,50 @@ fn s34_a_lost_trusted_remote_never_makes_local_main_the_anchor() {
         "broken record: {s:?}"
     );
 }
+
+/// S35 (item 47, X5): a URL whose authority ends at `?` or `#` names the
+/// host before it: `https://evil.invalid?@gitlab.com/...` is a request to
+/// `evil.invalid` for curl and git. A real `url.<x>.insteadOf` turns the
+/// trusted origin URL into such a URL; trust reads the URL git uses
+/// (after the rewrite), never parses `gitlab.com` out of it, and so
+/// refuses the commit as a redirected trusted remote.
+#[test]
+fn s35_a_query_or_fragment_before_the_at_never_trusts_the_host_after_it() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.sb().host_config(
+        "[scope]\nremotes = [\"*gitlab.com:victorkwak/*\", \"*gitlab.com/victorkwak/*\"]\n[verify]\nmin_free = \"1M\"\n",
+    );
+    for (configured, base, evil) in [
+        (
+            "https://gitlab.com/victorkwak/ws.git",
+            "https://gitlab.com/",
+            "https://evil.invalid?@gitlab.com/",
+        ),
+        (
+            "https://gitlab.com/victorkwak/ws.git",
+            "https://gitlab.com/",
+            "https://evil.invalid#@gitlab.com/",
+        ),
+        (
+            "git@gitlab.com:victorkwak/ws.git",
+            "git@gitlab.com:",
+            "evil.invalid?@gitlab.com:",
+        ),
+    ] {
+        lab.plain(&["remote", "set-url", "origin", configured]);
+        let key = format!("url.{evil}.insteadOf");
+        lab.plain(&["config", &key, base]);
+        let fetch = lab.plain(&["remote", "get-url", "--all", "origin"]);
+        assert!(fetch.starts_with(evil), "{fetch}");
+        lab.stage_bad_file(evil);
+        let s = lab.refused("git commit -m bad");
+        assert!(
+            s.out().contains("DENIED pre-commit")
+                && s.out().contains(&format!("git fetches it from {evil}")),
+            "{evil}: {s:?}"
+        );
+        lab.plain(&["rm", "-q", "--cached", "bad"]);
+        std::fs::remove_file(lab.repo.join("bad")).unwrap();
+        lab.plain(&["config", "--unset", &key]);
+    }
+}

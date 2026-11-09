@@ -98,17 +98,42 @@ fn segments(path: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Drops `user[:password]@` from an authority.
-fn without_user(authority: &str) -> &str {
-    authority.rsplit_once('@').map_or(authority, |(_, h)| h)
+/// Item 47: a character that ends or re-reads a URL part in some parser
+/// (`?` query, `#` fragment, `\` a `/` to WHATWG, `%` an encoding),
+/// whitespace or a control character. A trusted URL has none, anywhere.
+fn unsafe_url_char(c: char) -> bool {
+    matches!(c, '?' | '#' | '\\' | '%') || c.is_whitespace() || c.is_control()
+}
+
+/// `host[:port]` of an authority, without `user[:password]@`. Item 47:
+/// more than one `@` (parsers split at the first or the last) or an
+/// unsafe character in it parses as nothing.
+fn authority_host_port(authority: &str) -> Option<(String, Option<u16>)> {
+    if authority.chars().any(unsafe_url_char) {
+        return None;
+    }
+    let host = match authority.split_once('@') {
+        Some((_, h)) if h.contains('@') => return None,
+        Some((_, h)) => h,
+        None => authority,
+    };
+    host_port(host)
 }
 
 /// Parses a remote URL as git would reach a server; `None` for a local
-/// path, `file://`, any other scheme, or a malformed URL.
+/// path, `file://`, any other scheme, or a malformed URL. Item 47: the
+/// authority ends at the first `/`, `?` or `#` (RFC 3986, curl), and a
+/// URL with `?`, `#`, `\`, `%`, whitespace or a control character is
+/// malformed here, so the host is the one git and curl connect to. The
+/// scheme is lowercase as git spells it: git runs `HTTPS://` through a
+/// `git-remote-HTTPS` helper found on PATH, not its own transport.
 #[must_use]
 pub fn parse_url(url: &str) -> Option<RemoteUrl> {
+    if url.chars().any(unsafe_url_char) {
+        return None;
+    }
     if let Some((scheme, rest)) = url.split_once("://") {
-        let scheme = match scheme.to_ascii_lowercase().as_str() {
+        let scheme = match scheme {
             "https" => Scheme::Https,
             "ssh" | "git+ssh" | "ssh+git" => Scheme::Ssh,
             _ => return None,
@@ -117,7 +142,7 @@ pub fn parse_url(url: &str) -> Option<RemoteUrl> {
         if path.starts_with('/') {
             return None;
         }
-        let (host, port) = host_port(without_user(authority))?;
+        let (host, port) = authority_host_port(authority)?;
         return Some(RemoteUrl {
             scheme,
             host,
@@ -134,7 +159,7 @@ pub fn parse_url(url: &str) -> Option<RemoteUrl> {
         return None;
     }
     let (authority, path) = url.split_at(colon);
-    let (host, port) = host_port(without_user(authority))?;
+    let (host, port) = authority_host_port(authority)?;
     if port.is_some() {
         return None;
     }
@@ -168,7 +193,7 @@ impl TrustPattern {
             // `host:path` (scp-like) or `host/path`, any allowed scheme.
             let cut = p.find([':', '/'])?;
             let (authority, rest) = p.split_at(cut);
-            let (host, port) = host_port(without_user(authority))?;
+            let (host, port) = authority_host_port(authority)?;
             (None, host, port, rest[1..].to_owned())
         };
         let path = segments(&path)?
@@ -223,7 +248,7 @@ fn parse_url_pattern(p: &str) -> Option<(Scheme, String, Option<u16>, String)> {
         _ => return None,
     };
     let (authority, path) = rest.split_once('/')?;
-    let (host, port) = host_port(without_user(authority))?;
+    let (host, port) = authority_host_port(authority)?;
     Some((scheme, host, port, path.to_owned()))
 }
 
@@ -283,11 +308,15 @@ mod tests {
         let r = id("https://gitlab.com/victorkwak/r.git");
         for same in [
             "https://GitLab.com/victorkwak/r",
-            "HTTPS://user@gitlab.com/victorkwak/r.git/",
+            "https://user@gitlab.com/victorkwak/r.git/",
         ] {
             assert_eq!(id(same), r, "{same}");
         }
         for other in [
+            // Item 47: git runs `HTTPS://` through another helper, and
+            // curl connects to `evil` for `evil?@gitlab.com`.
+            "HTTPS://gitlab.com/victorkwak/r.git",
+            "https://evil?@gitlab.com/victorkwak/r.git",
             "ssh://gitlab.com/victorkwak/r.git",
             "https://gitlab.com:8443/victorkwak/r.git",
             "https://gitlab.com.evil.example/victorkwak/r.git",
@@ -311,6 +340,65 @@ mod tests {
             "srv/mirror/r.git",
         ] {
             assert_ne!(id(other), l, "{other}");
+        }
+    }
+
+    /// Item 47: the authority ends at the first `/`, `?` or `#`, as curl
+    /// and git read it, and a URL with `?`, `#`, `\`, `%`, whitespace, a
+    /// control character or a second `@` is never parsed (so never
+    /// trusted). `https://evil?@gitlab.com/g/r` connects to `evil`.
+    #[test]
+    fn authority_ends_at_query_or_fragment_item47() {
+        let p = TrustPattern::parse("*gitlab.com/victorkwak/*").unwrap();
+        let trusted = |u: &str| parse_url(u).is_some_and(|u| p.matches(&u));
+        for url in [
+            "https://evil?@gitlab.com/victorkwak/r",
+            "https://evil#@gitlab.com/victorkwak/r",
+            "https://evil.example?x@gitlab.com/victorkwak/r",
+            "https://evil\\@gitlab.com/victorkwak/r",
+            "https://evil%40@gitlab.com/victorkwak/r",
+            "https://evil%2f@gitlab.com/victorkwak/r",
+            "https://a@b@gitlab.com/victorkwak/r",
+            "https://ev il@gitlab.com/victorkwak/r",
+            "https://evil\t@gitlab.com/victorkwak/r",
+            "https://evil\n@gitlab.com/victorkwak/r",
+            "https://gitlab.com/victorkwak/r?x",
+            "https://gitlab.com/victorkwak/r#x",
+            "https://gitlab.com/victorkwak/r?@evil/x",
+            "ssh://evil?@gitlab.com/victorkwak/r",
+            "ssh://evil#@gitlab.com/victorkwak/r",
+            "evil?@gitlab.com:victorkwak/r",
+            "evil#@gitlab.com:victorkwak/r",
+            "evil\\@gitlab.com:victorkwak/r",
+            "evil%40@gitlab.com:victorkwak/r",
+            "a@b@gitlab.com:victorkwak/r",
+            "gitlab.com:victorkwak/r?x",
+            // Trailing-dot host (another name to a string matcher), and a
+            // scheme in capitals: git runs a `git-remote-HTTPS` helper
+            // found on PATH, not its https transport.
+            "https://gitlab.com./victorkwak/r",
+            "gitlab.com.:victorkwak/r",
+            "HTTPS://gitlab.com/victorkwak/r",
+            "Ssh://gitlab.com/victorkwak/r",
+        ] {
+            assert!(!trusted(url), "{url:?} trusted");
+        }
+        for url in [
+            "https://GITLAB.COM/victorkwak/r",
+            "https://oauth2:tok-en_1.x~@gitlab.com/victorkwak/r",
+            "ssh://git@GitLab.com/victorkwak/r.git",
+            "git@GITLAB.com:victorkwak/r.git",
+        ] {
+            assert!(trusted(url), "{url:?} not trusted");
+        }
+        // A pattern spelled with the same tricks names no host.
+        for pat in [
+            "*evil?@gitlab.com/victorkwak/*",
+            "*evil#@gitlab.com/victorkwak/*",
+            "*a@b@gitlab.com/victorkwak/*",
+            "*evil%40@gitlab.com:victorkwak/*",
+        ] {
+            assert!(TrustPattern::parse(pat).is_none(), "{pat:?}");
         }
     }
 }
