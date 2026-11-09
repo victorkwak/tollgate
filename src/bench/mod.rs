@@ -100,6 +100,10 @@ pub struct BenchArgs {
     pub json: bool,
     /// Also write the JSON report here.
     pub out: Option<PathBuf>,
+    /// Exit 1 when a measured L19 budget is over. The L19 tests assert CPU
+    /// time, which load does not move; this asserts the wall-clock p95
+    /// under the bench's concurrent commits.
+    pub enforce_budgets: bool,
 }
 
 /// How long cleanup waits for cancelled jobs and exiting runners.
@@ -603,6 +607,18 @@ pub fn bench(ctx: &Ctx, a: &BenchArgs) -> u8 {
     }
     if report.interrupted {
         code = code.max(exit::FAIL);
+    }
+    if a.enforce_budgets {
+        let over: Vec<&str> = report
+            .budgets
+            .iter()
+            .filter(|b| !b.ok)
+            .map(|b| b.name.as_str())
+            .collect();
+        if !over.is_empty() {
+            eprintln!("tollgate bench: L19 budget(s) over: {}", over.join(", "));
+            code = code.max(exit::FAIL);
+        }
     }
     code
 }

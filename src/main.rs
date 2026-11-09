@@ -441,6 +441,9 @@ struct BenchCmd {
     /// Also write the JSON report to this file.
     #[arg(long)]
     out: Option<PathBuf>,
+    /// Exit 1 when a measured L19 budget is over (wall-clock p95).
+    #[arg(long)]
+    enforce_budgets: bool,
 }
 
 impl BenchCmd {
@@ -464,6 +467,7 @@ impl BenchCmd {
             warm: !self.no_warm,
             json: self.json,
             out: self.out.clone(),
+            enforce_budgets: self.enforce_budgets,
         }
     }
 }

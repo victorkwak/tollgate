@@ -253,8 +253,9 @@ pub fn offline_env(root: &Path) -> Vec<(&'static str, PathBuf)> {
 }
 
 /// The host config `[job]` part that puts `programs`' dirs on the job PATH
-/// and keeps uv offline (R52).
-pub fn job_config(programs: &[&Path]) -> String {
+/// keeps uv offline (R52) and stops tools' upward config search at the
+/// sandbox `root` (see `Sandbox::env`).
+pub fn job_config(root: &Path, programs: &[&Path]) -> String {
     let mut dirs: Vec<String> = Vec::new();
     for p in programs {
         let d = p.parent().unwrap().display().to_string();
@@ -264,8 +265,9 @@ pub fn job_config(programs: &[&Path]) -> String {
     }
     let dirs: Vec<String> = dirs.iter().map(|d| format!("{d:?}")).collect();
     format!(
-        "[job]\npath_prepend = [{}]\n[job.env]\nUV_OFFLINE = \"1\"\nUV_PYTHON_DOWNLOADS = \"never\"\nUV_NO_PROGRESS = \"1\"\nNO_COLOR = \"1\"\n",
-        dirs.join(", ")
+        "[job]\npath_prepend = [{}]\n[job.env]\nUV_OFFLINE = \"1\"\nUV_PYTHON_DOWNLOADS = \"never\"\nUV_NO_PROGRESS = \"1\"\nNO_COLOR = \"1\"\nMISE_CEILING_PATHS = {:?}\n",
+        dirs.join(", "),
+        root.display().to_string()
     )
 }
 

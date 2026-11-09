@@ -126,7 +126,7 @@ fn project(test: &str, policy: Option<&str>, clean: bool) -> Option<Project> {
     sb.git(&repo, &["init", "-q"]);
     sb.host_config(&format!(
         "[verify]\nmin_free = \"1M\"\n{}",
-        tools::job_config(&[&uv, &pyright])
+        tools::job_config(&sb.root(), &[&uv, &pyright])
     ));
     Some(Project { sb, repo, uv })
 }
@@ -349,7 +349,7 @@ fn a_python_tool_missing_from_the_venv_is_a_setup_error_r46() {
     sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "lock"]);
     sb.host_config(&format!(
         "[verify]\nmin_free = \"1M\"\n{}",
-        tools::job_config(&[&uv])
+        tools::job_config(&sb.root(), &[&uv])
     ));
     let r = sb.tollgate(&repo, &["check", "--tier", "full", "--wait"]);
     let report = sb.report(&job_id(&r.out));
@@ -574,7 +574,7 @@ fn a_hooked_commit_gates_on_the_python_baseline_steps_r1_r17_r94() {
         tools::skip(test, "pyright is not on PATH");
         return;
     };
-    p.sb.scoped_host(&tools::job_config(&[&p.uv, &pyright]));
+    p.sb.scoped_host(&tools::job_config(&p.sb.root(), &[&p.uv, &pyright]));
     p.commit("python project");
 
     // No baselines: the pre-commit gate denies on legacy.py's type error

@@ -5,7 +5,12 @@ edition = "2024"
 # std `File::lock`/`try_lock` (R85) need 1.89.
 rust-version = "1.89"
 description = "Gates the git ref updates of Claude Code sessions on checks run against the exact tree"
-publish = false
+license = "Apache-2.0"
+repository = "https://github.com/victorkwak/tollgate"
+homepage = "https://github.com/victorkwak/tollgate"
+readme = "README.md"
+keywords = ["claude-code", "git", "hooks", "agents", "ci"]
+categories = ["command-line-utilities", "development-tools"]
 
 # One package, two targets: the library holds every module so integration
 # tests can drive them; `src/main.rs` is a thin shell over it (spec section 5).

@@ -60,11 +60,16 @@ L18. **Self-repair before deny.** When the guard's self-check (R24) finds a miss
 
 L19. **Performance budgets** (p95 on the Arch box, tested where marked):
 - Guard per call: under 10 ms (test: 200 calls).
-- Chained non-gate hook (for example `post-commit` with no repo hook): under 5 ms (test).
-- `pre-commit` on a cache hit: under 200 ms (test).
-- `pre-commit` on a docs-only tree: under 200 ms (test). Item 41: a hook waiting for a job looks at it after 1 ms, then at doubling pauses up to 100 ms, so a job of a few ms answers near its run time; the test asserts 90 ms (120 ms with detected Bun and Python roots), the measured p95 plus a margin.
+- Chained non-gate hook (for example `post-commit` with no repo hook): under 5 ms (test, bench).
+- `pre-commit` on a cache hit: under 200 ms (test, bench).
+- `pre-commit` on a docs-only tree: under 200 ms (test, bench). Item 41: a hook waiting for a job looks at it after 1 ms, then at doubling pauses up to 100 ms, so a job of a few ms answers near its run time (wall p95 42 ms alone, before 128 ms); the test asserts 90 ms of CPU time (120 ms with detected Bun and Python roots), tighter than the budget.
 - Fast job overhead beyond the steps themselves (checkout update, metadata, selection, record write): under 3 s for a myapp-sized workspace (bench).
 - No tollgate code on the path of git commands that run no hooks (`status`, `diff`, `log`, `show`, `fetch`).
+
+Where the budgets are enforced:
+- "test" is `tests/latency.rs`. It runs in both tiers (`fast`, `full`) and asserts the p95 of **CPU time** (user + system) of the hook and of every process it starts, against the budget above. On Linux the test process is a child subreaper, so the detached runner of a docs-only job is counted too (on macOS it is not). This work is sequential, so CPU time is a lower bound of wall-clock time: a CPU time over the budget is a breach on any host. Load does not move CPU time much (at load 30-40 on 16 threads: docs-only 55-75 ms CPU against 200-600 ms wall). The wall-clock p95 is printed next to it, not asserted.
+- "bench" is `tollgate bench --enforce-budgets` (L20, docs/benchmark.md): it asserts the **wall-clock** p95 under the bench's own concurrent commits and exits 1 when a measured budget is over. Run it on a quiet host before a rollout and after a change to a hook path. The guard is not in the bench; its test is its only check.
+- Reason: a gate verdict is stored by tree (R15). A wall-clock assertion in a tier made the verdict depend on host load: on 2026-11-05, at load 25-40 from other sessions, the `fast` job of this repo failed the docs-only budget (205-610 ms) and the chained-hook budget (5.5-42 ms), and a rerun of the same tree passed. A CPU-time assertion still catches a hook that does more work. It does not catch a new sleep or lock wait; the bench does.
 
 L20. **Benchmark before rollout.** `tollgate bench` (dev command, or `benches/` harness) replays commits concurrently from N worktrees of one repo through the real hooks and reports p50/p95 commit latency (hook start to allow), queue wait per resource, CPU load, peak test-Postgres connections, cache hits and step reuse. Rollout to myapp (R98 step 3) needs a run with 6 worktrees and realistic commits (a core change, an api-only change, a dashboard-only change, a docs change, a retry) and resource slot values (`cpu`, `pg`, `pg_max_threads`) chosen from that run, not guessed. L5's slot numbers are starting values only.
 Note (built, 2026-11-05): `tollgate bench <repo> --scenarios <file> [-n N]` (README "Benchmark"). The source repo is never written: the bench clones it (`--shared`, plus its local branches as L2 anchors) into a new scratch dir and makes N worktrees there; its git and tollgate processes get their own `XDG_*` dirs, a host config from the flags (scope root = the scratch dir) and hooks linked from the running binary, so neither a session's injection nor the installed state takes part (R8). Hook latency is git's trace2 time of the hook process. Queue wait per resource comes from the job reports (`steps[].resources`, `steps[].queue_ms`, `checkout_wait_ms`). Cleanup cancels running jobs, waits for their runners, kills what is left (Linux: by the state dir in the environment) and removes the scratch dir.
@@ -311,7 +316,7 @@ R46. Tools from lockfiles run from the project: `node_modules/.bin/<tool>` and `
 R47. CI mode `tollgate run --tier <t> --here [--report junit]` runs the steps in the current directory with no verify checkout and no result cache, exits non-zero on fail, writes `report.json` (and `junit.xml`). When a host config exists it takes the same resource slots (R86) unless `--no-host-locks` is given (hosted runners only).
 Reason: the GitLab runner on this workstation shares the test Postgres with local jobs; without slots the "too many clients" storm returns (critique).
 
-R48. `tollgate gc` removes verify checkouts whose repo is gone, records older than 90 days, bulky step logs older than 14 days (keeping `report.json` and `junit.xml` as long as the record, R82), tickets and markers older than 1 day.
+R48. `tollgate gc` removes verify checkouts whose repo is gone, records older than 90 days, bulky step logs older than 14 days (keeping `report.json` and `junit.xml` as long as the record, R82), tickets, markers and job staging dirs (and job dirs without `job.json`) older than 1 day.
 
 R49. Policy base checkout. Policy files (R71) that differ between `T` and the base are read from the base with `git show <base commit>:<path>` into the job dir; nextest gets `--config-file <that file>`; baseline steps read the base baseline file. The checkout itself stays at `T`.
 
@@ -477,7 +482,7 @@ R80. `selection` in a record: `all`, or `{base, packages: [..], roots: [..], ste
 R81. A `pass` record whose `report.json` is missing from `jobs/<job id>/` is invalid and treated as no record. A record also counts only as the record of its own key (its tree, tier and fingerprint hash to the file name) and only when its `report.json` says the same job, tree, tier and verdict; the store refuses to write any other (S11).
 Reason: a one-word edit of a record file (`fail` to `pass`) or a copy of another tree's pass record must not let a tree through. Same-user code can still write two consistent files: that is out of scope (section 1).
 
-R82. Job dirs `$XDG_STATE_HOME/tollgate/jobs/<job id>/` hold `<step>.log`, `report.json`, `junit.xml`. `report.json` and `junit.xml` live as long as the record (R48).
+R82. Job dirs `$XDG_STATE_HOME/tollgate/jobs/<job id>/` hold `job.json`, `spec.json`, `<step>.log`, `report.json`, `junit.xml`. `report.json` and `junit.xml` live as long as the record (R48). A job dir appears whole: the hook fills a hidden staging dir (`jobs/.new-*`) with `job.json`, `spec.json` and `waiters/`, then renames it. A hook killed at any point leaves no job dir or a whole one; readers skip staging dirs. A waiter never makes the job dir.
 
 R83. Poisoning. Records are written only by the job runner. The guard denies writes under the state dir (R25, R26). `tollgate audit [--since]` lists records with duration, job log size, tollgate version and `moved` tips (R30), so a 0 s pass or an old-version record stands out. Waive records (R113) carry `waived: true` and a synthetic job dir with the waiver text. The README states the same-user limitation.
 

@@ -1075,15 +1075,60 @@ fn runs_git_or_tollgate(ctx: &Context, words: &[String]) -> bool {
         .is_some_and(|w| git_call(words).is_some() || is_tollgate(ctx, w))
 }
 
-/// True when the command text names git or tollgate anywhere: in the raw
-/// text or the normalized text (quotes and backslashes inside the name do
-/// not hide it), heredoc bodies and messages included.
-fn mentions_git_or_tollgate(command: &str) -> bool {
+/// True when `name` is in `text` in a form that can be the program: not
+/// inside a longer word (`github`, `digit`, `.gitignore`, `tollgate.toml`)
+/// and not a directory part (`state/tollgate/x`). `.git/` stays a mention:
+/// it is the repo's own dir, hooks included.
+fn names_program(text: &str, name: &str) -> usize {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(name)
+        .filter(|(at, _)| {
+            let before = text[..*at].chars().next_back();
+            let after = text[*at + name.len()..].chars().next();
+            !(before.is_some_and(|c| word(c) || c == '-')
+                || after.is_some_and(|c| word(c) || c == '.')
+                || (after == Some('/') && before != Some('.'))
+                // `git-commit` is git; `tollgate-core2` is a checkout's name.
+                || (name == "tollgate" && after == Some('-')))
+        })
+        .count()
+}
+
+/// True when `text` has `cd <dir>` spelled out as its own words. A target
+/// written any other way (quotes, escapes, a line continuation) is not
+/// found, so its name still counts as a mention.
+fn plain_cd(text: &str, dir: &str) -> bool {
+    let wanted = format!("cd {dir}");
+    text.match_indices(&wanted).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + wanted.len()..].chars().next();
+        before.is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '('))
+            && after.is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
+    })
+}
+
+/// True when the command text names git or tollgate as a program: in the
+/// raw text or the normalized text (quotes and backslashes inside the name
+/// do not hide it), heredoc bodies and messages included. The target of a
+/// plain `cd` is a place, not a program: names are counted, and only a
+/// count above what the `cd` targets account for is a mention. The text is
+/// never edited, so a target cannot delete part of another word
+/// (`printf 'git push' | sh; cd g`).
+fn mentions_git_or_tollgate(command: &str, cmds: &[SimpleCommand]) -> bool {
     let raw = command.to_lowercase();
     let norm = normalize(command);
-    ["git", "tollgate"]
+    let dirs: Vec<String> = cmds
         .iter()
-        .any(|n| raw.contains(n) || norm.contains(n))
+        .filter_map(|cmd| match cmd.words.as_slice() {
+            [cd, dir] if cd == "cd" => Some(dir.to_lowercase()),
+            _ => None,
+        })
+        .filter(|dir| plain_cd(&raw, dir))
+        .collect();
+    ["git", "tollgate"].iter().any(|n| {
+        let places: usize = dirs.iter().map(|dir| names_program(dir, n)).sum();
+        names_program(&raw, n) > places || names_program(&norm, n) > places
+    })
 }
 
 /// Shells, and the builtins that run a file as shell code, whose stdin
@@ -1139,11 +1184,16 @@ fn program_from_stdin(name: &str, args: &[String]) -> bool {
 /// `\c` escape, and text fed to a shell (or to python or perl) through a
 /// pipe, a heredoc, a here-string or an input redirection, at any depth
 /// (`bash -c '... | sh'` included).
-fn hidden_text(command: &str, runs: &[Vec<Run>]) -> Option<Ruling> {
-    if !mentions_git_or_tollgate(command) {
+fn hidden_text(
+    command: &str,
+    cmds: &[SimpleCommand],
+    ansi_c: bool,
+    runs: &[Vec<Run>],
+) -> Option<Ruling> {
+    if !mentions_git_or_tollgate(command, cmds) {
         return None;
     }
-    if command.contains("$'") {
+    if ansi_c {
         return Some(Ruling::Deny(
             "ANSI-C quoting ($'...') in a command that runs git or tollgate is not checked: write the words plainly, and give a multi-line commit message with -F <file> or a quoted heredoc (item 31, R25)".into(),
         ));
@@ -1179,13 +1229,44 @@ fn hidden_text(command: &str, runs: &[Vec<Run>]) -> Option<Ruling> {
     None
 }
 
+/// Programs that only read and print: their arguments are data, and they
+/// start no other program ([`search_only`] handles `rg`'s options that do).
+const SEARCH_PROGRAMS: &[&str] = &[
+    "cd", "grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "wc", "ls", "cut",
+];
+
+/// True when every command, substitutions included, is one of
+/// [`SEARCH_PROGRAMS`], sets no variable, loses no environment, writes no
+/// file and takes no inline text. The R25 text rules are about running or
+/// setting a name; here the name is only what the command looks for.
+fn search_only(cmds: &[SimpleCommand], runs: &[Vec<Run>]) -> bool {
+    !cmds.is_empty()
+        && cmds.iter().zip(runs).all(|(cmd, runs)| {
+            !runs.is_empty()
+                && cmd.assignments.is_empty()
+                && !cmd
+                    .redirects
+                    .iter()
+                    .any(|r| r.writes_file() || matches!(r.op.as_str(), "<<" | "<<-" | "<<<"))
+                && runs.iter().all(|run| {
+                    run.env_loss.is_none()
+                        && run.assigns.is_empty()
+                        && run.words.first().is_some_and(|w| {
+                            let name = basename(w);
+                            SEARCH_PROGRAMS.contains(&name)
+                                && !(name == "rg"
+                                    && run.words.iter().any(|a| {
+                                        a.starts_with("--pre") || a.starts_with("--hostname-bin")
+                                    }))
+                        })
+                })
+        })
+}
+
 /// R25/R26 for a Bash command.
 #[must_use]
 pub fn bash_ruling(ctx: &Context, command: &str) -> Ruling {
-    if let Some(deny) = text_ruling(&normalize(command)) {
-        return deny;
-    }
-    let cmds = shell::parse(command);
+    let (cmds, ansi_c) = shell::parse_flagged(command);
     let runs: Vec<Vec<Run>> = cmds
         .iter()
         .map(|cmd| {
@@ -1194,7 +1275,11 @@ pub fn bash_ruling(ctx: &Context, command: &str) -> Ruling {
             runs
         })
         .collect();
-    if let Some(deny) = hidden_text(command, &runs) {
+    let search = search_only(&cmds, &runs);
+    if !search && let Some(deny) = text_ruling(&normalize(command)) {
+        return deny;
+    }
+    if let Some(deny) = hidden_text(command, &cmds, ansi_c, &runs) {
         return deny;
     }
     // The same rules on the words as bash passes them: quoting hides a
@@ -1205,7 +1290,7 @@ pub fn bash_ruling(ctx: &Context, command: &str) -> Ruling {
         .flatten()
         .map(|r| normalize(&r.source.join(" ")))
         .collect();
-    if let Some(deny) = text_ruling(&decoded.join(" ; ")) {
+    if !search && let Some(deny) = text_ruling(&decoded.join(" ; ")) {
         return deny;
     }
     // R8, X1: a guarded variable set for the rest of the shell counts for
@@ -1518,6 +1603,98 @@ mod tests {
             "git status || echo no",
         ] {
             assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
+    }
+
+    /// A harmless command is not a git command because of a substring: a
+    /// name inside a longer word or a directory part is not a program.
+    #[test]
+    fn names_inside_other_words_do_not_count_as_git() {
+        for cmd in [
+            "python3 - <<'EOF'\nprint('https://github.com/x/y and a digit')\nEOF",
+            "python3 - <<'EOF'\nopen('.gitignore').read()\nEOF",
+            "python3 - <<'EOF'\nopen('tollgate.toml').read()\nEOF",
+            "python3 - <<'EOF'\nopen('/h/.local/state/tollgate/flaky.jsonl').read()\nEOF",
+            "cd /h/Repos/tollgate; python3 - <<'EOF'\nprint(1)\nEOF",
+            "cd /h/Repos/tollgate && python3 -I - a <<'EOF'\nprint(1)\nEOF",
+            "cd /h/Repos/tollgate-core2; python3 - <<'EOF'\nprint(1)\nEOF",
+        ] {
+            assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
+        // A real name still counts, however it is written.
+        for cmd in [
+            "python3 - <<'EOF'\nimport os; os.system('git commit -m x')\nEOF",
+            "python3 - <<'EOF'\nimport os; os.system('/usr/bin/git commit -m x')\nEOF",
+            "python3 - <<'EOF'\nopen('.git/hooks/pre-commit','w')\nEOF",
+            "python3 - <<'EOF'\nimport os; os.system('tollgate check')\nEOF",
+            "python3 - <<'EOF'\nimport os; os.system('g\"i\"t status')\nEOF",
+            "cd /h/Repos/tollgate; git status; python3 - <<'EOF'\nprint(1)\nEOF",
+            "cd git; git status; python3 - <<'EOF'\nprint(1)\nEOF",
+            "cd /h/git; python3 - <<'EOF'\nimport os; os.system('git push')\nEOF",
+            "cd /h/Repos/tollgate; echo 'git commit -m x' | sh",
+            // A `cd` target never removes part of another word.
+            "printf 'git commit -n' | sh; cd g",
+            "printf 'git commit -n' | sh; cd i",
+            "abcd git commit | sh; cd g",
+            "printf 'git commit -n' | sh; cd git",
+            // A target that is not spelled out does not account for a name.
+            "cd g\\\nit; printf 'git commit -n' | sh",
+            "cd 'git'; printf 'git commit -n' | sh",
+            r"cd $'\x67it'; printf 'git commit -n' | sh",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+    }
+
+    /// `$'` is ANSI-C quoting only where bash reads it so: not at the end
+    /// of a single-quoted regex, in double quotes or in a heredoc body.
+    #[test]
+    fn dollar_quote_as_data_is_not_ansi_c_r25() {
+        for cmd in [
+            "git status --porcelain | grep -v '^?? x$'",
+            "grep -c 'digit$' README.md; git status",
+            "git log --format=%s | grep -E 'fix$'",
+            "git commit -F - <<'EOF'\nthe $'x' form\nEOF",
+            "git log --grep=\"a$'b\"",
+        ] {
+            assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
+        for cmd in [
+            r"git commit -m $'two\nlines'",
+            r#"git commit -m "$(echo $'x')""#,
+            r"git commit -m `echo $'x'`",
+            r"x=$'a'; git status",
+            r"git status; echo a$'b'",
+        ] {
+            assert!(deny(cmd), "{cmd}");
+        }
+    }
+
+    /// Text rules guard against running or setting a name. A command that
+    /// only reads and searches passes it as data, so it can look for it.
+    #[test]
+    fn searching_for_a_guarded_name_is_allowed_r25() {
+        for cmd in [
+            "grep -rn 'GIT_CONFIG_KEY_0' src | head -5",
+            "grep -n -- '--no-verify' notes.md",
+            "rg 'env -i' docs",
+            "grep -c 'tollgate waive' docs/spec.md | wc -l",
+            "cat a.md | grep GIT_CONFIG_COUNT",
+        ] {
+            assert_eq!(bash_ruling(&ctx(), cmd), Ruling::Allow, "{cmd}");
+        }
+        for cmd in [
+            "grep x a; git commit --no-verify -m x",
+            "grep -- --no-verify a | sh",
+            "grep \"$(git commit --no-verify -m x)\" a",
+            "GIT_CONFIG_COUNT=0 grep x a",
+            "env -i grep x a",
+            "rg --pre ./f GIT_CONFIG_COUNT a",
+            "cat <<'EOF' > run.sh\ngit commit --no-verify\nEOF",
+            "grep -- --no-verify a > run.sh",
+            "export GIT_CONFIG_COUNT=0",
+        ] {
+            assert!(deny(cmd), "{cmd}");
         }
     }
 

@@ -864,7 +864,7 @@ pub fn start(
                         return Ok(Started::Hit(Box::new(found)));
                     }
                 }
-                spec.write(dirs).map_err(|e| io(&e))?;
+                let spec_json = spec.to_json().map_err(|e| io(&e))?;
                 let meta = JobMeta {
                     id: spec.id.clone(),
                     key: spec.key.clone(),
@@ -876,7 +876,9 @@ pub fn start(
                     state: JobState::Queued,
                 };
                 let store = JobStore::new(dirs);
-                store.create(&meta).map_err(|e| io(&e))?;
+                store
+                    .create_with(&meta, &[("spec.json", &spec_json)])
+                    .map_err(|e| io(&e))?;
                 if let Err(e) = spawn::spawn(exe, dirs, &spec.id, claim.into_file(), env) {
                     let _ = store.transition(
                         &spec.id,
@@ -1012,11 +1014,15 @@ fn wait_pause(n: u32) -> Duration {
 /// lock (R89) meanwhile.
 pub fn wait(dirs: &Dirs, id: &JobId, deadline: Option<Instant>) -> WaitEnd {
     let store = JobStore::new(dirs);
-    let _waiter = sched::register_waiter(&dirs.job_dir(id));
+    // An attached job's dir may not exist yet: register once it does.
+    let mut waiter = None;
     // Since when the state seen is one that should not last.
     let mut odd_since: Option<Instant> = None;
     let mut looks = 0_u32;
     loop {
+        if waiter.is_none() {
+            waiter = sched::register_waiter(&dirs.job_dir(id)).ok();
+        }
         let settled = |since: &mut Option<Instant>| {
             since.get_or_insert_with(Instant::now).elapsed() >= WAIT_SETTLE
         };

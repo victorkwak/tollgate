@@ -6,6 +6,7 @@
 // Each test crate uses a different subset of these helpers.
 #![allow(dead_code)]
 
+pub mod cpu;
 pub mod tools;
 
 use std::ffi::OsStr;
@@ -51,6 +52,11 @@ impl Sandbox {
             ("XDG_CONFIG_HOME", root.join("config").into_os_string()),
             ("GIT_CONFIG_NOSYSTEM", "1".into()),
             ("LANG", "C".into()),
+            // The sandbox can sit under the real HOME (a job's TMPDIR is in
+            // its state dir). Tools that search parent dirs for config must
+            // stop here: mise reads the real `~/.config/mise/config.toml` as
+            // an untrusted project config, and its `node` shim then fails.
+            ("MISE_CEILING_PATHS", root.into_os_string()),
         ])
     }
 
@@ -315,6 +321,22 @@ impl Sandbox {
             .unwrap_or_default();
         ids.sort();
         ids
+    }
+
+    /// The `state` of `jobs/<id>/job.json` (`queued`, `running`, ...), or
+    /// `None` while the job dir does not exist.
+    pub fn job_state(&self, job: &str) -> Option<String> {
+        let text =
+            std::fs::read_to_string(self.state().join("jobs").join(job).join("job.json")).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+        json["state"].as_str().map(str::to_owned)
+    }
+
+    /// True when the first job exists and its runner runs its steps.
+    pub fn first_job_running(&self) -> bool {
+        self.jobs()
+            .first()
+            .is_some_and(|j| self.job_state(j).as_deref() == Some("running"))
     }
 
     /// `jobs/<id>/report.json` as JSON.
@@ -589,12 +611,17 @@ impl Armed {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
+        // The guard may exit before it reads stdin (the R23 forced panic
+        // does): then the write fails with EPIPE once the guard is gone,
+        // which a busy host makes likely. Its exit and stderr are the
+        // answer either way.
+        if let Err(e) = child.stdin.take().unwrap().write_all(input.as_bytes()) {
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe,
+                "writing the guard's stdin: {e}"
+            );
+        }
         let out = child.wait_with_output().unwrap();
         (
             out.status.code(),

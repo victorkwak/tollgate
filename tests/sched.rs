@@ -148,6 +148,10 @@ fn waiter_liveness_is_the_lock_r89() {
     let job = job_id(7);
     let job_dir = dirs.job_dir(&job);
     assert!(!sched::has_live_waiter(&job_dir).unwrap());
+    // A waiter never makes the job dir: that appears whole (R82).
+    assert!(sched::register_waiter(&job_dir).is_err());
+    assert!(!job_dir.exists());
+    std::fs::create_dir_all(&job_dir).unwrap();
     let mut kids = Kids(Vec::new());
     let w = kids.spawn(
         "wait",

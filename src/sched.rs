@@ -184,9 +184,16 @@ impl Drop for Waiter {
 }
 
 /// Registers the calling process as a waiter of the job in `job_dir`.
+/// Fails while the job dir does not exist yet.
 pub fn register_waiter(job_dir: &Path) -> Result<Waiter, SchedError> {
     let dir = job_dir.join("waiters");
-    fsx::ensure_dir(&dir).map_err(io_at(&dir))?;
+    // Never makes the job dir itself: it appears whole, by one rename (R82).
+    // Job dirs made before `waiters/` was part of them get it here.
+    match fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(io_at(&dir)(e)),
+    }
     let name = fsx::unique_suffix();
     let hidden = dir.join(format!(".tmp-{name}"));
     let visible = dir.join(&name);
@@ -418,7 +425,22 @@ impl JobStore {
 
     /// Creates the job dir with `meta` (and its queue marker when queued).
     pub fn create(&self, meta: &JobMeta) -> Result<(), SchedError> {
-        self.write_meta(meta)?;
+        self.create_with(meta, &[])
+    }
+
+    /// Creates the job dir with `job.json`, `files` (name, contents) and an
+    /// empty `waiters/` in one rename (R82): a process killed at any point
+    /// leaves no job dir or a whole one. Then writes the queue marker when
+    /// queued.
+    pub fn create_with(&self, meta: &JobMeta, files: &[(&str, &[u8])]) -> Result<(), SchedError> {
+        let dir = self.dirs.job_dir(&meta.id);
+        let json = serde_json::to_vec_pretty(meta).map_err(|e| SchedError::Corrupt {
+            path: self.meta_path(&meta.id),
+            message: e.to_string(),
+        })?;
+        let mut all: Vec<(&str, &[u8])> = vec![("job.json", &json)];
+        all.extend_from_slice(files);
+        fsx::publish_dir(&dir, &all, &["waiters"]).map_err(io_at(&dir))?;
         if meta.state == JobState::Queued {
             let marker = self.marker(meta);
             fsx::write_atomic(&marker, b"").map_err(io_at(&marker))?;

@@ -551,20 +551,16 @@ impl HostConfig {
         v
     }
 
-    /// The host config `install` writes when none exists (R95d), with the
-    /// L5 values. On Linux the verify root is the Arch box SSD
-    /// (`/mnt/devdisk`, which needs its `/etc/fstab` line); on macOS it is the
-    /// default under the state dir and Homebrew is on the job PATH.
+    /// The host config `install` writes when none exists (R95d). It names no
+    /// user's repos or disks: `scope.remotes` and `scope.include` start empty
+    /// (no repo is gated until the user names one) and the verify root is the
+    /// default under the state dir (R41). The slot counts are the L5 values.
+    /// On macOS Homebrew is on the job PATH.
     #[must_use]
     pub fn template(platform: Platform) -> String {
-        let (verify_root, path_prepend, resources) = match platform {
-            Platform::Linux => (
-                "root = \"/mnt/devdisk/tollgate/verify\"   # L5: SSD; needs its /etc/fstab line\n",
-                "path_prepend = []",
-                "cpu = 3\npg = { slots = 2 }\n",
-            ),
+        let (path_prepend, resources) = match platform {
+            Platform::Linux => ("path_prepend = []", "cpu = 3\npg = { slots = 2 }\n"),
             Platform::Macos => (
-                "# root defaults to ~/.local/state/tollgate/verify (R41)\n",
                 "path_prepend = [\"/opt/homebrew/bin\"]",
                 "# Q13: Mac values not decided; L5 values below.\ncpu = 3\npg = { slots = 2 }\n",
             ),
@@ -573,16 +569,18 @@ impl HostConfig {
             r#"# tollgate host config (R84). Written by `tollgate install` when absent.
 
 [scope]
-roots = ["~/Repos"]
-remotes = ["*gitlab.com:victorkwak/*", "*gitlab.com/victorkwak/*"]
-# Rollout step 1 (R98); widen to ["*"] at step 4.
-include = ["baton", "wikiknit"]
+roots = ["~/Repos"]   # repos directly under these dirs can be gated
+# Trusted remotes: pushes to them run the full tier, and policy comes from
+# their main. Example: ["*github.com:you/*", "*github.com/you/*"]
+remotes = []
+# Repo names to gate. Start with one repo (["myapp"]); ["*"] gates all.
+include = []
 exclude = []
 
 [resources]
 {resources}
 [nextest]
-pg_max_threads = 12   # L5: max_connections = 500, 6 connections per myapp test
+pg_max_threads = 12   # test threads per pg slot
 retries = 2
 slow_timeout = "120s"
 terminate_after = 2
@@ -590,7 +588,9 @@ global_timeout_fast = "15m"
 global_timeout_full = "100m"
 
 [verify]
-{verify_root}max_checkouts = 12        # L15: sticky fast checkouts per repo clone, LRU
+# root defaults to ~/.local/state/tollgate/verify. Put it on a fast disk
+# with room for build dirs: root = "/path/to/ssd/tollgate/verify"
+max_checkouts = 12       # L15: sticky fast checkouts per repo clone, LRU
 max_full_checkouts = 4
 min_free = "30G"
 max_target = "40G"
@@ -607,7 +607,7 @@ allow_ssh_agent = false
 # cargo_home = "~/.cargo"     # item 38: jobs never take these from the hook's env
 # rustup_home = "~/.rustup"
 [job.env]
-SQLX_OFFLINE = "true"
+# Variables every step gets, for example SQLX_OFFLINE = "true"
 "#
         )
     }
@@ -820,13 +820,12 @@ SQLX_OFFLINE = "true"
             assert_eq!(c.resource_slots(&rn("cpu")), 3);
             assert_eq!(c.resource_slots(&rn("pg")), 2);
             assert_eq!(c.nextest.pg_max_threads, 12);
-            assert_eq!(c.scope.include, ["baton", "wikiknit"]);
+            // Neutral: no user's repos, remotes, disks or env.
+            assert!(c.scope.include.is_empty());
+            assert!(c.scope.remotes.is_empty());
+            assert_eq!(c.verify.root, None);
+            assert!(c.job.env.is_empty());
         }
-        let linux = HostConfig::from_toml(&HostConfig::template(Platform::Linux)).unwrap();
-        assert_eq!(
-            linux.verify.root.as_deref(),
-            Some("/mnt/devdisk/tollgate/verify")
-        );
         let mac = HostConfig::from_toml(&HostConfig::template(Platform::Macos)).unwrap();
         assert_eq!(mac.verify.root, None);
         assert_eq!(mac.job.path_prepend, ["/opt/homebrew/bin"]);

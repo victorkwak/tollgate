@@ -73,6 +73,52 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
+/// Prefix of the staging dirs of [`publish_dir`]. Readers skip names that
+/// start with `.`; gc removes old staging dirs.
+pub const STAGING_PREFIX: &str = ".new-";
+
+/// Creates the directory `dest` with `files` (name, contents) and the empty
+/// subdirectories `subdirs` in one step: it fills a hidden staging sibling,
+/// syncs it and renames it to `dest`. A process killed at any point leaves
+/// no `dest` or a whole one (R37); a killed process can leave the staging
+/// dir. Fails when `dest` exists and is not empty.
+pub fn publish_dir(dest: &Path, files: &[(&str, &[u8])], subdirs: &[&str]) -> io::Result<()> {
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let name = dest.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("no file name in {}", dest.display()),
+        )
+    })?;
+    ensure_dir(parent)?;
+    let mut staged = std::ffi::OsString::from(STAGING_PREFIX);
+    staged.push(unique_suffix());
+    staged.push("-");
+    staged.push(name);
+    let stage = parent.join(staged);
+    let result = (|| {
+        fs::create_dir(&stage)?;
+        for (file, bytes) in files {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(stage.join(file))?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+        }
+        for d in subdirs {
+            fs::create_dir(stage.join(d))?;
+        }
+        File::open(&stage)?.sync_all()?;
+        fs::rename(&stage, dest)?;
+        File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&stage);
+    }
+    result
+}
+
 /// Reads `path`; `Ok(None)` when it does not exist.
 pub fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
     match fs::read(path) {
@@ -110,6 +156,25 @@ mod tests {
             read_optional(&tmp.path().join("yes")).unwrap(),
             Some(b"x".to_vec())
         );
+    }
+
+    #[test]
+    fn publish_dir_makes_the_whole_dir_or_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("jobs/j1");
+        publish_dir(&dest, &[("a.json", b"A"), ("b.json", b"B")], &["w"]).unwrap();
+        assert_eq!(fs::read(dest.join("a.json")).unwrap(), b"A");
+        assert_eq!(fs::read(dest.join("b.json")).unwrap(), b"B");
+        assert!(dest.join("w").is_dir());
+        // A second publish to a full dir fails and leaves no staging dir.
+        fs::write(dest.join("extra"), b"x").unwrap();
+        assert!(publish_dir(&dest, &[("a.json", b"C")], &[]).is_err());
+        assert_eq!(fs::read(dest.join("a.json")).unwrap(), b"A");
+        let names: Vec<_> = fs::read_dir(tmp.path().join("jobs"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("j1")]);
     }
 
     #[test]
