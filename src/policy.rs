@@ -72,6 +72,21 @@ const TOOL_CONFIGS: &[&str] = &[
     "**/.rustfmt.toml",
 ];
 
+/// The file names of [`TOOL_CONFIGS`] that clippy and rustfmt look for in
+/// a dir and its ancestors (R71, item 35).
+pub const TOOL_CONFIG_NAMES: &[&str] = &[
+    "clippy.toml",
+    ".clippy.toml",
+    "rustfmt.toml",
+    ".rustfmt.toml",
+];
+
+/// The dir cargo looks for in a dir and its ancestors (R71).
+pub const CARGO_DIR: &str = ".cargo";
+
+/// The files cargo reads in a [`CARGO_DIR`] (R71).
+pub const CARGO_CONFIG_NAMES: &[&str] = &["config.toml", "config"];
+
 fn tool_globs() -> &'static GlobSet {
     static SET: std::sync::OnceLock<GlobSet> = std::sync::OnceLock::new();
     SET.get_or_init(|| {

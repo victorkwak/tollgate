@@ -5,5 +5,6 @@ pub mod checkout;
 pub mod env;
 pub mod exec;
 pub mod job;
+pub mod probe;
 pub mod setup;
 pub mod spawn;

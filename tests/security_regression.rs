@@ -1,4 +1,4 @@
-//! Security regression suite (S1-S29): one test per bypass, each run the
+//! Security regression suite (S1-S42): one test per bypass, each run the
 //! way a Claude Code session runs git.
 //!
 //! The lab: the binary from this build installed by `tollgate install` at
@@ -2598,4 +2598,41 @@ fn s41_a_settings_file_swapped_before_the_answer_is_never_written() {
         );
         assert!(bin.exists(), "uninstall, {name}: the data dir stays");
     }
+}
+
+/// S42 (items 24-27, 35): a branch's build script writes cargo config
+/// above the verify checkout (`<tier dir>/.cargo/config.toml`, which cargo
+/// reads from every checkout below it) with a target runner that runs no
+/// test. The job that wrote it is an error; the next job, on another
+/// tree, refuses the leftover before its first step instead of running
+/// the tests through it.
+#[test]
+fn s42_cargo_config_written_above_the_checkout_does_not_pass() {
+    let lab = Lab::new(RUST_POLICY);
+    std::fs::write(
+        lab.repo.join("crates/b/build.rs"),
+        r#"fn main() {
+    let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let above = manifest.ancestors().nth(3).unwrap().join(".cargo");
+    std::fs::create_dir_all(&above).unwrap();
+    std::fs::write(
+        above.join("config.toml"),
+        format!("[target.{}]\nrunner = \"true\"\n", std::env::var("TARGET").unwrap()),
+    )
+    .unwrap();
+}
+"#,
+    )
+    .unwrap();
+    lab.plain(&["add", "crates/b/build.rs"]);
+    lab.stage_failing_test();
+    let s = lab.refused("git commit -m x");
+    assert!(s.out().contains("DENIED pre-commit"), "{s:?}");
+    lab.stage_code_change("again");
+    let s = lab.refused("git commit -m y");
+    assert!(
+        s.out().contains("DENIED pre-commit") && s.out().contains(".cargo/config.toml"),
+        "{s:?}"
+    );
+    lab.assert_no_bad_pass_of(None);
 }

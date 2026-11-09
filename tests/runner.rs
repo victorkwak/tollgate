@@ -309,22 +309,44 @@ fn tool_configs_reached_through_symlinks_are_refused_r71() {
         "{}",
         r.out
     );
-    // A symlink to a file or dir inside the checkout is fine, and so is
-    // one to an outside dir without tool configs (a local wheel index).
+    // A symlink to a file or dir of the tree is fine.
     let sb = Sandbox::new();
     host(&sb, "");
     let repo = repo_with(&sb, "r", PASS_POLICY);
     sb.commit_file(&repo, "docs/a.md", "a\n", "docs");
     sb.commit_file(&repo, "docs/clippy.toml", "\n", "tree config");
-    let wheels = tempfile::tempdir().unwrap();
-    std::fs::write(wheels.path().join("x.whl"), "w").unwrap();
     std::os::unix::fs::symlink("docs", repo.join("doc")).unwrap();
     std::os::unix::fs::symlink("docs/a.md", repo.join("a.md")).unwrap();
-    std::os::unix::fs::symlink(wheels.path(), repo.join("wheels")).unwrap();
-    sb.git(&repo, &["add", "doc", "a.md", "wheels"]);
+    sb.git(&repo, &["add", "doc", "a.md"]);
     sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "links"]);
     let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
+    // A dir link out of the checkout (a local wheel index) is fine while
+    // nothing under or above its target is a tool config. Item 24: the
+    // check runs again after every step, so a step that writes one there
+    // is an error.
+    let wheels = tempfile::tempdir().unwrap();
+    std::fs::write(wheels.path().join("x.whl"), "w").unwrap();
+    std::os::unix::fs::symlink(wheels.path(), repo.join("wheels")).unwrap();
+    sb.git(&repo, &["add", "wheels"]);
+    sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "wheels"]);
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    sb.commit_file(
+        &repo,
+        "tollgate.toml",
+        "version = 1\n[[step]]\nname = \"w\"\nkind = \"command\"\nrun = \"mkdir -p wheels/sub && touch wheels/sub/rustfmt.toml\"\n",
+        "write through the link",
+    );
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("cause checkout")
+            && r.out.contains("wheels links to")
+            && r.out.contains("sub/rustfmt.toml"),
+        "{}",
+        r.out
+    );
 }
 
 /// R71, R42, item 5: the overlaid tool configs are exempt from the
@@ -396,6 +418,158 @@ fn an_ignored_tool_config_written_by_a_step_is_an_error_r42_r71() {
     sb.commit_file(&repo, ".gitignore", "dist/\n__pycache__/\n", "ignore");
     let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
+}
+
+/// Gives every dir under `root` mode 0755 again (a step made one
+/// unreadable), so the sandbox can be removed.
+fn unlock_dirs(root: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+            unlock_dirs(&p);
+        }
+    }
+}
+
+/// R71, item 35: no walk of ignored output, so no entry budget: a step
+/// that leaves 25k ignored files (a `.mypy_cache`, `dist`) passes.
+#[test]
+fn a_large_ignored_output_dir_passes_item35() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"build\"\nkind = \"command\"\nrun = \"mkdir -p dist/a && cd dist/a && seq 1 25000 | xargs touch\"\n",
+    );
+    sb.commit_file(&repo, ".gitignore", "dist/\n", "ignore");
+    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+}
+
+/// One probe case: name, policy, files to commit, a link to commit (name,
+/// target), text the error names.
+type ProbeCase<'a> = (
+    &'a str,
+    String,
+    Vec<(&'a str, &'a str)>,
+    Option<(&'a str, &'a str)>,
+    &'a str,
+);
+
+/// R71, items 24-27, 35: after every step (and before the first), each
+/// dir of the checked tree, each ancestor of the checkout and each step
+/// cwd holds no tool config that the tree and the overlay do not account
+/// for, and none can hide behind a symlink or a dir it cannot read. Each
+/// case is one way a step (the branch's code) leaves config for the next
+/// step.
+#[test]
+fn tool_configs_a_step_leaves_anywhere_a_tool_looks_are_errors_items_24_27_35() {
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(outside.path().join(".cargo")).unwrap();
+    std::fs::write(
+        outside.path().join(".cargo/config.toml"),
+        "[alias]\nx = \"y\"\n",
+    )
+    .unwrap();
+    let outside = outside.path().to_str().unwrap().to_owned();
+    let cases: Vec<ProbeCase<'_>> = vec![
+        (
+            // Item 24: a dangling `.cargo` link (the policy commit's own)
+            // whose target a setup step creates.
+            "dangling .cargo link",
+            "version = 1\n[[setup]]\nname = \"gen\"\nrun = \"mkdir -p cfg && printf '[alias]\\\\nx = \\\"y\\\"\\\\n' > cfg/config.toml\"\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n".to_owned(),
+            vec![],
+            Some((".cargo", "cfg")),
+            ".cargo is a symlink that does not resolve",
+        ),
+        (
+            // Item 25: a tracked dir named like a kept dir is tree content.
+            "tracked target dir",
+            "version = 1\n[[step]]\nname = \"w\"\nkind = \"command\"\nrun = \"mkdir -p src/target/.cargo && echo x > src/target/.cargo/config.toml\"\n".to_owned(),
+            vec![("src/target/lib.rs", "\n")],
+            None,
+            "src/target/.cargo/config.toml: a tool config that is not in the tree",
+        ),
+        (
+            // Item 26: an ignored `.cargo` the step makes unreadable.
+            "unreadable .cargo",
+            "version = 1\n[[step]]\nname = \"w\"\nkind = \"command\"\nrun = \"mkdir -p .cargo && echo x > .cargo/config.toml && chmod 000 .cargo\"\n".to_owned(),
+            vec![(".gitignore", ".cargo/\n")],
+            None,
+            ": .cargo: a tool config that is not in the tree",
+        ),
+        (
+            // Item 26: a tree dir the step makes unreadable.
+            "unreadable tree dir",
+            "version = 1\n[[step]]\nname = \"w\"\nkind = \"command\"\nrun = \"mkdir -p sub/.cargo && echo x > sub/.cargo/config.toml && chmod 000 sub\"\n".to_owned(),
+            vec![("sub/a.txt", "a\n")],
+            None,
+            "sub/clippy.toml: cannot check for a tool config",
+        ),
+        (
+            // Item 27: a step-created dir symlink that the next step's cwd
+            // goes through (cargo reads the physical cwd's ancestors).
+            "step-created dir symlink",
+            format!(
+                "version = 1\n[[step]]\nname = \"link\"\nkind = \"command\"\nrun = \"ln -s {outside} gen\"\n[[step]]\nname = \"in gen\"\nkind = \"command\"\ncwd = \"gen\"\nrun = \"true\"\n"
+            ),
+            vec![(".gitignore", "gen\n")],
+            None,
+            "gen: a step cwd that resolves to",
+        ),
+        (
+            // Item 35: config written above the checkout root, which cargo,
+            // clippy and rustfmt all read.
+            "config above the checkout root",
+            "version = 1\n[[step]]\nname = \"w\"\nkind = \"command\"\nrun = \"mkdir -p ../.cargo && echo x > ../.cargo/config.toml\"\n".to_owned(),
+            vec![],
+            None,
+            "/.cargo/config.toml: a tool config above the checkout",
+        ),
+    ];
+    let mut bad = Vec::new();
+    for (name, policy, files, link, want) in cases {
+        let sb = Sandbox::new();
+        host(&sb, "");
+        let repo = repo_with(&sb, "r", &policy);
+        for (p, text) in files {
+            sb.commit_file(&repo, p, text, "file");
+        }
+        if let Some((l, target)) = link {
+            std::os::unix::fs::symlink(target, repo.join(l)).unwrap();
+            sb.git(&repo, &["add", l]);
+            sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "link"]);
+        }
+        let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+        unlock_dirs(&sb.state());
+        if r.code != Some(1) || !r.out.contains("cause checkout") || !r.out.contains(want) {
+            bad.push(format!("{name}: {}", r.out));
+            continue;
+        }
+        if name == "config above the checkout root" {
+            // It stays there: the next job refuses it before any step.
+            sb.commit_file(
+                &repo,
+                "tollgate.toml",
+                "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n",
+                "plain",
+            );
+            let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
+            assert_eq!(r.code, Some(1), "{name}, next job: {}", r.out);
+            assert!(
+                r.out.contains("cause checkout") && r.out.contains(want),
+                "{name}, next job: {}",
+                r.out
+            );
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
 #[test]

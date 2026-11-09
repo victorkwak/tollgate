@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use super::checkout::{self, Checkout, LockWait, Place, PrepareInput};
 use super::env::{EnvFile, JobEnv};
 use super::exec::{self, ExecEnd, ExecSpec};
+use super::probe::ToolProbe;
 use super::setup::{self, SetupResult};
 use crate::cache::record::{
     ENVIRONMENTAL_TTL, ErrorCause, Needed, Record, Selection, StepResult, StepStatus, Verdict,
@@ -205,6 +206,14 @@ enum End {
     Superseded,
 }
 
+/// The error text for R71 probe findings at a job's start or after setup.
+fn probe_message(found: &[String]) -> String {
+    format!(
+        "tool config check (R71: a tool config must be a regular file in the tree): {}",
+        found.join("; ")
+    )
+}
+
 fn error(cause: ErrorCause, msg: impl Into<String>) -> End {
     let msg = msg.into();
     if cause.writes_record() {
@@ -247,6 +256,8 @@ struct Runner<'a> {
     use_locks: bool,
     /// This binary, for `tollgate __step` (R94).
     tollgate: PathBuf,
+    /// R71 tool-config probe of the verify checkout (none for `--here`).
+    probe: Option<ToolProbe>,
 }
 
 /// The runner entry point (`tollgate __run-job <id>`). Returns the exit
@@ -352,6 +363,7 @@ impl<'a> Runner<'a> {
             pending_steps: Vec::new(),
             reused: false,
             inherit: Vec::new(),
+            probe: None,
             maps: BTreeMap::new(),
             here,
             use_locks,
@@ -513,20 +525,24 @@ impl Runner<'_> {
             Ok(e) => e,
             Err(e) => return error(ErrorCause::Internal, e.to_string()),
         };
-        let links = entries
-            .iter()
-            .filter(|e| e.mode == "120000")
-            .map(|e| e.path.as_path())
-            .chain(
-                self.spec
-                    .policy
-                    .overlay
-                    .iter()
-                    .filter(|(_, f)| matches!(f, crate::policy::OverlayFile::Symlink { .. }))
-                    .map(|(p, _)| p.as_path()),
-            );
-        if let Err(e) = co.check_links(links, &cache_dirs) {
-            return error(ErrorCause::Checkout, e.to_string());
+        // R71, item 35: the tool-config probe before setup (a leftover
+        // above the checkout, a dangling or outside link), and again after
+        // every setup step and step.
+        let probe = ToolProbe::new(
+            &co.path,
+            &entries,
+            &self.spec.policy.overlay,
+            config
+                .setup
+                .iter()
+                .filter_map(|s| s.cwd.as_deref())
+                .chain(config.steps.iter().filter_map(|s| s.cwd.as_deref())),
+            &self.env,
+        );
+        let found = probe.findings();
+        self.probe = Some(probe);
+        if !found.is_empty() {
+            return error(ErrorCause::Checkout, probe_message(&found));
         }
         self.say(&format!(
             "checkout {} holds {}",
@@ -660,6 +676,17 @@ impl Runner<'_> {
                         s.name,
                         d.as_secs_f64()
                     ));
+                    // R71: before its result is kept as up to date.
+                    let found = self.probe.as_ref().map_or_else(
+                        || vec!["the tool-config probe is missing".to_owned()],
+                        ToolProbe::findings,
+                    );
+                    if !found.is_empty() {
+                        return Some(error(
+                            ErrorCause::Checkout,
+                            format!("setup {:?}: {}", s.name, probe_message(&found)),
+                        ));
+                    }
                     let name = s.name.clone();
                     let _ = co.update_meta(|m| {
                         m.setup.insert(name, hash);
@@ -1262,13 +1289,18 @@ impl Runner<'_> {
             // R42 after every step that ran, so a step that changes the tree
             // is named and its pass is never stored for reuse (L16).
             if !stop && let Some(co) = co {
-                match co.changes(
-                    &self.env,
-                    &self.spec.tree,
-                    &cache_dirs,
-                    &before,
-                    &self.spec.policy.overlay,
-                ) {
+                let changes = match self.probe.as_ref() {
+                    Some(probe) => co.changes(
+                        &self.env,
+                        &self.spec.tree,
+                        &cache_dirs,
+                        &before,
+                        &self.spec.policy.overlay,
+                        probe,
+                    ),
+                    None => Ok(vec!["the tool-config probe is missing".to_owned()]),
+                };
+                match changes {
                     Ok(changed) if !changed.is_empty() => {
                         rep.status = StepStatus::Error;
                         rep.message = Some(format!(
