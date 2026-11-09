@@ -7,7 +7,8 @@
 //! - macOS: the table comes from `proc_listallpids` and `proc_pidinfo`
 //!   (`PROC_PIDTBSDINFO`) in libc, a process's arguments from
 //!   `KERN_PROCARGS2`. There is no subreaper: an orphan reparents to launchd,
-//!   so the walk finds only what is still attached.
+//!   so the walk finds only what is still attached. A dead runner's steps
+//!   are found from their step records ([`StepRecord`], item 49).
 //!
 //! The stale-lock owner check of R39 (doctor) and the parent-command lookup
 //! of R13 (CUT by L1) are not here.
@@ -262,6 +263,135 @@ pub fn under(table: &ProcTable, dirs: &[PathBuf]) -> BTreeSet<i32> {
                 .iter()
                 .any(|t| inside(Path::new(t)))
     })
+}
+
+/// R35, item 49: a step leader as the runner recorded it before the step
+/// could run (`<job dir>/steps/<pid>.json`). The step runs in its own
+/// process group, so `pgid` is `pid`; with `start_time` the record names
+/// one process even after its pid is reused. It is how a dead runner's
+/// steps are found on macOS, which has no parent-death signal and gives
+/// no other process's environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StepRecord {
+    /// The leader's pid.
+    pub pid: i32,
+    /// Its process group.
+    pub pgid: i32,
+    /// [`start_time`] of the leader.
+    pub start_time: u64,
+}
+
+impl StepRecord {
+    /// The record file of `pid` in `dir`.
+    #[must_use]
+    pub fn path(dir: &Path, pid: i32) -> PathBuf {
+        dir.join(format!("{pid}.json"))
+    }
+
+    /// Writes the record into `dir` by rename, so a reader sees all of it
+    /// or nothing. Not synced: after a reboot no recorded process lives.
+    pub fn write(&self, dir: &Path) -> io::Result<PathBuf> {
+        use std::io::Write as _;
+        std::fs::create_dir_all(dir)?;
+        let path = Self::path(dir, self.pid);
+        let tmp = dir.join(format!(".{}-{}.tmp", self.pid, crate::fsx::unique_suffix()));
+        let body = serde_json::to_vec(self).map_err(io::Error::other)?;
+        let done = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(&body))
+            .and_then(|()| std::fs::rename(&tmp, &path));
+        if done.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        done.map(|()| path)
+    }
+
+    /// Every readable record in `dir` (names that start with `.` are
+    /// partial writes).
+    #[must_use]
+    pub fn read_all(dir: &Path) -> Vec<Self> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|e| !e.file_name().as_encoded_bytes().starts_with(b"."))
+            .filter_map(|e| serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok())
+            .collect()
+    }
+}
+
+/// R35 after a runner died: the live processes of the recorded steps,
+/// with the exclusions of [`marked`].
+///
+/// - The leader still runs with its recorded start time: it, its group
+///   and every descendant of either.
+/// - The leader is gone (or a zombie): the members of its group that
+///   started no earlier than it did, and their descendants. Its pid
+///   cannot have been reused while the group had a member, so a group of
+///   that id is the step's, unless the group emptied, the pid was reused
+///   and the new process made a group of its own; the start-time bound
+///   leaves out what predates the step.
+/// - The pid runs another process (another start time): the group is
+///   gone with its last member; nothing is taken.
+#[must_use]
+pub fn recorded(table: &ProcTable, records: &[StepRecord]) -> BTreeSet<i32> {
+    recorded_by(table, std::process::id().cast_signed(), records, start_time)
+}
+
+/// [`recorded`] for the process `me`, with `start_of` giving start times.
+fn recorded_by(
+    table: &ProcTable,
+    me: i32,
+    records: &[StepRecord],
+    start_of: impl Fn(i32) -> Option<u64>,
+) -> BTreeSet<i32> {
+    let kept = table.ancestors(me);
+    let kept_groups: BTreeSet<i32> = kept
+        .iter()
+        .filter_map(|p| table.get(*p).map(|i| i.pgid))
+        .collect();
+    let mut out = BTreeSet::new();
+    for r in records {
+        if r.pid <= 1 || r.pgid <= 1 || kept_groups.contains(&r.pgid) {
+            continue;
+        }
+        let leader_runs = match (table.get(r.pid), start_of(r.pid)) {
+            (None, _) => false,
+            (Some(_), Some(t)) if t == r.start_time => true,
+            (Some(p), None) if p.zombie => false,
+            // Another process has the pid, or its start time is unreadable
+            // (another user's).
+            (Some(_), _) => continue,
+        };
+        let mut roots: BTreeSet<i32> = table
+            .group_members(r.pgid)
+            .into_iter()
+            .filter(|m| leader_runs || start_of(*m).is_some_and(|t| t >= r.start_time))
+            .collect();
+        if leader_runs {
+            roots.insert(r.pid);
+        }
+        let mut set = roots.clone();
+        for root in &roots {
+            set.extend(table.descendants(*root));
+        }
+        out.extend(
+            set.into_iter()
+                .filter(|p| *p != me && !kept.contains(p) && table.alive(*p)),
+        );
+    }
+    out
+}
+
+/// SIGKILLs every process [`recorded`] finds, like [`kill_marked`].
+pub fn kill_recorded(records: &[StepRecord], limit: std::time::Duration) -> (usize, usize) {
+    if records.is_empty() {
+        return (0, 0);
+    }
+    kill_found(limit, |table| recorded(table, records))
 }
 
 /// SIGKILLs every process [`under`] finds, like [`kill_marked`].
@@ -805,5 +935,95 @@ mod tests {
             let _ = c.kill();
             c.wait().unwrap();
         }
+    }
+    /// Item 49: a recorded step is found by its leader (pid and start time
+    /// match), by its group when the leader is gone (members no older than
+    /// the leader), and not at all when the pid runs another process.
+    #[test]
+    fn recorded_steps_are_found_by_leader_group_and_start_time_r35() {
+        // 200 is the caller; 600 a step leader with a child 601 in its
+        // group and a grandchild 602 that left the group.
+        let t = table(&[
+            (1, 0, 1),
+            (100, 1, 100),
+            (200, 100, 100),
+            (600, 1, 600),
+            (601, 600, 600),
+            (602, 601, 602),
+            (700, 1, 700),
+        ]);
+        let starts = |p: i32| -> Option<u64> {
+            Some(match p {
+                600 => 50,
+                601 => 51,
+                602 => 52,
+                700 => 10,
+                _ => 1,
+            })
+        };
+        let rec = |pid, start_time| StepRecord {
+            pid,
+            pgid: pid,
+            start_time,
+        };
+        // Leader alive with its start time: leader, group, descendants.
+        assert_eq!(
+            recorded_by(&t, 200, &[rec(600, 50)], starts),
+            BTreeSet::from([600, 601, 602])
+        );
+        // Same pid, other start time: pid reused, nothing.
+        assert_eq!(
+            recorded_by(&t, 200, &[rec(600, 49)], starts),
+            BTreeSet::new()
+        );
+        // Leader gone: the group members no older than it, and below them.
+        let gone = table(&[
+            (1, 0, 1),
+            (100, 1, 100),
+            (200, 100, 100),
+            (601, 1, 600),
+            (602, 601, 602),
+            (603, 1, 600),
+        ]);
+        let starts_gone = |p: i32| -> Option<u64> {
+            Some(match p {
+                601 => 51,
+                602 => 52,
+                603 => 5,
+                _ => 1,
+            })
+        };
+        assert_eq!(
+            recorded_by(&gone, 200, &[rec(600, 50)], starts_gone),
+            BTreeSet::from([601, 602])
+        );
+        // The caller's own group and ancestors are never taken.
+        assert_eq!(
+            recorded_by(&t, 200, &[rec(100, 1)], starts),
+            BTreeSet::new()
+        );
+        let r = StepRecord {
+            pid: 600,
+            pgid: 1,
+            start_time: 50,
+        };
+        assert_eq!(recorded_by(&t, 200, &[r], starts), BTreeSet::new());
+    }
+
+    #[test]
+    fn step_records_round_trip_and_skip_partial_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let steps = dir.path().join("steps");
+        assert!(StepRecord::read_all(&steps).is_empty());
+        let r = StepRecord {
+            pid: 42,
+            pgid: 42,
+            start_time: 7,
+        };
+        let path = r.write(&steps).unwrap();
+        assert_eq!(path, steps.join("42.json"));
+        std::fs::write(steps.join(".43-x.tmp"), b"{").unwrap();
+        std::fs::write(steps.join("44.json"), b"not json").unwrap();
+        assert_eq!(StepRecord::read_all(&steps), [r]);
     }
 }

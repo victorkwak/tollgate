@@ -151,9 +151,14 @@ pub fn reap_if_lost(dirs: &Dirs, id: &JobId) -> Result<bool, SchedError> {
     if meta.state.is_terminal() || running_job(dirs, &meta.key)?.as_ref() == Some(id) {
         return Ok(false);
     }
+    // Item 49: the recorded step leaders, on every platform (the only way
+    // on macOS), then (Linux) every process with the job's TMPDIR.
+    let records = crate::procs::StepRecord::read_all(&dirs.job_steps_dir(id));
+    let (by_record, left_record) = crate::procs::kill_recorded(&records, Duration::from_secs(10));
     let mut marker = b"TMPDIR=".to_vec();
     marker.extend_from_slice(dirs.job_dir(id).join("tmp").as_os_str().as_encoded_bytes());
-    let (killed, left) = crate::procs::kill_marked(&marker, Duration::from_secs(10));
+    let (by_marker, left_marker) = crate::procs::kill_marked(&marker, Duration::from_secs(10));
+    let (killed, left) = (by_record + by_marker, left_record.max(left_marker));
     let reason = format!(
         "its runner died; {killed} leftover process(es) killed{}",
         if left > 0 {

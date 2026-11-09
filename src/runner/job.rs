@@ -665,6 +665,7 @@ impl Runner<'_> {
                 &co.path,
                 &self.env,
                 &log,
+                &self.job_dir.join(crate::dirs::JOB_STEPS_DIR),
                 None,
                 &mut abort,
                 &self.inherit,
@@ -717,7 +718,18 @@ impl Runner<'_> {
                 .job_dir
                 .join(format!("setup-{}.log", report::slug(&s.name)));
             let mut never = || None;
-            match setup::run(s, "", None, workdir, &self.env, &log, None, &mut never, &[]) {
+            match setup::run(
+                s,
+                "",
+                None,
+                workdir,
+                &self.env,
+                &log,
+                &self.job_dir.join(crate::dirs::JOB_STEPS_DIR),
+                None,
+                &mut never,
+                &[],
+            ) {
                 SetupResult::Ran(d) => self.say(&format!(
                     "setup {:?}: ran in {:.1}s",
                     s.name,
@@ -765,6 +777,7 @@ impl Runner<'_> {
             grace: Duration::from_secs(10),
             abort: &mut abort,
             inherit: &self.inherit,
+            records: &self.job_dir.join(crate::dirs::JOB_STEPS_DIR),
         });
         let parsed = if out.success() {
             std::fs::read_to_string(&out_file)
@@ -1221,6 +1234,7 @@ impl Runner<'_> {
                 grace: s.grace(),
                 abort: &mut abort,
                 inherit: &inherit,
+                records: &self.job_dir.join(crate::dirs::JOB_STEPS_DIR),
             });
             drop(held);
             self.run_time += out.duration;
@@ -1589,6 +1603,7 @@ impl Runner<'_> {
                 grace: Duration::from_secs(10),
                 abort: &mut never,
                 inherit: &self.inherit,
+                records: &self.job_dir.join(crate::dirs::JOB_STEPS_DIR),
             });
         }
     }

@@ -55,6 +55,9 @@ pub struct Dirs {
     data_home: PathBuf,
 }
 
+/// Name of the step-record dir inside a job dir (item 49).
+pub const JOB_STEPS_DIR: &str = "steps";
+
 impl Dirs {
     /// Resolves the dirs from `HOME` and the `XDG_*_HOME` variables. An XDG
     /// value that is empty or relative is ignored, as the XDG spec requires.
@@ -236,6 +239,13 @@ impl Dirs {
     #[must_use]
     pub fn job_dir(&self, id: &JobId) -> PathBuf {
         self.jobs_dir().join(id.as_str())
+    }
+
+    /// `jobs/<job id>/steps/`: the records of the job's step leaders
+    /// (R35, item 49).
+    #[must_use]
+    pub fn job_steps_dir(&self, id: &JobId) -> PathBuf {
+        self.job_dir(id).join(JOB_STEPS_DIR)
     }
 
     /// `jobs/<job id>/report.json`; a pass without it is invalid (R81).

@@ -1608,6 +1608,44 @@ fn waiting_on_a_dead_runner_reaps_its_steps_r35() {
     assert_eq!(c.code, Some(0), "{}", c.out);
 }
 
+/// Item 49 (R35): a step process that drops the job's `TMPDIR` and stays
+/// in the step's group carries no marker. When the runner dies, the
+/// leader dies with it (Linux) and the group has no marked member, so the
+/// marker alone finds nothing; the step record (leader pid, start time,
+/// group) still names the group. This is how a dead runner's steps are
+/// found on macOS, which has no parent-death signal and no environment
+/// of other processes.
+#[test]
+fn a_dead_runners_unmarked_step_process_is_reaped_by_its_step_record_r35() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"s\"\nkind = \"command\"\nrun = '''\nd=$TMPDIR/..\nenv -u TMPDIR sh -c 'echo $$ > \"$0\"/child; exec sleep 30' \"$d\" &\nwait\n'''\n",
+    );
+    let r = sb.tollgate(&repo, &["check", "--detach"]);
+    let job = job_id(&r.out);
+    let dir = sb.state().join("jobs").join(&job);
+    assert!(eventually(20, || !pids(&dir.join("child")).is_empty()));
+    let child = pids(&dir.join("child"))[0];
+    tollgate::procs::signal(pids(&dir.join("runner.pid"))[0], libc::SIGKILL).unwrap();
+    let w = sb.tollgate(&repo, &["wait", &job, "--timeout", "20s"]);
+    let gone = eventually(10, || !alive(child));
+    if !gone {
+        let _ = tollgate::procs::signal(child, libc::SIGKILL);
+    }
+    assert_eq!(w.code, Some(1), "{}", w.out);
+    assert!(
+        gone,
+        "the unmarked step process outlived its dead runner: {}",
+        w.out
+    );
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("job.json")).unwrap()).unwrap();
+    assert_eq!(meta["state"], "lost", "{meta}");
+}
+
 #[test]
 fn an_unchecked_or_empty_base_disables_selection_r56() {
     let sb = Sandbox::new();

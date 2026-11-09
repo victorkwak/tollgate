@@ -9,6 +9,16 @@
 //! the set too. Processes a step leaves behind after a normal exit are
 //! killed the same way, so a resource slot is released only after the
 //! step's processes are gone.
+//!
+//! Item 49: before the step can exec, the runner records its leader (pid,
+//! group, start time) in `records` (`<job dir>/steps/`). The child blocks
+//! in `pre_exec` on a pipe until the record is written; a runner that dies
+//! first closes the pipe and the child exits before exec, so no step runs
+//! unrecorded. A runner that dies later leaves the record, from which
+//! `sched::reap_if_lost` finds the step on every platform (macOS has no
+//! parent-death signal and no way to read another process's environment).
+//! Residual: on macOS a step process that leaves the group (`setsid`,
+//! `setpgid`) and is orphaned to launchd is not found.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -57,6 +67,131 @@ pub struct ExecSpec<'a> {
     /// lock): a lock stays held while any process of the step lives, also
     /// when the runner itself dies (R35, R85, R87).
     pub inherit: &'a [std::os::fd::RawFd],
+    /// Dir of the step records (item 49): `<job dir>/steps`.
+    pub records: &'a Path,
+}
+
+/// Serializes gated spawns: while a child waits on its gate, no other
+/// gated child is forked, so none holds a copy of another's release pipe
+/// (a copy would keep that pipe open after the runner died).
+static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Spawns `cmd` so that it execs only after its leader is recorded in
+/// `records` (item 49). The child sends its pid on one pipe, then blocks
+/// reading another until the runner has written the record and releases
+/// it with one byte. EOF instead (the runner died, or the record could not
+/// be written) makes the child fail before exec. Returns the child and its
+/// record file.
+fn spawn_recorded(cmd: &mut Command, records: &Path) -> io::Result<(Child, std::path::PathBuf)> {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+
+    std::fs::create_dir_all(records)?;
+    let _serial = GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Both pipes are close-on-exec: other children of this process drop
+    // them at their exec.
+    let (mut report_r, report_w) = io::pipe()?;
+    let (release_r, mut release_w) = io::pipe()?;
+    let fds = [
+        report_r.as_raw_fd(),
+        report_w.as_raw_fd(),
+        release_r.as_raw_fd(),
+        release_w.as_raw_fd(),
+    ];
+    // SAFETY: the closure runs in the forked child before exec and calls
+    // only async-signal-safe functions (close, getpid, write, read); it
+    // reads `fds`, which was set up before the fork, and allocates nothing.
+    unsafe {
+        cmd.pre_exec(move || {
+            let [report_r, report_w, release_r, release_w] = fds;
+            // The child's copies of the runner's ends: the release pipe
+            // must reach EOF when the runner dies.
+            libc::close(report_r);
+            libc::close(release_w);
+            let pid = libc::getpid().to_ne_bytes();
+            let mut sent = 0;
+            while sent < pid.len() {
+                let n = libc::write(report_w, pid[sent..].as_ptr().cast(), pid.len() - sent);
+                if n > 0 {
+                    sent += n.cast_unsigned();
+                } else if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                } else {
+                    return Err(io::Error::from_raw_os_error(libc::EPIPE));
+                }
+            }
+            libc::close(report_w);
+            let mut byte = 0_u8;
+            loop {
+                let n = libc::read(release_r, (&raw mut byte).cast(), 1);
+                if n == 1 {
+                    return Ok(());
+                }
+                if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                // EOF: the runner died or refused to release it.
+                return Err(io::Error::from_raw_os_error(libc::ECANCELED));
+            }
+        });
+    }
+    std::thread::scope(|scope| {
+        // `spawn` returns only after the child execs (or fails), which
+        // needs the release, so the recording runs beside it. The spawn
+        // itself stays on this thread: Linux sends the parent-death signal
+        // when the thread that forked the child exits.
+        let recorder = scope.spawn(move || {
+            let mut pid = [0_u8; 4];
+            let recorded = report_r
+                .read_exact(&mut pid)
+                .map_err(|e| io::Error::other(format!("step gate: no pid from the child: {e}")))
+                .and_then(|()| {
+                    let pid = i32::from_ne_bytes(pid);
+                    // SAFETY: getpgid only reads the group of a process.
+                    let pgid = unsafe { libc::getpgid(pid) };
+                    if pgid != pid {
+                        return Err(io::Error::other(format!(
+                            "step gate: child {pid} is in group {pgid}, not its own"
+                        )));
+                    }
+                    let start_time = procs::start_time(pid)
+                        .ok_or_else(|| io::Error::other("step gate: no start time of the child"))?;
+                    procs::StepRecord {
+                        pid,
+                        pgid,
+                        start_time,
+                    }
+                    .write(records)
+                });
+            let released = recorded.and_then(|path| release_w.write_all(&[1]).map(|()| path));
+            // Without the byte, this drop is the EOF that stops the child.
+            drop(release_w);
+            released
+        });
+        let child = cmd.spawn();
+        // The child has its copies (or was never forked): without these,
+        // the recorder sees EOF when no child sends a pid.
+        drop(report_w);
+        drop(release_r);
+        let released = recorder
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("step gate: recorder panicked")));
+        match (child, released) {
+            (Ok(c), Ok(path)) => Ok((c, path)),
+            (Ok(mut c), Err(e)) => {
+                // It cannot have run without the byte; collect it.
+                let _ = c.wait();
+                Err(e)
+            }
+            (Err(e), released) => {
+                if let Ok(path) = released {
+                    let _ = std::fs::remove_file(path);
+                }
+                Err(e)
+            }
+        }
+    })
 }
 
 /// How a step ended.
@@ -249,7 +384,7 @@ pub fn run(spec: ExecSpec<'_>) -> ExecOutcome {
             Ok(())
         });
     }
-    let mut child = match cmd.spawn() {
+    let (mut child, record) = match spawn_recorded(&mut cmd, spec.records) {
         Ok(c) => c,
         Err(e) => return failed(e),
     };
@@ -308,6 +443,11 @@ pub fn run(spec: ExecSpec<'_>) -> ExecOutcome {
             }
         );
     }
+    // The step's set is gone: its record names nothing to reap. With
+    // survivors it stays for a later reap.
+    if survivors == 0 {
+        let _ = std::fs::remove_file(&record);
+    }
     ExecOutcome {
         end,
         duration: start.elapsed(),
@@ -322,6 +462,12 @@ mod tests {
 
     fn env() -> JobEnv {
         JobEnv::from_vars([("PATH", "/usr/bin:/bin")])
+    }
+
+    /// One step-record dir for the tests of this module.
+    fn records() -> &'static Path {
+        static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| tempfile::tempdir().unwrap()).path()
     }
 
     fn sh(script: &str) -> Vec<OsString> {
@@ -346,8 +492,9 @@ mod tests {
             grace: Duration::from_secs(1),
             abort: &mut never,
             inherit: &[],
+            records: records(),
         });
-        assert_eq!(out.exit_code(), Some(3));
+        assert_eq!(out.exit_code(), Some(3), "{:?}", out.end);
         assert!(!out.success());
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(text.contains("out") && text.contains("err"), "{text}");
@@ -372,6 +519,7 @@ mod tests {
             grace: Duration::from_secs(1),
             abort: &mut never,
             inherit: &[],
+            records: records(),
         });
         assert!(out.success());
         let text = std::fs::read_to_string(&log).unwrap();
@@ -402,6 +550,7 @@ mod tests {
             grace: Duration::from_millis(300),
             abort: &mut never,
             inherit: &[],
+            records: records(),
         });
         assert!(matches!(out.end, ExecEnd::TimedOut), "{:?}", out.end);
         assert!(start.elapsed() < Duration::from_secs(10));
@@ -435,6 +584,7 @@ mod tests {
             grace: Duration::from_secs(5),
             abort: &mut abort,
             inherit: &[],
+            records: records(),
         });
         assert!(
             matches!(out.end, ExecEnd::Aborted(ref r) if r == "cancelled"),
@@ -466,6 +616,7 @@ mod tests {
             grace: Duration::from_secs(1),
             abort: &mut never,
             inherit: &[],
+            records: records(),
         });
         assert!(out.success());
         assert_eq!(out.killed, 1);
@@ -494,7 +645,69 @@ mod tests {
             grace: Duration::from_secs(1),
             abort: &mut never,
             inherit: &[],
+            records: records(),
         });
         assert!(matches!(out.end, ExecEnd::SpawnFailed(_)));
+    }
+    fn run_in(tmp: &Path, records: &Path, script: &str) -> ExecOutcome {
+        let env = env();
+        let mut never = || None;
+        run(ExecSpec {
+            program: "sh".into(),
+            arg0: None,
+            args: sh(script),
+            cwd: tmp,
+            env: &env,
+            log: &tmp.join("s.log"),
+            stdout: None,
+            deadline: None,
+            grace: Duration::from_secs(1),
+            abort: &mut never,
+            inherit: &[],
+            records,
+        })
+    }
+
+    /// Item 49: the leader's record (pid, own group, start time) is on
+    /// disk before the step runs, and removed once its set is gone.
+    #[test]
+    fn a_step_runs_only_after_its_record_is_written_r35() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recs = tmp.path().join("steps");
+        let out = run_in(
+            tmp.path(),
+            &recs,
+            &format!("cat '{}'/$$.json > seen.json", recs.display()),
+        );
+        assert!(out.success(), "{:?}", out.end);
+        let seen: procs::StepRecord =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("seen.json")).unwrap()).unwrap();
+        assert_eq!(seen.pgid, seen.pid);
+        assert!(seen.start_time > 0);
+        assert_eq!(std::fs::read_dir(&recs).unwrap().count(), 0);
+    }
+
+    /// Item 49, fail closed: when the record cannot be written the child
+    /// gets EOF instead of the release byte and never execs.
+    #[test]
+    fn a_step_whose_record_cannot_be_written_never_runs_r35() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let recs = tmp.path().join("steps");
+        std::fs::create_dir(&recs).unwrap();
+        std::fs::set_permissions(&recs, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Root writes into a read-only dir; the check means nothing there.
+        let writable = std::fs::write(recs.join("probe"), b"").is_ok();
+        let out = run_in(tmp.path(), &recs, "touch ran");
+        std::fs::set_permissions(&recs, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if writable {
+            return;
+        }
+        assert!(matches!(out.end, ExecEnd::SpawnFailed(_)), "{:?}", out.end);
+        assert!(!tmp.path().join("ran").exists());
+        // A record dir under a file: the same, before any fork.
+        let out = run_in(tmp.path(), &tmp.path().join("s.log/steps"), "touch ran");
+        assert!(matches!(out.end, ExecEnd::SpawnFailed(_)), "{:?}", out.end);
+        assert!(!tmp.path().join("ran").exists());
     }
 }
