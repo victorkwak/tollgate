@@ -21,11 +21,13 @@
 //! The first rule that fails denies the call with a message that names the
 //! allowed shape.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use super::cmds::{self, Class, Lang, OptValue};
 use super::paths;
+use super::reach;
 use super::rules::{Assessment, Context, Ruling, basename, is_tollgate};
 use super::runners::{self, Launch};
 use super::shell::{self, AndOr, Command, Kind, Op, Part, Pipeline, Redir, Script, Simple, Word};
@@ -246,6 +248,24 @@ fn is_number(v: &str) -> bool {
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '#' | '@' | '_')))
 }
 
+/// Review G7/R25: a path in or above one of tollgate's dirs, and that dir.
+type Reached = (PathBuf, PathBuf);
+
+/// The cwd (`None`: unknown) and a word's value.
+type ValueKey = (Option<PathBuf>, String);
+
+/// Review G7/R25: what a word names, as far as the guard can tell.
+enum Reach {
+    /// A path in or above one of tollgate's dirs, and that dir.
+    Hit(PathBuf, PathBuf),
+    /// No such path.
+    Clear,
+    /// A part only known at run time.
+    Unknown,
+    /// Too many brace results or glob entries to check.
+    TooMany,
+}
+
 /// The walk's state.
 pub struct Walker<'a> {
     pub(super) ctx: &'a Context,
@@ -303,12 +323,27 @@ pub struct Walker<'a> {
     /// variable.
     namerefs: BTreeSet<String>,
     loose_for: BTreeSet<String>,
+    /// Review G7/R25: the command, or a script it runs, spells one of
+    /// tollgate's dirs ([`paths::spells_tollgate_dir`]).
+    tollgate_named: bool,
+    /// [`Walker::candidate_reach`] per lexical path and spelling.
+    reach_memo: RefCell<HashMap<(PathBuf, bool), Option<Reached>>>,
+    /// [`Walker::names_tollgate_dir`] per cwd and value.
+    value_memo: RefCell<HashMap<ValueKey, Option<Reached>>>,
+    /// [`Walker::canon_cached`]: the real path of each dir looked up.
+    dir_memo: RefCell<HashMap<PathBuf, PathBuf>>,
+    /// Review G7/R25 (L19): the cwd and words of each unknown program
+    /// whose words are being walked as a command, all checked: a command
+    /// from a tail of them in that cwd needs no second check (code text in
+    /// them is new words, and is checked).
+    checked_tails: Vec<(Cwd, Vec<String>)>,
 }
 
 /// R25/R26/R28 for a Bash command.
 #[must_use]
 pub fn assess(ctx: &Context, command: &str) -> Assessment {
     let mut w = Walker::new(ctx);
+    w.tollgate_named = paths::spells_tollgate_dir(ctx, command);
     let r = match shell::parse(command) {
         Err(e) => Err(format!(
             "the guard cannot parse this command ({e}); write it as plain commands (G1)"
@@ -365,6 +400,11 @@ impl<'a> Walker<'a> {
             run_depth: 0,
             namerefs: BTreeSet::new(),
             loose_for: BTreeSet::new(),
+            tollgate_named: false,
+            reach_memo: RefCell::new(HashMap::new()),
+            value_memo: RefCell::new(HashMap::new()),
+            dir_memo: RefCell::new(HashMap::new()),
+            checked_tails: Vec::new(),
         }
     }
 
@@ -1587,6 +1627,7 @@ impl<'a> Walker<'a> {
             ));
         }
         if gitish {
+            self.tollgate_dir_words(name, &argv[1..], &env, Some(via))?;
             if let Some(prog) = self.foreign.last().cloned() {
                 return self.foreign_git(&prog, argv, env, f, via);
             }
@@ -1606,8 +1647,14 @@ impl<'a> Walker<'a> {
         }
         match class {
             Class::Wrapper(w) => self.wrapper(w, argv, env, f, via, certain),
-            Class::Launcher(l) => self.launcher(l, argv, env, f, via),
-            Class::Shell(sh) => self.shell(sh, argv, env, f, via),
+            Class::Launcher(l) => {
+                self.tollgate_dir_words(name, &argv[1..], &env, Some(via))?;
+                self.launcher(l, argv, env, f, via)
+            }
+            Class::Shell(sh) => {
+                self.tollgate_dir_words(name, &argv[1..], &env, Some(via))?;
+                self.shell(sh, argv, env, f, via)
+            }
             Class::Opaque(o) => self.opaque(o, argv, env, f, via),
             Class::Eval => {
                 self.no_elsewhere(via, "eval")?;
@@ -1628,6 +1675,7 @@ impl<'a> Walker<'a> {
             Class::Source => {
                 self.no_elsewhere(via, name)?;
                 self.env_check(&env, Target::Code)?;
+                self.tollgate_dir_words(name, &argv[1..], &env, Some(via))?;
                 let mut i = 1;
                 if argv.get(1).and_then(Word::literal).as_deref() == Some("--") {
                     i = 2;
@@ -1637,7 +1685,10 @@ impl<'a> Walker<'a> {
                 };
                 self.script_file(file, false, env, f, name)
             }
-            Class::Interp(lang) => self.interp(lang, &base, argv, env, f, via),
+            Class::Interp(lang) => {
+                self.tollgate_dir_words(name, &argv[1..], &env, Some(via))?;
+                self.interp(lang, &base, argv, env, f, via)
+            }
             Class::VarWrite(b) => self.var_writer(b, argv, &env),
             Class::Cd(b) => {
                 self.env_check(&env, Target::Other)?;
@@ -1908,6 +1959,7 @@ impl<'a> Walker<'a> {
             return self.code(&code, true, &frame, "flock -c");
         }
         let inner = first + pre;
+        self.tollgate_dir_words(name, &argv[1..inner.min(argv.len())], &[], None)?;
         let via = if name == "xargs" { Via::Elsewhere } else { via };
         let Some(cmd) = argv.get(inner) else {
             // No command: xargs runs echo; the others run nothing (or fail).
@@ -2190,9 +2242,13 @@ impl<'a> Walker<'a> {
         self.env_check(&env, Target::Other)?;
         let (at, prefix, moved) = match l {
             Launch::Deny(why) => return Err(why),
-            Launch::Strict { from } => return self.launch_tokens(base, &argv[from..]),
+            Launch::Strict { from } => {
+                self.tollgate_dir_words(base, &argv[1..], &env, Some(via))?;
+                return self.launch_tokens(base, &argv[from..]);
+            }
             Launch::Walk { at, prefix, moved } => (at, prefix, moved),
         };
+        self.tollgate_dir_words(base, &argv[1..at.min(argv.len())], &[], None)?;
         let Some(cmd) = argv.get(at) else {
             return Ok(());
         };
@@ -2760,6 +2816,7 @@ impl<'a> Walker<'a> {
             String::from_utf8(bytes)
                 .map_err(|_| format!("{shown} is not UTF-8 text; the guard cannot check it (G3)"))?
         };
+        self.tollgate_named |= paths::spells_tollgate_dir(self.ctx, &text);
         let s = shell::parse(&text)
             .map_err(|e| format!("the guard cannot parse the script {shown} ({e}) (G3)"))?;
         if self.depth >= MAX_CODE_DEPTH {
@@ -2815,6 +2872,8 @@ impl<'a> Walker<'a> {
         if is_binary(&head) {
             return self.other(name, base, argv, &env, f, via);
         }
+        // A script gets its arguments as `$1`...: it is no reader.
+        self.tollgate_dir_words(name, &argv[1..], &env, Some(via))?;
         let interp = shebang(&head);
         match interp.as_deref() {
             Some(prog) if cmds::interp(prog).is_some() => {
@@ -3255,6 +3314,17 @@ impl<'a> Walker<'a> {
                 }
             }
             _ => {
+                // Review G7/R25: the guard must know when the cwd is one
+                // of tollgate's dirs.
+                if let Some(w) = arg
+                    && self.resolve(w).is_none()
+                    && paths::spells_tollgate_tail(self.ctx, &w.raw)
+                {
+                    return Err(format!(
+                        "{b} to `{}`, a dir bash builds at run time that names /tollgate; write it literally (R25, G7, G8)",
+                        w.raw
+                    ));
+                }
                 let target = match arg {
                     None => Some(self.home.clone()),
                     Some(w) => match w.literal().as_deref() {
@@ -3337,12 +3407,15 @@ impl<'a> Walker<'a> {
     /// `text` as an absolute, canonical path; `None` when it is relative
     /// and the cwd is unknown.
     pub(super) fn abs_path(&self, text: &str) -> Option<PathBuf> {
+        // `canon` applies `..` to the dir a link resolves to, as the
+        // kernel does (`lnk/../hooks`); a lexical `..` first would drop
+        // the link.
         let p = Path::new(text);
         if p.is_absolute() {
-            return Some(paths::canon(&paths::lexical(Path::new("/"), p)));
+            return Some(paths::canon(p));
         }
         match &self.scope.cwd {
-            Cwd::Known(c) => Some(paths::canon(&paths::lexical(c, p))),
+            Cwd::Known(c) => Some(paths::canon(&c.join(p))),
             Cwd::Unknown => None,
         }
     }
@@ -3431,6 +3504,287 @@ impl<'a> Walker<'a> {
         Ok(())
     }
 
+    /// The tollgate dir that text `v` (an argument or environment value)
+    /// names as a path, and that path; see [`paths::path_candidates`].
+    fn names_tollgate_dir(&self, v: &str) -> Option<(PathBuf, PathBuf)> {
+        // Kept per cwd and value: each word of an unknown program is
+        // checked again as a command with the words after it (L19).
+        let cwd = match &self.scope.cwd {
+            Cwd::Known(c) => Some(c.clone()),
+            Cwd::Unknown => None,
+        };
+        let key = (cwd, v.to_owned());
+        if let Some(r) = self.value_memo.borrow().get(&key) {
+            return r.clone();
+        }
+        let r = paths::path_candidates(v, &self.home)
+            .iter()
+            .find_map(|c| self.candidate_reach(c));
+        self.value_memo.borrow_mut().insert(key, r.clone());
+        r
+    }
+
+    /// [`Self::names_tollgate_dir`] for one candidate path.
+    /// Results are kept per path for the call: a word list repeats paths
+    /// (L19: 100 words of an unknown program are each checked as a
+    /// command with the words after it).
+    fn candidate_reach(&self, c: &str) -> Option<(PathBuf, PathBuf)> {
+        let l = self.lexical_path(c)?;
+        let spelled = c.contains('/') || c.starts_with(['.', '~']);
+        // The path as written, from the cwd: the key holds the cwd.
+        let key = match &self.scope.cwd {
+            Cwd::Known(cwd) => (cwd.join(c), spelled),
+            Cwd::Unknown => (PathBuf::from(c), spelled),
+        };
+        if let Some(r) = self.reach_memo.borrow().get(&key) {
+            return r.clone();
+        }
+        let p = self.canon_cached(&key.0)?;
+        let r = paths::reaches_tollgate_dir(self.ctx, &p, spelled)
+            .map(|d| (p, d.clone()))
+            // The path as spelled too: `canon` keeps a link's name when
+            // the link dangles.
+            .or_else(|| {
+                paths::reaches_tollgate_dir(self.ctx, &l, spelled).map(|d| (l.clone(), d.clone()))
+            });
+        self.reach_memo.borrow_mut().insert(key, r.clone());
+        r
+    }
+
+    /// [`paths::canon`] of absolute `raw` (`None`: relative), with the
+    /// real path of its dir kept for the call (L19: most words are names
+    /// in the cwd, whose real path is known): one `lstat` of the last
+    /// name, and the full resolution only when it is a link or `raw` has
+    /// `..`.
+    fn canon_cached(&self, raw: &Path) -> Option<PathBuf> {
+        if !raw.is_absolute() {
+            return None;
+        }
+        let dotted = raw.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        });
+        let (Some(dir), Some(name), false) = (raw.parent(), raw.file_name(), dotted) else {
+            return Some(paths::canon(raw));
+        };
+        let real_dir = match &self.scope.cwd {
+            Cwd::Known(c) if c == dir => c.clone(),
+            _ => {
+                let hit = self.dir_memo.borrow().get(dir).cloned();
+                hit.unwrap_or_else(|| {
+                    let r = paths::canon(dir);
+                    self.dir_memo.borrow_mut().insert(dir.to_owned(), r.clone());
+                    r
+                })
+            }
+        };
+        let full = real_dir.join(name);
+        match std::fs::symlink_metadata(&full) {
+            Ok(m) if m.file_type().is_symlink() => Some(paths::canon(&full)),
+            _ => Some(full),
+        }
+    }
+
+    /// Review G7/R25: what word `w` names, as bash expands it: its value
+    /// when the guard knows it, else its brace lists, `$'...'` text and
+    /// globs (against the file system) when no part is only known at run
+    /// time ([`reach`]).
+    fn word_reach(&self, w: &Word) -> Reach {
+        if let Some(v) = self.arg_value(w) {
+            return self
+                .names_tollgate_dir(&v)
+                .map_or(Reach::Clear, |(p, d)| Reach::Hit(p, d));
+        }
+        let lookup = |n: &str| self.lookup(n);
+        let Some(toks) = reach::tokens(w, &self.home, &lookup) else {
+            return Reach::Unknown;
+        };
+        let Some(all) = reach::braces(&toks) else {
+            return Reach::TooMany;
+        };
+        let cwd = match &self.scope.cwd {
+            Cwd::Known(c) => Some(c.as_path()),
+            Cwd::Unknown => None,
+        };
+        for t in all {
+            for c in paths::path_candidates(&reach::text(&t), &self.home) {
+                if reach::has_glob(&c) {
+                    match reach::glob_reach(self.ctx, cwd, &c) {
+                        Ok(Some((p, d))) => return Reach::Hit(p, d),
+                        Ok(None) => {}
+                        Err(()) => return Reach::TooMany,
+                    }
+                } else if let Some((p, d)) = self.candidate_reach(&c) {
+                    return Reach::Hit(p, d);
+                }
+            }
+        }
+        if cwd.is_none() {
+            return Reach::Unknown;
+        }
+        Reach::Clear
+    }
+
+    /// Review G7/R25: a program that is not a known reader may write any
+    /// path it is given, in place (`curl -o`, `sort -o`, `tar -C`, `cc
+    /// -o`, `cargo install --root`, `git init`), and the installed copy and
+    /// every hook are one inode, so no list of writers is enough. `what`
+    /// with `words` (its arguments, or a launcher's whole command) and
+    /// `env` denies when a word, an option's value, a glued `-oVALUE`, an
+    /// environment value or a variable this command set names a path in
+    /// tollgate's state, data or config dir (or one of them lies under it),
+    /// when a word bash builds at run time spells `/tollgate`, and when it
+    /// runs in one of those dirs (`curl -O`, `tar -x` and `git init` write
+    /// their cwd).
+    ///
+    /// `leaf` (how the program is run) is `None` for a wrapper's or
+    /// runner's own options: the command it runs is checked as typed, with
+    /// the cwd and variables. When the call spells one of tollgate's dirs
+    /// anywhere ([`paths::spells_tollgate_dir`]), a value the guard cannot
+    /// know may be such a path (`ls DIR | xargs sort -o`, `for f in
+    /// DIR/*; do curl -o "$f" ...; done`): a word or environment value bash
+    /// builds at run time, arguments from xargs or find, and an unknown
+    /// cwd deny too.
+    pub(super) fn tollgate_dir_words(
+        &self,
+        what: &str,
+        words: &[Word],
+        env: &[EnvSet],
+        leaf: Option<Via>,
+    ) -> W {
+        if leaf.is_some()
+            && self.checked_tails.iter().any(|(cwd, raws)| {
+                *cwd == self.scope.cwd
+                    && raws.len() >= words.len()
+                    && raws[raws.len() - words.len()..]
+                        .iter()
+                        .zip(words)
+                        .all(|(r, w)| *r == w.raw)
+            })
+        {
+            return Ok(());
+        }
+        let named = self.tollgate_named;
+        let unknown = |shown: &str| {
+            Err(format!(
+                "`{what}` gets {shown}, which the guard cannot know, in a command that names tollgate's dirs; it is not a known reader (cat, grep, ls, ...), so it may write there; write the paths literally (R25, G7, G8)"
+            ))
+        };
+        if named && leaf == Some(Via::Elsewhere) {
+            return unknown("arguments from xargs, parallel or find");
+        }
+        if named && leaf.is_some() && matches!(self.scope.cwd, Cwd::Unknown) {
+            return unknown("a cwd");
+        }
+        let leaf = leaf.is_some();
+        let deny = |shown: &str, d: &Path| {
+            Err(format!(
+                "`{what}` is given {shown} in tollgate's dir {}, and it is not a known reader (cat, head, tail, grep, rg, jq, ls, stat, wc, diff, ...); a program may write any path it is given (R25, G7)",
+                d.display()
+            ))
+        };
+        if leaf && let Cwd::Known(c) = &self.scope.cwd {
+            if let Some(d) = paths::tollgate_dir(self.ctx, c, false) {
+                return Err(format!(
+                    "`{what}` runs in tollgate's dir {}, where only known readers (cat, ls, grep, ...) run; a program may write its cwd (R25, G7)",
+                    d.display()
+                ));
+            }
+            if let Some(d) = paths::above_tollgate_dir(self.ctx, c) {
+                return Err(format!(
+                    "`{what}` runs in {}, above tollgate's dir {}, where only known readers (cat, ls, grep, ...) run; a program may write its cwd (R25, G7)",
+                    c.display(),
+                    d.display()
+                ));
+            }
+        }
+        let built = |raw: &str| paths::spells_tollgate_tail(self.ctx, raw);
+        for w in words {
+            match self.word_reach(w) {
+                Reach::Hit(p, d) => return deny(&format!("the path {}", p.display()), &d),
+                Reach::Clear => {}
+                Reach::TooMany => {
+                    return Err(format!(
+                        "`{what}` is given `{}`, whose brace lists or globs give too many paths for the guard to check against tollgate's dirs (R25, G7, G8)",
+                        w.raw
+                    ));
+                }
+                Reach::Unknown if built(&w.raw) => {
+                    return Err(format!(
+                        "`{what}` is given `{}`, a word bash builds at run time that names /tollgate; write paths in tollgate's dirs literally, and only to readers (R25, G7, G8)",
+                        w.raw
+                    ));
+                }
+                Reach::Unknown if named && leaf => return unknown(&format!("`{}`", w.raw)),
+                Reach::Unknown => {}
+            }
+        }
+        for e in env {
+            // `NAME=~/x` has no literal value; bash expands the `~`.
+            let v = e.value.clone().or_else(|| {
+                let (_, t) = e.raw.split_once('=')?;
+                (!t.contains(['$', '`', '"', '\'', '\\'])).then(|| t.to_owned())
+            });
+            match v {
+                Some(v) => {
+                    if let Some((p, d)) = self.names_tollgate_dir(&v) {
+                        return deny(
+                            &format!("{} = {} in its environment", e.name, p.display()),
+                            &d,
+                        );
+                    }
+                }
+                None if built(&e.raw) => {
+                    return Err(format!(
+                        "`{what}` gets `{}`, a value bash builds at run time that names /tollgate (R25, G7, G8)",
+                        e.raw
+                    ));
+                }
+                None if named && leaf => return unknown(&format!("`{}`", e.raw)),
+                None => {}
+            }
+        }
+        if !leaf {
+            return Ok(());
+        }
+        // `export`, `set -a` and `declare -x` hand a variable to every
+        // later program; the guard does not track which ones are exported.
+        let mut vars: Vec<(&String, &String)> = self
+            .scope
+            .vars
+            .iter()
+            .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
+            .collect();
+        vars.sort();
+        for (name, v) in vars {
+            if let Some((p, d)) = self.names_tollgate_dir(v) {
+                return Err(format!(
+                    "`{what}` runs while variable {name} = {} names tollgate's dir {}, and a program may write a path from its environment; unset {name} first, or use the path only with readers (cat, ls, grep, ...) (R25, G7)",
+                    p.display(),
+                    d.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Review G7/R25: `name` is a known reader ([`TOLLGATE_DIR_READERS`])
+    /// as the system has it: found on the session's `PATH` (no `PATH` set
+    /// in the command), or named by its path in `/usr/bin` or `/bin`.
+    fn tollgate_reader(&self, name: &str, base: &str, env: &[EnvSet]) -> bool {
+        if !TOLLGATE_DIR_READERS.contains(&base) {
+            return false;
+        }
+        if name.contains('/') {
+            return ["/usr/bin/", "/bin/"]
+                .iter()
+                .any(|d| name.strip_prefix(d).is_some_and(|n| !n.contains('/')));
+        }
+        !self.scope.vars.contains_key("PATH") && !env.iter().any(|e| e.name == "PATH")
+    }
+
     /// After `cat > FILE <<'EOF'` ran: FILE holds the heredoc's text, when
     /// this is the only write of FILE so far and `cat` is the real one.
     fn note_known(&mut self, sc: &Simple, redirs: &[Redir], stdin: &Feed) {
@@ -3473,14 +3827,44 @@ impl<'a> Walker<'a> {
         via: Via,
     ) -> W {
         self.env_check(env, Target::Other)?;
-        if self.scope.funcs.contains(name) {
+        let lits = self.lits(argv);
+        let function = self.scope.funcs.contains(name);
+        if function {
+            // A function gets its arguments as `$1`...: it is no reader.
+            self.tollgate_dir_words(name, &argv[1..], env, Some(via))?;
             // Checked where it was defined; it may change the cwd and any
             // variable.
             self.scope.forget();
             self.log.push("*".into());
             return Ok(());
         }
-        let lits = self.lits(argv);
+        let reader = self.tollgate_reader(name, base, env);
+        if reader && !self.tollgate_named {
+            // What a reader lists or prints may feed a later command
+            // (`ls LINK | xargs ...`), also through a link that does not
+            // spell the dir.
+            self.tollgate_named = argv[1..]
+                .iter()
+                .any(|w| matches!(self.word_reach(w), Reach::Hit(..)));
+        }
+        // sed, sort and uniq write files their words name: from xargs,
+        // parallel or find, those words are not seen.
+        let parsed_writer = matches!(base, "sed" | "sort" | "uniq");
+        let mut all_checked = false;
+        if !reader || (parsed_writer && via == Via::Elsewhere) {
+            // The files `cp` and `install` copy from are read; where they
+            // write is checked here and by `write_target`.
+            let sources = copy_sources(base, argv, &lits);
+            let words: Vec<Word> = argv
+                .iter()
+                .enumerate()
+                .skip(1)
+                .filter(|(k, _)| !sources.contains(k))
+                .map(|(_, w)| w.clone())
+                .collect();
+            self.tollgate_dir_words(name, &words, env, Some(via))?;
+            all_checked = sources.is_empty();
+        }
         match base {
             "alias"
                 if lits[1..]
@@ -3523,7 +3907,17 @@ impl<'a> Walker<'a> {
         }
         let values: Vec<Option<String>> = argv.iter().map(|w| self.arg_value(w)).collect();
         if !READS_ONLY.contains(&base) {
-            self.foreign_args(argv, &values, env, f, via)?;
+            // Review G7/R25 (L19): a command walked from these words gets a
+            // tail of them, with this cwd and environment, all checked.
+            if all_checked {
+                let raws = argv[1..].iter().map(|w| w.raw.clone()).collect();
+                self.checked_tails.push((self.scope.cwd.clone(), raws));
+            }
+            let r = self.foreign_args(argv, &values, env, f, via);
+            if all_checked {
+                self.checked_tails.pop();
+            }
+            r?;
         }
         let fx = super::progs::check(base, &values)?;
         for file in &fx.sed_files {
@@ -3536,6 +3930,13 @@ impl<'a> Walker<'a> {
         }
         for (w, removal) in write_targets(base, argv, &lits) {
             if via == Via::Elsewhere && w.literal().as_deref() == Some("{}") {
+                // Review G7/R25: in a call that names tollgate's dirs,
+                // `{}` may be a path there.
+                if self.tollgate_named {
+                    return Err(format!(
+                        "{base} writes `{{}}`, a path from xargs, parallel or find, in a command that names tollgate's dirs (R25, G7)"
+                    ));
+                }
                 continue;
             }
             self.write_target(&w, removal, base)?;
@@ -3713,6 +4114,16 @@ impl<'a> Walker<'a> {
             i += 1;
         }
         let mut removal = false;
+        // Review G7/R25: `{}` stands for paths in tollgate's dirs there.
+        let in_tollgate = starts.iter().any(|w| match self.word_reach(w) {
+            Reach::Hit(..) | Reach::TooMany => true,
+            Reach::Clear => false,
+            Reach::Unknown => self.tollgate_named || paths::spells_tollgate_tail(self.ctx, &w.raw),
+        }) || (starts.is_empty()
+            && matches!(&self.scope.cwd, Cwd::Known(c) if paths::tollgate_dir(self.ctx, c, false).is_some()));
+        // What `-exec` gets for `{}` lies there (a link that does not
+        // spell the dir included).
+        self.tollgate_named |= in_tollgate;
         while i < argv.len() {
             match lits[i].as_deref() {
                 Some("-delete") => removal = true,
@@ -3732,6 +4143,11 @@ impl<'a> Walker<'a> {
                     let name = self.command_word(first)?;
                     if WRITE_CMDS.contains(&basename(&name)) {
                         removal = true;
+                    }
+                    if in_tollgate && !TOLLGATE_DIR_READERS.contains(&basename(&name)) {
+                        return Err(format!(
+                            "find -exec {name} on tollgate's dirs: `{{}}` names their files, and {name} is not a known reader (cat, grep, ...) (R25, G7)"
+                        ));
                     }
                     self.run(inner, &name, Vec::new(), f, Via::Elsewhere, false)?;
                     i = end;
@@ -4113,6 +4529,143 @@ fn foreign_shell_ok(sh: &str, code: &str) -> W {
     Ok(())
 }
 
+/// Review G7/R25: programs that only read the files they are given (or
+/// whose writes [`write_targets`] parses: sed's `-i` and `w`, `sort -o`
+/// and `-T`, `uniq IN OUT`), so they may name paths in tollgate's dirs
+/// and run there. Any other program may write a path it is given (`curl
+/// -o`, `xxd -r IN OUT`, `file -C`, `tree -o`, `less -o`), so it may
+/// not.
+const TOLLGATE_DIR_READERS: &[&str] = &[
+    "cat",
+    "tac",
+    "more",
+    "head",
+    "tail",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "ag",
+    "ack",
+    "jq",
+    "ls",
+    "stat",
+    "wc",
+    "du",
+    "df",
+    "diff",
+    "cmp",
+    "md5sum",
+    "sha1sum",
+    "sha224sum",
+    "sha256sum",
+    "sha384sum",
+    "sha512sum",
+    "b2sum",
+    "b3sum",
+    "cksum",
+    "readlink",
+    "realpath",
+    "basename",
+    "dirname",
+    "test",
+    "[",
+    "echo",
+    "printf",
+    "pwd",
+    "true",
+    "false",
+    ":",
+    "sed",
+    "od",
+    "hexdump",
+    "strings",
+    "nl",
+    "cut",
+    "sleep",
+    "date",
+    "sort",
+    "uniq",
+    "tr",
+    "column",
+    "fold",
+    "fmt",
+    "expand",
+    "unexpand",
+    "paste",
+    "join",
+    "comm",
+    "rev",
+    "seq",
+    // Shell builtins that open no file.
+    "break",
+    "continue",
+    "return",
+    "exit",
+    "shift",
+    "set",
+    "shopt",
+    "wait",
+    "times",
+];
+
+/// Review G7/R25: the indices in `argv` of the sources of `cp` or
+/// `install`, which they only read; none when they may link them to the
+/// target (`-l`, `-s`, `--link`, `--symbolic-link`, a word bash builds),
+/// since a later write of the link writes the source. A value option
+/// the parse does not know leaves its value a source only when it is not
+/// the last word; a misparse checks more words, never fewer.
+fn copy_sources(base: &str, argv: &[Word], lits: &[Option<String>]) -> Vec<usize> {
+    if !matches!(base, "cp" | "install") {
+        return Vec::new();
+    }
+    let la = &lits[1..];
+    let mut dashdash = false;
+    for a in la {
+        let Some(a) = a.as_deref() else {
+            return Vec::new();
+        };
+        if dashdash {
+            continue;
+        }
+        if a == "--" {
+            dashdash = true;
+        } else if let Some(long) = a.strip_prefix("--") {
+            let name = long.split('=').next().unwrap_or_default();
+            if !name.is_empty() && ("link".starts_with(name) || "symbolic-link".starts_with(name)) {
+                return Vec::new();
+            }
+        } else if a.len() > 1 && a.starts_with('-') && a[1..].contains(['l', 's']) {
+            return Vec::new();
+        }
+    }
+    let (pos, _) = positionals(
+        &argv[1..],
+        la,
+        "tSmogeT",
+        &[
+            "--target-directory",
+            "--suffix",
+            "--mode",
+            "--owner",
+            "--group",
+        ],
+    );
+    let to_dir = la.iter().flatten().any(|a| {
+        a.starts_with("--target-directory")
+            || (a.starts_with('-') && !a.starts_with("--") && a.contains('t'))
+    });
+    let n = if to_dir {
+        pos.len()
+    } else {
+        pos.len().saturating_sub(1)
+    };
+    pos[..n]
+        .iter()
+        .filter_map(|w| argv.iter().position(|a| std::ptr::eq(a, *w)))
+        .collect()
+}
+
 /// Commands that write or remove files named in their arguments.
 const WRITE_CMDS: &[&str] = &[
     "rm", "rmdir", "unlink", "shred", "mv", "cp", "install", "rsync", "ln", "tee", "touch",
@@ -4279,6 +4832,105 @@ fn write_targets(base: &str, argv: &[Word], lits: &[Option<String>]) -> Vec<(Wor
                 pos.into_iter().skip(usize::from(!script_given)).collect(),
                 false,
             )
+        }
+        // Review G7/R25: `-o FILE` (also glued, `--output[=]` and its
+        // prefixes) and the temporary dir `-T DIR` (`--temporary-directory`)
+        // are written; `-k`, `-t`, `-S` take a value.
+        "sort" => {
+            let mut out = Vec::new();
+            let mut k = 0;
+            while k < args.len() {
+                match la[k].as_deref() {
+                    Some("--") => break,
+                    Some(a) if a.starts_with("--") => {
+                        let (name, value) = match a[2..].split_once('=') {
+                            Some((n, v)) => (n, Some(v)),
+                            None => (&a[2..], None),
+                        };
+                        let writes = !name.is_empty()
+                            && ("output".starts_with(name)
+                                || "temporary-directory".starts_with(name));
+                        let takes = writes
+                            || [
+                                "key",
+                                "field-separator",
+                                "buffer-size",
+                                "files0-from",
+                                "random-source",
+                                "compress-program",
+                                "batch-size",
+                                "parallel",
+                                "sort",
+                            ]
+                            .iter()
+                            .any(|l| !name.is_empty() && l.starts_with(name));
+                        match value {
+                            Some(v) if writes => out.push((lit_word(v), false)),
+                            None if takes => {
+                                k += 1;
+                                if writes && let Some(w) = args.get(k) {
+                                    out.push((w.clone(), false));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(a) if a.len() > 1 && a.starts_with('-') => {
+                        for (j, c) in a.char_indices().skip(1) {
+                            if "ktoST".contains(c) {
+                                let rest = &a[j + 1..];
+                                let value = if rest.is_empty() {
+                                    k += 1;
+                                    args.get(k).cloned()
+                                } else {
+                                    Some(lit_word(rest))
+                                };
+                                if matches!(c, 'o' | 'T')
+                                    && let Some(v) = value
+                                {
+                                    out.push((v, false));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    // A word bash builds may be an option (`-o/x`, or `-o`
+                    // with the next word as its value), unless it starts
+                    // with text that is not `-`.
+                    None => {
+                        let (prefix, _) = args[k].literal_prefix();
+                        if prefix.starts_with('-') {
+                            out.push((args[k].clone(), false));
+                        }
+                        if (prefix.is_empty() || prefix.starts_with('-'))
+                            && let Some(w) = args.get(k + 1)
+                        {
+                            out.push((w.clone(), false));
+                        }
+                    }
+                    Some(_) => {}
+                }
+                k += 1;
+            }
+            out
+        }
+        "uniq" => {
+            let (pos, _) = positionals(
+                args,
+                la,
+                "fsw",
+                &["--skip-fields", "--skip-chars", "--check-chars"],
+            );
+            // An unquoted word bash builds may split into IN and OUT.
+            let split =
+                matches!(pos.as_slice(), [w] if w.literal().is_none() && !w.raw.starts_with('"'));
+            if split {
+                return all(pos, false);
+            }
+            pos.get(1)
+                .map(|w| ((*w).clone(), false))
+                .into_iter()
+                .collect()
         }
         "perl" => {
             let in_place = la

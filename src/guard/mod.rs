@@ -37,6 +37,7 @@ mod git;
 mod gitopts;
 pub mod paths;
 mod progs;
+mod reach;
 pub mod rules;
 mod runners;
 pub mod shell;

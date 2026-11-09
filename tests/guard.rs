@@ -89,7 +89,11 @@ fn ask_rules_return_an_ask_decision_t16_r26() {
         "git branch -m a b",
         "git config url./tmp/fake.git.insteadOf git@gitlab.example:v/r.git",
     ] {
-        let (code, out, err) = a.bash(cmd);
+        // In the repo: the sandbox root holds `config`, the dir above
+        // tollgate's config dir, which no program may be given (review
+        // G7/R25).
+        let cmd = format!("cd {} && {cmd}", repo.display());
+        let (code, out, err) = a.bash(&cmd);
         assert_eq!(code, Some(0), "{cmd}: {err}");
         assert!(ask(&out), "{cmd}: {out}");
     }

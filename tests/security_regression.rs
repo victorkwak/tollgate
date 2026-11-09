@@ -1,4 +1,4 @@
-//! Security regression suite (S1-S42): one test per bypass, each run the
+//! Security regression suite (S1-S51): one test per bypass, each run the
 //! way a Claude Code session runs git.
 //!
 //! The lab: the binary from this build installed by `tollgate install` at
@@ -3721,4 +3721,238 @@ fn s50_unknown_launchers_never_run_git_tollgate_or_a_shell_unwalked() {
         let g = lab.guard(cmd);
         assert!(matches!(g, Guarded::Allowed(_)), "{cmd}: {g:?}");
     }
+}
+
+/// S51 (G7, R25, review G7/R25): the installed copy and every hook name
+/// are hard links to one inode, and many programs write a file they are
+/// given (`curl -o`, `sort -o`, `tar -C`, `git init`, a compiler's `-o`,
+/// `cargo install --root`), in place, keeping that inode. A list of
+/// writers misses them, so the guard denies every program that is not a
+/// known reader when a word, an `--opt=VALUE` or `NAME=VALUE` value, a
+/// glued `-oVALUE` or an environment value names a path in tollgate's
+/// state, data or config dir (through `..`, links and the tracked cwd),
+/// and any such program whose cwd is one of those dirs (`curl -O`, `tar
+/// -x` and `git init` write the cwd). Reads stay open. Only the guard
+/// runs here, except the last command, which runs in the session.
+#[test]
+fn s51_no_program_writes_tollgates_dirs_unlisted() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    let root = lab.root();
+    let r = root.display().to_string();
+    let data = lab.a.data();
+    let d = data.display().to_string();
+    let b = lab.a.bin().display().to_string();
+    let s = lab.sb().state().display().to_string();
+    let c = root.join("config/tollgate").display().to_string();
+    let fake = root.join("fake");
+    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+    let f = fake.display().to_string();
+    std::fs::create_dir_all(lab.sb().state().join("trusted-remotes")).unwrap();
+    std::os::unix::fs::symlink(&data, root.join("lnk")).unwrap();
+    // A link to a dir in it: `..` after it is the data dir.
+    std::os::unix::fs::symlink(data.join("bin"), root.join("lnkbin")).unwrap();
+    std::fs::write(root.join("w.sh"), "sort -o \"$1\" /dev/null\n").unwrap();
+    std::fs::create_dir_all(root.join("b")).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/sort", root.join("b/cat")).unwrap();
+    let attacks = [
+        format!("curl -so {b} file://{f}"),
+        format!("curl -s --output {b} file://{f}"),
+        format!("wget -qO {b} file://{f}"),
+        format!("wget -qO{b} file://{f}"),
+        format!("sort -o {b} {f}"),
+        format!("sort -o{b} {f}"),
+        format!("sort --output={b} {f}"),
+        format!("sort -uo{b} {f}"),
+        format!("uniq {f} {b}"),
+        format!("xxd -r {f} {b}"),
+        format!("gpg -o {c}/config.toml -d x"),
+        format!("cmake -E copy {f} {b}"),
+        format!("patch {c}/config.toml < {f}"),
+        format!("tar -xf x.tar -C {c}"),
+        format!("tar -xf x.tar --directory={c}"),
+        format!("unzip -o x.zip -d {d}"),
+        format!("cc -o {b} x.c"),
+        format!("cc -Wl,-o,{b} x.c"),
+        format!("rustc -o {b} x.rs"),
+        format!("cargo install --root {d} x"),
+        format!("cargo install --root={d} x"),
+        format!("make install DESTDIR={d}"),
+        "make install DESTDIR=~/../data/tollgate".to_owned(),
+        "sort -o ~/../data/tollgate/bin/tollgate x".to_owned(),
+        format!("DESTDIR={d} make install"),
+        format!("CARGO_INSTALL_ROOT={d} cargo install x"),
+        format!("env sort -o {b} {f}"),
+        format!("timeout 5 sort -o {b} {f}"),
+        format!("nice -n 5 curl -so {b} file://{f}"),
+        format!("sort -o {r}/lnk/bin/tollgate {f}"),
+        format!("sort -o {r}/x/../data/tollgate/bin/tollgate {f}"),
+        format!("cd {r} && sort -o data/tollgate/bin/tollgate {f}"),
+        format!("cd {r}/data && sort -o tollgate/bin/tollgate {f}"),
+        format!("cd {r}/data && tar -xf {r}/x.tar -C tollgate"),
+        format!("cd {r}/data && tar -xf {r}/x.tar"),
+        format!("tar -xf x.tar -C {r}/data"),
+        format!("cp -r {r}/evil/. {r}/data/"),
+        format!("cp -l {b} {r}/hard && sort -o {r}/hard {f}"),
+        format!("cp -s {b} {r}/soft && sort -o {r}/soft {f}"),
+        format!("cp --link {b} {r}/hard"),
+        format!("cp -t {d}/bin {f}"),
+        format!("cp --target-directory={d}/bin {f}"),
+        format!("cp {f} {r}/lnk/bin/tollgate"),
+        format!("export DESTDIR={d}; make install"),
+        format!("cd \"$(printf %s {d})\" && curl -sO file://{f}"),
+        // Paths that reach the program at run time, in a call that names
+        // tollgate's dirs.
+        format!("w() {{ sort -o \"$1\" {f}; }}; w {b}"),
+        format!("cat() {{ sort -o \"$1\" {f}; }}; cat {b}"),
+        format!("printf '%s\\n' {b} | xargs -I{{}} sort -o {{}} {f}"),
+        format!("ls {d}/bin/* | while read -r x; do sort -o \"$x\" {f}; done"),
+        format!("for x in {d}/bin/*; do sort -o \"$x\" {f}; done"),
+        format!("x=$(ls -d {d}/bin/tollgate); sort -o \"$x\" {f}"),
+        format!("{r}/w.sh {b}"),
+        format!("bash {r}/w.sh {b}"),
+        format!(". {r}/w.sh {b}"),
+        format!("cd {r}/b && PATH={r}/b:$PATH cat {b}"),
+        format!("{r}/b/cat {b}"),
+        format!("cd \"$(ls -d {d})\" && curl -sO file://{f}"),
+        // `..` after a link applies to the link's target, as the kernel
+        // does it.
+        format!("sort -o {r}/lnkbin/../hooks/pre-commit {f}"),
+        format!("curl -so {r}/lnkbin/../hooks/pre-commit file://{f}"),
+        format!("printf x > {r}/lnkbin/../hooks/pre-commit"),
+        format!("ls {r}/lnk/bin | xargs -I{{}} sort -o {{}} {f}"),
+        format!("find {r}/lnk/bin -name tollgate -exec sort -o {{}} {f} ';'"),
+        format!("ls {s} | xargs -I{{}} rm -f {{}}"),
+        format!("ls {r}/lnk/bin/* | xargs sed -i s/a/b/"),
+        format!("ls {s}/* | xargs sed -i s/a/b/"),
+        format!("ls {r}/lnk/bin/* | xargs sort -o"),
+        format!("sort -T {s} {f}"),
+        format!("sort --temporary-directory={s} {f}"),
+        format!("sort --outp={b} {f}"),
+        format!("sort -rko{b} {f} -o{b}"),
+        format!("uniq {f} {b}"),
+        format!("uniq -c -- {f} {b}"),
+        // Code other programs run.
+        format!("sh -c 'sort -o {b} {f}'"),
+        format!("bash -c 'cd {d} && curl -sO file://{f}'"),
+        format!("eval 'curl -so {b} file://{f}'"),
+        format!("script -qc 'curl -so {b} file://{f}' /dev/null"),
+        format!("env -C {d}/bin curl -sO file://{f}"),
+        format!("timeout 5 env -C {d} git init -q"),
+        format!("dd if={f} of={b}"),
+        format!("git -c core.worktree={s} checkout -- ."),
+        format!("strace -o {s}/x true"),
+        format!("frobnicate sh -c 'cd {d} && curl -sO file://{f}'"),
+        format!("frobnicate python3 x.py {b}"),
+        format!("jq bash -c 'sort -o {b} {f}'"),
+        format!("time -o {s}/x true"),
+        // Spellings bash expands at run time.
+        format!("sort -o {r}/data/tollgat$'\\x65'/bin/tollgate {f}"),
+        format!("sort -o {r}/d$'\\141't$'\\141'/$'\\x74'ollgat$'\\145'/bin/x {f}"),
+        format!("sort -o {r}/d*/t*/b*/t* {f}"),
+        format!("sort -o {r}/dat?/tollgat?/bin/tollgat? {f}"),
+        format!("sort -o {r}/[d]ata/tollgat[e]/bin/x {f}"),
+        format!("sort -o {r}/l*/bin/tollgate {f}"),
+        format!("sort -o {r}/data/tollgat{{e,x}}/bin/tollgate {f}"),
+        format!("sort -o {r}/{{x,data}}/tollgat{{y,e}}/bin/tollgate {f}"),
+        format!("sort -o{r}/d*/t*/b*/t* {f}"),
+        format!("sort --output={r}/d*/t*/b*/t* {f}"),
+        format!("cd {r} && sort -o d*/t*/b*/t* {f}"),
+        format!("sort -o \"$XDG_DATA_HOME/tollgate/bin/tollgate\" {f}"),
+        format!("sort -o \"$(printf %s {b})\" {f}"),
+        format!("D={d}; sort -o $D/bin/tollgate {f}"),
+        format!("python3 w.py --out {b}"),
+        format!("find {s} -delete"),
+        format!("find {s} -name x -exec sort -o {{}} {f} ';'"),
+        format!("find {s} -fprint {s}/x"),
+        // The cwd: these write it without naming it.
+        format!("cd {d}/bin && curl -sO file://{f}"),
+        format!("cd {d}/bin && tar -xf {r}/x.tar"),
+        format!("cd {d} && unzip -o {r}/x.zip"),
+        format!("pushd {d} && git init -q"),
+        // git's own ways to write a path.
+        format!("git clone -q x {d}/hooks"),
+        format!("git init -q {s}/trusted-remotes"),
+        format!("git -C {s}/trusted-remotes clean -fxq"),
+        format!("git init -q {s}/trusted-remotes && git -C {s}/trusted-remotes clean -fxq"),
+        format!("git archive -o {c}/config.toml HEAD"),
+        format!("git archive --output={c}/config.toml HEAD"),
+        format!("git diff --output={c}/config.toml"),
+        format!("git format-patch -o {s} HEAD~1"),
+        format!("git bundle create {s}/x.bundle HEAD"),
+        format!("git --git-dir={s}/g init"),
+        format!("git --work-tree={s} checkout -- ."),
+        format!("GIT_DIR={s}/g git init -q"),
+        format!("git worktree add {s}/wt HEAD"),
+    ];
+    let mut bad: Vec<String> = attacks
+        .iter()
+        .filter_map(|cmd| match lab.guard(cmd) {
+            Guarded::Denied(_) => None,
+            g => Some(format!("{cmd}  => {g:?}")),
+        })
+        .collect();
+    // Reads, and writes elsewhere, stay open.
+    for cmd in [
+        format!("cat {c}/config.toml"),
+        format!("ls -la {s} {d}/bin"),
+        format!("grep -rn x {s}"),
+        format!("rg -n x {s}"),
+        format!("tail -n 5 {s}/x.log"),
+        format!("head -c 64 {b} | xxd"),
+        format!("jq . {s}/x.json"),
+        format!("sed -n 1,5p {c}/config.toml"),
+        format!("diff {c}/config.toml {f}"),
+        format!("wc -l {c}/config.toml"),
+        format!("stat {b}"),
+        format!("du -sh {s}"),
+        format!("sha256sum {b}"),
+        format!("b3sum {b}"),
+        format!("find {s} -name '*.json'"),
+        format!("find {s} -name '*.json' -exec cat {{}} +"),
+        format!("test -x {b} && echo armed"),
+        format!("[ -d {s} ] && echo yes"),
+        format!("cd {s} && ls && cat x.json"),
+        format!("cd {s} && cd {r} && sort -o out.txt {f}"),
+        format!("sort -o {r}/sorted {f}"),
+        format!("curl -so {r}/dl file://{f}"),
+        format!("cp {c}/config.toml {r}/config-backup.toml"),
+        format!("for j in $(ls {s}); do grep -c x \"{s}/$j\"; done"),
+        format!("ls {s} | xargs -I{{}} cat {s}/{{}}"),
+        format!("ls {s} && for x in a b; do cargo test -p \"$x\"; done"),
+        format!("cd {r} && git config --get user.name"),
+        "printf a/b | tr / _ | cut -d_ -f2 | sort -t/ -k1".to_owned(),
+        "awk -F/ '{print $2}' Cargo.toml".to_owned(),
+        "sort -o out.txt src/*.rs crates/*/Cargo.toml".to_owned(),
+        format!("cd {s} && grep -h x * | sort | uniq -c | sort -rn | head"),
+        format!("cd {s} && ls | tr a-z A-Z | column"),
+        "f=Cargo.toml; sort \"$f\" | uniq -c".to_owned(),
+        format!("sort -k2 -t, {c}/config.toml"),
+        "tollgate status".to_owned(),
+        "cargo test -p a".to_owned(),
+        "git status --short".to_owned(),
+    ] {
+        match lab.guard(&cmd) {
+            Guarded::Allowed(_) => {}
+            g => bad.push(format!("{cmd}  => not allowed: {g:?}")),
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    // End to end: the installed copy and the trusted-remote records are
+    // as they were.
+    let before = std::fs::read(lab.a.bin()).unwrap();
+    let rec = lab.sb().state().join("trusted-remotes/sentinel.json");
+    std::fs::write(&rec, "{}").unwrap();
+    for cmd in [
+        format!("sort -o {b} {f}"),
+        format!("git init -q {s}/trusted-remotes && git -C {s}/trusted-remotes clean -fxq"),
+    ] {
+        let run = lab.session(&cmd);
+        assert!(run.denied(), "{cmd}: {run:?}");
+    }
+    assert_eq!(
+        std::fs::read(lab.a.bin()).unwrap(),
+        before,
+        "the guard was replaced"
+    );
+    assert!(rec.exists(), "a trusted-remote record is gone");
 }

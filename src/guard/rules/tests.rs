@@ -1197,12 +1197,27 @@ fn r25_tollgate_dirs() {
         "find ~/.local/state/tollgate -name '*.json' -delete",
         "find ~/.local/state/tollgate -exec rm {} +",
         "echo x > \"$OUT\"",
+        // Review G7/R25: any program that is not a known reader.
+        "sort -o ~/.local/share/tollgate/bin/tollgate /tmp/f",
+        "curl -so ~/.local/share/tollgate/bin/tollgate file:///tmp/f",
+        "wget -qO/h/.local/share/tollgate/bin/tollgate file:///tmp/f",
+        "tar -xf x.tar -C ~/.local/share",
+        "git init -q ~/.local/state/tollgate/trusted-remotes",
+        "git -C ~/.local/state/tollgate/trusted-remotes clean -fxq",
+        "cd ~/.local/state/tollgate && git init -q",
+        "cd ~/.local/share && tar -xf /tmp/x.tar -C tollgate",
+        "cargo install --root=~/.local/share/tollgate x",
+        "DESTDIR=~/.local/share/tollgate make install",
+        "find ~/.local/state/tollgate -exec sort -o {} /tmp/f ';'",
     ]);
     allowed(&[
         "grep FAIL ~/.local/state/tollgate/jobs/J/tests.log",
         "cat /h/.local/state/tollgate/jobs/x/report.json | head",
         "tail -n 50 ~/.local/state/tollgate/jobs/J/clippy.log",
         "cp ~/.local/state/tollgate/jobs/J/report.json /tmp/r.json",
+        "cd ~/.local/state/tollgate && ls jobs && tail -n 5 jobs/J/tests.log",
+        "find ~/.local/state/tollgate -name '*.json' -exec cat {} +",
+        "sed -n 1,5p ~/.config/tollgate/config.toml",
         "find ~/.local/state/tollgate -name '*.json' -exec cat {} +",
         "OUT=/tmp/o.log; cargo test > \"$OUT\"",
         "cargo test > \"$TMPDIR/x.log\" 2>&1",
@@ -1445,6 +1460,13 @@ fn tmp_probe() {
 /// form the guard knows; reads, removals and new dirs do not.
 #[test]
 fn tool_writes_ask_item35() {
+    // A copy into a dir above tollgate's dirs can write them too: denied
+    // (review G7/R25).
+    denied(&[
+        "cp -r /tmp/evil/. ~/.local",
+        "cp -r /tmp/.cargo ~",
+        "cd /h/.local && cp /bin/true bin/bun",
+    ]);
     asked(&[
         "printf '[target.x86_64-unknown-linux-gnu]\\nrunner = \"true\"\\n' >> ~/.cargo/config.toml",
         "printf x > \"$HOME\"/.cargo/config",
@@ -1455,14 +1477,11 @@ fn tool_writes_ask_item35() {
         "ln -sf /bin/true ~/.local/bin/cargo",
         "ln -s ~/.cargo /tmp/c",
         "cd ~/.local/bin && ln -sf /bin/true uv",
-        "cd /h/.local && cp /bin/true bin/bun",
         "mv /tmp/x ~/.bun/bin/bun",
         "mv ~/.cargo ~/.cargo.bak",
         "echo x | tee -a ~/.rustfmt.toml",
         "sed -i s/a/b/ ~/.config/rustfmt/rustfmt.toml",
         "truncate -s 0 ~/rustfmt.toml",
-        "cp -r /tmp/evil/. ~/.local",
-        "cp -r /tmp/.cargo ~",
         "chmod +x ~/.local/bin/x",
         "cp x ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc",
         "cp x ~/.rustup/settings.toml",
@@ -1735,6 +1754,15 @@ fn item_22_local_repo_in_every_spelling() {
 fn item_21_review_settings_writes_ask_r26() {
     let mut c = ctx();
     c.vars.push(("CLAUDE_CONFIG_DIR".into(), "/cfg".into()));
+    // The home dir holds tollgate's dirs: a copy into it, or git run on
+    // it, is denied (review G7/R25).
+    denied_in(
+        &c,
+        &[
+            "cd /h && cp -r /tmp/x/. .",
+            "git -C /h config --file .claude/settings.json a.b c",
+        ],
+    );
     for cmd in [
         "printf x > /cfg/settings.json",
         "printf x > $CLAUDE_CONFIG_DIR/settings.local.json",
@@ -1746,10 +1774,9 @@ fn item_21_review_settings_writes_ask_r26() {
         "printf x > /w/repo/.claude/settings.json",
         "cd sub/.. && printf x > .claude/settings.local.json",
         "mv /h/.claude /tmp/c",
-        "cd /h && cp -r /tmp/x/. .",
         "chmod 000 /h/.claude/settings.json",
         "git config --file .claude/settings.json a.b c",
-        "git -C /h config --file .claude/settings.json a.b c",
+        "cd /h/.claude/.. && git config --file .claude/settings.json a.b c",
     ] {
         assert!(
             matches!(bash_ruling(&c, cmd), Ruling::Ask(_)),

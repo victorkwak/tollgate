@@ -167,7 +167,7 @@ impl Word {
 }
 
 /// `NAME` of `$NAME` or `${NAME}` (no operators); `None` otherwise.
-fn simple_param(text: &str) -> Option<&str> {
+pub(super) fn simple_param(text: &str) -> Option<&str> {
     let name = text
         .strip_prefix('{')
         .and_then(|t| t.strip_suffix('}'))
