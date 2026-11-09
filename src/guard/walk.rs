@@ -255,6 +255,9 @@ pub struct Walker<'a> {
     /// literal heredoc (`cat > f <<'EOF'`): a later part may run them,
     /// and they are checked as that text (G3).
     known: HashMap<PathBuf, String>,
+    /// Files whose mode or owner this command changes (`chmod +x`): a
+    /// launcher may run them as programs (G2, item 20).
+    moded: Vec<PathBuf>,
     pub(super) saw_git: bool,
     pub(super) saw_tollgate: bool,
     /// [`cmds::scoped`] variables written for the rest of the shell, and
@@ -323,6 +326,7 @@ impl<'a> Walker<'a> {
             in_script: false,
             written: Vec::new(),
             known: HashMap::new(),
+            moded: Vec::new(),
             saw_git: false,
             saw_tollgate: false,
             scoped_writes: Vec::new(),
@@ -1588,10 +1592,14 @@ impl<'a> Walker<'a> {
         for o in &opts {
             match (name, o.name.as_str()) {
                 ("exec", "-c" | "-a") => {
-                    return self.launch_tokens(
-                        "exec -c/-a (a changed environment or argv[0])",
-                        &argv[first..],
-                    );
+                    // bash finds the program on its own PATH, then runs
+                    // it with the environment cleared (-c).
+                    let what = "exec -c/-a (a changed environment or argv[0])";
+                    self.launch_tokens(what, &argv[first..])?;
+                    return match argv.get(first).and_then(|c| c.literal_home(&self.home)) {
+                        Some(n) => self.launched_name(what, &n, &env, false),
+                        None => Ok(()),
+                    };
                 }
                 ("time", "-o" | "--output") => {
                     if let Some(w) = value(o) {
@@ -1803,10 +1811,31 @@ impl<'a> Walker<'a> {
         }
         if let Some(what) = losing {
             self.env_check(&env, Target::Other)?;
-            return self.launch_tokens(
-                &format!("{what} (it drops or replaces the session environment, the hook injection included)"),
-                &argv[i..],
+            let what = format!(
+                "{what} (it drops or replaces the session environment, the hook injection included)"
             );
+            let clears = matches!(losing, Some("env -i" | "env -"));
+            let check = |w: &mut Self| {
+                w.launch_tokens(&what, &argv[i..])?;
+                match argv.get(i).and_then(|c| c.literal_home(&w.home)) {
+                    Some(name) => w.launched_name(&what, &name, &env, clears),
+                    None => Ok(()),
+                }
+            };
+            // `-C DIR`: paths in the command are relative to DIR.
+            return match chdir {
+                None => check(self),
+                Some(d) => {
+                    let dir = self.resolve(&d);
+                    self.isolated(|w| {
+                        w.scope.cwd = match dir.and_then(|t| w.abs_path(&t)) {
+                            Some(p) => Cwd::Known(p),
+                            None => Cwd::Unknown,
+                        };
+                        check(w)
+                    })
+                }
+            };
         }
         let Some(cmd) = argv.get(i) else {
             if via == Via::Elsewhere {
@@ -1846,6 +1875,21 @@ impl<'a> Walker<'a> {
     /// escapes or variables (item 18).
     fn split_string(&self, w: Option<&Word>) -> W {
         match w.and_then(Word::literal) {
+            // env reads PATH and -C from the string itself: a name found on
+            // that PATH or a path relative to that dir is not what the
+            // guard checks.
+            Some(s)
+                if s.replace(['\'', '"'], "").split_whitespace().any(|a| {
+                    a.starts_with("PATH=")
+                        || a.starts_with("--c")
+                        || (a.starts_with('-') && !a.starts_with("--") && a.contains('C'))
+                }) =>
+            {
+                Err(
+                    "env -S with PATH= or -C in its string: give the program's path and run it from its dir (G2, G3)"
+                        .into(),
+                )
+            }
             Some(s) if !s.contains(['\\', '$']) => {
                 self.launch_tokens("env -S", &[lit_word(&s)])
             }
@@ -1872,6 +1916,94 @@ impl<'a> Walker<'a> {
                 return Err(format!(
                     "{what} runs {kind} (`{t}`) where the guard cannot follow it; run it directly in the session (G2)"
                 ));
+            }
+            for tok in cmds::tokens(&t).filter(|tok| tok.contains('/')) {
+                self.launched_file(what, tok, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// G2, G3 (item 20, review note 9): `text`, a path in what a launcher
+    /// runs, may not be a script: the launcher runs it unread (a shell or
+    /// an interpreter), and an environment-dropping one runs the git in
+    /// it without the hook injection. A file this command writes first is
+    /// unknown, so it is denied too; a binary runs (21d). `command` is true
+    /// when `text` is in the program's place (the command word of `env`
+    /// or `exec` with their environment options): any text file there is
+    /// a script (execvp runs a file with no `#!` with sh, and a mode
+    /// change the guard does not see can make it executable). Elsewhere a
+    /// word may be data (`sudo cat /etc/hosts`), so a text file counts
+    /// when it is executable, starts with `#!`, or this command changes
+    /// its mode.
+    fn launched_file(&self, what: &str, text: &str, command: bool) -> W {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Some(p) = self.abs_path(text) else {
+            return Err(format!(
+                "{what} with {text} after a cd the guard cannot follow; use an absolute path (G2, G8)"
+            ));
+        };
+        if self.was_written(&p) {
+            return Err(format!(
+                "{what} with {text}, which this command writes first; the guard cannot read what runs there (G2, G3)"
+            ));
+        }
+        // Not there or not a file: nothing runs it as a program.
+        let Ok(meta) = std::fs::metadata(&p) else {
+            return Ok(());
+        };
+        if !meta.is_file() {
+            return Ok(());
+        }
+        let exec =
+            meta.permissions().mode() & 0o111 != 0 || self.moded.iter().any(|m| p.starts_with(m));
+        let head = match read_head(&p) {
+            Ok(h) => h,
+            Err(_) if !command && !exec => return Ok(()),
+            Err(e) => {
+                return Err(format!(
+                    "{what} with {text}, a program the guard cannot read ({e}) (G2, G3)"
+                ));
+            }
+        };
+        if is_binary(&head) || !(command || exec || head.starts_with(b"#!")) {
+            return Ok(());
+        }
+        Err(format!(
+            "{what} runs the script {text} where the guard cannot read it, and git in it may run without the gate hooks; run the script directly in the session (G2, G3)"
+        ))
+    }
+
+    /// G2, G3: a bare command name under a launcher that drops or
+    /// replaces the environment, found on a `PATH` this command sets (in
+    /// `env`'s assignments, in front, or earlier in the shell): every
+    /// match is checked as [`Self::launched_file`]. `clears` is true when
+    /// the launcher starts from an empty environment (`env -i`, `env -`),
+    /// so only a `PATH` it is given applies.
+    fn launched_name(&self, what: &str, name: &str, env: &[EnvSet], clears: bool) -> W {
+        if name.contains('/') {
+            return self.launched_file(what, name, true);
+        }
+        let path = match env.iter().rev().find(|e| e.name == "PATH") {
+            Some(e) => e.value.clone().ok_or_else(|| {
+                format!(
+                    "{what} with `{}`, a PATH bash builds at run time; give the program's path (G2, G3)",
+                    e.raw
+                )
+            })?,
+            None if clears => return Ok(()),
+            None if self.scope.opaque || self.scope.vars.contains_key("PATH") => {
+                return Err(format!(
+                    "{what} {name} after this command changes PATH; give the program's path (G2, G3)"
+                ));
+            }
+            None => return Ok(()),
+        };
+        for dir in path.split(':') {
+            let dir = if dir.is_empty() { "." } else { dir };
+            self.launched_file(what, &format!("{dir}/{name}"), true)?;
+            if let Some(rest) = dir.strip_prefix('~') {
+                self.launched_file(what, &format!("{}{rest}/{name}", self.home), true)?;
             }
         }
         Ok(())
@@ -2235,10 +2367,7 @@ impl<'a> Walker<'a> {
             }
             head
         };
-        let binary = head.starts_with(b"\x7fELF")
-            || head.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
-            || head.starts_with(&[0xca, 0xfe, 0xba, 0xbe]);
-        if binary {
+        if is_binary(&head) {
             return self.other(name, base, argv, &env, f, via);
         }
         let interp = shebang(&head);
@@ -2716,6 +2845,8 @@ impl<'a> Walker<'a> {
             }
             self.known.remove(&p);
             self.written.push(p);
+        } else if matches!(how, "chmod" | "chown" | "chgrp") {
+            self.moded.push(p);
         }
         Ok(())
     }
@@ -3269,6 +3400,13 @@ fn ssh_without_command(lits: &[String]) -> bool {
         k += 1;
     }
     operands < 2
+}
+
+/// True when `head` starts an ELF or Mach-O binary.
+fn is_binary(head: &[u8]) -> bool {
+    head.starts_with(b"\x7fELF")
+        || head.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
+        || head.starts_with(&[0xca, 0xfe, 0xba, 0xbe])
 }
 
 /// The first bytes of a file.

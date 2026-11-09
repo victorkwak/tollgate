@@ -2732,3 +2732,99 @@ fn s43_values_git_runs_are_read_as_code_on_every_git_command() {
         assert_eq!(s.code(), Some(0), "{cmd}: {s:?}");
     }
 }
+
+/// S44 (G2, G3, item 20, review note 9): a launcher that drops or
+/// replaces the session environment (`env -i`, `env -`, `exec -c`) runs
+/// git without the hook injection, so nothing of tollgate runs, not even
+/// the post-commit unverified record. A script it runs is a shell or an
+/// interpreter the guard does not read there, whether it is named by a
+/// path, through a symlink, written earlier in the call, or found on a
+/// `PATH` the command sets. The same holds for `exec -a` and the other
+/// launchers. A binary still runs (the residual risk of 21d).
+#[test]
+fn s44_launchers_never_run_an_unread_script() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    let root = lab.root();
+    let body = "git -c user.name=a -c user.email=a@b.invalid commit -n -q -m x\n";
+    write_exe(&lab.repo.join("e2.sh"), &format!("#!/bin/sh\n{body}"));
+    write_exe(&lab.repo.join("e3"), body);
+    write_exe(&root.join("bin/e4"), &format!("#!/bin/sh\n{body}"));
+    write_exe(&lab.repo.join("sub/e5.sh"), &format!("#!/bin/sh\n{body}"));
+    std::os::unix::fs::symlink("e2.sh", lab.repo.join("l")).unwrap();
+    std::fs::copy("/usr/bin/true", lab.repo.join("t")).unwrap();
+    // Text with no `#!` and no x bit: a chmod in the call makes it run.
+    std::fs::write(lab.repo.join("e7"), body).unwrap();
+    // Executable but unreadable: the guard cannot tell what it is.
+    write_exe(&lab.repo.join("e8"), &format!("#!/bin/sh\n{body}"));
+    let mode = std::os::unix::fs::PermissionsExt::from_mode(0o111);
+    std::fs::set_permissions(lab.repo.join("e8"), mode).unwrap();
+    std::fs::write(lab.repo.join("notes.txt"), "data\n").unwrap();
+    let e2 = lab.repo.join("e2.sh").display().to_string();
+    let bin = root.join("bin").display().to_string();
+    let bad = lab.not_denied(&[
+        "printf 'git commit -n -m x\\n' > e.sh && chmod +x e.sh && env -i ./e.sh".to_owned(),
+        format!("printf '#!/bin/sh\\n{body}' > e.sh && chmod +x e.sh && env -i ./e.sh"),
+        format!("printf '#!/bin/sh\\n{body}' > e.sh && chmod +x e.sh && exec -c ./e.sh"),
+        "env -i ./e2.sh".to_owned(),
+        "env -i ./e3".to_owned(),
+        "env -i ./l".to_owned(),
+        format!("env -i {e2}"),
+        "env --ignore-environment ./e2.sh".to_owned(),
+        "env --ignore-env ./e2.sh".to_owned(),
+        "env - ./e2.sh".to_owned(),
+        "env -i X=1 ./e2.sh".to_owned(),
+        "env -iC . ./e2.sh".to_owned(),
+        "env -S '-i ./e2.sh'".to_owned(),
+        "env -i -S ./e2.sh".to_owned(),
+        "exec -c ./e2.sh".to_owned(),
+        "exec -c -- ./e2.sh".to_owned(),
+        "exec -cl ./e2.sh".to_owned(),
+        "exec -a x ./e2.sh".to_owned(),
+        "command exec -c ./e2.sh".to_owned(),
+        "nohup env -i ./e2.sh >/dev/null 2>&1".to_owned(),
+        "env -u HOME ./e2.sh".to_owned(),
+        // Found on a PATH the command sets.
+        "env -i PATH=. e2.sh".to_owned(),
+        "env -i PATH=.:/usr/bin e3".to_owned(),
+        format!("env -i PATH={bin} e4"),
+        format!("env -i PATH=/usr/bin:{bin} e4"),
+        "env -i PATH=$PWD e2.sh".to_owned(),
+        "env -S '-i PATH=. e2.sh'".to_owned(),
+        format!("PATH={bin}:$PATH; exec -c e4"),
+        format!("export PATH={bin}:$PATH; exec -c e4"),
+        "PATH=. exec -c e2.sh".to_owned(),
+        // Spellings, dirs, copies, links and modes.
+        "env -i $'./e2.sh'".to_owned(),
+        "env -i \"./e2\".sh".to_owned(),
+        "env -i .//e2.sh".to_owned(),
+        "env -iC sub ./e5.sh".to_owned(),
+        "env -i --chdir=sub ./e5.sh".to_owned(),
+        "env -S \"'P'ATH=. e2.sh\"".to_owned(),
+        "env -S '-C sub ./e5.sh'".to_owned(),
+        "cp e2.sh n && env -i ./n".to_owned(),
+        "ln -s e2.sh m && env -i ./m".to_owned(),
+        "chmod +x e7 && env -i ./e7".to_owned(),
+        "chmod +x e7 && setpriv --nnp ./e7".to_owned(),
+        "env -i ./e8".to_owned(),
+        "xargs env -i ./e2.sh </dev/null".to_owned(),
+        "env -i sudo -n ./e2.sh".to_owned(),
+        // Another launcher.
+        "setpriv --nnp ./e2.sh".to_owned(),
+    ]);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    for cmd in [
+        "env -i ./t",
+        "env -i /usr/bin/true",
+        "env -i true",
+        "env -i PATH=/usr/bin:/bin true",
+        "env -u FOO true",
+        "exec -c ./t",
+        "exec -a x true",
+        "env -i",
+        "setpriv --nnp cat ./notes.txt",
+    ] {
+        let s = lab.session(cmd);
+        assert_eq!(s.code(), Some(0), "{cmd}: {s:?}");
+    }
+}
