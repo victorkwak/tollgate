@@ -106,8 +106,14 @@ pub struct BenchArgs {
     pub enforce_budgets: bool,
 }
 
-/// How long cleanup waits for cancelled jobs and exiting runners.
-const CANCEL_WAIT: Duration = Duration::from_secs(30);
+/// What cleanup adds to the largest step grace (R35) while it waits for
+/// cancelled jobs and exiting runners: the runner's SIGKILL of the step's
+/// set and its final state write.
+const CANCEL_MARGIN: Duration = Duration::from_secs(15);
+
+/// The grace cleanup assumes for a config it cannot read: the largest
+/// default (R35, `nextest`).
+const DEFAULT_MAX_GRACE: Duration = Duration::from_secs(60);
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -533,7 +539,7 @@ pub fn bench(ctx: &Ctx, a: &BenchArgs) -> u8 {
     };
     let mut run = Run::default();
     let result = execute(ctx, a, &prep, &layout, &env, &dirs, &mut run);
-    let mut cleanup = cleanup_jobs(&dirs, &layout);
+    let mut cleanup = cleanup_jobs(&env, &dirs, &layout, &prep.head);
     let warm_job = run.warm.as_ref().and_then(|w| w.job.clone());
     let jobs = collect_jobs(&dirs, warm_job.as_deref());
     let scratch_removed = match scratch.finish(a.keep) {
@@ -993,10 +999,50 @@ impl Worker<'_> {
     }
 }
 
-/// Cancels the jobs that still run, waits for every runner to exit, and
-/// kills what is left (Linux: every process whose environment names the
-/// bench's state dir).
-fn cleanup_jobs(dirs: &Dirs, layout: &Layout) -> Cleanup {
+/// The longest a cancelled runner may take to end its step (R35): the
+/// largest step grace in the configs the open jobs can run under (each
+/// job's tree, and the source HEAD the policy anchors come from), plus
+/// [`CANCEL_MARGIN`]. A config that cannot be read counts as
+/// [`DEFAULT_MAX_GRACE`].
+fn cancel_wait(env: &BenchEnv, layout: &Layout, head: &str, trees: &[String]) -> Duration {
+    let clone = layout.clone_dir();
+    let no_hooks = layout.no_hooks();
+    let grace_at = |rev: &str| -> Duration {
+        let text = run_cmd(
+            env.git(&no_hooks, &clone).args([
+                "cat-file",
+                "blob",
+                &format!("{rev}:{}", crate::policy::CONFIG_FILE),
+            ]),
+            "git cat-file",
+        );
+        text.ok()
+            .and_then(|t| crate::config::repo::RepoConfig::from_toml(&t).ok())
+            .map_or(DEFAULT_MAX_GRACE, |c| {
+                c.steps
+                    .iter()
+                    .map(crate::config::repo::Step::grace)
+                    .max()
+                    .unwrap_or_default()
+            })
+    };
+    std::iter::once(head)
+        .chain(trees.iter().map(String::as_str))
+        .map(grace_at)
+        .max()
+        .unwrap_or(DEFAULT_MAX_GRACE)
+        // Setup steps run with a fixed 10 s grace.
+        .max(Duration::from_secs(10))
+        + CANCEL_MARGIN
+}
+
+/// Cancels the jobs that still run, waits for every runner to end its
+/// steps (R35: up to the largest step grace), and kills what is left:
+/// every process whose environment names the bench's state dir (Linux),
+/// then every process whose working dir or `TMPDIR` lies under the
+/// scratch dir (item 36: a step's leftovers carry the job environment,
+/// not the bench's).
+fn cleanup_jobs(env: &BenchEnv, dirs: &Dirs, layout: &Layout, head: &str) -> Cleanup {
     let store = JobStore::new(dirs);
     let all = store.list().unwrap_or_default();
     let open: Vec<JobId> = all
@@ -1025,7 +1071,12 @@ fn cleanup_jobs(dirs: &Dirs, layout: &Layout) -> Cleanup {
                 .is_some_and(|id| id == m.id)
         })
     };
-    let end = Instant::now() + CANCEL_WAIT;
+    let trees: Vec<String> = all
+        .iter()
+        .filter(|m| open.contains(&m.id))
+        .map(|m| m.tree.to_string())
+        .collect();
+    let end = Instant::now() + cancel_wait(env, layout, head, &trees);
     while Instant::now() < end && (!still_open().is_empty() || runner_alive()) {
         for id in still_open() {
             let _ = crate::sched::reap_if_lost(dirs, &id);
@@ -1035,6 +1086,10 @@ fn cleanup_jobs(dirs: &Dirs, layout: &Layout) -> Cleanup {
     let mut marker = b"XDG_STATE_HOME=".to_vec();
     marker.extend_from_slice(layout.state_home().as_os_str().as_encoded_bytes());
     c.killed = crate::procs::kill_marked(&marker, Duration::from_secs(5)).0;
+    // `layout.root` is canonical (prepare); the kernel reports canonical
+    // working dirs, and `TMPDIR` is spelled from `layout.root`.
+    c.killed +=
+        crate::procs::kill_under(std::slice::from_ref(&layout.root), Duration::from_secs(5)).0;
     for id in still_open() {
         let _ = crate::sched::reap_if_lost(dirs, &id);
     }

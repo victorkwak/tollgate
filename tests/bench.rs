@@ -526,3 +526,207 @@ fn a_signal_stops_the_bench_and_it_still_cleans_up_l20() {
     assert_eq!(report["scratch_removed"], true, "{report:#}");
     assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
 }
+
+/// Waits up to `secs` for `pid` to leave the process table; SIGKILLs it
+/// when it did not, so a failing test leaves nothing behind. Returns
+/// whether it went by itself.
+fn gone_or_kill(pid: i32, secs: u64) -> bool {
+    let gone = eventually(secs, || {
+        !tollgate::procs::ProcTable::snapshot().unwrap().alive(pid)
+    });
+    if !gone {
+        let _ = tollgate::procs::signal(pid, libc::SIGKILL);
+    }
+    gone
+}
+
+fn read_pid(path: &Path) -> Option<i32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+}
+
+/// Linux: the processes whose working dir lies under `dir` (killed, so a
+/// failing test leaves none behind). Elsewhere the step pid checks stand
+/// alone.
+fn processes_in(dir: &str) -> Vec<i32> {
+    let mut out = Vec::new();
+    if !cfg!(target_os = "linux") || dir.is_empty() {
+        return out;
+    }
+    for e in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Ok(cwd) = std::fs::read_link(e.path().join("cwd")) else {
+            continue;
+        };
+        // A removed dir reads as "<path> (deleted)".
+        let text = cwd.to_string_lossy().into_owned();
+        let text = text.strip_suffix(" (deleted)").unwrap_or(&text);
+        if Path::new(text).starts_with(dir) {
+            let _ = tollgate::procs::signal(pid, libc::SIGKILL);
+            out.push(pid);
+        }
+    }
+    out
+}
+
+/// Runs the bench over one `slow` scenario whose step is `run`, with the
+/// hook's inline cap at 10 s; returns (exit, stdout, stderr, report).
+fn bench_slow(sb: &Sandbox, step: &str) -> (Option<i32>, String, String, serde_json::Value) {
+    let repo = workspace(sb, step);
+    let scenarios = sb.root().join("scenarios.toml");
+    std::fs::write(
+        &scenarios,
+        "[[scenario]]\nname = \"slow\"\nworktrees = 1\nedit = [{ path = \"slow/go\", write = \"go\\n\" }]\n",
+    )
+    .unwrap();
+    let parent = scratch_parent();
+    let out_file = sb.root().join("bench.json");
+    let (code, stdout, stderr) = bench(
+        sb,
+        &[
+            repo.to_str().unwrap(),
+            "--scenarios",
+            scenarios.to_str().unwrap(),
+            "--no-warm",
+            "--inline-cap",
+            "10",
+            "--min-free",
+            "1M",
+            "--scratch",
+            parent.path().to_str().unwrap(),
+            "--out",
+            out_file.to_str().unwrap(),
+        ],
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&out_file).unwrap_or_default()).unwrap_or_default();
+    assert_eq!(
+        std::fs::read_dir(parent.path()).unwrap().count(),
+        0,
+        "{report:#}"
+    );
+    (code, stdout, stderr, report)
+}
+
+/// Item 36: a step that ignores SIGTERM and has a grace longer than the
+/// bench's old 30 s cancel wait. Cleanup waits out the grace, so the
+/// runner kills its own step and ends the job `cancelled`; the bench has
+/// nothing left to kill and no process keeps running in the removed
+/// scratch dir.
+#[test]
+fn bench_waits_out_the_step_grace_of_a_sigterm_ignoring_step_l20() {
+    let sb = Sandbox::new();
+    let pid_file = sb.root().join("slow.pid");
+    let child_file = sb.root().join("child.pid");
+    let (code, stdout, stderr, report) = bench_slow(
+        &sb,
+        &format!(
+            "[[step]]\nname = \"slow\"\nkind = \"command\"\ngrace = \"35s\"\nrun = \"test -e slow/go || exit 0; trap '' TERM; echo $$ > '{}'; sleep 1000 & echo $! > '{}'; wait\"\n",
+            pid_file.display(),
+            child_file.display()
+        ),
+    );
+    let scratch = report["scratch"].as_str().unwrap_or_default().to_owned();
+    let leftover = if scratch.is_empty() {
+        0
+    } else {
+        bench_processes(&scratch)
+    };
+    let step = read_pid(&pid_file);
+    let child = read_pid(&child_file);
+    let step_gone = step.is_none_or(|p| gone_or_kill(p, 5));
+    let child_gone = child.is_none_or(|p| gone_or_kill(p, 5));
+    let in_scratch = processes_in(&scratch);
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    assert!(
+        step.is_some() && child.is_some(),
+        "the slow step never ran: {report:#}"
+    );
+    assert!(step_gone && child_gone, "the step outlived the bench");
+    assert_eq!(
+        in_scratch,
+        Vec::<i32>::new(),
+        "processes left in the scratch dir"
+    );
+    assert_eq!(leftover, 0, "bench processes left running");
+    assert_eq!(
+        report["cleanup"]["cancelled"].as_array().unwrap().len(),
+        1,
+        "{report:#}"
+    );
+    // The runner ended the job itself: nothing was killed from outside.
+    assert_eq!(report["cleanup"]["killed"], 0, "{report:#}");
+    assert_eq!(report["cleanup"]["leftover"], serde_json::json!([]));
+    let jobs = report["jobs"].as_array().unwrap();
+    assert!(jobs.iter().all(|j| j["state"] == "cancelled"), "{report:#}");
+    assert_eq!(report["scratch_removed"], true, "{report:#}");
+}
+
+/// Item 36: the runner dies (here the step kills it) and the step leaves
+/// two session leaders behind: one without the job's `TMPDIR` whose
+/// working dir is the verify checkout, one that keeps `TMPDIR` but moved
+/// to `/`. Neither carries the bench's state-dir marker nor is in the
+/// step's group; cleanup still finds both (working dir under the scratch
+/// dir, `TMPDIR` under the bench's state dir) and kills them.
+#[test]
+fn bench_kills_step_leftovers_of_a_dead_runner_by_cwd_and_tmpdir_l20() {
+    let sb = Sandbox::new();
+    let gc1 = sb.root().join("gc1.pid");
+    let gc2 = sb.root().join("gc2.pid");
+    let script = sb.root().join("escape.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "detach() {{ perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' \"$@\" </dev/null >/dev/null 2>&1 & }}\n\
+             (unset TMPDIR; detach sh -c 'echo $$ > \"$0\"; exec sleep 1000' '{gc1}')\n\
+             (cd / && detach sh -c 'echo $$ > \"$0\"; exec sleep 1000' '{gc2}')\n\
+             while [ ! -s '{gc1}' ] || [ ! -s '{gc2}' ]; do sleep 0.1; done\n\
+             kill -9 $PPID\n\
+             exec sleep 1000\n",
+            gc1 = gc1.display(),
+            gc2 = gc2.display()
+        ),
+    )
+    .unwrap();
+    let (_code, stdout, stderr, report) = bench_slow(
+        &sb,
+        &format!(
+            "[[step]]\nname = \"slow\"\nkind = \"command\"\nrun = \"test -e slow/go || exit 0; exec sh '{}'\"\n",
+            script.display()
+        ),
+    );
+    let scratch = report["scratch"].as_str().unwrap_or_default().to_owned();
+    let leftover = if scratch.is_empty() {
+        0
+    } else {
+        bench_processes(&scratch)
+    };
+    let p1 = read_pid(&gc1);
+    let p2 = read_pid(&gc2);
+    let gone1 = p1.is_none_or(|p| gone_or_kill(p, 5));
+    let gone2 = p2.is_none_or(|p| gone_or_kill(p, 5));
+    let in_scratch = processes_in(&scratch);
+    assert!(
+        p1.is_some() && p2.is_some(),
+        "the step never detached: {stdout}\n{stderr}\n{report:#}"
+    );
+    assert!(
+        gone1,
+        "the leftover in the checkout outlived the bench: {report:#}"
+    );
+    assert!(
+        gone2,
+        "the leftover with the job TMPDIR outlived the bench: {report:#}"
+    );
+    assert_eq!(
+        in_scratch,
+        Vec::<i32>::new(),
+        "processes left in the scratch dir"
+    );
+    assert_eq!(leftover, 0, "bench processes left running");
+    assert_eq!(report["cleanup"]["leftover"], serde_json::json!([]));
+    assert_eq!(report["scratch_removed"], true, "{report:#}");
+}

@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// One process table entry.
@@ -232,17 +233,63 @@ fn marked_by(table: &ProcTable, me: i32, has_marker: impl Fn(i32) -> bool) -> BT
     out
 }
 
+/// The working dir of process `pid`, when it can be read: Linux
+/// `/proc/<pid>/cwd`, macOS `PROC_PIDVNODEPATHINFO`. Another user's
+/// process has none.
+#[must_use]
+pub fn cwd(pid: i32) -> Option<PathBuf> {
+    platform::cwd(pid)
+}
+
+/// Every value of the environment variable `key` in process `pid`
+/// (Linux `/proc/<pid>/environ`; a block can hold a name twice). Empty on
+/// macOS, which gives no other process's environment.
+#[must_use]
+pub fn environ_values(pid: i32, key: &[u8]) -> Vec<OsString> {
+    platform::environ_values(pid, key)
+}
+
+/// Item 36, bench cleanup: the live processes (with the exclusions of
+/// [`marked`]) whose working dir lies under one of `dirs`, or whose
+/// `TMPDIR` does, plus the members of their process groups. Paths compare
+/// by components, so `/s/bench-1` does not hold `/s/bench-10`.
+#[must_use]
+pub fn under(table: &ProcTable, dirs: &[PathBuf]) -> BTreeSet<i32> {
+    let inside = |p: &Path| dirs.iter().any(|d| p.starts_with(d));
+    marked_by(table, std::process::id().cast_signed(), |pid| {
+        cwd(pid).is_some_and(|c| inside(&c))
+            || environ_values(pid, b"TMPDIR")
+                .iter()
+                .any(|t| inside(Path::new(t)))
+    })
+}
+
+/// SIGKILLs every process [`under`] finds, like [`kill_marked`].
+pub fn kill_under(dirs: &[PathBuf], limit: std::time::Duration) -> (usize, usize) {
+    kill_found(limit, |table| under(table, dirs))
+}
+
 /// SIGKILLs every process [`marked`] finds until none is left or `limit`
 /// passes. Returns how many it signalled and how many were still alive at
 /// the end.
 pub fn kill_marked(marker: &[u8], limit: std::time::Duration) -> (usize, usize) {
+    kill_found(limit, |table| marked(table, marker))
+}
+
+/// SIGKILLs every process `find` returns until it returns none or `limit`
+/// passes. Returns how many it signalled and how many were still alive at
+/// the end.
+fn kill_found(
+    limit: std::time::Duration,
+    find: impl Fn(&ProcTable) -> BTreeSet<i32>,
+) -> (usize, usize) {
     let end = std::time::Instant::now() + limit;
     let mut killed = BTreeSet::new();
     loop {
         let Ok(table) = ProcTable::snapshot() else {
             return (killed.len(), 0);
         };
-        let set = marked(&table, marker);
+        let set = find(&table);
         if set.is_empty() || std::time::Instant::now() >= end {
             return (killed.len(), set.len());
         }
@@ -352,6 +399,23 @@ mod platform {
     pub(super) fn environ_has(pid: i32, marker: &[u8]) -> bool {
         fs::read(format!("/proc/{pid}/environ"))
             .is_ok_and(|env| env.split(|b| *b == 0).any(|e| e == marker))
+    }
+
+    /// The values of `key` in `/proc/<pid>/environ`.
+    pub(super) fn environ_values(pid: i32, key: &[u8]) -> Vec<OsString> {
+        let Ok(env) = fs::read(format!("/proc/{pid}/environ")) else {
+            return Vec::new();
+        };
+        env.split(|b| *b == 0)
+            .filter_map(|e| e.strip_prefix(key)?.strip_prefix(b"="))
+            .map(|v| OsStr::from_bytes(v).to_owned())
+            .collect()
+    }
+
+    /// The `/proc/<pid>/cwd` link. A dir removed since reads as
+    /// `<path> (deleted)`, which is still under the dir that held it.
+    pub(super) fn cwd(pid: i32) -> Option<std::path::PathBuf> {
+        fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
 
     /// Field 22 of `/proc/<pid>/stat` (`starttime`, 20th after the comm).
@@ -502,6 +566,42 @@ mod platform {
     /// shows none either), so marked processes cannot be found here.
     pub(super) fn environ_has(_pid: i32, _marker: &[u8]) -> bool {
         false
+    }
+
+    /// See [`environ_has`].
+    pub(super) fn environ_values(_pid: i32, _key: &[u8]) -> Vec<OsString> {
+        Vec::new()
+    }
+
+    /// `pvi_cdir` of `PROC_PIDVNODEPATHINFO`: a NUL-terminated path of at
+    /// most `MAXPATHLEN` bytes.
+    pub(super) fn cwd(pid: i32) -> Option<std::path::PathBuf> {
+        // SAFETY: proc_vnodepathinfo is plain old data; zeroed is valid.
+        let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_vnodepathinfo>()).ok()?;
+        // SAFETY: `info` is a writable proc_vnodepathinfo of `size` bytes.
+        let r = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                (&raw mut info).cast(),
+                size,
+            )
+        };
+        if r != size {
+            return None;
+        }
+        // libc spells `vip_path[MAXPATHLEN]` as 32 rows of 32.
+        let bytes: Vec<u8> = info
+            .pvi_cdir
+            .vip_path
+            .iter()
+            .flatten()
+            .map(|c| c.cast_unsigned())
+            .take_while(|b| *b != 0)
+            .collect();
+        (!bytes.is_empty()).then(|| OsStr::from_bytes(&bytes).to_owned().into())
     }
 
     /// `pbi_start_tvsec` and `pbi_start_tvusec` of `PROC_PIDTBSDINFO`.
@@ -668,5 +768,42 @@ mod tests {
         // Signalling a reaped pid is not an error.
         assert!(signal(i32::MAX - 1, libc::SIGTERM).is_ok());
         assert!(signal(0, libc::SIGTERM).is_err());
+    }
+    /// Item 36: a process is under a dir by its working dir (any platform)
+    /// or its `TMPDIR` (Linux), compared by path components; a sibling
+    /// whose name only starts with the dir's name is not under it.
+    #[test]
+    fn processes_under_a_dir_by_cwd_and_tmpdir() {
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        let dir = base.join("bench");
+        let sibling = base.join("bench0");
+        std::fs::create_dir_all(dir.join("wt")).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let spawn = |cwd: &Path, tmp: &Path| {
+            Command::new("sleep")
+                .arg("30")
+                .current_dir(cwd)
+                .env("TMPDIR", tmp)
+                .stdin(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        };
+        let mut by_cwd = spawn(&dir.join("wt"), Path::new("/tmp"));
+        let mut by_tmp = spawn(Path::new("/"), &dir.join("state/jobs/j/tmp"));
+        let mut outside = spawn(&sibling, &sibling);
+        let pids = [&by_cwd, &by_tmp, &outside].map(|c| c.id().cast_signed());
+        // The spawn returns after exec, and chdir comes before exec.
+        assert_eq!(cwd(pids[0]).as_deref(), Some(dir.join("wt").as_path()));
+        let set = under(&ProcTable::snapshot().unwrap(), std::slice::from_ref(&dir));
+        assert!(set.contains(&pids[0]), "{set:?}");
+        assert_eq!(set.contains(&pids[1]), cfg!(target_os = "linux"), "{set:?}");
+        assert!(!set.contains(&pids[2]), "{set:?}");
+        assert!(!set.contains(&std::process::id().cast_signed()));
+        for c in [&mut by_cwd, &mut by_tmp, &mut outside] {
+            let _ = c.kill();
+            c.wait().unwrap();
+        }
     }
 }
