@@ -79,6 +79,89 @@ const LAUNCHERS: &[&str] = &[
     "dbus-send",
     "script",
     "watch",
+    // Item 40, review notes 11 and 1. pty runners: they also give a
+    // TTY-only command the terminal it checks for.
+    "dtach",
+    "abduco",
+    "empty",
+    "faketty",
+    "ttyd",
+    "gotty",
+    "rlwrap",
+    // Terminals (`-e CMD`) and what types into one.
+    "konsole",
+    "yakuake",
+    "xterm",
+    "uxterm",
+    "alacritty",
+    "gnome-terminal",
+    "kgx",
+    "ptyxis",
+    "xfce4-terminal",
+    "mate-terminal",
+    "lxterminal",
+    "qterminal",
+    "terminator",
+    "tilix",
+    "terminology",
+    "urxvt",
+    "rxvt",
+    "st",
+    "foot",
+    "footclient",
+    "wezterm",
+    "ghostty",
+    "zellij",
+    "x-terminal-emulator",
+    "wtype",
+    "ydotool",
+    "xdotool",
+    "dotool",
+    "dotoolc",
+    "qdbus",
+    "qdbus6",
+    "qdbus-qt6",
+    "gdbus",
+    // Another identity, root, environment or file system view.
+    "run0",
+    "sg",
+    "newgrp",
+    "capsh",
+    "fakeroot",
+    "fakechroot",
+    "faketime",
+    "proot",
+    "schroot",
+    "systemd-nspawn",
+    "lxc-attach",
+    "toolbox",
+    "distrobox",
+    "distrobox-enter",
+    "envdir",
+    "chpst",
+    "setuidgid",
+    "envuidgid",
+    "softlimit",
+    "ssh-agent",
+    "dbus-launch",
+    "dbus-run-session",
+    "torsocks",
+    "proxychains",
+    "proxychains4",
+    "tsocks",
+    // Supervisors, queues, watchers and benchmarks.
+    "tini",
+    "dumb-init",
+    "daemonize",
+    "start-stop-daemon",
+    "watchexec",
+    "entr",
+    "nodemon",
+    "hyperfine",
+    "pueue",
+    "tsp",
+    "nq",
+    "sem",
 ];
 
 const VAR_WRITERS: &[&str] = &[
@@ -186,6 +269,9 @@ pub fn sensitive(name: &str) -> Option<&'static str> {
         "LESSOPEN" | "LESSCLOSE" => Some("makes less run a program on each file it shows (G3)"),
         n if n.starts_with("LESSKEY") => {
             Some("names a lesskey file, which can set LESS to run a command (G3)")
+        }
+        "UV_ENV_FILE" => {
+            Some("makes uv run load variables from a file the guard does not read (G5)")
         }
         "GIT_ALLOW_PROTOCOL" => {
             Some("can turn on the ext:: transport, which runs a command (G3, item 21)")
@@ -406,6 +492,28 @@ pub fn forbidden(token: &str, git_known: &[&str]) -> Option<&'static str> {
         return Some("an interpreter");
     }
     None
+}
+
+/// Why the tollgate subcommand starting `pos` (positional words in
+/// lowercase) is for a person only (R25), if it is.
+#[must_use]
+pub fn person_only(pos: &[&str]) -> Option<String> {
+    match pos {
+        ["waive", ..] => Some("tollgate waive is not for agents (R25)".into()),
+        ["remotes", "forget", ..] => {
+            Some("forgetting a lost trusted remote needs Victor's terminal (item 33, R25)".into())
+        }
+        ["policy", "approve", ..] => Some("policy approval is not for agents (R25)".into()),
+        // A pty wrapper (`script -c`, `unbuffer`) would give it the
+        // terminal it checks for and type the yes.
+        [s, ..] if matches!(*s, "install" | "uninstall") => Some(format!(
+            "tollgate {s} changes the Claude Code settings; it needs Victor's terminal (item 29, L10, R25)"
+        )),
+        ["baseline", "record", ..] => {
+            Some("baseline record needs Victor's terminal (R94, R25)".into())
+        }
+        _ => None,
+    }
 }
 
 /// Option grammar of a wrapper (getopt and getopt_long rules: short

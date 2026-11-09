@@ -238,6 +238,18 @@ fn settings_are_never_edited_without_confirmation_l10_r95b() {
     }
     let r = e.run(Path::new(BIN), &["install"], &[]);
     assert!(r.out.contains("interactive terminal"), "{}", r.out);
+    // A pty an agent makes (script, dtach, faketty) passes the TTY test,
+    // but the command still runs in the Claude Code session, which marks
+    // its environment: refused before any question (review note 1).
+    for args in [&["install"][..], &["uninstall"]] {
+        let cmd = e.cmd(Path::new(BIN), args, &[("CLAUDECODE", "1")]);
+        let r = pty::run(cmd, pty::Streams::All, &["y"]);
+        assert_ne!(r.code, Some(0), "{args:?}: {}", r.out);
+        assert!(r.out.contains("Claude Code session"), "{}", r.out);
+        assert!(!r.out.contains("[y/N]"), "{}", r.out);
+        assert_eq!(std::fs::read_to_string(e.settings()).unwrap(), FIXTURE);
+        assert!(!e.data().exists(), "{args:?}: {}", r.out);
+    }
     // At a terminal, a no (or anything but a yes) keeps the settings; the
     // copy and links are made.
     for answer in ["n", "", "yy"] {

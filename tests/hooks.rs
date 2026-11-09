@@ -443,7 +443,7 @@ fn a_lost_trusted_remote_denies_instead_of_local_anchors_item33() {
     // At a terminal (util-linux `script` gives one): "n" keeps the
     // record, "y" removes it and local anchors count again.
     if cfg!(target_os = "linux") && Path::new("/usr/bin/script").exists() {
-        let at_terminal = |answer: &str| {
+        let at_terminal_with = |answer: &str, extra: &[(&str, &str)]| {
             let mut cmd = std::process::Command::new("/usr/bin/script");
             cmd.env_clear()
                 .current_dir(&repo)
@@ -458,6 +458,9 @@ fn a_lost_trusted_remote_denies_instead_of_local_anchors_item33() {
             for (k, v) in sb.env().iter() {
                 cmd.env(k, v);
             }
+            for (k, v) in extra {
+                cmd.env(k, v);
+            }
             let mut child = cmd.spawn().unwrap();
             std::io::Write::write_all(child.stdin.as_mut().unwrap(), answer.as_bytes()).unwrap();
             let out = child.wait_with_output().unwrap();
@@ -466,6 +469,14 @@ fn a_lost_trusted_remote_denies_instead_of_local_anchors_item33() {
                 String::from_utf8_lossy(&out.stdout).into_owned(),
             )
         };
+        let at_terminal = |answer: &str| at_terminal_with(answer, &[]);
+        // A terminal an agent made (script here, dtach or faketty in a
+        // session) inside a Claude Code session: refused, the record
+        // stays (review note 1).
+        let (code, out) = at_terminal_with("y\n", &[("CLAUDECODE", "1")]);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(out.contains("Claude Code session"), "{out}");
+        assert_eq!(commit("d").code, Some(1));
         let (code, out) = at_terminal("n\n");
         assert_eq!(code, Some(2), "{out}");
         assert!(out.contains(bare.to_str().unwrap()), "{out}");

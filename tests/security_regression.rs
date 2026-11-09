@@ -2962,3 +2962,168 @@ fn s44_launchers_never_run_an_unread_script() {
         assert_eq!(s.code(), Some(0), "{cmd}: {s:?}");
     }
 }
+
+/// S47 (G2, item 40, review notes 11 and 1): programs that run the
+/// command in their arguments are walked or held to the launcher rule,
+/// whatever they are: pty runners (which also give a TTY-only command
+/// the terminal it checks for), tracers, package runners, terminals,
+/// supervisors and environment changers. A program the guard does not
+/// know still may not take git with a gated subcommand, or tollgate with
+/// a subcommand for a person only, as separate words. Only the guard
+/// runs here: an allowed terminal would open a window.
+#[test]
+fn s47_programs_that_run_their_arguments_are_followed() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    let not_denied = |cmds: &[&str]| -> Vec<String> {
+        cmds.iter()
+            .filter_map(|c| match lab.guard(c) {
+                Guarded::Denied(_) => None,
+                g => Some(format!("{c}  => {g:?}")),
+            })
+            .collect()
+    };
+    let bad = not_denied(&[
+        // pty runners; the second step types into the first.
+        "dtach -n /tmp/s git commit -n -m x",
+        "dtach -n /tmp/s tollgate remotes forget",
+        "printf 'y\\n' | dtach -p /tmp/s",
+        "dtach -p /tmp/s < answers.txt",
+        "abduco -n s git commit -n -m x",
+        "printf 'y\\n' | abduco -a s",
+        "empty -f tollgate remotes forget",
+        "empty -s -o in 'tollgate remotes forget'",
+        "faketty tollgate install",
+        "ttyd bash",
+        // Tracers and debuggers.
+        "strace -f git commit -n -m x",
+        "strace -f -o /tmp/t -- git commit -n -m x",
+        "ltrace git commit -n -m x",
+        "valgrind --trace-children=yes git commit -n -m x",
+        "perf stat -- git commit -n -m x",
+        "perf record -o /tmp/p git commit -n -m x",
+        "catchsegv git commit -n -m x",
+        "gdb --args git commit -n -m x",
+        // Package runners.
+        "uv run -- git commit -n -m x",
+        "uv run git commit -n -m x",
+        "uv run --with rich env git commit -n -m x",
+        "uv run bash -c 'echo hi'",
+        "uv run python -c 'import subprocess; subprocess.run([\"ls\"])'",
+        "uv run -m pip --version && uv run --env-file .env cargo build",
+        "uvx git commit -n -m x",
+        "bunx git commit -n -m x",
+        "bun x git commit -n -m x",
+        "npx git commit -n -m x",
+        "npx -c 'git commit -n -m x'",
+        "npm exec -- git commit -n -m x",
+        "pnpm dlx tollgate remotes forget",
+        "cargo run -- remotes forget",
+        "cargo run -q --bin tollgate -- install",
+        "cargo r -- uninstall",
+        // Session and environment changers.
+        "rlwrap git commit -n -m x",
+        "chronic git commit -n -m x",
+        "fakeroot git commit -n -m x",
+        "printf 'git commit -n -m x\\n' | fakeroot",
+        "printf 'git commit -n -m x\\n' | newgrp users",
+        "ssh-agent git commit -n -m x",
+        "dbus-run-session -- git commit -n -m x",
+        "xvfb-run git commit -n -m x",
+        "systemd-inhibit git commit -n -m x",
+        "systemd-cat git commit -n -m x",
+        "envdir ./e git commit -m x",
+        "faketime yesterday git commit -m x",
+        "run0 git commit -n -m x",
+        // Terminals and what types into them.
+        "konsole -e git commit -n -m x",
+        "xterm -e git commit -n -m x",
+        "alacritty -e git commit -n -m x",
+        "zellij run -- git commit -n -m x",
+        "zellij action write-chars 'tollgate remotes forget'",
+        "wtype 'tollgate remotes forget'",
+        "ydotool type 'git commit -n -m x'",
+        "qdbus org.kde.konsole /Sessions/1 runCommand 'tollgate remotes forget'",
+        // Supervisors and file watchers.
+        "tini -- git commit -n -m x",
+        "dumb-init git commit -n -m x",
+        "daemonize /usr/bin/git commit -n -m x",
+        "chpst git commit -n -m x",
+        "start-stop-daemon --start --exec /usr/bin/git -- commit -n -m x",
+        "watchexec -- git commit -n -m x",
+        "echo a | entr git commit -n -m x",
+        "hyperfine 'git commit -n -m x'",
+        // Programs the guard does not know.
+        "frobnicate git commit -n -m x",
+        "frobnicate --opt git -C . commit -n -m x",
+        "frobnicate /usr/bin/git push -f origin main",
+        "frobnicate git-commit -n -m x",
+        "frobnicate tollgate install",
+        "frobnicate --x /usr/bin/tollgate remotes forget",
+        "frobnicate TOLLGATE uninstall",
+        "G=git; frobnicate $G commit -n -m x",
+        // Spellings and nesting.
+        "STRACE -f git commit -n -m x",
+        "strace -f env git commit -n -m x",
+        "nohup uv run git commit -n -m x",
+        "timeout 9 dtach -n /tmp/s git commit -n -m x",
+        "uv run -- sh -c 'echo hi'",
+        "uv run python3 -c 'import os; os.system(\"ls\")'",
+        "npx --registry=https://r.example git commit -n -m x",
+        "strace -E GIT_CONFIG_COUNT=0 cargo build",
+        "bunx --cwd /tmp ./x.sh",
+        "cargo run --release -- REMOTES forget",
+        "frobnicate --exec=git commit -n -m x",
+        "frobnicate --exec=/usr/bin/tollgate install",
+        // Words from elsewhere.
+        "echo commit | xargs strace git",
+        "echo commit | xargs frobnicate git",
+        "echo install | xargs frobnicate tollgate",
+        "find . -maxdepth 0 -exec uv run git commit -n -m x \\;",
+        // Options before the run subcommand.
+        "uv --env-file .env run cargo build",
+        "npm --prefix /x exec -c 'git commit -n -m x'",
+        "bun --env-file .env x git commit -n -m x",
+        "uv --directory sub run ./x.sh",
+    ]);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    // Everyday uses stay allowed.
+    for cmd in [
+        "uv run pytest -q",
+        "uv run python -c 'print(1)'",
+        "uv run -- python -m pytest -q",
+        "uv run --with requests python -c 'print(2)'",
+        "uv run -m pytest -q",
+        "uv run python -c 'print(\"git commit\")'",
+        "uvx ruff check .",
+        "bunx tsc --noEmit",
+        "bun x tsc --noEmit",
+        "npx prettier --check .",
+        "strace -f -o /tmp/t ls",
+        "valgrind --leak-check=full ls",
+        "perf stat -e cycles cargo build",
+        "xvfb-run -a bun test",
+        "systemd-inhibit --why=bench cargo bench",
+        "chronic cargo build",
+        "cargo run -- status",
+        "cargo run --release -p x -- --help",
+        "echo git commit -n",
+        "grep -rn 'git commit' src",
+        "gh pr create --title x --body 'run git commit -n here'",
+        "frobnicate --verbose build",
+        "konsole --version",
+        "faketty cargo test",
+        "pacman -Qi git",
+        "brew install git gh",
+        "yay -S git lfs",
+        "kubectl exec pod -- git status",
+        "cargo test -p tollgate",
+        "notesmd-cli search-content 'tollgate install'",
+        "uv pip install python-dotenv",
+        "uv python install 3.12",
+        "npm install",
+        "perf report -i perf.data",
+    ] {
+        let g = lab.guard(cmd);
+        assert!(matches!(g, Guarded::Allowed(_)), "{cmd}: {g:?}");
+    }
+}

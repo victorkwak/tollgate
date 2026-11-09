@@ -1220,11 +1220,18 @@ pub fn run_job(ctx: &Ctx, job: &str, lock_fd: Option<i32>) -> u8 {
 /// `tollgate remotes forget [repo]` (item 33): removes the record of the
 /// trusted remotes the repo had, so a lost one no longer denies; the next
 /// gated command records those it has then. At an interactive terminal
-/// only (stdin and stdout are TTYs; Claude's Bash has none), after a
-/// confirmation that lists what the record holds: forgetting a lost
-/// trusted remote lets the policy anchor fall back to local refs.
+/// only (stdin and stdout are TTYs; Claude's Bash has none) outside a
+/// Claude Code session (review note 1), after a confirmation that lists
+/// what the record holds: forgetting a lost trusted remote lets the
+/// policy anchor fall back to local refs.
 pub fn remotes_forget(ctx: &Ctx, repo: Option<&Path>) -> u8 {
     use std::io::{BufRead as _, IsTerminal as _, Write as _};
+    if let Some(var) = crate::install::claude_session(&ctx.env) {
+        eprintln!(
+            "tollgate remotes forget: runs inside a Claude Code session ({var} is set; review note 1); accepting a lost trusted remote is for a person, not an agent; run it in your own terminal"
+        );
+        return exit::FAIL;
+    }
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
         eprintln!(
             "tollgate remotes forget: needs an interactive terminal on stdin and stdout (item 33); accepting a lost trusted remote is for a person, not an agent"

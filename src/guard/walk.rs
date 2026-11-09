@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use super::cmds::{self, Class, Lang, OptValue};
 use super::paths;
 use super::rules::{Assessment, Context, Ruling, basename, is_tollgate};
+use super::runners::{self, Launch};
 use super::shell::{self, AndOr, Command, Kind, Op, Part, Pipeline, Redir, Script, Simple, Word};
 
 /// A deny reason.
@@ -280,6 +281,9 @@ pub struct Walker<'a> {
     returns: Vec<Vec<Scope>>,
     /// Body walks taken by unrolled `for` loops so far.
     unrolled_walks: usize,
+    /// How many runners ([`runners`]) the command being walked runs
+    /// under: git, tollgate and shells may not run there (item 40).
+    pub(super) runner_depth: usize,
 }
 
 /// R25/R26/R28 for a Bash command.
@@ -337,6 +341,7 @@ impl<'a> Walker<'a> {
             loops: Vec::new(),
             returns: Vec::new(),
             unrolled_walks: 0,
+            runner_depth: 0,
         }
     }
 
@@ -1320,21 +1325,36 @@ impl<'a> Walker<'a> {
             && (lower == "git"
                 || lower.starts_with("git-")
                 || lower == "tollgate"
+                || runners::is_runner(&lower)
                 || cmds::classify(&lower) != Class::Other)
         {
             return Err(format!(
                 "`{name}`: write the command name in lowercase; a case-insensitive file system runs {lower} for it (G1)"
             ));
         }
-        if base == "git"
+        let gitish = base == "git"
             || base
                 .strip_prefix("git-")
-                .is_some_and(|s| super::git::KNOWN.contains(&s))
+                .is_some_and(|s| super::git::KNOWN.contains(&s));
+        let tollgate = is_tollgate(self.ctx, name) || base == "tollgate";
+        if self.runner_depth > 0
+            && (gitish || tollgate || matches!(class, Class::Shell(_) | Class::Busybox))
         {
+            return Err(format!(
+                "`{name}` under a runner (uv run, npx, strace, ...): the runner may find another program by that name, or trace or detach it; run it directly in the session (G2, item 40)"
+            ));
+        }
+        if gitish {
             return self.git(argv, env, f, via);
         }
-        if is_tollgate(self.ctx, name) || base == "tollgate" {
+        if tollgate {
             return self.tollgate(argv, env, via);
+        }
+        if matches!(class, Class::Other | Class::Interp(Lang::Bun)) && runners::is_runner(&base) {
+            let lits = self.lits(argv);
+            if let Some(l) = runners::launch(&base, &lits) {
+                return self.runner(&base, l, argv, env, f, via, certain);
+            }
         }
         match class {
             Class::Wrapper(w) => self.wrapper(w, argv, env, f, via, certain),
@@ -1900,6 +1920,48 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// G2 (item 40): runner `base` runs a command from its words with the
+    /// session's environment ([`runners`]): the command is walked as if
+    /// typed, with no git, tollgate or shell at any depth under it; when
+    /// the runner's options are not known, every word is held to the
+    /// launcher rule instead.
+    #[allow(clippy::too_many_arguments)]
+    fn runner(
+        &mut self,
+        base: &str,
+        l: Launch,
+        argv: &[Word],
+        env: Vec<EnvSet>,
+        f: &Frame,
+        via: Via,
+        certain: bool,
+    ) -> W {
+        // Words from elsewhere may be the command (`xargs strace`).
+        self.no_elsewhere(via, base)?;
+        self.env_check(&env, Target::Other)?;
+        let (at, prefix, moved) = match l {
+            Launch::Deny(why) => return Err(why),
+            Launch::Strict { from } => return self.launch_tokens(base, &argv[from..]),
+            Launch::Walk { at, prefix, moved } => (at, prefix, moved),
+        };
+        let Some(cmd) = argv.get(at) else {
+            return Ok(());
+        };
+        let word = self.command_word(cmd)?;
+        if moved && word.contains('/') && !word.starts_with('/') {
+            return Err(format!(
+                "{base} changes the directory before it runs {word}; give the program's absolute path (G2, G8)"
+            ));
+        }
+        let mut inner: Vec<Word> = prefix.iter().map(|p| lit_word(p)).collect();
+        inner.extend_from_slice(&argv[at..]);
+        let name = prefix.first().map_or(word, |p| (*p).to_owned());
+        self.runner_depth += 1;
+        let r = self.run(&inner, &name, env, f, via, certain);
+        self.runner_depth -= 1;
+        r
+    }
+
     /// G2b: `what` runs `args` elsewhere or with another environment: no
     /// git, tollgate, shell or interpreter in them, all literal.
     fn launch_tokens(&self, what: &str, args: &[Word]) -> W {
@@ -2090,6 +2152,43 @@ impl<'a> Walker<'a> {
             },
             "nsenter" | "unshare" | "chroot" | "firejail" if self.stdin(f) != Feed::Tty => {
                 Some("it may start a shell that reads its stdin")
+            }
+            // Item 40: they type text into a session or window, which may
+            // be a shell or a TTY-only prompt.
+            "dtach" if cluster_has('p') => Some("dtach -p types its stdin into a session"),
+            "empty" if cluster_has('s') => Some("empty -s types text into a session"),
+            "zellij"
+                if lits.iter().any(|a| {
+                    matches!(a.as_str(), "write-chars" | "write" | "send-keys" | "paste")
+                }) =>
+            {
+                Some("zellij action write types text into a pane")
+            }
+            "qdbus" | "qdbus6" | "qdbus-qt6" | "gdbus" | "dbus-send" | "busctl"
+                if lits.iter().any(|a| {
+                    let a = a.to_ascii_lowercase();
+                    a.contains("runcommand") || a.contains("sendtext")
+                }) =>
+            {
+                Some("it types text into a terminal session")
+            }
+            "wtype" | "dotool" | "dotoolc" => {
+                Some("it types text into the window that has focus, which may be a shell")
+            }
+            "ydotool" | "xdotool"
+                if lits
+                    .iter()
+                    .any(|a| matches!(a.as_str(), "type" | "key" | "keydown" | "keyup")) =>
+            {
+                Some("it types text into the window that has focus, which may be a shell")
+            }
+            "dtach" | "abduco" | "empty" | "faketty" | "fakeroot" | "fakechroot" | "proot"
+            | "newgrp" | "sg" | "run0" | "capsh" | "schroot" | "systemd-nspawn" | "lxc-attach"
+            | "toolbox" | "distrobox" | "distrobox-enter" | "dbus-run-session" | "zellij"
+            | "rlwrap"
+                if self.stdin(f) != Feed::Tty =>
+            {
+                Some("it may start a shell or a session that reads its stdin")
             }
             _ => None,
         };
@@ -2406,6 +2505,8 @@ impl<'a> Walker<'a> {
     ) -> W {
         self.no_elsewhere(via, base)?;
         self.env_check(&env, Target::Other)?;
+        let values: Vec<Option<String>> = argv.iter().map(|w| self.arg_value(w)).collect();
+        self.foreign_args(argv, &values, &env, f, via)?;
         let lits = self.lits(argv);
         let prog = interp_program(lang, &lits, argv)?;
         match prog {
@@ -2902,7 +3003,7 @@ impl<'a> Walker<'a> {
         base: &str,
         argv: &[Word],
         env: &[EnvSet],
-        _f: &Frame,
+        f: &Frame,
         via: Via,
     ) -> W {
         self.env_check(env, Target::Other)?;
@@ -2955,6 +3056,9 @@ impl<'a> Walker<'a> {
             _ => {}
         }
         let values: Vec<Option<String>> = argv.iter().map(|w| self.arg_value(w)).collect();
+        if !READS_ONLY.contains(&base) {
+            self.foreign_args(argv, &values, env, f, via)?;
+        }
         let fx = super::progs::check(base, &values)?;
         for file in &fx.sed_files {
             for w in self.sed_file(file)? {
@@ -3371,6 +3475,13 @@ fn is_exit(p: &Pipeline) -> bool {
         _ => false,
     })
 }
+
+/// Programs that print, search or describe their words and run none of
+/// them: [`Walker::foreign_args`] does not read their words.
+const READS_ONLY: &[&str] = &[
+    "echo", "man", "info", "tldr", "whatis", "apropos", "help", "type", "which", "whereis", "grep",
+    "egrep", "fgrep", "rg", "ag", "ack",
+];
 
 fn lit_word(t: &str) -> Word {
     Word {

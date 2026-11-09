@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use super::cmds;
-use super::rules::basename;
+use super::rules::{basename, is_tollgate};
 use super::shell::{Part, Word};
 use super::walk::{Cwd, EnvSet, Feed, Frame, Target, Via, W, Walker};
 
@@ -1360,26 +1360,117 @@ impl Walker<'_> {
             .map(|w| w.to_lowercase())
             .collect();
         let pos: Vec<&str> = lower.iter().map(String::as_str).collect();
+        if let Some(why) = cmds::person_only(&pos) {
+            return Err(why);
+        }
         match pos.as_slice() {
-            ["waive", ..] => Err("tollgate waive is not for agents (R25)".into()),
-            ["remotes", "forget", ..] => Err(
-                "forgetting a lost trusted remote needs Victor's terminal (item 33, R25)".into(),
-            ),
-            ["policy", "approve", ..] => Err("policy approval is not for agents (R25)".into()),
-            // A pty wrapper (`script -c`, `unbuffer`) would give it the
-            // terminal it checks for and type the yes.
-            [s, ..] if matches!(*s, "install" | "uninstall") => Err(format!(
-                "tollgate {s} changes the Claude Code settings; it needs Victor's terminal (item 29, L10, R25)"
-            )),
-            ["baseline", "record", ..] => {
-                Err("baseline record needs Victor's terminal (R94, R25)".into())
-            }
             [s, ..] if matches!(*s, "check" | "wait" | "merge") => {
                 self.long = true;
                 Ok(())
             }
             _ => Ok(()),
         }
+    }
+
+    /// G2 (item 40, review notes 11 and 1): a program the guard does not
+    /// follow may run the command in its words, with any environment. A
+    /// word `git` (or `git-<sub>`) with a gated subcommand, and `tollgate`
+    /// with a person-only one (R25) anywhere after it, deny; a git command
+    /// with another subcommand is checked as if typed. A word bash builds
+    /// at run time may be git, so a gated subcommand after one denies.
+    /// `values` are the words' values ([`Walker::lits`] or better).
+    pub(super) fn foreign_args(
+        &mut self,
+        argv: &[Word],
+        values: &[Option<String>],
+        env: &[EnvSet],
+        f: &Frame,
+        via: Via,
+    ) -> W {
+        let gated_after = |i: usize| {
+            values[i + 1..]
+                .iter()
+                .flatten()
+                .find(|v| GATED.contains(&v.as_str()))
+                .cloned()
+        };
+        for i in 1..argv.len() {
+            let Some(word) = values[i].as_deref() else {
+                if let Some(g) = gated_after(i) {
+                    return Err(format!(
+                        "`{}` before `{g}`: a word bash builds at run time may be git, and `{}` may run it; write the words literally, or run git directly (G1, G2, item 40)",
+                        argv[i].raw, argv[0].raw
+                    ));
+                }
+                continue;
+            };
+            // `--exec=git`: the value of an option.
+            let w = match word.split_once('=') {
+                Some((o, v)) if o.starts_with('-') => v,
+                _ => word,
+            };
+            let base = basename(w);
+            if via == Via::Elsewhere
+                && (base == "git"
+                    || base.starts_with("git-")
+                    || base.eq_ignore_ascii_case("tollgate"))
+            {
+                return Err(format!(
+                    "xargs, find -exec and parallel give `{}` more words from elsewhere, after {w}; run it directly (G2, item 40)",
+                    argv[0].raw
+                ));
+            }
+            if base == "git"
+                || base
+                    .strip_prefix("git-")
+                    .is_some_and(|s| KNOWN.contains(&s))
+            {
+                let deny = |what: &str| {
+                    Err(format!(
+                        "`{}` may run {what} ({w}), and the guard does not follow it there; run git directly in the session (G2, item 40)",
+                        argv[0].raw
+                    ))
+                };
+                if self.runner_depth > 0 {
+                    return deny("git under a runner");
+                }
+                let globals = parse_globals(&argv[i..], &values[i..]);
+                match globals.as_ref().ok().and_then(|g| g.sub.clone()) {
+                    Some((_, sub)) if GATED.contains(&sub.as_str()) => {
+                        return deny(&format!("git {sub}"));
+                    }
+                    Some((_, sub)) if KNOWN.contains(&sub.as_str()) => {
+                        self.git(&argv[i..], env.to_vec(), f, via)?;
+                    }
+                    // Not a git command line: git is data here (`pacman
+                    // -S git`), unless a gated word follows options the
+                    // guard cannot read.
+                    _ => {
+                        let unread = globals.as_ref().map_or(true, |g| g.unknown.is_some());
+                        if let Some(g) = gated_after(i).filter(|_| unread) {
+                            return deny(&format!("git {g}"));
+                        }
+                    }
+                }
+                continue;
+            }
+            if base.eq_ignore_ascii_case("tollgate") || is_tollgate(self.ctx, w) {
+                let lower: Vec<String> = values[i + 1..]
+                    .iter()
+                    .flatten()
+                    .filter(|a| !a.starts_with('-'))
+                    .map(|a| a.to_lowercase())
+                    .collect();
+                let pos: Vec<&str> = lower.iter().map(String::as_str).collect();
+                if let Some(why) = (0..pos.len()).find_map(|k| cmds::person_only(&pos[k..])) {
+                    return Err(format!(
+                        "{why}; `{}` may run {w} with it (G2, item 40)",
+                        argv[0].raw
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 

@@ -271,13 +271,34 @@ pub fn claude_version(env: &EnvSnapshot) -> Result<(String, (u32, u32, u32)), St
 /// question) are TTYs. Claude's Bash has none. No flag, variable or path
 /// rule opens a way around it: Claude Code's active config dir can be
 /// anywhere (`CLAUDE_CONFIG_DIR`), so no file is safe to edit unasked.
-fn interactive(what: &str) -> Result<(), String> {
+/// Nor inside a Claude Code session ([`claude_session`]).
+fn interactive(env: &EnvSnapshot, what: &str) -> Result<(), String> {
+    if let Some(var) = claude_session(env) {
+        return Err(format!(
+            "runs inside a Claude Code session ({var} is set; review note 1); it changes the Claude Code settings only after a person confirms the diff; run tollgate {what} in your own terminal"
+        ));
+    }
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         return Ok(());
     }
     Err(format!(
         "needs an interactive terminal on stdin and stdout (L10, item 29); it changes the Claude Code settings only after a person confirms the diff; run tollgate {what} in your own terminal"
     ))
+}
+
+/// Review note 1: the variable that shows a command runs in a Claude Code
+/// session, if one is set. Claude Code sets `CLAUDECODE` for every
+/// command its Bash tool runs, and what those start inherits it, so a
+/// pty an agent makes (`script`, `dtach`, `faketty`, a terminal it opens)
+/// passes the TTY test but not this one. A person's own terminal, also
+/// one the Claude desktop app opens, has none. Neither test holds against
+/// same-user code that drops the variable and makes a pty from a file the
+/// guard does not read (21d); the guard denies the Bash ways to do it.
+#[must_use]
+pub fn claude_session(env: &EnvSnapshot) -> Option<&'static str> {
+    ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"]
+        .into_iter()
+        .find(|v| env.get(v).is_some())
 }
 
 /// Asks on the terminal (stdout, which [`interactive`] made sure is one);
@@ -350,7 +371,7 @@ fn fail(msg: impl std::fmt::Display) -> u8 {
 /// `tollgate install` (R95), at an interactive terminal only (L10, item
 /// 29).
 pub fn install(ctx: &Ctx) -> u8 {
-    if let Err(e) = interactive("install") {
+    if let Err(e) = interactive(&ctx.env, "install") {
         return fail(e);
     }
     let dirs = match Dirs::from_env(&ctx.env) {
@@ -523,7 +544,7 @@ pub fn uninstall(ctx: &Ctx) -> u8 {
         eprintln!("tollgate uninstall: {m}");
         exit::FAIL
     };
-    if let Err(e) = interactive("uninstall") {
+    if let Err(e) = interactive(&ctx.env, "uninstall") {
         return fail(e);
     }
     let dirs = match Dirs::from_env(&ctx.env) {

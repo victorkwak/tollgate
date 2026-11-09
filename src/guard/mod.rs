@@ -37,6 +37,7 @@ mod git;
 pub mod paths;
 mod progs;
 pub mod rules;
+mod runners;
 pub mod shell;
 mod walk;
 
