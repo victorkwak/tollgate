@@ -57,6 +57,7 @@ fn ctx_at(cwd: &Path, home: &Path) -> Context {
                 .to_string(),
         ],
         inline_cap: 540,
+        git_env: crate::env::EnvSnapshot::default(),
     }
 }
 
@@ -1486,4 +1487,230 @@ fn tool_writes_ask_item35() {
         file_ruling(&c, "/h/.config/kitty/kitty.conf"),
         Ruling::Allow
     );
+}
+
+/// git in `dir` with no user or system config.
+fn git_in(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// Item 22, secreview note 7: a fetch or push reaches the local repo in
+/// every spelling git reads as it: `./`, `.git`, `..` from a subdir, the
+/// absolute path, a `file://` URL, a symlink, another worktree, a path
+/// that is not a remote name, and a remote, `insteadOf` or `pushurl`
+/// that points there. Destinations count in every spelling git expands
+/// (`heads/main`, `remotes/origin/main`, `origin/main`, globs, full names
+/// of full refs), and so do pushes whose refspecs come from config.
+#[test]
+fn item_22_local_repo_in_every_spelling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let w = std::fs::canonicalize(tmp.path()).unwrap().join("w");
+    let repo = w.join("repo");
+    let other = w.join("other");
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let r = repo.display().to_string();
+    let wd = w.display().to_string();
+    git_in(&repo, &["init", "-q", "-b", "feat"]);
+    git_in(&repo, &["commit", "-q", "--allow-empty", "-m", "x"]);
+    let oid = std::fs::read_to_string(repo.join(".git/refs/heads/feat")).unwrap();
+    std::fs::create_dir_all(repo.join(".git/refs/remotes/origin")).unwrap();
+    std::fs::write(repo.join(".git/refs/remotes/origin/main"), &oid).unwrap();
+    git_in(
+        &repo,
+        &["remote", "add", "origin", "git@gitlab.com:v/r.git"],
+    );
+    git_in(&repo, &["remote", "add", "mirror", &r]);
+    git_in(
+        &repo,
+        &["config", "remote.pl.url", "git@gitlab.com:v/r.git"],
+    );
+    git_in(&repo, &["config", "remote.pl.pushurl", "."]);
+    git_in(&repo, &["config", &format!("url.{wd}/.insteadOf"), "gl:"]);
+    git_in(
+        &repo,
+        &["config", &format!("url.{wd}/.pushInsteadOf"), "gp:"],
+    );
+    git_in(&repo, &["config", "branch.feat.remote", "."]);
+    git_in(&repo, &["config", "branch.feat.merge", "refs/heads/main"]);
+    git_in(
+        &repo,
+        &["worktree", "add", "-q", "-b", "wtb", &format!("{wd}/wt")],
+    );
+    std::os::unix::fs::symlink(&repo, w.join("link")).unwrap();
+    git_in(&other, &["init", "-q", "-b", "feat"]);
+    git_in(
+        &other,
+        &["remote", "add", "origin", "git@gitlab.com:v/o.git"],
+    );
+    git_in(&other, &["config", "branch.feat.remote", "origin"]);
+    git_in(&other, &["config", "branch.feat.merge", "refs/heads/main"]);
+
+    let home = w.join("h");
+    let mut c = ctx_at(&repo, &home);
+    c.git_env = crate::env::EnvSnapshot::from_pairs([
+        ("HOME", home.display().to_string()),
+        ("GIT_CONFIG_NOSYSTEM", "1".to_owned()),
+    ]);
+    let open = |c: &Context, cmds: &[String]| -> Vec<String> {
+        cmds.iter()
+            .filter(|cmd| !matches!(bash_ruling(c, cmd), Ruling::Deny(_)))
+            .map(|cmd| format!("{cmd} -> {:?}", bash_ruling(c, cmd)))
+            .collect()
+    };
+    let deny: Vec<String> = [
+        "git push ./ x:main",
+        "git push {r} x:main",
+        "git push {r}/ x:main",
+        "git push {r}/.git x:main",
+        "git push {r}/sub/.. x:main",
+        "git push .git HEAD:main",
+        "git push sub/.. HEAD:main",
+        "git push file://{r} x:main",
+        "git push file://{w}/%72epo x:main",
+        "git push {w}/link x:main",
+        "git push {w}/wt x:main",
+        "git push {w}/new x:main",
+        "ln -s {r} {w}/new && git push {w}/new x:main",
+        "mv {w}/other {w}/o2 && ln -s {r} {w}/other && git push {w}/other x:main",
+        "git push {w}/./repo x:main",
+        "git push {w}/other/../repo x:main",
+        "git push ~/../repo x:main",
+        "git push ~bob/repo x:main",
+        "git push fd::3 x:main",
+        "git push repo2 x:main",
+        "git push mirror x:main",
+        "git push pl x:main",
+        "git push gl:repo x:main",
+        "git push gp:repo x:main",
+        "git push --rep origin . x:main",
+        "git push --recurse-submodules origin . x:main",
+        "git push --bogus origin . x:main",
+        "git push -d . main",
+        "git push . main",
+        "git push . heads/main",
+        "git push . x:heads/main",
+        "git push . x:remotes/origin/main",
+        "git push . x:origin/main",
+        "git push . x:origin",
+        "git push . 'refs/heads/x-*:refs/heads/*'",
+        "git push . x:refs/heads/integration/a",
+        "git push . x:INTEGRATION/a",
+        "git push --all .",
+        "git push --branches .",
+        "git push --mirror ./",
+        "git push .",
+        "git push --repo=.",
+        "git push",
+        "git fetch .git x:main",
+        "git fetch repo2 x:main",
+        "git fetch file://{r} x:main",
+        "git fetch mirror x:main",
+        "git fetch gl:repo x:main",
+        "git fetch . x:heads/main",
+        "git fetch . x:remotes/origin/main",
+        "git fetch origin x:remotes/origin/main",
+        "git fetch . 'refs/tags/*:refs/heads/*'",
+        "git fetch . x:refs/heads/integration/a",
+        "git fetch --refm=refs/heads/x:refs/heads/main . x",
+        "git fetch --stdin . <<< x:main",
+        "git fetch --depth 1 . x:main",
+        "git pull . x:main",
+        "git pull .git x:main",
+        "git pull --refmap=refs/heads/x:refs/heads/main . x",
+    ]
+    .iter()
+    .map(|s| s.replace("{r}", &r).replace("{w}", &wd))
+    .collect();
+    let bad = open(&c, &deny);
+    assert!(bad.is_empty(), "not denied:\n{}", bad.join("\n"));
+    // Denied for what the push or fetch writes, not for a step before it.
+    let other_reason: Vec<String> = deny
+        .iter()
+        .filter(|cmd| !cmd.contains("<<<"))
+        .filter_map(|cmd| match bash_ruling(&c, cmd) {
+            Ruling::Deny(m)
+                if m.contains("git push") || m.contains("git fetch") || m.contains("git pull") =>
+            {
+                None
+            }
+            r => Some(format!("{cmd} -> {r:?}")),
+        })
+        .collect();
+    assert!(other_reason.is_empty(), "{}", other_reason.join("\n"));
+    let sub = ctx_at(&repo.join("sub"), &home);
+    let sub = Context {
+        git_env: c.git_env.clone(),
+        ..sub
+    };
+    let bad = open(
+        &sub,
+        &[
+            "git push .. HEAD:main".to_owned(),
+            "git -C .. push . HEAD:main".to_owned(),
+            "git -C .. fetch repo x:main".to_owned(),
+            "git fetch ../.git x:main".to_owned(),
+        ],
+    );
+    assert!(bad.is_empty(), "not denied:\n{}", bad.join("\n"));
+
+    let allow: Vec<String> = [
+        "git push origin main",
+        "git push origin feat:main",
+        "git push origin x:refs/heads/main",
+        "git push -u origin feat",
+        "git push origin",
+        "git push origin 'refs/heads/*:refs/heads/*'",
+        "git push {w}/other main",
+        "git push . feat:other",
+        "git push . x:feat/a",
+        "git push mirror feat:other",
+        "git fetch origin",
+        "git fetch origin main:main",
+        "git fetch pl x:main",
+        "git fetch gp:repo x:main",
+        "git fetch . x:feat",
+        "git fetch repo2 x:feat",
+        "git pull origin main",
+        "git pull --ff-only",
+    ]
+    .iter()
+    .map(|s| s.replace("{r}", &r).replace("{w}", &wd))
+    .collect();
+    for cmd in &allow {
+        assert_eq!(bash_ruling(&c, cmd), Ruling::Allow, "{cmd}");
+    }
+    let o = Context {
+        git_env: c.git_env.clone(),
+        ..ctx_at(&other, &home)
+    };
+    allowed_in(&o, &["git push", "git push origin"]);
+
+    // Packed remote-tracking refs count as loose ones do.
+    git_in(&other, &["commit", "-q", "--allow-empty", "-m", "x"]);
+    git_in(&other, &["update-ref", "refs/remotes/up/x", "HEAD"]);
+    git_in(&other, &["pack-refs", "--all"]);
+    denied_in(&o, &["git push . HEAD:up/y", "git push . HEAD:up/x"]);
+    allowed_in(&o, &["git push . HEAD:feat/y"]);
+
+    // A config the guard cannot read without git (an include): a remote
+    // name may point here, so only refspecs that move no anchor pass.
+    std::fs::write(
+        repo.join(".git/config"),
+        format!(
+            "{}[include]\n\tpath = more\n",
+            std::fs::read_to_string(repo.join(".git/config")).unwrap()
+        ),
+    )
+    .unwrap();
+    denied_in(&c, &["git push origin main", "git push", "git push origin"]);
+    allowed_in(&c, &["git push origin feat", "git push origin feat:other"]);
 }

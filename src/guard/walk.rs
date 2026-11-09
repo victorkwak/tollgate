@@ -2378,6 +2378,16 @@ impl<'a> Walker<'a> {
         self.written.iter().any(|w| p.starts_with(w))
     }
 
+    /// True when this command writes, removes or replaces `p` (absolute),
+    /// a dir above it or anything under it before now (G7, item 22,
+    /// secreview note 7: a link or repo it makes).
+    pub(super) fn changes(&self, p: &Path) -> bool {
+        let c = paths::canon(p);
+        self.written
+            .iter()
+            .any(|w| p.starts_with(w) || w.starts_with(p) || c.starts_with(w) || w.starts_with(&c))
+    }
+
     /// The text of `p`, which this command writes first: known only when a
     /// literal heredoc wrote it whole, once.
     fn known_text(&self, p: &Path, shown: &str) -> Result<String, Deny> {

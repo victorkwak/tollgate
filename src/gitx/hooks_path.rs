@@ -120,7 +120,7 @@ pub fn config_files(
     Ok(files)
 }
 
-fn read_entries(path: &Path) -> Result<Option<Vec<config_file::Entry>>, NeedsGit> {
+pub(crate) fn read_entries(path: &Path) -> Result<Option<Vec<config_file::Entry>>, NeedsGit> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

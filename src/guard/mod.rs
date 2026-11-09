@@ -40,6 +40,7 @@ mod progs;
 pub mod rules;
 mod runners;
 pub mod shell;
+mod transfer;
 mod walk;
 
 use std::path::{Path, PathBuf};
@@ -321,6 +322,15 @@ fn context(
         full_refs,
         tollgate_names: names,
         inline_cap,
+        git_env: EnvSnapshot::from_pairs(
+            env.iter()
+                .filter(|(k, _)| {
+                    k.to_str().is_some_and(|k| {
+                        k == "HOME" || k == "XDG_CONFIG_HOME" || k.starts_with("GIT_")
+                    })
+                })
+                .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        ),
     }
 }
 

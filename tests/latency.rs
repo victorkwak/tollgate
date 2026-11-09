@@ -241,6 +241,36 @@ fn the_guard_answers_in_under_10_ms_l19() {
     within_budget("guard", t, Duration::from_millis(10));
 }
 
+/// Item 22, secreview note 7: a push or fetch whose refspecs can move an
+/// anchor reads the repo's config files and resolves the repository
+/// argument (no subprocess); the guard stays in budget.
+#[test]
+fn the_guard_reads_push_and_fetch_targets_in_under_10_ms_l19_item22() {
+    let meter = CpuMeter::new();
+    let a = Armed::new();
+    let repo = a.sb.repo("r");
+    a.sb.git(
+        &repo,
+        &["remote", "add", "origin", "git@gitlab.com:v/r.git"],
+    );
+    a.sb.git(&repo, &["config", "url.git@gitlab.com:.insteadOf", "gl:"]);
+    let input = serde_json::json!({
+        "cwd": repo,
+        "tool_name": "Bash",
+        "tool_input": {"command": "git push origin main && git push && git fetch origin main:main && git push . HEAD:feat && git pull gl:v/r main"},
+    })
+    .to_string();
+    let t = p95(&meter, 3, 200, || {
+        let (code, _, err) = a.guard_raw(&input, &[]);
+        assert_eq!(code, Some(0), "{err}");
+    });
+    within_budget(
+        "guard on push and fetch targets",
+        t,
+        Duration::from_millis(10),
+    );
+}
+
 /// Detection runs on the `pre-commit` path when the policy commit has no
 /// `tollgate.toml` (one `git cat-file` per TypeScript root, R65). A
 /// docs-only commit next to detected Bun and Python roots stays in the

@@ -133,6 +133,13 @@ fn input(a: &Armed, cmd: &str) -> String {
 fn setup() -> (Armed, std::path::PathBuf) {
     let a = Armed::new();
     let repo = a.sb.repo("r");
+    // As in the session transcripts: the repo has its server remote. A
+    // push to a name that is no remote is a push to a path (item 22,
+    // secreview note 7).
+    a.sb.git(
+        &repo,
+        &["remote", "add", "origin", "git@gitlab.com:v/r.git"],
+    );
     let scripts = a.sb.root().join("scripts");
     std::fs::create_dir_all(&scripts).unwrap();
     for (name, text) in [

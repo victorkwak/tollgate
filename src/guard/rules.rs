@@ -74,6 +74,10 @@ pub struct Context {
     /// The `TOLLGATE_INLINE_CAP` the guard exports for this call (G6): a
     /// client value may only lower it.
     pub inline_cap: u64,
+    /// The session variables that pick the config files git reads and the
+    /// config it carries (`HOME`, `XDG_CONFIG_HOME`, `GIT_*`): which repo a
+    /// fetch or push reaches (G7, item 22, secreview note 7).
+    pub git_env: crate::env::EnvSnapshot,
 }
 
 impl Context {

@@ -2426,6 +2426,42 @@ fn s28_remote_identity_and_ref_writes() {
         "printf '[remote \"origin\"]\\n\\turl = /tmp/x\\n' >> .git/config",
     ]));
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+    // Item 22, secreview note 7: the local repo in every spelling git
+    // reads as it, destinations in every spelling git expands, and pushes
+    // whose refspecs come from config.
+    let repo = lab.repo.display().to_string();
+    lab.plain(&["remote", "add", "self", &repo]);
+    lab.plain(&["branch", "-q", "--set-upstream-to=main"]);
+    let mut spellings: Vec<String> = [
+        "git push ./ feat:main",
+        "git push .git feat:main",
+        "git push {r} feat:main",
+        "git push {r}/crates/.. feat:main",
+        "git push file://{r} feat:main",
+        "git push self feat:main",
+        "git push . feat:heads/main",
+        "git push . feat:origin/main",
+        "git push . feat:remotes/origin/main",
+        "git push --recurse-submodules no . feat:main",
+        "git config push.default upstream && git push",
+        "git push --repo=. --force",
+        "git fetch .git feat:main",
+        "git fetch self feat:main",
+        "git fetch . feat:heads/main",
+        "git fetch . feat:remotes/origin/main",
+        "git fetch --refm=refs/heads/feat:refs/heads/main . feat",
+        "git pull . feat:main",
+        "cd crates && git push . feat:main",
+    ]
+    .iter()
+    .map(|s| s.replace("{r}", &repo))
+    .collect();
+    spellings.push(format!(
+        "ln -s {repo} {0}/l && git push {0}/l feat:main",
+        lab.root().display()
+    ));
+    let bad = lab.not_denied(&spellings);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
     let write = serde_json::json!({
         "tool_name": "Write",
         "cwd": lab.repo,

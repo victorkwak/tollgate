@@ -13,6 +13,7 @@ use super::cmds;
 use super::gitopts::{self, Arg};
 use super::rules::{basename, is_tollgate};
 use super::shell::{Part, Word};
+use super::transfer::{self, Url};
 use super::walk::{Cwd, EnvSet, Feed, Frame, Target, Via, W, Walker};
 
 /// Subcommands that run a gate hook or move a branch (G4).
@@ -646,7 +647,7 @@ impl Walker<'_> {
             }
             self.program_opts(&sub, args, arg_lits)?;
             let dir = self.git_dir(&g.dirs);
-            return self.plain_git(&sub, args, arg_lits, f, dir.as_deref());
+            return self.plain_git(&sub, args, arg_lits, f, dir.as_deref(), &g);
         }
         if let Some(r) = &g.redirect {
             return Err(format!(
@@ -673,11 +674,12 @@ impl Walker<'_> {
             return Err("git send-pack skips the pre-push gate (R25, G4)".into());
         }
         let words: Vec<String> = arg_lits.iter().flatten().cloned().collect();
-        let positionals = self.gated_flags(&sub, &words)?;
-        if sub == "push" {
-            self.push_dot(&positionals, &dir)?;
+        self.gated_flags(&sub, &words)?;
+        match sub.as_str() {
+            "push" => self.push(&words, &dir, &g),
+            "pull" => self.pull(&words, &dir, &g),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     /// `-c` and `--config-env` (G4 on gated commands, R25/R26 on all).
@@ -996,20 +998,358 @@ impl Walker<'_> {
         Ok(pos)
     }
 
-    /// G7: `git push . <src>:<dst>` writes a local ref.
-    fn push_dot(&mut self, pos: &[String], dir: &Path) -> W {
-        let Some((repo, specs)) = pos.split_first() else {
-            return Ok(());
+    /// Item 22, secreview note 7: the words of a push, fetch or pull read
+    /// with `table`. Each element is one way git may read them: the
+    /// repository argument (`None`: none given) and the refspecs. When an
+    /// option the table cannot name may take the next word, every split
+    /// counts.
+    fn xfer_words(
+        sub: &str,
+        table: &gitopts::Table,
+        words: &[String],
+    ) -> Result<(gitopts::Parsed, Vec<Split>), String> {
+        let args: Vec<Arg> = words.iter().cloned().map(Arg::Known).collect();
+        let p = gitopts::parse(table, &args).map_err(|e| format!("git {sub} with {e} (G7)"))?;
+        let pos: Vec<String> = p
+            .positionals
+            .iter()
+            .map(|a| match a {
+                Arg::Known(s) => s.clone(),
+                Arg::Unknown { raw, .. } => raw.clone(),
+            })
+            .collect();
+        let starts: Vec<usize> = if p.uncertain.is_some() {
+            (0..=pos.len()).collect()
+        } else {
+            vec![0]
         };
-        if repo != "." {
-            return Ok(());
+        let splits = starts
+            .into_iter()
+            .map(|k| match pos.get(k) {
+                Some(r) => (Some(r.clone()), pos[k + 1..].to_vec()),
+                None => (None, Vec::new()),
+            })
+            .collect();
+        Ok((p, splits))
+    }
+
+    /// The repo a push, fetch or pull runs in (G7, item 22, secreview
+    /// note 7).
+    fn xfer_repo(&self, dir: Option<&Path>, g: &Globals) -> transfer::Repo {
+        match dir {
+            Some(d) if g.redirect.is_none() => {
+                transfer::open(d, &self.ctx.git_env, &g.configs, !g.config_env.is_empty())
+            }
+            _ => transfer::Repo::Unreadable,
         }
-        for s in specs {
-            let s = s.trim_start_matches('+');
-            let dst = s.split_once(':').map_or(s, |(_, d)| d);
-            self.ref_write(dst, Some(dir), "git push .")?;
+    }
+
+    /// True when repository argument `t` of a push may reach this repo.
+    /// `explicit`: the command or config names it (git then reads an
+    /// unconfigured name as a path); else it is git's fallback `origin`.
+    fn push_reaches_self(&self, repo: &transfer::Repo, t: &str, explicit: bool) -> bool {
+        match repo {
+            transfer::Repo::Absent => path_like(t),
+            transfer::Repo::Unreadable => true,
+            transfer::Repo::Found(f) => {
+                if !explicit && f.is_remote(t) == Some(false) {
+                    return false;
+                }
+                let Some(urls) = f.urls(t, true) else {
+                    return true;
+                };
+                urls.iter().any(|u| match transfer::classify(u) {
+                    Url::Remote => false,
+                    Url::Unknown => true,
+                    Url::Local(p) => f.may_be_self(&p, &self.ctx.git_env, &|p| self.changes(p)),
+                })
+            }
+        }
+    }
+
+    /// True when repository argument `t` of a fetch may be a local repo:
+    /// any local repo can hold any commit under any name.
+    fn fetch_is_local(repo: &transfer::Repo, t: &str) -> bool {
+        match repo {
+            transfer::Repo::Absent => path_like(t),
+            transfer::Repo::Unreadable => true,
+            transfer::Repo::Found(f) => f
+                .urls(t, false)
+                .is_none_or(|u| u.iter().any(|u| transfer::classify(u) != Url::Remote)),
+        }
+    }
+
+    /// G7: a refspec destination with `*` that writes the local repo:
+    /// denied when it can name a branch or a remote-tracking ref.
+    fn glob_write(full: &str, how: &str) -> W {
+        let l = full.to_lowercase();
+        let prefix = l.split('*').next().unwrap_or_default();
+        let branches = ["refs/heads/", "refs/remotes/"]
+            .iter()
+            .any(|r| prefix.starts_with(r) || r.starts_with(prefix));
+        if branches || !prefix.starts_with("refs/") {
+            return Err(format!(
+                "{how} writes {full}, a pattern that can name a policy anchor, full ref or remote-tracking ref (G7, item 22)"
+            ));
         }
         Ok(())
+    }
+
+    /// G7: push destination `d` into this repo, as git expands it: a full
+    /// name, `HEAD`, or a short name matched against the refs there
+    /// (`refs/<d>`, `refs/heads/<d>`, `refs/remotes/<d>`,
+    /// `refs/remotes/<d>/HEAD`).
+    fn push_dst(&mut self, repo: &transfer::Repo, d: &str, dir: &Path, how: &str) -> W {
+        let found = match repo {
+            transfer::Repo::Found(f) => Some(f),
+            _ => None,
+        };
+        if d.contains('*') {
+            return Self::glob_write(d, how);
+        }
+        if d.starts_with("refs/") {
+            return self.ref_write(d, Some(dir), how);
+        }
+        if d == "HEAD" || d == "@" {
+            return match found.and_then(transfer::Found::current) {
+                Some(cur) => self.ref_write(&cur, Some(dir), how),
+                None if matches!(repo, transfer::Repo::Absent) => Ok(()),
+                None => Err(format!(
+                    "{how} writes the branch HEAD names, which the guard cannot read (G7)"
+                )),
+            };
+        }
+        self.ref_write(&format!("refs/heads/{d}"), Some(dir), how)?;
+        self.ref_write(&format!("refs/{d}"), Some(dir), how)?;
+        let tracking = match repo {
+            transfer::Repo::Absent => false,
+            transfer::Repo::Unreadable => true,
+            transfer::Repo::Found(f) => {
+                let first = d.split('/').next().unwrap_or(d);
+                f.remote_names()
+                    .is_some_and(|n| n.contains(&first.to_lowercase()))
+                    || f.remote_refs_may_exist(first)
+                    || f.ref_may_exist(&format!("refs/remotes/{d}"))
+                    || f.ref_may_exist(&format!("refs/remotes/{d}/HEAD"))
+            }
+        };
+        if tracking {
+            return Err(format!(
+                "{how} writes {d}, which git can match to a remote-tracking ref; remote-tracking refs come only from fetches of their remote (G7, item 2)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// G7: refspec `s` of a push into this repo.
+    fn push_spec(&mut self, repo: &transfer::Repo, s: &str, dir: &Path, how: &str) -> W {
+        match transfer::split_spec(s) {
+            None => Ok(()),
+            Some(("", Some(""))) => Err(format!(
+                "{how} with `:` pushes every matching branch into this repo (G7)"
+            )),
+            Some((src, None | Some(""))) => self.push_dst(repo, src, dir, how),
+            Some((_, Some(d))) => self.push_dst(repo, d, dir, how),
+        }
+    }
+
+    /// G7: `git push` writes this repo's refs when its repository is this
+    /// repo in any spelling: `.`, `./`, `.git`, the absolute path, a
+    /// `file://` URL, a symlink, another worktree, a remote, `pushurl` or
+    /// `pushInsteadOf` that points here (item 22, secreview note 7).
+    fn push(&mut self, words: &[String], dir: &Path, g: &Globals) -> W {
+        let (p, splits) = Self::xfer_words("push", &gitopts::PUSH, words)?;
+        let has = |k: &str| p.opts.iter().any(|o| o.key == k);
+        let every = has("--all") || has("--branches") || has("--mirror");
+        let flag_repo = p
+            .opts
+            .iter()
+            .rev()
+            .find(|o| o.key == "--repo")
+            .and_then(|o| match &o.value {
+                Some(Arg::Known(v)) => Some(v.clone()),
+                _ => None,
+            });
+        let repo = self.xfer_repo(Some(dir), g);
+        if matches!(repo, transfer::Repo::Absent) && splits.iter().all(|(t, _)| t.is_none()) {
+            return Ok(());
+        }
+        for (target, specs) in splits {
+            let (name, explicit) = match target.or_else(|| flag_repo.clone()) {
+                Some(t) => (t, true),
+                None => match &repo {
+                    transfer::Repo::Found(f) => default_push_remote(f),
+                    _ => (String::new(), true),
+                },
+            };
+            if !self.push_reaches_self(&repo, &name, explicit) {
+                continue;
+            }
+            let remote = match &repo {
+                transfer::Repo::Found(f) => f.is_remote(&name) == Some(true),
+                _ => false,
+            };
+            let how = if remote || matches!(transfer::classify(&name), Url::Remote) {
+                format!("git push {name}")
+            } else {
+                format!(
+                    "git push {name} (no remote has this name; git reads it as a path to this repo, or to none yet)"
+                )
+            };
+            if every {
+                return Err(format!(
+                    "{how} with --all, --branches or --mirror moves every branch of this repo (G7)"
+                ));
+            }
+            if !specs.is_empty() {
+                for s in &specs {
+                    self.push_spec(&repo, s, dir, &how)?;
+                }
+                continue;
+            }
+            // No refspec: config picks what is pushed.
+            let transfer::Repo::Found(f) = &repo else {
+                return Err(format!(
+                    "{how} pushes what config names into this repo, and the guard cannot read the repo (G7)"
+                ));
+            };
+            let Some(cfg) = f.config.as_deref() else {
+                return Err(format!(
+                    "{how} pushes what config names into this repo, and the guard cannot read git's config (an include, a syntax error or a variable) (G7)"
+                ));
+            };
+            let section = format!("remote.{name}");
+            if cfg
+                .iter()
+                .any(|e| e.section == section && e.key == "mirror")
+            {
+                return Err(format!(
+                    "{how}: remote.{name}.mirror moves every branch (G7)"
+                ));
+            }
+            let pushes: Vec<String> = cfg
+                .iter()
+                .filter(|e| e.section == section && e.key == "push")
+                .filter_map(|e| e.value.clone())
+                .collect();
+            if !pushes.is_empty() {
+                for s in &pushes {
+                    self.push_spec(&repo, s, dir, &how)?;
+                }
+                continue;
+            }
+            let mode = f.get("push", "default").unwrap_or("simple").to_lowercase();
+            let Some(cur) = f.current() else {
+                continue;
+            };
+            match mode.as_str() {
+                "nothing" => {}
+                "current" | "simple" | "upstream" | "tracking" => {
+                    self.ref_write(&cur, Some(dir), &how)?;
+                    let short = cur.strip_prefix("refs/heads/").unwrap_or(&cur);
+                    if let Some(m) = f.get(&format!("branch.{short}"), "merge") {
+                        let m = m.to_owned();
+                        self.push_dst(&repo, &m, dir, &how)?;
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "{how} with push.default {mode} pushes branches into this repo the guard cannot list (G7)"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// G7: fetch refspecs (`fetch`, `pull`) that write `refs/remotes/*`,
+    /// or a policy anchor or full ref from a local repo; `--refmap` and
+    /// `--stdin` (item 22, secreview note 7).
+    fn fetch_specs(
+        &mut self,
+        sub: &str,
+        table: &gitopts::Table,
+        words: &[String],
+        dir: Option<&Path>,
+        g: &Globals,
+    ) -> W {
+        let (p, splits) = Self::xfer_words(sub, table, words)?;
+        if p.opts.iter().any(|o| o.key == "--stdin") {
+            return Err(format!(
+                "git {sub} --stdin reads refspecs the guard cannot see (G7)"
+            ));
+        }
+        for o in p.opts.iter().filter(|o| o.key == "--refmap") {
+            let Some(Arg::Known(v)) = &o.value else {
+                continue;
+            };
+            if let Some((_, Some(d))) = transfer::split_spec(v)
+                && !d.is_empty()
+            {
+                let full = transfer::fetch_dst(d);
+                let how = format!("git {sub} --refmap");
+                if full.contains('*') {
+                    Self::glob_write(&full, &how)?;
+                } else {
+                    self.ref_write(&full, dir, &how)?;
+                }
+            }
+        }
+        if p.opts
+            .iter()
+            .any(|o| matches!(o.key.as_str(), "--all" | "--multiple" | "-m"))
+        {
+            return Ok(());
+        }
+        let mut repo = None;
+        for (target, specs) in splits {
+            let Some(t) = target else {
+                continue;
+            };
+            for s in &specs {
+                let Some((_, Some(d))) = transfer::split_spec(s) else {
+                    continue;
+                };
+                if d.is_empty() {
+                    continue;
+                }
+                let full = transfer::fetch_dst(d);
+                let l = full.to_lowercase();
+                let prefix = l.split('*').next().unwrap_or_default();
+                if prefix.starts_with("refs/remotes/")
+                    || (l.contains('*') && "refs/remotes/".starts_with(prefix))
+                {
+                    return Err(format!(
+                        "git {sub} {t} {s} writes {full}: remote-tracking refs come only from fetches with the remote's own refspec (G7, item 2)"
+                    ));
+                }
+                let r = repo.get_or_insert_with(|| self.xfer_repo(dir, g));
+                if Self::fetch_is_local(r, &t) {
+                    let how = format!("git {sub} {t}");
+                    if full.contains('*') {
+                        Self::glob_write(&full, &how)?;
+                    } else {
+                        self.ref_write(&full, dir, &how)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn fetch(&mut self, w: &[String], dir: Option<&Path>, g: &Globals) -> W {
+        if w.iter()
+            .any(|a| names(a.split('=').next().unwrap_or(a), "--upload-pack", 4))
+        {
+            return Err(
+                "git fetch --upload-pack runs a program of the command's choosing (G4)".into(),
+            );
+        }
+        self.fetch_specs("fetch", &gitopts::FETCH, w, dir, g)
+    }
+
+    fn pull(&mut self, w: &[String], dir: &Path, g: &Globals) -> W {
+        self.fetch_specs("pull", &gitopts::PULL, w, Some(dir), g)
     }
 
     /// G7: writing ref `r` (a full name, or a branch name).
@@ -1020,13 +1360,19 @@ impl Walker<'_> {
                 "{how} writes {r}: remote-tracking refs come only from fetches of their remote (G7, item 2)"
             ));
         }
-        let branch = l.strip_prefix("refs/heads/").unwrap_or(&l).to_owned();
+        // A branch by its short or full name; other full names (tags,
+        // notes) are not branches.
+        let branch = match l.strip_prefix("refs/heads/") {
+            Some(b) => b.to_owned(),
+            None if l.starts_with("refs/") => return Ok(()),
+            None => l.clone(),
+        };
         let anchors = match dir {
             Some(d) => self.anchors(d),
             None => vec!["main".into(), "master".into()],
         };
         if anchors.iter().any(|a| a.to_lowercase() == branch)
-            || (!l.starts_with("refs/") && self.ctx.full_refs.is_match(&branch))
+            || self.ctx.full_refs.is_match(&branch)
         {
             return Err(format!(
                 "{how} moves {r}, a policy anchor or full ref; it moves only through tollgate merge and the push gate (G7)"
@@ -1102,6 +1448,7 @@ impl Walker<'_> {
         lits: &[Option<String>],
         f: &Frame,
         dir: Option<&Path>,
+        g: &Globals,
     ) -> W {
         let all_lit = || -> Result<Vec<String>, String> {
             lits.iter()
@@ -1150,7 +1497,7 @@ impl Walker<'_> {
             },
             "fetch" => {
                 let w = all_lit()?;
-                self.fetch(&w, dir)
+                self.fetch(&w, dir, g)
             }
             "remote" => {
                 let w = all_lit()?;
@@ -1282,83 +1629,6 @@ impl Walker<'_> {
         }
         if force && let Some(n) = pos.first() {
             self.ref_write(n, dir, "git branch -f")?;
-        }
-        Ok(())
-    }
-
-    /// G7: fetch refspecs that write `refs/remotes/*`, or a policy anchor
-    /// from a local repo.
-    fn fetch(&mut self, w: &[String], dir: Option<&Path>) -> W {
-        const VAL: &[&str] = &[
-            "--depth",
-            "--deepen",
-            "--shallow-since",
-            "--shallow-exclude",
-            "-o",
-            "--server-option",
-            "--negotiation-tip",
-            "--filter",
-            "-j",
-            "--jobs",
-            "--recurse-submodules-default",
-            "--submodule-prefix",
-        ];
-        let mut pos: Vec<&str> = Vec::new();
-        let mut many = false;
-        let mut i = 0;
-        while i < w.len() {
-            let a = w[i].as_str();
-            if names(a.split('=').next().unwrap_or(a), "--upload-pack", 4) {
-                return Err(
-                    "git fetch --upload-pack runs a program of the command's choosing (G4)".into(),
-                );
-            }
-            if a == "--refmap" || a.starts_with("--refmap=") {
-                let v = a
-                    .split_once('=')
-                    .map(|(_, v)| v)
-                    .or_else(|| w.get(i + 1).map(String::as_str))
-                    .unwrap_or("");
-                if let Some((_, dst)) = v.trim_start_matches('+').split_once(':') {
-                    self.ref_write(dst, dir, "git fetch --refmap")?;
-                }
-                if !a.contains('=') {
-                    i += 1;
-                }
-            } else if VAL.contains(&a) {
-                i += 1;
-            } else if a == "--all" || a == "--multiple" {
-                many = true;
-            } else if !a.starts_with('-') {
-                pos.push(a);
-            }
-            i += 1;
-        }
-        if many {
-            return Ok(());
-        }
-        let Some((repo, specs)) = pos.split_first() else {
-            return Ok(());
-        };
-        let local = *repo == "."
-            || repo.starts_with('/')
-            || repo.starts_with("./")
-            || repo.starts_with("../")
-            || repo.starts_with('~')
-            || repo.starts_with("file://");
-        for s in specs {
-            let Some((_, dst)) = s.trim_start_matches('+').split_once(':') else {
-                continue;
-            };
-            let l = dst.to_lowercase();
-            if l.starts_with("refs/remotes/") {
-                return Err(format!(
-                    "git fetch {repo} {s} writes {dst}: remote-tracking refs come only from fetches with the remote's own refspec (G7, item 2)"
-                ));
-            }
-            if local {
-                self.ref_write(dst, dir, &format!("git fetch {repo}"))?;
-            }
         }
         Ok(())
     }
@@ -1693,6 +1963,40 @@ fn config_write(lits: &[Option<String>]) -> Option<String> {
         )
         || (k.starts_with("remote.") && k.matches('.').count() == 1);
     asks.then(|| format!("git config writes {key} (R26, G7)"))
+}
+
+/// One way git may read the words of a push, fetch or pull: the
+/// repository argument (`None`: none given) and the refspecs.
+type Split = (Option<String>, Vec<String>);
+
+/// Outside a repo git refuses fetch and push, and no config names a
+/// remote: only a word that is a path or a URL git cannot read counts as
+/// a local repo there.
+fn path_like(t: &str) -> bool {
+    match transfer::classify(t) {
+        Url::Remote => false,
+        Url::Unknown => true,
+        Url::Local(_) => t.starts_with(['.', '/', '~']) || t.contains('/'),
+    }
+}
+
+/// The remote a `git push` with no repository argument pushes to, and
+/// whether config names it: `branch.<b>.pushRemote`, `remote.pushDefault`,
+/// `branch.<b>.remote`, else git's fallback `origin`.
+fn default_push_remote(f: &transfer::Found) -> (String, bool) {
+    let short = f
+        .current()
+        .map(|c| c.strip_prefix("refs/heads/").unwrap_or(&c).to_owned());
+    let branch = |key: &str| {
+        short
+            .as_ref()
+            .and_then(|b| f.get(&format!("branch.{b}"), key))
+            .map(str::to_owned)
+    };
+    branch("pushremote")
+        .or_else(|| f.get("remote", "pushdefault").map(str::to_owned))
+        .or_else(|| branch("remote"))
+        .map_or(("origin".to_owned(), false), |r| (r, true))
 }
 
 /// The branch `HEAD` names in the repo at `dir` (`.git` dir or file).
