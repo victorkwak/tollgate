@@ -127,7 +127,7 @@ v1 installs no `reference-transaction` hook. Commits that `cherry-pick`, `revert
 
 ### Other limits
 
-- macOS is not built or tested yet (L13). Every platform-specific call has a macOS branch that is expected to compile.
+- macOS (L13) builds and passes its tests except `a_dead_runner_leaves_no_step_and_no_free_slot_behind_r35_r85` and `waiting_on_a_dead_runner_reaps_its_steps_r35`. It has no parent-death signal, so a step outlives a SIGKILLed runner, and `KERN_PROCARGS2` shows an unprivileged caller no environment, so `reap_if_lost` cannot find the lost job's processes by their `TMPDIR` entry. Those processes keep their resource slots until they exit. Also on macOS: no subreaper, so a process a step had already orphaned is out of the walk, and `doctor` only warns about an old git lock, because it cannot tell whether a live git owns it (R39).
 - The settings `env` reaches the Bash calls of subagents (R3; checked with Claude Code 2.1.317). The guard denies every Bash call when the injection is missing, so a gap in another version fails closed.
 - A Python root without `uv.lock` gets no `uv sync` setup step: its tools must be on the job `PATH`.
 - In a command that names git or tollgate, the guard denies what it does not check instead of decoding it: ANSI-C quoting (`$'...'`), a `\c` escape, and text fed to a shell (or to python or perl) through a pipe, a heredoc, a here-string or an input redirection (item 31). Give a multi-line commit message with `-F <file>` or `-m "$(cat <<'EOF' ... EOF)"`. The guard is still a parser: a command name built from a variable (`${x}t commit`) or arguments that `xargs` reads from a pipe are not seen. A commit made that way without the hooks is marked unverified by `post-commit`, and the push gate and CI check it.
@@ -141,7 +141,7 @@ The rollout plan of R98, adapted to v3. It is written for the author's machines;
 3. **Benchmark (L20).** Run `tollgate bench` (see [benchmark.md](benchmark.md)) with 6 worktrees of myapp and realistic commits (a core change, an api-only change, a dashboard-only change, a docs change, a retry). Choose `cpu`, `pg` and `pg_max_threads` from that run, not from guesses.
 4. **myapp.** Add `myapp*` to `scope.include`. Write `~/Repos/myapp/tollgate.toml`: `select.owners` for `migrations/**`, `select.fast.pg_tests`, the dashboard setup and steps. Add the CI job (`tollgate ci-snippet --gitlab`). Protect `main` on the remote.
 5. **All repos.** Set `scope.include = ["*"]`.
-6. **Mac.** Repeat steps 1-5 on a Mac (L13; not built yet). Use `only_on = ["macos"]` for iOS steps. When the Mac runs its own cargo guard script, teach it the `verify.root` (R44).
+6. **Mac.** Repeat steps 1-5 on a Mac (L13). Use `only_on = ["macos"]` for iOS steps. When the Mac runs its own cargo guard script, teach it the `verify.root` (R44).
 7. **Retire the old hook.** `tollgate install` removes a PreToolUse entry for `pre-commit-checks.sh` (the commit-check script tollgate replaces), when the settings have one. Delete the script two weeks after step 5. Keep `.pyright-baseline.json` and `.pytest-baseline.json` in the repos: tollgate reads the same files.
 
 v3 changes to the original plan: there is no `reference-transaction` gate (L1), no `tollgate policy approve` (L2: policy changes apply after they merge), and no `tollgate waive` (L3).

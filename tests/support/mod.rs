@@ -9,10 +9,11 @@
 pub mod cpu;
 pub mod tools;
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, SystemTime};
 
 use tollgate::env::EnvSnapshot;
 
@@ -44,7 +45,7 @@ impl Sandbox {
     /// Environment for tollgate code and git in the sandbox.
     pub fn env(&self) -> EnvSnapshot {
         let root = self.root();
-        EnvSnapshot::from_pairs([
+        EnvSnapshot::from_pairs(rustup_dirs().into_iter().chain([
             ("PATH", std::env::var_os("PATH").unwrap_or_default()),
             ("HOME", self.home.clone().into_os_string()),
             ("XDG_STATE_HOME", root.join("state").into_os_string()),
@@ -57,7 +58,7 @@ impl Sandbox {
             // stop here: mise reads the real `~/.config/mise/config.toml` as
             // an untrusted project config, and its `node` shim then fails.
             ("MISE_CEILING_PATHS", root.into_os_string()),
-        ])
+        ]))
     }
 
     /// Runs real git in `dir` with the sandbox env plus `extra`.
@@ -255,6 +256,33 @@ impl Sandbox {
         self.git(&dir, &["commit", "-q", "--no-verify", "-m", "workspace"]);
         dir
     }
+}
+
+/// `CARGO_HOME` and `RUSTUP_HOME` of the real HOME, on a machine whose only
+/// cargo is rustup's: a sandbox HOME has no toolchain, and jobs find it
+/// through these (R52). Empty when there is a system cargo.
+pub fn rustup_dirs() -> Vec<(&'static str, OsString)> {
+    if Path::new("/usr/bin/cargo").exists() {
+        return Vec::new();
+    }
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")]
+        .into_iter()
+        .map(|(key, dir)| {
+            let path = std::env::var_os(key).unwrap_or_else(|| home.join(dir).into_os_string());
+            (key, path)
+        })
+        .collect()
+}
+
+/// Sets the modification time of `path` to `secs` seconds ago.
+pub fn backdate(path: &Path, secs: u64) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(secs))
+        .unwrap();
 }
 
 /// The tollgate binary under test.

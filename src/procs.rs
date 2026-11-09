@@ -5,13 +5,15 @@
 //!   a step orphans (a `setsid` grandchild whose parent died) are reparented
 //!   to the runner and stay findable.
 //! - macOS: the table comes from `proc_listallpids` and `proc_pidinfo`
-//!   (`PROC_PIDTBSDINFO`) in libc. There is no subreaper: an orphan
-//!   reparents to launchd, so the walk finds only what is still attached.
+//!   (`PROC_PIDTBSDINFO`) in libc, a process's arguments from
+//!   `KERN_PROCARGS2`. There is no subreaper: an orphan reparents to launchd,
+//!   so the walk finds only what is still attached.
 //!
 //! The stale-lock owner check of R39 (doctor) and the parent-command lookup
 //! of R13 (CUT by L1) are not here.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -108,6 +110,19 @@ impl ProcTable {
 #[must_use]
 pub fn start_time(pid: i32) -> Option<u64> {
     platform::start_time(pid)
+}
+
+/// The arguments process `pid` was started with, `argv[0]` first, when they
+/// can be read.
+#[must_use]
+pub fn argv(pid: i32) -> Option<Vec<OsString>> {
+    platform::argv(pid)
+}
+
+/// The parent of process `pid`.
+#[must_use]
+pub fn parent_of(pid: i32) -> Option<i32> {
+    platform::parent_of(pid)
 }
 
 static SUBREAPER: AtomicBool = AtomicBool::new(false);
@@ -263,8 +278,10 @@ pub fn reap_adopted_zombies(table: &ProcTable, keep: &[i32]) {
 
 #[cfg(target_os = "linux")]
 mod platform {
+    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io;
+    use std::os::unix::ffi::OsStrExt as _;
 
     use super::ProcInfo;
 
@@ -306,6 +323,22 @@ mod platform {
         Ok(out)
     }
 
+    pub(super) fn argv(pid: i32) -> Option<Vec<OsString>> {
+        let bytes = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        Some(
+            bytes
+                .split(|b| *b == 0)
+                .filter(|a| !a.is_empty())
+                .map(|a| OsStr::from_bytes(a).to_owned())
+                .collect(),
+        )
+    }
+
+    pub(super) fn parent_of(pid: i32) -> Option<i32> {
+        let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        parse_stat(&text).map(|p| p.ppid)
+    }
+
     /// True when `/proc/<pid>/environ` holds the entry `marker` exactly.
     pub(super) fn environ_has(pid: i32, marker: &[u8]) -> bool {
         fs::read(format!("/proc/{pid}/environ"))
@@ -336,12 +369,92 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 mod platform {
+    use std::ffi::{OsStr, OsString};
     use std::io;
+    use std::os::unix::ffi::OsStrExt as _;
 
     use super::ProcInfo;
 
     /// `SZOMB` in `<sys/proc.h>`.
     const SZOMB: u32 = 5;
+
+    /// `PROC_PIDTBSDINFO` of `pid`.
+    fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
+        // SAFETY: proc_bsdinfo is plain old data; zeroed is valid.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+        // SAFETY: `info` is a writable proc_bsdinfo of `size` bytes.
+        let r = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+        };
+        (r == size).then_some(info)
+    }
+
+    /// The `KERN_PROCARGS2` block of `pid`. Another user's process, or one
+    /// that has exited, has none.
+    fn procargs(pid: i32) -> Option<Vec<u8>> {
+        let mut max: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        let mut name = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        // SAFETY: `max` is a writable c_int and `size` holds its size.
+        let r = unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                2,
+                (&raw mut max).cast(),
+                &raw mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if r != 0 {
+            return None;
+        }
+        let mut block = vec![0_u8; usize::try_from(max).ok()?];
+        let mut size = block.len();
+        let mut name = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        // SAFETY: `block` is writable for `size` bytes.
+        let r = unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                3,
+                block.as_mut_ptr().cast(),
+                &raw mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if r != 0 {
+            return None;
+        }
+        block.truncate(size);
+        Some(block)
+    }
+
+    /// The arguments in a `KERN_PROCARGS2` block: `argc` as a `c_int`, the
+    /// executable path, NUL padding, then `argc` NUL-terminated arguments.
+    pub(super) fn parse_procargs(block: &[u8]) -> Option<Vec<&[u8]>> {
+        let (argc, rest) = block.split_first_chunk::<4>()?;
+        let argc = usize::try_from(libc::c_int::from_ne_bytes(*argc)).ok()?;
+        let padding = &rest[rest.iter().position(|b| *b == 0)?..];
+        let strings = &padding[padding.iter().position(|b| *b != 0)?..];
+        let args: Vec<&[u8]> = strings.split(|b| *b == 0).take(argc).collect();
+        (args.len() == argc).then_some(args)
+    }
+
+    pub(super) fn argv(pid: i32) -> Option<Vec<OsString>> {
+        let block = procargs(pid)?;
+        Some(
+            parse_procargs(&block)?
+                .into_iter()
+                .map(|a| OsStr::from_bytes(a).to_owned())
+                .collect(),
+        )
+    }
+
+    pub(super) fn parent_of(pid: i32) -> Option<i32> {
+        i32::try_from(bsd_info(pid)?.pbi_ppid).ok()
+    }
 
     pub(super) fn list() -> io::Result<Vec<ProcInfo>> {
         // SAFETY: a null buffer asks only for the needed size in bytes.
@@ -361,17 +474,7 @@ mod platform {
         pids.truncate(usize::try_from(n).unwrap_or(0).min(cap));
         let mut out = Vec::new();
         for pid in pids.into_iter().filter(|p| *p > 0) {
-            // SAFETY: proc_bsdinfo is plain old data; zeroed is valid.
-            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-            let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
-                .unwrap_or(libc::c_int::MAX);
-            // SAFETY: `info` is a writable proc_bsdinfo of `size` bytes.
-            let r = unsafe {
-                libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
-            };
-            if r != size {
-                continue;
-            }
+            let Some(info) = bsd_info(pid) else { continue };
             out.push(ProcInfo {
                 pid,
                 ppid: i32::try_from(info.pbi_ppid).unwrap_or(0),
@@ -386,25 +489,20 @@ mod platform {
         Ok(false)
     }
 
-    /// No portable way to read another process's environment here.
+    /// `KERN_PROCARGS2` has no environment for an unprivileged caller (`ps e`
+    /// shows none either), so marked processes cannot be found here.
     pub(super) fn environ_has(_pid: i32, _marker: &[u8]) -> bool {
         false
     }
 
     /// `pbi_start_tvsec` and `pbi_start_tvusec` of `PROC_PIDTBSDINFO`.
     pub(super) fn start_time(pid: i32) -> Option<u64> {
-        // SAFETY: proc_bsdinfo is plain old data; zeroed is valid.
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
-        // SAFETY: `info` is a writable proc_bsdinfo of `size` bytes.
-        let r = unsafe {
-            libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
-        };
-        (r == size).then(|| {
+        let info = bsd_info(pid)?;
+        Some(
             info.pbi_start_tvsec
                 .saturating_mul(1_000_000)
-                .saturating_add(info.pbi_start_tvusec)
-        })
+                .saturating_add(info.pbi_start_tvusec),
+        )
     }
 }
 
@@ -463,6 +561,41 @@ mod tests {
         assert_eq!((p.pid, p.ppid, p.pgid, p.zombie), (42, 7, 42, false));
         assert!(platform::parse_stat("9 (x) Z 1 9 9").unwrap().zombie);
         assert!(platform::parse_stat("garbage").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn procargs_blocks_parse() {
+        let block = |rest: &[u8]| [2_i32.to_ne_bytes().as_slice(), rest].concat();
+        let full = block(b"/bin/sleep\0\0\0sleep\x005\0A=1\0\0");
+        assert_eq!(
+            platform::parse_procargs(&full).unwrap(),
+            [b"sleep".as_slice(), b"5"]
+        );
+        // An empty argument is an argument; an empty block is not a process.
+        let empty_arg = block(b"/bin/sh\0sh\0\0");
+        assert_eq!(
+            platform::parse_procargs(&empty_arg).unwrap(),
+            [b"sh".as_slice(), b""]
+        );
+        assert!(platform::parse_procargs(b"").is_none());
+    }
+
+    #[test]
+    fn a_processes_arguments_and_parent_read_back() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id().cast_signed();
+        let args = argv(pid).unwrap();
+        assert!(args[0].to_string_lossy().ends_with("sleep"), "{args:?}");
+        assert_eq!(args[1], "30");
+        assert_eq!(parent_of(pid), Some(std::process::id().cast_signed()));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(argv(pid).is_none());
     }
 
     #[test]
