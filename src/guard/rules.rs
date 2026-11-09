@@ -213,6 +213,12 @@ pub fn file_ruling(ctx: &Context, file: &str) -> Ruling {
     if comps.iter().any(|c| c == ".git") {
         return Ruling::Ask(format!("write under .git/: {} (R26)", p.display()));
     }
+    if let Some(f) = paths::git_global_config(ctx, &p) {
+        return Ruling::Ask(format!(
+            "edit of git's config file {}, whose program keys every git command runs (item 21)",
+            f.display()
+        ));
+    }
     if comps.iter().any(|c| c == ".githooks") {
         return Ruling::Ask(format!("edit of a repo hook {} (R26)", p.display()));
     }

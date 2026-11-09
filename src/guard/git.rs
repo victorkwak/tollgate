@@ -9,8 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
+use super::cmds;
 use super::rules::basename;
-use super::shell::Word;
+use super::shell::{Part, Word};
 use super::walk::{Cwd, EnvSet, Feed, Frame, Target, Via, W, Walker};
 
 /// Subcommands that run a gate hook or move a branch (G4).
@@ -262,9 +263,75 @@ enum KeyClass {
     Deny(&'static str),
     /// Changes which server a remote reaches, or how (R26, G7, X1).
     Ask(&'static str),
-    /// Its value is shell code git runs (editor, pager).
-    Code,
+    /// Git runs its value (editor, pager, diff and filter drivers, ...).
+    Runs(Value),
     Plain,
+}
+
+/// How git runs a config value (item 21).
+#[derive(Clone, Copy)]
+enum Value {
+    /// As [`cmds::Runs`].
+    As(cmds::Runs),
+    /// A credential helper: `!code`, an absolute program path with
+    /// arguments, or `git-credential-<value>`; all through a shell, with
+    /// arguments.
+    Helper,
+    /// `submodule.<name>.update`: `!code` is shell code.
+    SubmoduleUpdate,
+    /// `protocol.allow` and `protocol.ext.allow`: anything but `never`
+    /// can turn on the `ext::` transport, which runs a command.
+    ExtProtocol,
+}
+
+const fn shell(args: bool) -> KeyClass {
+    KeyClass::Runs(Value::As(cmds::Runs::Shell { args }))
+}
+
+const PROGRAM: KeyClass = KeyClass::Runs(Value::As(cmds::Runs::Program));
+
+/// Config keys whose value git runs (item 21), given in lowercase:
+/// `section.key` or `section.<sub>.key`.
+fn runs_key(k: &str) -> Option<KeyClass> {
+    let parts: Vec<&str> = k.split('.').collect();
+    let (Some(&section), Some(&last)) = (parts.first(), parts.last()) else {
+        return None;
+    };
+    let sub = parts.len() > 2;
+    let c = match (section, last) {
+        ("core", "editor") | ("sequence", "editor") => shell(true),
+        ("core", "askpass") => PROGRAM,
+        ("core", "pager") | ("pager", _) | ("interactive", "difffilter") => shell(false),
+        ("diff", "external") => shell(true),
+        ("diff", "command" | "textconv") if sub => shell(true),
+        ("filter", "clean" | "smudge" | "process") if sub => shell(false),
+        ("merge", "driver") if sub => shell(false),
+        ("mergetool" | "difftool" | "guitool", "cmd") if sub => shell(false),
+        ("man" | "browser", "cmd") if sub => shell(true),
+        ("mergetool" | "difftool" | "man" | "browser", "path") if sub => PROGRAM,
+        ("gpg", "program") => PROGRAM,
+        ("gpg", "defaultkeycommand") if sub => shell(false),
+        ("credential", "helper") => KeyClass::Runs(Value::Helper),
+        ("submodule", "update") if sub => KeyClass::Runs(Value::SubmoduleUpdate),
+        ("protocol", "allow") if !sub || parts[1] == "ext" => KeyClass::Runs(Value::ExtProtocol),
+        ("imap", "tunnel") | ("instaweb", "httpd" | "browser") => shell(true),
+        ("sendemail", _) if last.ends_with("cmd") || last == "smtpserver" => shell(true),
+        ("lfs", "path") if sub => PROGRAM,
+        ("lfs", "clean" | "smudge") if sub => shell(false),
+        ("uploadpack", "packobjectshook") => {
+            KeyClass::Deny("runs a program for every pack git serves")
+        }
+        ("core", "alternaterefscommand") => {
+            KeyClass::Deny("runs a program for every fetch from a repo with alternates")
+        }
+        ("hook", _) => KeyClass::Deny("defines a hook, which runs a program on git events"),
+        _ if last.ends_with("cmd") || last.ends_with("command") || last.ends_with("program") => {
+            // A key this list does not name yet: read its value as code.
+            shell(true)
+        }
+        _ => return None,
+    };
+    Some(c)
 }
 
 fn key_class(key: &str) -> KeyClass {
@@ -294,10 +361,40 @@ fn key_class(key: &str) -> KeyClass {
     if k == "core.sshcommand" || k == "core.gitproxy" || k.starts_with("ssh.") {
         return KeyClass::Ask("picks the program git reaches a server with (R26, X1)");
     }
-    if matches!(k.as_str(), "core.editor" | "sequence.editor" | "core.pager") {
-        return KeyClass::Code;
-    }
-    KeyClass::Plain
+    runs_key(&k).unwrap_or(KeyClass::Plain)
+}
+
+/// The shell text git runs for program value `v` of `how`, `None` when
+/// it runs nothing; `Err` when the guard cannot read it as code.
+fn value_code(how: Value, v: &str) -> Result<Option<String>, String> {
+    let v = v.trim();
+    let with_args = cmds::with_args;
+    Ok(match how {
+        Value::As(r) => return cmds::runs_code(r, v),
+        Value::Helper => {
+            if v.is_empty() {
+                None
+            } else if let Some(code) = v.strip_prefix('!') {
+                Some(with_args(code))
+            } else if v.starts_with('/') {
+                Some(with_args(v))
+            } else {
+                // git runs its own helpers or `git-credential-<name>`
+                // from PATH.
+                Some(with_args(&format!("git-credential-{v}")))
+            }
+        }
+        Value::SubmoduleUpdate => v.strip_prefix('!').map(with_args),
+        Value::ExtProtocol => {
+            if v.eq_ignore_ascii_case("never") {
+                None
+            } else {
+                return Err(format!(
+                    "`{v}` can turn on the ext:: transport, which runs a command"
+                ));
+            }
+        }
+    })
 }
 
 /// A gated subcommand's options: short letters with a value, short
@@ -405,6 +502,70 @@ fn sub_opts(sub: &str) -> SubOpts {
     }
 }
 
+/// An option whose value a program runs (item 21).
+struct OptSpec {
+    short: Option<char>,
+    long: &'static str,
+    /// Characters of `long` git needs to take a prefix of it.
+    min: usize,
+    /// The value is only glued (`-Ocmd`, `--opt=cmd`); alone, the option
+    /// takes none.
+    glued_only: bool,
+    kind: OptKind,
+}
+
+#[derive(Clone, Copy)]
+enum OptKind {
+    /// Denied whatever the value is.
+    Deny,
+    /// The value runs as this.
+    Runs(cmds::Runs),
+    /// A `key=value` config entry the command writes (`clone -c`).
+    Config,
+}
+
+const fn opt(short: Option<char>, long: &'static str, min: usize, kind: OptKind) -> OptSpec {
+    OptSpec {
+        short,
+        long,
+        min,
+        glued_only: false,
+        kind,
+    }
+}
+
+/// The options of `sub` whose value git runs (item 21), and the short
+/// letters of `sub` that take a value (the rest of the word, or the next
+/// word).
+fn program_opt_specs(sub: &str) -> Option<(&'static [OptSpec], &'static str)> {
+    const SHELL_ARGS: OptKind = OptKind::Runs(cmds::Runs::Shell { args: true });
+    const DIFFTOOL: &[OptSpec] = &[opt(Some('x'), "--extcmd", 3, SHELL_ARGS)];
+    const GREP: &[OptSpec] = &[OptSpec {
+        short: Some('O'),
+        long: "--open-files-in-pager",
+        min: 4,
+        glued_only: true,
+        kind: SHELL_ARGS,
+    }];
+    const CLONE: &[OptSpec] = &[
+        opt(Some('u'), "--upload-pack", 3, OptKind::Deny),
+        opt(Some('c'), "--config", 4, OptKind::Config),
+    ];
+    const UPLOAD_PACK: &[OptSpec] = &[
+        opt(None, "--upload-pack", 3, OptKind::Deny),
+        opt(None, "--exec", 3, OptKind::Deny),
+    ];
+    const ARCHIVE: &[OptSpec] = &[opt(None, "--exec", 3, OptKind::Deny)];
+    Some(match sub {
+        "difftool" => (DIFFTOOL, "tx"),
+        "grep" => (GREP, "efABCmO"),
+        "clone" => (CLONE, "obucj"),
+        "ls-remote" | "fetch-pack" => (UPLOAD_PACK, ""),
+        "archive" => (ARCHIVE, ""),
+        _ => return None,
+    })
+}
+
 /// `abbrev` names long option `full` (git takes unique prefixes): at least
 /// `min` characters of it.
 fn names(abbrev: &str, full: &str, min: usize) -> bool {
@@ -433,6 +594,15 @@ impl Walker<'_> {
     pub(super) fn git(&mut self, argv: &[Word], env: Vec<EnvSet>, f: &Frame, via: Via) -> W {
         self.saw_git = true;
         let lits = self.lits(argv);
+        if let Some(u) = lits
+            .iter()
+            .flatten()
+            .find(|l| l.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("ext::")))
+        {
+            return Err(format!(
+                "git with `{u}`: the ext:: transport runs a command (G3, item 21)"
+            ));
+        }
         let g = parse_globals(argv, &lits)?;
         let Some((si, sub)) = g.sub.clone() else {
             if via == Via::Elsewhere && !g.no_run {
@@ -473,6 +643,7 @@ impl Walker<'_> {
                     "git --exec-path=<dir> runs git's programs from that dir (G4, X1)".into(),
                 );
             }
+            self.program_opts(&sub, args, arg_lits)?;
             let dir = self.git_dir(&g.dirs);
             return self.plain_git(&sub, args, arg_lits, f, dir.as_deref());
         }
@@ -520,13 +691,14 @@ impl Walker<'_> {
             match key_class(key) {
                 KeyClass::Deny(why) => return Err(format!("git -c {c}: {why} (R25)")),
                 KeyClass::Ask(why) if !gated => self.ask(format!("git -c {c}: {why}")),
-                KeyClass::Code => {
+                KeyClass::Runs(how) => {
                     let v = c.split_once('=').map_or("", |(_, v)| v);
-                    let frame = Frame {
-                        stdin: Feed::Unknown,
-                        env: Vec::new(),
-                    };
-                    self.code(v, true, &frame, &format!("git -c {key}"))?;
+                    let what = format!("git -c {key}");
+                    let code =
+                        value_code(how, v).map_err(|e| format!("{what}: {e} (G3, item 21)"))?;
+                    if let Some(code) = code {
+                        self.program_code(&code, &what)?;
+                    }
                 }
                 _ => {}
             }
@@ -547,15 +719,165 @@ impl Walker<'_> {
             match key_class(key) {
                 KeyClass::Deny(why) => return Err(format!("git --config-env {key}: {why} (R25)")),
                 KeyClass::Ask(why) => self.ask(format!("git --config-env {key}: {why}")),
-                KeyClass::Code => {
+                KeyClass::Runs(_) => {
                     return Err(format!(
-                        "git --config-env {key}: its value is code from a variable the guard cannot see (G4)"
+                        "git --config-env {key}: git runs its value, which comes from a variable the guard cannot see (G3, item 21)"
                     ));
                 }
                 KeyClass::Plain => {}
             }
         }
         Ok(())
+    }
+
+    /// Item 21: options of non-gated subcommands whose value git runs
+    /// (`difftool -x`, `grep -O`, `clone -u`, `ls-remote --upload-pack`,
+    /// `archive --exec`), `clone -c` keys, and subcommands that run code
+    /// or commands the guard does not follow.
+    fn program_opts(&mut self, sub: &str, args: &[Word], lits: &[Option<String>]) -> W {
+        let deny_sub = match sub {
+            "filter-branch" => Some("runs shell filters and rewrites branches without a gate"),
+            "for-each-repo" => Some("runs a git command in repos named by config"),
+            "send-email" => Some("sends mail and runs programs named by its options"),
+            "instaweb" => Some("starts a web server and a browser named by its options"),
+            _ => None,
+        };
+        if let Some(why) = deny_sub {
+            return Err(format!("git {sub} {why} (G3, item 21)"));
+        }
+        let Some((spec, short_val)) = program_opt_specs(sub) else {
+            return Ok(());
+        };
+        // A word bash builds is checked by its value when the guard knows
+        // it and bash does not split it into several.
+        let vals: Vec<Option<String>> = lits
+            .iter()
+            .zip(args)
+            .map(|(l, w)| {
+                l.clone().or_else(|| {
+                    let unquoted = w
+                        .parts
+                        .iter()
+                        .any(|p| !matches!(p, Part::Lit(_) | Part::Single(_) | Part::Double(_)));
+                    self.resolve(w).filter(|v| {
+                        !(unquoted && v.contains(|c: char| c.is_whitespace() || "*?[".contains(c)))
+                    })
+                })
+            })
+            .collect();
+        let mut k = 0;
+        while k < vals.len() {
+            let Some(a) = vals[k].as_deref() else {
+                // An unknown word can be an option, unless it starts with
+                // literal text that is not `-`, or is the value of `-e`.
+                let (prefix, _) = args[k].literal_prefix();
+                let pattern =
+                    sub == "grep" && k > 0 && matches!(vals[k - 1].as_deref(), Some("-e" | "-f"));
+                if (prefix.is_empty() || prefix.starts_with('-')) && !pattern {
+                    return Err(format!(
+                        "git {sub} with `{}`, a word bash builds at run time where an option can run a program; put --end-of-options before it{} (G3, item 21)",
+                        args[k].raw,
+                        if sub == "grep" {
+                            ", or give a pattern with -e"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+                k += 1;
+                continue;
+            };
+            if a == "--" || a == "--end-of-options" {
+                break;
+            }
+            let mut found: Vec<(&OptSpec, Option<String>)> = Vec::new();
+            let mut takes_next = false;
+            if let Some(long) = a.strip_prefix("--") {
+                let (name, glued) = match long.split_once('=') {
+                    Some((n, v)) => (format!("--{n}"), Some(v.to_owned())),
+                    None => (a.to_owned(), None),
+                };
+                for o in spec {
+                    if names(&name, o.long, o.min) {
+                        let v = if glued.is_some() || o.glued_only {
+                            glued.clone()
+                        } else {
+                            takes_next = true;
+                            vals.get(k + 1).cloned().flatten()
+                        };
+                        found.push((o, v));
+                    }
+                }
+            } else if let Some(cluster) = a.strip_prefix('-') {
+                for (j, c) in cluster.char_indices() {
+                    if !short_val.contains(c) {
+                        continue;
+                    }
+                    let rest = &cluster[j + c.len_utf8()..];
+                    let o = spec.iter().find(|o| o.short == Some(c));
+                    let glued_only = o.is_some_and(|o| o.glued_only);
+                    let v = if !rest.is_empty() {
+                        Some(rest.to_owned())
+                    } else if glued_only {
+                        None
+                    } else {
+                        takes_next = true;
+                        vals.get(k + 1).cloned().flatten()
+                    };
+                    if let Some(o) = o {
+                        found.push((o, v));
+                    }
+                    break;
+                }
+            }
+            for (o, v) in found {
+                let shown = format!("git {sub} {}", o.long);
+                match (o.kind, v) {
+                    (OptKind::Deny, _) => {
+                        return Err(format!(
+                            "{shown} runs a program of the command's choosing (G3, item 21)"
+                        ));
+                    }
+                    // `grep -O` alone: the session's own pager.
+                    (OptKind::Runs(_), None) if o.glued_only => {}
+                    (_, None) => {
+                        return Err(format!(
+                            "{shown} with a value bash builds at run time (G3, item 21)"
+                        ));
+                    }
+                    (OptKind::Config, Some(c)) => self.clone_config(&c)?,
+                    (OptKind::Runs(r), Some(v)) => {
+                        let code = cmds::runs_code(r, &v)
+                            .map_err(|e| format!("{shown}: {e} (G3, item 21)"))?;
+                        if let Some(code) = code {
+                            self.program_code(&code, &shown)?;
+                        }
+                    }
+                }
+            }
+            k += if takes_next { 2 } else { 1 };
+        }
+        Ok(())
+    }
+
+    /// `git clone -c key=value`: git sets it for the clone and writes it
+    /// into the new repo's config, where later commands read it.
+    fn clone_config(&mut self, c: &str) -> W {
+        let key = c.split('=').next().unwrap_or(c);
+        match key_class(key) {
+            KeyClass::Deny(why) => Err(format!("git clone -c {c}: {why} (R25)")),
+            KeyClass::Ask(why) => {
+                self.ask(format!("git clone -c {c}: {why}"));
+                Ok(())
+            }
+            KeyClass::Runs(_) => {
+                self.ask(format!(
+                    "git clone -c {c} writes a value git runs into the new repo's config (item 21)"
+                ));
+                Ok(())
+            }
+            KeyClass::Plain => Ok(()),
+        }
     }
 
     fn stdin_of(&self, f: &Frame) -> Feed {
@@ -1247,7 +1569,7 @@ fn config_write(lits: &[Option<String>]) -> Option<String> {
         || k.starts_with("alias")
         || matches!(
             key_class(&k),
-            KeyClass::Ask(_) | KeyClass::Deny(_) | KeyClass::Code
+            KeyClass::Ask(_) | KeyClass::Deny(_) | KeyClass::Runs(_)
         )
         || (k.starts_with("remote.") && k.matches('.').count() == 1);
     asks.then(|| format!("git config writes {key} (R26, G7)"))

@@ -2636,3 +2636,99 @@ fn s42_cargo_config_written_above_the_checkout_does_not_pass() {
     );
     lab.assert_no_bad_pass_of(None);
 }
+
+/// Puts back every ref in `before` (a [`Lab::refs`] listing).
+fn put_back(lab: &Lab, before: &str) {
+    for line in before.lines() {
+        let (r, v) = line.split_once(' ').unwrap();
+        lab.plain(&["update-ref", r, v]);
+    }
+}
+
+/// S43 (item 21, review note 8): git runs the value of many config keys,
+/// variables and options as a program or as shell code, on commands that
+/// move no ref themselves: `diff.external`, textconv and filter drivers,
+/// credential helpers, askpass, `gpg.program`, `gpg.ssh.defaultKeyCommand`,
+/// config hooks (`hook.*`), the `ext::` transport, `difftool -x`,
+/// `grep -O`, `clone -u`, `archive --exec`, `for-each-repo`. Each is
+/// read as code or denied on every git command, so none of them runs
+/// `git commit -n`. Pagers run only on a terminal, so those are run on a
+/// pty here as well, to show what the guard stops.
+#[test]
+fn s43_values_git_runs_are_read_as_code_on_every_git_command() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    std::fs::write(
+        lab.repo.join(".gitattributes"),
+        "bad diff=x\nbad2 filter=y\n",
+    )
+    .unwrap();
+    std::fs::write(lab.repo.join("bad2"), "2\n").unwrap();
+    let repo = lab.repo.display().to_string();
+    let bare = lab.bare.display().to_string();
+    let root = lab.root().display().to_string();
+    let p = format!("git -C {repo} commit -n -q -m x >/dev/null 2>&1");
+    let f = lab.root().join("f.sh");
+    write_exe(
+        &f,
+        &format!("#!/bin/sh\nunset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE\n{p}\n"),
+    );
+    let f = f.display().to_string();
+    let ext = format!("git -C {repo} commit -n -q -m x").replace(' ', "% ");
+    let fill = "credential fill <<'EOF'\nprotocol=https\nhost=x.invalid\n\nEOF";
+    let bad = lab.not_denied(&[
+        format!("git -c diff.external='{p}; true #' diff HEAD"),
+        format!("GIT_EXTERNAL_DIFF='{p}; true #' git diff HEAD"),
+        format!("export GIT_EXTERNAL_DIFF='{p}; true #'; git diff HEAD"),
+        format!("env GIT_EXTERNAL_DIFF='{p}; true #' git diff HEAD"),
+        format!("printf '#!/bin/sh\\n{p}\\n' > e.sh && chmod +x e.sh && GIT_EXTERNAL_DIFF=./e.sh git diff HEAD"),
+        format!("git -c diff.x.textconv='{p}; cat #' diff HEAD"),
+        format!("git -c filter.y.clean='{p}; cat #' hash-object bad2"),
+        format!("git -c credential.helper='!{p}; true #' {fill}"),
+        format!("git -c core.askpass={f} {fill}"),
+        format!("GIT_ASKPASS={f} git {fill}"),
+        format!("git -c gpg.program={f} -c user.signingkey=x commit-tree -S -m x HEAD:"),
+        format!("git -c gpg.format=ssh -c gpg.ssh.defaultKeyCommand='git -C {repo} commit -n -q -m x' commit-tree -S -m x HEAD:"),
+        format!("git -c hook.x.event=post-checkout -c hook.x.command={f} checkout -q HEAD"),
+        format!("git -c protocol.ext.allow=always fetch 'ext::sh -c {ext}'"),
+        format!("git -c protocol.allow=always ls-remote 'ext::sh -c {ext}'"),
+        format!("git difftool -y -x '{p}; true #' HEAD"),
+        format!("git -c diff.tool=t -c difftool.t.cmd='{p}' difftool -y HEAD"),
+        format!("git grep -O'{p}; true #' -e scratch"),
+        format!("git clone -q -u '{p}; false #' {bare} {root}/c-u"),
+        format!("git ls-remote --upload-pack='{p}; false #' {bare}"),
+        format!("git archive --remote={bare} --exec='{p}; false #' HEAD"),
+        format!("git -c x.r={repo} for-each-repo --config=x.r commit -n -q -m x"),
+        format!("printf '[diff]\\n\\texternal = \"{p}; true #\"\\n' >> ~/.gitconfig && git diff HEAD"),
+    ]);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    for cmd in [
+        format!("git -c pager.log='{p}; cat >/dev/null #' log -1"),
+        format!("GIT_PAGER='{p}; cat >/dev/null #' git log -1"),
+        format!("PAGER='{p}; cat >/dev/null #' git log -1"),
+    ] {
+        let s = lab.session(&cmd);
+        assert!(s.denied(), "{cmd}: {s:?}");
+        // What it does when it runs, on a terminal.
+        let before = lab.refs();
+        let mut c = lab.cmd("bash", &lab.repo);
+        c.args(["-c", &cmd]);
+        let r = pty::run(c, pty::Streams::All, &[]);
+        let moved = lab.refs() != before;
+        put_back(&lab, &before);
+        assert!(moved, "{cmd} moved no ref on a terminal: {r:?}");
+    }
+    // less runs `+!cmd` from LESS, then waits for a key.
+    let s = lab.session(&format!("GIT_PAGER=less LESS='+!{p}' git log -1"));
+    assert!(s.denied(), "{s:?}");
+    for cmd in [
+        "git -c core.pager=cat log -1 --oneline".to_owned(),
+        "GIT_PAGER=cat git log -1 --oneline".to_owned(),
+        format!("git -c credential.helper= -c protocol.file.allow=always ls-remote {bare}"),
+        "git -c diff.x.textconv=cat diff HEAD --stat".to_owned(),
+        "git grep -n scratch".to_owned(),
+    ] {
+        let s = lab.session(&cmd);
+        assert_eq!(s.code(), Some(0), "{cmd}: {s:?}");
+    }
+}

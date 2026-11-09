@@ -184,6 +184,12 @@ pub fn sensitive(name: &str) -> Option<&'static str> {
             Some("makes a shell run code the guard does not read (G3)")
         }
         "LESSOPEN" | "LESSCLOSE" => Some("makes less run a program on each file it shows (G3)"),
+        n if n.starts_with("LESSKEY") => {
+            Some("names a lesskey file, which can set LESS to run a command (G3)")
+        }
+        "GIT_ALLOW_PROTOCOL" => {
+            Some("can turn on the ext:: transport, which runs a command (G3, item 21)")
+        }
         "PS0" | "PS1" | "PS2" | "PS4" => Some(
             "is a prompt bash expands with command substitution (PS4 on every `set -x` line) (G3)",
         ),
@@ -253,15 +259,117 @@ pub const GATED_ENV: &[&str] = &[
     "TOLLGATE_INLINE_CAP",
 ];
 
-/// [`GATED_ENV`] variables whose value git runs as shell code.
-pub const CODE_ENV: &[&str] = &[
-    "GIT_EDITOR",
-    "GIT_SEQUENCE_EDITOR",
-    "EDITOR",
-    "VISUAL",
-    "GIT_PAGER",
-    "PAGER",
-];
+/// How a program runs a value it reads from a variable, a config key or
+/// an option (G3, item 21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Runs {
+    /// Shell code; `args`: the program appends arguments, as `"$@"`.
+    Shell { args: bool },
+    /// One program path, run with arguments and without a shell.
+    Program,
+    /// less options: `+cmd`, lesskey files and log files.
+    LessOpts,
+}
+
+/// Variables whose value a program runs (item 21): git's editors, pagers,
+/// askpass and external diff, and the editors and pagers other programs
+/// run (`man`, `crontab -e`, `systemctl`). Checked in front of every
+/// command and in every write position.
+#[must_use]
+pub fn program_var(name: &str) -> Option<Runs> {
+    match name {
+        "GIT_EDITOR" | "GIT_SEQUENCE_EDITOR" | "EDITOR" | "VISUAL" | "GIT_EXTERNAL_DIFF" => {
+            Some(Runs::Shell { args: true })
+        }
+        "GIT_PAGER" | "PAGER" | "MANPAGER" | "SYSTEMD_PAGER" => Some(Runs::Shell { args: false }),
+        "GIT_ASKPASS" | "SSH_ASKPASS" | "SUDO_ASKPASS" => Some(Runs::Program),
+        "LESS" => Some(Runs::LessOpts),
+        _ => None,
+    }
+}
+
+/// Stands for the arguments a program appends to a value it runs (a file
+/// git made, a diff's paths, `get`): an absolute path that does not exist,
+/// so a value that runs its arguments (`env`, `sh`, `x=`) reads a script
+/// the guard cannot read and denies, while `sed -i` on it is allowed.
+pub const ARG_STAND_IN: &str = "/nonexistent/tollgate-guard-arg";
+
+/// `code` with the stand-in arguments appended, as git appends `"$@"`.
+#[must_use]
+pub fn with_args(code: &str) -> String {
+    format!("{code} {ARG_STAND_IN}")
+}
+
+/// The shell text a program runs for value `v` read as `r`, `None` when
+/// it runs nothing; `Err` (the reason) when the guard cannot read it as
+/// code.
+pub fn runs_code(r: Runs, v: &str) -> Result<Option<String>, String> {
+    let v = v.trim();
+    match r {
+        Runs::Shell { args } => {
+            Ok((!v.is_empty()).then(|| if args { with_args(v) } else { v.to_owned() }))
+        }
+        Runs::Program if v.is_empty() => Ok(None),
+        Runs::Program if program_path(v) => Ok(Some(with_args(v))),
+        Runs::Program => Err(format!(
+            "`{v}` is a program run without a shell; give a path of letters, digits and `/._+-@,:%` only"
+        )),
+        Runs::LessOpts if less_opts_ok(v) => Ok(None),
+        Runs::LessOpts => Err(format!(
+            "less options `{v}` run a command or name a lesskey or log file"
+        )),
+    }
+}
+
+/// A program path whose shell reading is the path itself: no blanks,
+/// quotes, expansions or operators, no `~` (an exec does not expand it)
+/// and no leading `-`.
+#[must_use]
+pub fn program_path(v: &str) -> bool {
+    !v.is_empty()
+        && !v.starts_with('-')
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._+-@,:%".contains(c))
+}
+
+/// True when less options `v` (the `LESS` variable) run no command and
+/// write no file: no `+` initial command, no lesskey file (`-k`,
+/// `--lesskey-*`), no log file (`-o`, `-O`, `--log-file`), no shell text.
+#[must_use]
+pub fn less_opts_ok(v: &str) -> bool {
+    const RISKY_LONG: &[&str] = &["lesskey-file", "lesskey-src", "lesskey-content", "log-file"];
+    // Short options whose value is the rest of the word.
+    const VALUE: &str = "bhjpPtTxyzD#";
+    if v.contains(['!', '|', '$', '`', '\\', ';', '&']) {
+        return false;
+    }
+    v.split_whitespace().all(|t| {
+        if t.starts_with('+') {
+            return false;
+        }
+        if let Some(long) = t.strip_prefix("--") {
+            // less takes unambiguous prefixes of long names.
+            let name = long
+                .split('=')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            return name.is_empty()
+                || !RISKY_LONG
+                    .iter()
+                    .any(|d| d.starts_with(&name) || name.starts_with(d));
+        }
+        for c in t.trim_start_matches(['-', '+']).chars() {
+            if matches!(c, 'k' | 'o' | 'O') {
+                return false;
+            }
+            if VALUE.contains(c) {
+                break;
+            }
+        }
+        true
+    })
+}
 
 /// Splits literal text into the words a shell or a launcher may run:
 /// blanks, shell operators, quotes and `=` separate them.

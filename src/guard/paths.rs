@@ -92,13 +92,18 @@ pub fn tollgate_dir<'a>(ctx: &'a Context, path: &Path, removal: bool) -> Option<
 
 /// G7: `.git/refs`, `.git/packed-refs`, `.git/config` or `.git/hooks`
 /// (also inside them, and with `.git` of any case) when `path` is or is
-/// under one of them; the name.
+/// under one of them, or a worktree's `config.worktree` under `.git`
+/// (item 21); the name.
 #[must_use]
 pub fn git_internal(path: &Path) -> Option<&'static str> {
     let comps: Vec<String> = path
         .components()
         .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
         .collect();
+    let in_git = comps.iter().position(|c| c == ".git");
+    if in_git.is_some_and(|k| comps[k + 1..].iter().any(|c| c == "config.worktree")) {
+        return Some(".git/config.worktree");
+    }
     comps.windows(2).find_map(|w| {
         if w[0] != ".git" {
             return None;
@@ -111,6 +116,27 @@ pub fn git_internal(path: &Path) -> Option<&'static str> {
             _ => None,
         }
     })
+}
+
+/// Item 21: git's global config files (`~/.gitconfig`,
+/// `$XDG_CONFIG_HOME/git/config`), which every git command reads and
+/// whose program keys it runs, when a write of `path` replaces one: the
+/// file itself, or a dir above it inside the home dir (`mv x
+/// ~/.config/git`). The file's name.
+#[must_use]
+pub fn git_global_config(ctx: &Context, path: &Path) -> Option<PathBuf> {
+    let xdg = ctx
+        .var("XDG_CONFIG_HOME")
+        .filter(|v| v.starts_with('/'))
+        .map_or_else(|| ctx.home.join(".config"), PathBuf::from);
+    let home = lower(&canon(&ctx.home));
+    let p = lower(path);
+    [ctx.home.join(".gitconfig"), xdg.join("git/config")]
+        .into_iter()
+        .find(|f| {
+            let f = lower(&canon(f));
+            p == f || (f.starts_with(&format!("{p}/")) && p.starts_with(&format!("{home}/")))
+        })
 }
 
 /// G7 for a removal: `rm -rf .git` (or a dir above it) removes the refs
@@ -151,6 +177,8 @@ mod tests {
             "/r/.git/hooks/pre-commit",
             "/r/.GIT/refs/remotes/origin/main",
             "/r/.git/refs",
+            "/r/.git/config.worktree",
+            "/r/.git/worktrees/w/config.worktree",
         ] {
             assert!(git_internal(Path::new(p)).is_some(), "{p}");
         }

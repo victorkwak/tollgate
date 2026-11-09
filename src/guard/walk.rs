@@ -95,6 +95,17 @@ pub struct EnvSet {
     pub raw: String,
 }
 
+/// What a write gives a shell variable.
+#[derive(Debug, Clone, Copy)]
+pub enum Written<'a> {
+    /// A value the guard does not know.
+    Unknown,
+    /// No new value: `unset`, or `export NAME` of the value it holds.
+    Kept,
+    /// This literal value.
+    Value(&'a str),
+}
+
 /// What a command inherits from where it runs.
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -1097,7 +1108,6 @@ impl<'a> Walker<'a> {
         if sc.words.is_empty() {
             for a in &sc.assigns {
                 self.subscript_check(&a.raw, &a.name)?;
-                self.var_write(&a.name, "an assignment")?;
                 let value = (!a.array)
                     .then(|| {
                         a.value
@@ -1105,6 +1115,12 @@ impl<'a> Walker<'a> {
                             .and_then(|v| self.resolve(v).or_else(|| self.mktemp_value(v)))
                     })
                     .flatten();
+                let appends = a.raw.starts_with(&format!("{}+=", a.name));
+                let written = match value.as_deref() {
+                    Some(v) if !appends => Written::Value(v),
+                    _ => Written::Unknown,
+                };
+                self.var_set(&a.name, "an assignment", written)?;
                 let number = !a.array && a.value.first().is_some_and(|v| self.only_numbers(v));
                 self.scope.vars.insert(a.name.clone(), value);
                 if number {
@@ -1400,6 +1416,11 @@ impl<'a> Walker<'a> {
             if let Some(why) = cmds::sensitive(&e.name) {
                 return Err(format!("`{}` sets {}, which {why} (G5)", e.raw, e.name));
             }
+            if let Some(r) = cmds::program_var(&e.name) {
+                let appends = e.raw.starts_with(&format!("{}+=", e.name));
+                let v = e.value.as_deref().filter(|_| !appends);
+                self.program_var(&e.name, r, v, &format!("`{}`", e.raw))?;
+            }
             if let Some((reach, why)) = cmds::scoped(&e.name) {
                 let hit = match reach {
                     cmds::Reach::GitOrTollgate => gitish,
@@ -1420,18 +1441,11 @@ impl<'a> Walker<'a> {
                         cmds::GATED_ENV.join(", ")
                     ));
                 }
-                let Some(v) = e.value.clone() else {
+                if e.value.is_none() {
                     return Err(format!(
                         "`{}`: a variable in front of a gated git or tollgate command needs a literal value (G4)",
                         e.raw
                     ));
-                };
-                if cmds::CODE_ENV.contains(&e.name.as_str()) {
-                    let frame = Frame {
-                        stdin: Feed::Unknown,
-                        env: Vec::new(),
-                    };
-                    self.code(&v, true, &frame, &format!("the value of {}", e.name))?;
                 }
             }
         }
@@ -1439,8 +1453,21 @@ impl<'a> Walker<'a> {
     }
 
     /// G5: a write of shell variable `name` (assignment, `export`,
-    /// `declare`, `read`, ...).
+    /// `declare`, `read`, ...) with a value the guard does not know.
     pub(super) fn var_write(&mut self, name: &str, how: &str) -> W {
+        self.var_set(name, how, Written::Unknown)
+    }
+
+    /// G5, item 21: a write of shell variable `name`; a program variable
+    /// may only take a literal value, which is read as the program runs it.
+    pub(super) fn var_set(&mut self, name: &str, how: &str, written: Written<'_>) -> W {
+        if let Some(r) = cmds::program_var(name) {
+            match written {
+                Written::Kept => {}
+                Written::Value(v) => self.program_var(name, r, Some(v), how)?,
+                Written::Unknown => self.program_var(name, r, None, how)?,
+            }
+        }
         if name == "TOLLGATE_INLINE_CAP" {
             return Err(format!(
                 "{how} writes TOLLGATE_INLINE_CAP; it may only be a number written in front of git or tollgate (G6)"
@@ -1457,6 +1484,38 @@ impl<'a> Walker<'a> {
         self.scope.ints.remove(name);
         self.log.push(name.to_owned());
         Ok(())
+    }
+
+    /// Item 21: program variable `name` (read as `r`) gets value `v`
+    /// (`None`: one bash builds at run time) through `how`.
+    fn program_var(&mut self, name: &str, r: cmds::Runs, v: Option<&str>, how: &str) -> W {
+        let Some(v) = v else {
+            return Err(format!(
+                "{how} gives {name} a value bash builds at run time; a program runs that value, so give it literally (G3, item 21)"
+            ));
+        };
+        let what = format!("{how}: {name}");
+        let code = cmds::runs_code(r, v).map_err(|e| format!("{what}: {e} (G3, item 21)"))?;
+        match code {
+            Some(code) => self.program_code(&code, &what),
+            None => Ok(()),
+        }
+    }
+
+    /// Item 21: shell text a program runs from a value (a git config key,
+    /// a variable, an option), checked as code with no stdin, none of
+    /// this command's variables and an unknown cwd: git runs most of them
+    /// from the top of the work tree, not from here, so a relative script
+    /// or write in them denies (G8).
+    pub(super) fn program_code(&mut self, code: &str, what: &str) -> W {
+        let frame = Frame {
+            stdin: Feed::Unknown,
+            env: Vec::new(),
+        };
+        self.isolated(|w| {
+            w.scope.cwd = Cwd::Unknown;
+            w.code(code, true, &frame, what)
+        })
     }
 
     /// Parses `text` as shell code and checks it (G3).
@@ -2338,7 +2397,16 @@ impl<'a> Walker<'a> {
                     if !shell::is_name(&name) {
                         return Err(nonlit(w));
                     }
-                    self.var_write(&name, b)?;
+                    let v = value
+                        .and_then(|w| shell::split_assign(w).and_then(|(_, v)| self.resolve(&v)));
+                    let written = match (value, v.as_deref()) {
+                        (None, _) => Written::Kept,
+                        (Some(_), Some(v)) if !prefix.contains("+=") && !prefix.contains('[') => {
+                            Written::Value(v)
+                        }
+                        _ => Written::Unknown,
+                    };
+                    self.var_set(&name, b, written)?;
                     if nameref {
                         // `declare -n ref=NAME`: writes through ref reach NAME.
                         let target = lits[k]
@@ -2354,8 +2422,6 @@ impl<'a> Walker<'a> {
                         self.scope.forget();
                         self.log.push("*".into());
                     }
-                    let v = value
-                        .and_then(|w| shell::split_assign(w).and_then(|(_, v)| self.resolve(&v)));
                     if value.is_some() || !self.scope.vars.contains_key(&name) {
                         self.scope.vars.insert(name, v);
                     }
@@ -2373,7 +2439,7 @@ impl<'a> Walker<'a> {
                         continue;
                     }
                     if !funcs {
-                        self.var_write(a, "unset")?;
+                        self.var_set(a, "unset", Written::Kept)?;
                         self.scope.vars.insert(a.to_owned(), Some(String::new()));
                     }
                 }
@@ -2642,6 +2708,12 @@ impl<'a> Walker<'a> {
             how,
             "chmod" | "chown" | "chgrp" | "setfattr" | "touch" | "mkdir"
         ) {
+            if let Some(f) = paths::git_global_config(self.ctx, &p) {
+                return Err(format!(
+                    "{how} writes git's config file {}, whose program keys every git command runs; set keys with git config, which the guard checks (G7, item 21)",
+                    f.display()
+                ));
+            }
             self.known.remove(&p);
             self.written.push(p);
         }

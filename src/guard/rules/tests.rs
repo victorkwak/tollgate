@@ -557,6 +557,183 @@ fn x2_transport_variables_in_every_write_position() {
     allowed(&["echo $GIT_SSH_COMMAND", "git config --get core.sshCommand"]);
 }
 
+/// Item 21 (review note 8): every git config key, variable and option
+/// whose value git runs as a program or as shell code is read as code
+/// (G3) on every git command, not only on gated ones, or denied; the
+/// program variables are read in front of any command and in every write
+/// position; `ext::` transports stay off.
+#[test]
+fn item_21_program_values_are_code_on_every_command() {
+    denied(&[
+        // Config keys git runs through a shell.
+        "git -c diff.external='git commit -n -m x #' diff HEAD~1",
+        "git -c Diff.External='git commit -n -m x #' diff",
+        "git -c diff.x.command='git commit -n #' diff",
+        "git -c diff.x.textconv='git commit -n #' diff",
+        "git -c filter.x.clean='git commit -n #' add .",
+        "git -c filter.x.smudge='git commit -n #' checkout -- f",
+        "git -c filter.x.process='git commit -n #' status",
+        "git -c merge.x.driver='git commit -n #' merge-tree --write-tree a b",
+        "git -c mergetool.x.cmd='git commit -n' mergetool -t x",
+        "git -c difftool.x.cmd='git commit -n' difftool -t x HEAD",
+        "git -c interactive.diffFilter='git commit -n' add -p",
+        "git -c credential.helper='!git commit -n -m x #' fetch origin",
+        "git -c credential.https://x.helper='!git commit -n #' fetch origin",
+        "git -c credential.helper='x; git commit -n -m x' fetch origin",
+        "git -c pager.log='git commit -n -m x #' log",
+        "git -c imap.tunnel='git commit -n' imap-send",
+        "git -c submodule.s.update='!git commit -n -m x' submodule update",
+        "git -c gpg.ssh.defaultKeyCommand='git commit -n -m x' log",
+        // Config keys git runs as one program: a path with no shell text.
+        "git -c core.askpass='git commit -n -m x #' fetch origin",
+        "git -c gpg.program='git commit -n -m x #' log --show-signature",
+        "git -c gpg.ssh.program='git commit -n' log --show-signature",
+        "git -c difftool.x.path='/usr/bin/git commit -n' difftool -t x",
+        // Keys no session needs.
+        "git -c uploadpack.packObjectsHook='git commit -n #' fetch origin",
+        "git -c core.alternateRefsCommand=/tmp/x fetch origin",
+        "git -c hook.x.command='git commit -n' -c hook.x.event=post-checkout checkout main",
+        "git -c protocol.ext.allow=always fetch 'ext::sh -c git% commit% -n% -m% x'",
+        "git -c protocol.EXT.allow=user ls-remote origin",
+        "git -c protocol.allow=always ls-remote origin",
+        "git ls-remote 'ext::sh -c git% commit% -n'",
+        "git clone EXT::sh x",
+        "GIT_ALLOW_PROTOCOL=ext git ls-remote origin",
+        "export GIT_ALLOW_PROTOCOL=file:ext",
+        "git --config-env=diff.external=X diff",
+        "git --config-env pager.log=X log",
+        // Program variables, in front of any command and in every write.
+        "GIT_PAGER='git commit -n -m x #' git log",
+        "PAGER='git commit -n #' git log",
+        "PAGER='git commit -n #' man ls",
+        "MANPAGER='git commit -n #' man ls",
+        "EDITOR='git commit -n #' crontab -e",
+        "VISUAL='git commit -n #' crontab -e",
+        "GIT_ASKPASS='git commit -n -m x' git fetch origin",
+        "SSH_ASKPASS=/tmp/x/../a.sh git fetch origin",
+        "GIT_EXTERNAL_DIFF='git commit -n #' git diff",
+        "GIT_EXTERNAL_DIFF=\"$X\" git diff",
+        "env GIT_PAGER='git commit -n #' git log",
+        "export GIT_PAGER='git commit -n #'; git log",
+        "GIT_PAGER='git commit -n #'; git log",
+        "declare -x GIT_EXTERNAL_DIFF='git commit -n #'; git diff",
+        "export GIT_EXTERNAL_DIFF=\"$(cat f)\"; git diff",
+        "P='git commit -n #'; GIT_PAGER=$P git log",
+        "GIT_PAGER+=' ; git commit -n' git log",
+        "read GIT_PAGER < f; git log",
+        "printf -v GIT_EDITOR x; git commit --amend",
+        "for GIT_EXTERNAL_DIFF in x; do git diff; done",
+        "bash -c \"GIT_PAGER='git commit -n #' git log\"",
+        "printf 'git commit -n -m x\\n' > e.sh; chmod +x e.sh; GIT_EXTERNAL_DIFF=./e.sh git diff",
+        // git's other config files, written in the same call.
+        "printf '[diff]\\n\\texternal = git commit -n #\\n' >> ~/.gitconfig; git diff",
+        "cp x /h/.gitconfig",
+        "echo x | tee -a /h/.config/git/config",
+        "mv x ~/.config/git",
+        "printf '[diff]\\n\\texternal = x\\n' >> .git/config.worktree; git diff",
+        "cat > /w/repo/.git/worktrees/w/config.worktree <<'EOF'\n[diff]\nexternal = x\nEOF",
+        // less runs commands from LESS and from a lesskey file.
+        "LESS='+!git commit -n -m x' git log",
+        "LESS='-R +|xgit commit -n' less f",
+        "export LESS='-k/tmp/keys'",
+        "LESS='--lesskey-file=/tmp/k' git log",
+        "LESS=\"$L\" git log",
+        "LESSKEYIN=/tmp/k git log",
+        // Options whose value git runs.
+        "git difftool -x 'git commit -n -m x #' HEAD~1",
+        "git difftool --extcmd='git commit -n' HEAD",
+        "git difftool --ext 'git commit -n' HEAD",
+        "git difftool -yx 'git commit -n' HEAD",
+        "git difftool $X HEAD",
+        "git grep -O'git commit -n -m x #' foo",
+        "git grep -iO'git commit -n' foo",
+        "git grep --open-files-in-pager='git commit -n' foo",
+        "git grep --open='git commit -n' foo",
+        "git grep \"$X\" foo",
+        "git grep -n x $(cat f)",
+        "S='*'; git grep x $S",
+        "git grep x *",
+        "X=-O./e.sh; git grep \"$X\" foo",
+        "X='-Ogit commit -n #'; git grep \"$X\" foo",
+        "git -c diff.external=env diff",
+        "git -c diff.external=sh diff",
+        "git -c core.editor='x=' commit --amend",
+        "git -c core.editor=./e.sh commit --amend",
+        "git clone -u 'git commit -n #' /tmp/x y",
+        "git clone -qu 'git commit -n #' /tmp/x y",
+        "git clone --upload-pack='git commit -n #' /tmp/x y",
+        "git clone --upl='git commit -n #' /tmp/x y",
+        "git clone -c core.fsmonitor=/tmp/x /tmp/x y",
+        "git clone \"$U\" y",
+        "git ls-remote --upload-pack='git commit -n #' /tmp/x",
+        "git ls-remote --upl='git commit -n #' /tmp/x",
+        "git fetch-pack --upload-pack='git commit -n #' /tmp/x",
+        "git fetch-pack --exec='git commit -n #' /tmp/x",
+        "git archive --remote=/tmp/x --exec='git commit -n #' HEAD",
+        "git archive --ex='git commit -n #' --remote /tmp/x HEAD",
+        "git filter-branch --tree-filter 'git commit -n -m x' HEAD",
+        "git filter-branch --msg-filter cat HEAD",
+        "git -c x.r=/w/repo for-each-repo --config=x.r commit -n -m x",
+        "git send-email --to-cmd='git commit -n #' x.patch",
+        "git instaweb --httpd='git commit -n'",
+    ]);
+    asked(&[
+        "git config diff.external 'git commit -n #'",
+        "git config --global credential.helper '!x'",
+        "git config core.askpass /tmp/x",
+        "git config pager.log x",
+        "git config hook.x.command y",
+        "git config protocol.ext.allow always",
+        "git clone -c diff.external=x /tmp/x y",
+    ]);
+    allowed(&[
+        "git -c core.pager=cat log",
+        "git -c pager.log=false log",
+        "git -c pager.diff='less -R' diff",
+        "git --no-pager log -5",
+        "GIT_PAGER=cat git log -5",
+        "PAGER=cat git log",
+        "GIT_PAGER= git log",
+        "LESS=-R git log",
+        "LESS=FRX git log",
+        "git -c credential.helper= ls-remote origin",
+        "git -c credential.helper=store fetch origin",
+        "git -c credential.helper='store --file=/tmp/c' fetch origin",
+        "git -c credential.helper=libsecret fetch origin",
+        "git -c credential.helper=/usr/lib/git-core/git-credential-libsecret fetch origin",
+        "git -c credential.helper='!f() { echo password=x; }; f' fetch origin",
+        "git -c protocol.file.allow=always submodule update --init",
+        "git -c protocol.ext.allow=never fetch origin",
+        "git -c diff.external= diff",
+        "git -c diff.x.textconv=cat diff",
+        "git -c gpg.program=gpg2 log --show-signature",
+        "GIT_ASKPASS=/usr/bin/true git fetch origin",
+        "GIT_EDITOR=true git rebase --continue",
+        "GIT_SEQUENCE_EDITOR=\"sed -i -e 's/^pick/fixup/'\" git rebase -i HEAD~3",
+        "git difftool --tool-help",
+        "git difftool -y -t meld HEAD",
+        "git grep -n foo",
+        "git grep -O foo",
+        "git grep -e \"$X\" foo",
+        "S=abc123; git grep -n x $S -- src",
+        "git grep -n x --end-of-options $(git rev-parse HEAD)",
+        "for f in 'fn a' 'fn b'; do git grep -n \"$f\"; done",
+        "D=/tmp/x; git clone $D/orig y",
+        "X=-Ocat; git grep \"$X\" foo",
+        "git clone https://example.com/x.git y",
+        "git clone -c core.autocrlf=false https://example.com/x.git",
+        "git ls-remote origin",
+        "git archive -o x.tar HEAD",
+        "export GIT_PAGER=cat; git log",
+        "unset GIT_PAGER; git log",
+        "echo $GIT_PAGER",
+        "cat ~/.gitconfig",
+        "touch ~/.gitconfig",
+        "mkdir -p ~/.config/git",
+        "echo x > ~/.config/gitk",
+    ]);
+}
+
 // ---- the grammar's groups ------------------------------------------------
 
 /// G1: the command name of every simple command is literal, nested ones
@@ -990,7 +1167,12 @@ fn file_rules_r26_g7() {
     ] {
         assert!(deny(f), "{f}");
     }
+    assert!(deny(".git/config.worktree"));
     assert!(ask(".git/info/exclude"));
+    // Item 21: git's global config files.
+    assert!(ask("~/.gitconfig"));
+    assert!(ask("/h/.config/git/config"));
+    assert_eq!(file_ruling(&c, "/h/.config/gitk"), Ruling::Allow);
     assert!(ask(".githooks/pre-commit"));
     assert_eq!(file_ruling(&c, "src/main.rs"), Ruling::Allow);
     let _ = PathBuf::new();
