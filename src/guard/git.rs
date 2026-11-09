@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use super::cmds;
+use super::gitopts::{self, Arg};
 use super::rules::{basename, is_tollgate};
 use super::shell::{Part, Word};
 use super::walk::{Cwd, EnvSet, Feed, Frame, Target, Via, W, Walker};
@@ -1034,6 +1035,64 @@ impl Walker<'_> {
         Ok(())
     }
 
+    /// The words of a git subcommand as the option parser sees them: the
+    /// value when the guard knows it, else what bash can make of the word.
+    fn opt_args(&self, args: &[Word]) -> Vec<Arg> {
+        args.iter()
+            .map(|w| {
+                if let Some(v) = self.resolve(w) {
+                    return Arg::Known(v);
+                }
+                let (prefix, _) = w.literal_prefix();
+                let dash = prefix.is_empty() || prefix.starts_with('-');
+                // Unquoted expansions split into words of any text; a glob's
+                // words all start with its literal prefix.
+                let split = w.brace
+                    || w.parts.iter().any(|p| {
+                        matches!(
+                            p,
+                            Part::Param(..) | Part::CmdSub(_) | Part::Backtick(_) | Part::Arith(..)
+                        ) || (matches!(p, Part::Glob(_)) && dash)
+                    });
+                Arg::Unknown {
+                    raw: w.raw.clone(),
+                    split,
+                    dash,
+                }
+            })
+            .collect()
+    }
+
+    /// G7 (item 22, secreview note 5): the options in `keys` create or
+    /// reset the branch they name, in every spelling git takes.
+    fn force_create(
+        &mut self,
+        how: &str,
+        table: &gitopts::Table,
+        keys: &[&str],
+        args: &[Word],
+        dir: Option<&Path>,
+    ) -> W {
+        let p = gitopts::parse(table, &self.opt_args(args))
+            .map_err(|e| format!("git {how} with {e} (G7)"))?;
+        for o in p.opts.iter().filter(|o| keys.contains(&o.key.as_str())) {
+            match &o.value {
+                // No word left for the name: git refuses the command.
+                None => {}
+                Some(Arg::Known(name)) => {
+                    self.ref_write(name, dir, &format!("git {how} {}", o.written))?;
+                }
+                Some(Arg::Unknown { raw, .. }) => {
+                    return Err(format!(
+                        "git {how} {} with `{raw}`, a branch name bash builds at run time (G7)",
+                        o.written
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Subcommands that are not gated: G7 ref and remote writes, R25 and
     /// R26.
     fn plain_git(
@@ -1072,40 +1131,23 @@ impl Walker<'_> {
                 let w = all_lit()?;
                 self.branch(&w, dir)
             }
-            "checkout" | "switch" => {
-                let force_create = |a: &str| {
-                    if sub == "checkout" {
-                        a == "-B"
-                    } else {
-                        a == "-C" || a == "--force-create" || a.starts_with("--force-create=")
-                    }
-                };
-                for (k, l) in lits.iter().enumerate() {
-                    let Some(a) = l.as_deref() else { continue };
-                    if force_create(a) {
-                        let name = a
-                            .split_once('=')
-                            .map(|(_, v)| v.to_owned())
-                            .or_else(|| lits.get(k + 1).cloned().flatten());
-                        let name = name.ok_or_else(|| {
-                            format!("git {sub} {a} with a branch name bash builds at run time (G7)")
-                        })?;
-                        self.ref_write(&name, dir, &format!("git {sub} {a}"))?;
-                    }
-                }
-                Ok(())
+            "checkout" => self.force_create(sub, &gitopts::CHECKOUT, &["-B"], args, dir),
+            "switch" => {
+                self.force_create(sub, &gitopts::SWITCH, &["-C", "--force-create"], args, dir)
             }
-            "worktree" => {
-                if lits.first().and_then(Option::as_deref) == Some("add") {
-                    for (k, l) in lits.iter().enumerate() {
-                        if l.as_deref() == Some("-B") {
-                            let name = lits.get(k + 1).cloned().flatten().ok_or("git worktree add -B with a branch name bash builds at run time (G7)")?;
-                            self.ref_write(&name, dir, "git worktree add -B")?;
-                        }
-                    }
-                }
-                Ok(())
-            }
+            "worktree" => match self.opt_args(args).first() {
+                Some(Arg::Known(a)) if a == "add" => self.force_create(
+                    "worktree add",
+                    &gitopts::WORKTREE_ADD,
+                    &["-B"],
+                    &args[1..],
+                    dir,
+                ),
+                Some(Arg::Unknown { raw, .. }) => Err(format!(
+                    "git worktree with `{raw}`, a word bash builds at run time where git reads the worktree command (G7)"
+                )),
+                _ => Ok(()),
+            },
             "fetch" => {
                 let w = all_lit()?;
                 self.fetch(&w, dir)
@@ -1199,43 +1241,30 @@ impl Walker<'_> {
     }
 
     /// G7, R25, R26: `git branch` force, rename and copy.
+    /// Options by git's grammar (item 22, secreview note 5): groups,
+    /// glued values, abbreviated long options, `--` and `--end-of-options`.
     fn branch(&mut self, w: &[String], dir: Option<&Path>) -> W {
-        const VAL: &[&str] = &[
-            "-u",
-            "--set-upstream-to",
-            "--contains",
-            "--no-contains",
-            "--merged",
-            "--no-merged",
-            "--points-at",
-            "--sort",
-            "--format",
-        ];
-        let mut force = false;
-        let mut moves = false;
-        let mut pos: Vec<&str> = Vec::new();
-        let mut i = 0;
-        while i < w.len() {
-            let a = w[i].as_str();
-            if VAL.contains(&a) {
-                i += 2;
-                continue;
-            }
-            if a == "--force" {
-                force = true;
-            } else if a == "--move" || a == "--copy" {
-                moves = true;
-            } else if let Some(c) = a
-                .strip_prefix('-')
-                .filter(|c| !c.starts_with('-') && !c.is_empty())
-            {
-                force |= c.contains('f') || c.contains('M') || c.contains('C');
-                moves |= c.chars().any(|ch| "mMcC".contains(ch));
-            } else if !a.starts_with('-') {
-                pos.push(a);
-            }
-            i += 1;
+        let words: Vec<Arg> = w.iter().cloned().map(Arg::Known).collect();
+        let p = gitopts::parse(&gitopts::BRANCH, &words)
+            .map_err(|e| format!("git branch with {e} (G7)"))?;
+        let has = |keys: &[&str]| p.opts.iter().any(|o| keys.contains(&o.key.as_str()));
+        let force = has(&["-f", "-M", "-C", "--force"]);
+        let moves = has(&["-m", "-M", "-c", "-C", "--move", "--copy"]);
+        if (force || moves)
+            && let Some(u) = &p.uncertain
+        {
+            return Err(format!(
+                "git branch {u}: an option the guard cannot name, so it cannot tell which word is the branch that moves (G7)"
+            ));
         }
+        let pos: Vec<&str> = p
+            .positionals
+            .iter()
+            .filter_map(|a| match a {
+                Arg::Known(s) => Some(s.as_str()),
+                Arg::Unknown { .. } => None,
+            })
+            .collect();
         if moves {
             if let Some(t) = pos.last() {
                 let branch = t.strip_prefix("refs/heads/").unwrap_or(t);

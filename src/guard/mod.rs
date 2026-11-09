@@ -34,6 +34,7 @@
 
 mod cmds;
 mod git;
+mod gitopts;
 pub mod paths;
 mod progs;
 pub mod rules;

@@ -433,6 +433,113 @@ fn item_22_r4_remote_identity_and_ref_writes() {
     allowed_in(&c, &["git update-ref HEAD abc1234"]);
 }
 
+/// Item 22, secreview note 5: the options that create or reset a branch
+/// count in every spelling git takes: a short option inside a group, the
+/// branch name glued to the letter, and a long option abbreviated to a
+/// prefix. Options that take a value hide the letters after them; words
+/// after `--` and values are not options.
+#[test]
+fn item_22_force_create_in_every_spelling() {
+    let c = ctx();
+    let open: Vec<&str> = [
+        "git switch -fC main HEAD~3",
+        "git switch -qfCmain HEAD~3",
+        "git switch --force-c main HEAD~3",
+        "git switch --force-create=main HEAD~3",
+        "git switch --force-cr=main HEAD~3",
+        "git switch --forc main HEAD~3",
+        "git switch -f --force-c main HEAD~3",
+        "git switch feat -C main",
+        "git checkout -qB main HEAD~3",
+        "git checkout -fBmain HEAD~3",
+        "git checkout -Bmain HEAD~3",
+        "git checkout -tqB main HEAD~3",
+        "git checkout HEAD~3 -B main",
+        "git checkout -b x -B main HEAD~3",
+        "git checkout -U3 -B main HEAD~3",
+        "git worktree add -fB main ../wt HEAD~3",
+        "git worktree add -Bmain ../wt HEAD~3",
+        "git worktree add -qfB main ../wt HEAD~3",
+        "git worktree add ../wt -B main HEAD~3",
+        "git branch --forc main HEAD~3",
+        "git branch --forc=x main HEAD~3",
+        "git branch --fo main HEAD~3",
+        "git branch -qf main HEAD~3",
+        "git branch -f --sor refname main HEAD~3",
+        "git branch -f --sort refname main HEAD~3",
+        "git branch -f --forma x main HEAD~3",
+        "git branch -f --points x main HEAD~3",
+        "git branch -f --no-con x main HEAD~3",
+        "git branch -fu origin/x main HEAD~3",
+        "git branch --mo --forc feat main",
+        "git branch --cop -f feat main",
+        "git branch -fqM feat main",
+        "git branch -f -- main HEAD~3",
+        "git branch -f \"$X\" main HEAD~3",
+        "git checkout \"$X\" main HEAD~3",
+        "git checkout $X main HEAD~3",
+        "git switch \"$X\" main HEAD~3",
+        "git worktree add \"$X\" main ../wt HEAD~3",
+        "git checkout \"$BRANCH\"",
+        "git switch \"$BRANCH\"",
+        "git worktree add ../wt \"$B\"",
+        "git worktree \"$X\" -B main ../wt",
+        "git checkout -B*",
+        "git checkout *",
+        "git checkout {-B,main}",
+        "git checkout -b x$Y HEAD~3",
+        "git checkout -B \"$N\" HEAD~3",
+        "git checkout $'-Bmain' HEAD~3",
+        "git checkout \"-\"B main HEAD~3",
+        "git -C . switch -fC MAIN HEAD~3",
+    ]
+    .into_iter()
+    .filter(|cmd| !matches!(bash_ruling(&c, cmd), Ruling::Deny(_)))
+    .collect();
+    assert!(open.is_empty(), "not denied:\n{}", open.join("\n"));
+    allowed_in(
+        &c,
+        &[
+            "git switch -c feat2 main",
+            "git switch -f main",
+            "git switch --force main",
+            "git switch --no-force-create main",
+            "git switch -C feat2 main",
+            "git switch --force-create=feat2 main",
+            "git switch -c=-C main",
+            "git checkout -b B main",
+            "git checkout -bB main",
+            "git checkout -b x main",
+            "git checkout -B feat2 main",
+            "git checkout -fBfeat2 main",
+            "git checkout -U5 main",
+            "git checkout --conflict -B",
+            "git checkout --orphan -B",
+            "git checkout main -- -Bmain",
+            "git checkout -- -B main",
+            "git checkout --end-of-options \"$BRANCH\"",
+            "B=feat; git checkout \"$B\"",
+            "git checkout feat/\"$N\"",
+            "git checkout -b \"$NEW\" main",
+            "git checkout -- *.rs",
+            "git switch --end-of-options \"$BRANCH\"",
+            "git worktree add -b B ../wt main",
+            "git worktree add -bB ../wt main",
+            "git worktree add -fB feat2 ../wt main",
+            "git worktree add --reason -B ../wt main",
+            "git worktree add --end-of-options ../wt \"$B\"",
+            "git worktree list \"$X\"",
+            "git branch -f feat main",
+            "git branch --forc feat main",
+            "git branch -f --sort refname feat main",
+            "git branch -f --sor=refname feat main",
+            "git branch --list main",
+            "git branch -f -- feat main",
+            "git branch main",
+        ],
+    );
+}
+
 /// Item 31: ANSI-C quoting, `\c`, and text fed to a shell are never
 /// decoded where they matter: `$'...'` is not literal, so a gated command
 /// holding one denies; a here-string or literal heredoc fed to a shell is
