@@ -626,8 +626,9 @@ full = "2h"
 allow_ssh_agent = false
 # cargo_home = "~/.cargo"     # item 38: jobs never take these from the hook's env
 # rustup_home = "~/.rustup"
-# Host tool configs jobs may read, each with the blake3 of its reviewed
-# content (`tollgate doctor` prints it); any other one fails every job.
+# Host tool configs jobs may read (cargo, rustfmt, bun, uv user configs),
+# each with the blake3 of its reviewed content (`tollgate doctor` prints
+# it); any other one fails every job.
 # host_tool_configs = {{ "~/.cargo/config.toml" = "<blake3>" }}
 [job.env]
 # Variables every step gets, for example SQLX_OFFLINE = "true"

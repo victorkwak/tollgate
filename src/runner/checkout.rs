@@ -153,6 +153,19 @@ pub struct Checkout {
     /// Meta file.
     pub meta_path: PathBuf,
     _lock: LockFile,
+    /// The tracked files with a `filter` attribute (review note 14), read
+    /// once per job.
+    filtered: std::sync::OnceLock<Vec<Filtered>>,
+}
+
+/// A tracked regular file whose `filter` attribute is set.
+#[derive(Debug, Clone)]
+struct Filtered {
+    path: String,
+    /// Its index blob.
+    oid: String,
+    /// The attribute's value (the driver name).
+    driver: String,
 }
 
 /// The git dir named by `<path>/.git`, when the checkout is a live worktree
@@ -319,6 +332,7 @@ pub fn prepare(
         git_dir,
         meta_path: place.meta.clone(),
         _lock: lock,
+        filtered: std::sync::OnceLock::new(),
     })
 }
 
@@ -328,6 +342,172 @@ fn nul_list(bytes: &[u8]) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(|s| String::from_utf8_lossy(s).into_owned())
         .collect()
+}
+
+/// Attributes an `info/attributes` rule may set: they change diffs,
+/// merges, archives or tooling, never the bytes a checkout writes.
+const INFO_ATTRIBUTES_OK: &[&str] = &[
+    "diff",
+    "merge",
+    "whitespace",
+    "conflict-marker-size",
+    "export-ignore",
+    "export-subst",
+    "delta",
+    "encoding",
+    "lockable",
+];
+
+/// True when an `info/attributes` line changes no checked-out content: a
+/// blank line, a comment, or a pattern whose attributes are all in
+/// [`INFO_ATTRIBUTES_OK`] or `linguist-*`. A macro definition (`[attr]`),
+/// a macro use (`binary` or a tracked macro) and any other attribute are
+/// not (review note 14).
+fn info_attribute_line_ok(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return true;
+    }
+    if line.starts_with("[attr]") {
+        return false;
+    }
+    // The pattern may be a C-style quoted string with spaces in it.
+    let rest = if let Some(q) = line.strip_prefix('"') {
+        let mut esc = false;
+        let Some(end) = q.char_indices().find_map(|(i, c)| {
+            let close = c == '"' && !esc;
+            esc = c == '\\' && !esc;
+            close.then_some(i)
+        }) else {
+            return false;
+        };
+        &q[end + 1..]
+    } else {
+        line.split_once(char::is_whitespace).map_or("", |(_, r)| r)
+    };
+    rest.split_whitespace().all(|a| {
+        let name = a.trim_start_matches(['-', '!']);
+        let name = name.split_once('=').map_or(name, |(n, _)| n);
+        INFO_ATTRIBUTES_OK.contains(&name) || name.starts_with("linguist-")
+    })
+}
+
+/// The contents of `git cat-file --batch` output, one per requested
+/// object, in order; a missing object gives an empty entry.
+fn parse_batch(mut out: &[u8]) -> Vec<Vec<u8>> {
+    let mut blobs = Vec::new();
+    while let Some(nl) = out.iter().position(|b| *b == b'\n') {
+        let header = String::from_utf8_lossy(&out[..nl]).into_owned();
+        out = &out[nl + 1..];
+        let size = header
+            .rsplit(' ')
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|_| !header.ends_with(" missing"));
+        match size {
+            Some(n) if out.len() > n => {
+                blobs.push(out[..n].to_vec());
+                out = &out[n + 1..];
+            }
+            _ => blobs.push(Vec::new()),
+        }
+    }
+    blobs
+}
+
+/// A git-lfs pointer: the sha256 (lowercase hex) and size of its object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LfsPointer {
+    /// sha256 of the object, 64 lowercase hex digits.
+    pub sha256: String,
+    /// Size of the object in bytes.
+    pub size: u64,
+}
+
+impl LfsPointer {
+    /// True when `path` is a regular file (not a link) whose size and
+    /// sha256 are the pointer's.
+    #[must_use]
+    pub fn matches(&self, path: &Path) -> bool {
+        use sha2::Digest as _;
+        use std::io::Read as _;
+        let Ok(md) = path.symlink_metadata() else {
+            return false;
+        };
+        if !md.is_file() || md.len() != self.size {
+            return false;
+        }
+        let Ok(mut f) = fs::File::open(path) else {
+            return false;
+        };
+        let mut h = sha2::Sha256::new();
+        let mut buf = vec![0u8; 1 << 16];
+        let mut total = 0u64;
+        loop {
+            match f.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    h.update(&buf[..n]);
+                    total += n as u64;
+                }
+                Err(_) => return false,
+            }
+        }
+        let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        total == self.size && hex == self.sha256
+    }
+}
+
+/// The git-lfs pointer `blob` is, by the pointer spec (v1): under 1024
+/// bytes of UTF-8, `version https://git-lfs.github.com/spec/v1` first,
+/// then `key value` lines sorted by key and ending in a newline, with
+/// `oid sha256:<64 hex>` and `size <digits>`. `None` for anything else.
+#[must_use]
+pub fn lfs_pointer(blob: &[u8]) -> Option<LfsPointer> {
+    if blob.len() >= 1024 || !blob.ends_with(b"\n") {
+        return None;
+    }
+    let text = std::str::from_utf8(blob).ok()?;
+    let mut lines = text[..text.len() - 1].split('\n');
+    if lines.next()? != "version https://git-lfs.github.com/spec/v1" {
+        return None;
+    }
+    let (mut sha256, mut size, mut last) = (None, None, String::new());
+    for line in lines {
+        let (key, value) = line.split_once(' ')?;
+        let key_ok = !key.is_empty()
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-');
+        if !key_ok || key <= last.as_str() {
+            return None;
+        }
+        last = key.to_owned();
+        match key {
+            "oid" => {
+                let hex = value.strip_prefix("sha256:")?;
+                if hex.len() != 64
+                    || !hex
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return None;
+                }
+                sha256 = Some(hex.to_owned());
+            }
+            "size" => {
+                if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                size = Some(value.parse().ok()?);
+            }
+            _ => {}
+        }
+    }
+    Some(LfsPointer {
+        sha256: sha256?,
+        size: size?,
+    })
 }
 
 impl Checkout {
@@ -360,6 +540,7 @@ impl Checkout {
         cache_dirs: &[String],
     ) -> Result<(), CheckoutError> {
         let git = self.git(env);
+        self.check_info_attributes()?;
         git.run(["read-tree", "-u", "--reset", tree.as_str()])?;
         let keep: Vec<&str> = KEEP_DIRS
             .iter()
@@ -399,7 +580,161 @@ impl Checkout {
                 "write-tree gives {written}, expected {tree}"
             )));
         }
+        let differ = self.filtered_changes(env)?;
+        if !differ.is_empty() {
+            return Err(CheckoutError::Mismatch(format!(
+                "files on disk are not their blobs, so the checks would read other content: {}",
+                differ.join("; ")
+            )));
+        }
         Ok(())
+    }
+
+    /// Review note 14: `info/attributes` in the repo's git dir (or the
+    /// checkout's own) is outside the tree, so a rule there may name only
+    /// attributes that change no checked-out content. Any other rule, or
+    /// a macro definition, is an error that names the file and the line.
+    fn check_info_attributes(&self) -> Result<(), CheckoutError> {
+        let mut dirs = vec![self.git_dir.clone()];
+        if let Ok(common) = fs::read_to_string(self.git_dir.join("commondir")) {
+            dirs.push(self.git_dir.join(common.trim()));
+        }
+        for d in dirs {
+            let file = d.join("info/attributes");
+            let text = match fs::read(&file) {
+                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(CheckoutError::Mismatch(format!(
+                        "cannot read {}: {e}",
+                        file.display()
+                    )));
+                }
+            };
+            if let Some(line) = text.lines().find(|l| !info_attribute_line_ok(l)) {
+                return Err(CheckoutError::Mismatch(format!(
+                    "{} has `{}`, which can change what the checkout holds and is not in the tree; move the rule to a tracked .gitattributes",
+                    file.display(),
+                    line.trim()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Review note 14: each tracked regular file whose `filter` attribute
+    /// is set and whose bytes on disk are not its blob, as `path (filter
+    /// <driver>, blob <oid>)`. A file equal to the git-lfs object its
+    /// pointer blob names (sha256 and size) is its blob's content. The
+    /// filtered files are listed once per checkout (by [`Checkout::update`]):
+    /// a step that changes the index or a `.gitattributes` is an R42 change
+    /// already.
+    pub fn filtered_changes(&self, env: &JobEnv) -> Result<Vec<String>, CheckoutError> {
+        let files = match self.filtered.get() {
+            Some(f) => f,
+            None => {
+                let f = self.filtered_files(env)?;
+                self.filtered.get_or_init(|| f)
+            }
+        };
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let git = self.git(env);
+        let mut out = Vec::new();
+        let mut differ: Vec<&Filtered> = Vec::new();
+        for chunk in files.chunks(512) {
+            let mut args: Vec<&str> = vec!["hash-object", "--no-filters", "--"];
+            args.extend(chunk.iter().map(|f| f.path.as_str()));
+            let hashes = String::from_utf8_lossy(&git.run(&args)?).into_owned();
+            let hashes: Vec<&str> = hashes.lines().collect();
+            if hashes.len() != chunk.len() {
+                return Err(CheckoutError::Mismatch(format!(
+                    "git hash-object gave {} ids for {} files",
+                    hashes.len(),
+                    chunk.len()
+                )));
+            }
+            differ.extend(
+                chunk
+                    .iter()
+                    .zip(hashes)
+                    .filter(|(f, h)| f.oid != *h)
+                    .map(|(f, _)| f),
+            );
+        }
+        if differ.is_empty() {
+            return Ok(out);
+        }
+        // Read the blobs of the files that differ: a git-lfs pointer may
+        // stand for them.
+        let mut input = Vec::new();
+        for f in &differ {
+            input.extend_from_slice(f.oid.as_bytes());
+            input.push(b'\n');
+        }
+        let batch = git.run_with_input(["cat-file", "--batch"], &input)?;
+        let blobs = parse_batch(&batch);
+        for (i, f) in differ.iter().enumerate() {
+            let is_object = blobs
+                .get(i)
+                .and_then(|b| lfs_pointer(b))
+                .is_some_and(|ptr| ptr.matches(&self.path.join(&f.path)));
+            if !is_object {
+                out.push(format!("{} (filter {}, blob {})", f.path, f.driver, f.oid));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The tracked regular files whose `filter` attribute is set, read
+    /// from the index (`check-attr --cached`, so a filtered
+    /// `.gitattributes` cannot hide itself). Only a tracked
+    /// `.gitattributes` can set `filter` (the rest is pinned or checked),
+    /// so a tree without one costs one `ls-files`.
+    fn filtered_files(&self, env: &JobEnv) -> Result<Vec<Filtered>, CheckoutError> {
+        let git = self.git(env);
+        let mut files: Vec<(String, String)> = Vec::new();
+        let mut attributes = false;
+        for rec in nul_list(&git.run(["ls-files", "-s", "-z"])?) {
+            let Some((meta, path)) = rec.split_once('\t') else {
+                continue;
+            };
+            let mut parts = meta.split(' ');
+            let (Some(mode), Some(oid)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            attributes |= path == ".gitattributes" || path.ends_with("/.gitattributes");
+            if mode == "100644" || mode == "100755" {
+                files.push((path.to_owned(), oid.to_owned()));
+            }
+        }
+        if !attributes {
+            return Ok(Vec::new());
+        }
+        let mut input = Vec::new();
+        for (p, _) in &files {
+            input.extend_from_slice(p.as_bytes());
+            input.push(0);
+        }
+        let attrs = nul_list(&git.run_with_input(
+            ["check-attr", "--cached", "--stdin", "-z", "filter"],
+            &input,
+        )?);
+        let drivers: std::collections::BTreeMap<&str, &str> = attrs
+            .chunks(3)
+            .filter_map(|c| match c {
+                [p, _, v] if v != "unspecified" && v != "unset" => Some((p.as_str(), v.as_str())),
+                _ => None,
+            })
+            .collect();
+        Ok(files
+            .into_iter()
+            .filter_map(|(path, oid)| {
+                let driver = (*drivers.get(path.as_str())?).to_owned();
+                Some(Filtered { path, oid, driver })
+            })
+            .collect())
     }
 
     /// Untracked, non-ignored files outside the kept dirs (R42), one path
@@ -467,6 +802,7 @@ impl Checkout {
             })
             .collect();
         out.extend(self.overlay_changes(overlay));
+        out.extend(self.filtered_changes(env)?);
         out.extend(probe.findings());
         out.sort();
         out.dedup();
@@ -720,4 +1056,118 @@ pub fn dir_size(dir: &Path) -> u64 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn pointer_text(sha: &str, size: usize) -> String {
+        format!("version https://git-lfs.github.com/spec/v1\noid sha256:{sha}\nsize {size}\n")
+    }
+
+    /// Review note 14: a file passes for its lfs pointer only with the
+    /// pointer's sha256 and size; a link to the right bytes does not.
+    #[test]
+    fn an_lfs_pointer_matches_only_its_object_note14() {
+        let t = tempfile::tempdir().unwrap();
+        let object = b"large object\n";
+        let file = t.path().join("data.bin");
+        fs::write(&file, object).unwrap();
+        let ptr = lfs_pointer(pointer_text(&sha256_hex(object), object.len()).as_bytes()).unwrap();
+        assert!(ptr.matches(&file));
+        let wrong_sha = LfsPointer {
+            sha256: sha256_hex(b"other object\n"),
+            size: object.len() as u64,
+        };
+        assert!(!wrong_sha.matches(&file));
+        let wrong_size = LfsPointer {
+            size: object.len() as u64 + 1,
+            ..ptr.clone()
+        };
+        assert!(!wrong_size.matches(&file));
+        let link = t.path().join("link.bin");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(!ptr.matches(&link));
+        assert!(!ptr.matches(&t.path().join("gone.bin")));
+    }
+
+    #[test]
+    fn only_spec_pointers_parse_note14() {
+        let sha = sha256_hex(b"x");
+        assert_eq!(
+            lfs_pointer(pointer_text(&sha, 1).as_bytes()),
+            Some(LfsPointer {
+                sha256: sha.clone(),
+                size: 1
+            })
+        );
+        let ext = format!(
+            "version https://git-lfs.github.com/spec/v1\next-0-foo sha256:{sha}\noid sha256:{sha}\nsize 1\n"
+        );
+        assert!(lfs_pointer(ext.as_bytes()).is_some());
+        for bad in [
+            // No final newline, unsorted keys, upper-case hex, short hex,
+            // a size that is not a number, no size, another version, too
+            // large.
+            pointer_text(&sha, 1).trim_end().to_owned(),
+            format!("version https://git-lfs.github.com/spec/v1\nsize 1\noid sha256:{sha}\n"),
+            pointer_text(&sha.to_uppercase(), 1),
+            pointer_text(&sha[1..], 1),
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{sha}\nsize 1x\n"),
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{sha}\n"),
+            pointer_text(&sha, 1).replace("spec/v1", "spec/v2"),
+            format!("{}zz {}\n", pointer_text(&sha, 1), "z".repeat(1000)),
+        ] {
+            assert_eq!(lfs_pointer(bad.as_bytes()), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn info_attributes_may_name_only_content_neutral_attributes_note14() {
+        for ok in [
+            "",
+            "   ",
+            "# *.txt filter=x",
+            "*.txt diff=plain -merge",
+            "*.lock -diff linguist-generated",
+            "\"a b.txt\" whitespace=-trailing",
+            "docs/** export-ignore !delta",
+        ] {
+            assert!(info_attribute_line_ok(ok), "{ok:?}");
+        }
+        for bad in [
+            "*.txt filter=x",
+            "*.txt eol=crlf",
+            "*.txt -text",
+            "*.txt !text",
+            "* ident",
+            "*.txt crlf",
+            "*.txt working-tree-encoding=UTF-16",
+            "*.bin binary",
+            "*.txt mymacro",
+            "[attr]mymacro filter=x",
+            "\"a b.txt\" filter=x",
+            "\"unclosed filter=x",
+        ] {
+            assert!(!info_attribute_line_ok(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn batch_output_splits_per_object() {
+        let out = b"aaa blob 3\nabc\nbbb missing\nccc blob 0\n\n";
+        assert_eq!(
+            parse_batch(out),
+            vec![b"abc".to_vec(), Vec::new(), Vec::new()]
+        );
+    }
 }

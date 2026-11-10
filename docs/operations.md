@@ -89,6 +89,18 @@ An agent works as before. The gates run by themselves.
 
 When a hook waits longer than its inline budget, it denies and leaves the job running. The deny message gives one command that waits and then retries, for example `tollgate wait <job> && git commit <same args>` (L17).
 
+### Checkout errors from repo config (review notes 14, 20)
+
+The verify checkout must hold exactly the tree (R42). These job errors (cause `checkout`) say that something outside the tree would change what the checks read:
+
+| Error names | Cause | Fix |
+|---|---|---|
+| `.git/info/attributes has ...; move the rule to a tracked .gitattributes` | A rule there sets `filter`, `text`, `eol`, `crlf`, `ident`, `working-tree-encoding`, `binary`, a macro, or another attribute that is not known to leave the bytes alone. | Move the rule into a tracked `.gitattributes`, or delete it. |
+| `files on disk are not their blobs ...: <path> (filter <driver>, blob <oid>)` | A filter driver in the git config (repo, global) writes other bytes than the blob, or a step changed a filtered file. | Remove the driver from the config, or fix it so the checkout equals the blob. git-lfs files pass when the file is the object its pointer names. |
+| `<path>: host tool config is not approved (blake3 ...)` | A cargo, rustfmt, bun (`~/.bunfig.toml`, `~/.config/.bunfig.toml`) or uv (`~/.config/uv/uv.toml`) user config exists that the host config does not approve. | Review the file, then add its blake3 to `[job.host_tool_configs]` in the host config. `tollgate doctor` lists each file. |
+
+An fsmonitor program set in the repo config does not run in the verify checkout; tollgate's git calls there pin `core.fsmonitor=false` and the other keys of R42.
+
 ### Metrics log (item 50)
 
 `tollgate stats` reads `metrics.jsonl` in the state dir. Every guard call, gate hook check, chained hook run and finished job appends one JSON line:

@@ -1,4 +1,4 @@
-//! Security regression suite (S1-S54): one test per bypass, each run the
+//! Security regression suite (S1-S58): one test per bypass, each run the
 //! way a Claude Code session runs git.
 //!
 //! The lab: the binary from this build installed by `tollgate install` at
@@ -4795,4 +4795,209 @@ fn s54_nested_agents_never_run_without_the_guard() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Policy for the note-14 labs: a step that refuses `data.txt` when it
+/// holds `FAIL`.
+const CONTENT_POLICY: &str = "version = 1\n[[step]]\nname = \"content\"\nkind = \"command\"\nrun = \"! grep -q FAIL data.txt\"\n";
+
+/// A sandbox (no install) with a repo whose `main` holds `policy`.
+fn content_lab(policy: &str) -> (Sandbox, PathBuf) {
+    let sb = Sandbox::new();
+    sb.host_config("[verify]\nmin_free = \"1M\"\n");
+    let repo = sb.repo("r");
+    sb.commit_file(&repo, "tollgate.toml", policy, "policy");
+    (sb, repo)
+}
+
+/// The trees of the pass records in `sb`.
+fn sandbox_pass_trees(sb: &Sandbox) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(shards) = std::fs::read_dir(sb.state().join("results")) else {
+        return out;
+    };
+    for shard in shards.flatten() {
+        for f in std::fs::read_dir(shard.path()).unwrap().flatten() {
+            let Ok(v) =
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(f.path()).unwrap())
+            else {
+                continue;
+            };
+            if v["verdict"] == "pass" {
+                out.push(v["tree"].as_str().unwrap_or_default().to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// S55 (review note 14): the verify checkout is a worktree of the
+/// agent's repo, so it reads the repo config the agent can write. A
+/// tracked `filter=` attribute plus a smudge filter in that config made
+/// the file on disk differ from the blob (and a matching clean filter
+/// hid it from `diff-files`), so the steps read content that is not the
+/// tree and a pass was written for it. Now each path with a `filter`
+/// attribute must hash, without filters, to its blob: the job errors,
+/// names the path and the filter, and writes no record.
+#[test]
+fn s55_a_smudge_filter_cannot_change_what_the_checks_read_note14() {
+    let (sb, repo) = content_lab(CONTENT_POLICY);
+    sb.commit_file(&repo, ".gitattributes", "*.txt filter=swap\n", "attributes");
+    sb.git(&repo, &["config", "filter.swap.smudge", "sed s/FAIL/PASS/"]);
+    sb.git(&repo, &["config", "filter.swap.clean", "sed s/PASS/FAIL/"]);
+    sb.commit_file(&repo, "data.txt", "FAIL\n", "data");
+    let tree = sb.git(&repo, &["rev-parse", "HEAD^{tree}"]);
+    assert_eq!(sb.git(&repo, &["show", "HEAD:data.txt"]), "FAIL");
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("cause checkout") && r.out.contains("data.txt") && r.out.contains("swap"),
+        "{}",
+        r.out
+    );
+    assert!(
+        !sandbox_pass_trees(&sb).contains(&tree),
+        "a pass for {tree}"
+    );
+
+    // The same filter on content it leaves alone passes: only a changed
+    // file counts.
+    sb.commit_file(&repo, "data.txt", "ok\n", "fixed");
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+}
+
+/// S55b (review note 14, git-lfs): the blob is an lfs pointer and the
+/// smudge filter puts the object it names on disk. The file differs from
+/// the blob but is the pointer's object (sha256 and size), so the job
+/// passes; an object with other bytes is refused.
+#[test]
+fn s55b_a_file_equal_to_its_lfs_pointer_passes_note14() {
+    use sha2::Digest as _;
+    let (sb, repo) = content_lab(
+        "version = 1\n[[step]]\nname = \"content\"\nkind = \"command\"\nrun = \"grep -qx 'large object' data.bin\"\n",
+    );
+    let object = "large object\n";
+    let pointer_of = |o: &str| {
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n",
+            sha2::Sha256::digest(o.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            o.len()
+        )
+    };
+    let pointer = pointer_of(object);
+    sb.commit_file(&repo, ".gitattributes", "*.bin filter=lfs\n", "attributes");
+    sb.commit_file(&repo, "data.bin", &pointer, "pointer");
+    let store = sb.root().join("lfs-object");
+    std::fs::write(&store, object).unwrap();
+    let pointer_file = sb.root().join("lfs-pointer");
+    std::fs::write(&pointer_file, &pointer).unwrap();
+    let smudge = format!("cat '{}'", store.display());
+    let clean = format!("cat '{}'", pointer_file.display());
+    sb.git(&repo, &["config", "filter.lfs.smudge", &smudge]);
+    sb.git(&repo, &["config", "filter.lfs.clean", &clean]);
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+
+    // A pointer to another object of the same size: the smudge filter
+    // still writes the first one.
+    let other = pointer_of("other object\n");
+    std::fs::write(&pointer_file, &other).unwrap();
+    sb.commit_file(&repo, "data.bin", &other, "other pointer");
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains("cause checkout") && r.out.contains("data.bin") && r.out.contains("lfs"),
+        "{}",
+        r.out
+    );
+}
+
+/// S56 (review note 14): `core.fsmonitor` in the repo config names a
+/// program; tollgate's git calls in the verify checkout never run it.
+#[test]
+fn s56_fsmonitor_never_runs_in_the_verify_checkout_note14() {
+    let (sb, repo) = content_lab(CONTENT_POLICY);
+    let mark = sb.root().join("fsmonitor-ran");
+    let hook = sb.root().join("fsmonitor.sh");
+    write_exe(
+        &hook,
+        &format!("#!/bin/sh\npwd >> '{}'\nexit 1\n", mark.display()),
+    );
+    sb.git(&repo, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+    sb.commit_file(&repo, "data.txt", "ok\n", "data");
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let ran = std::fs::read_to_string(&mark).unwrap_or_default();
+    assert!(
+        ran.lines().all(|l| !l.contains("/verify/")),
+        "fsmonitor ran in the verify checkout: {ran}"
+    );
+}
+
+/// S57 (review note 14): `info/attributes` in the repo's git dir is not
+/// in the tree, and a `filter`, `text`, `eol`, `crlf`, `ident` or
+/// `working-tree-encoding` rule there (or a macro) changes what the
+/// checkout holds. The job errors and says to move the rule into a
+/// tracked `.gitattributes`.
+#[test]
+fn s57_info_attributes_cannot_change_checked_content_note14() {
+    let (sb, repo) = content_lab(CONTENT_POLICY);
+    sb.commit_file(&repo, "data.txt", "FAIL\n", "data");
+    let tree = sb.git(&repo, &["rev-parse", "HEAD^{tree}"]);
+    sb.git(&repo, &["config", "filter.swap.smudge", "sed s/FAIL/PASS/"]);
+    sb.git(&repo, &["config", "filter.swap.clean", "sed s/PASS/FAIL/"]);
+    let info = repo.join(".git/info/attributes");
+    std::fs::create_dir_all(info.parent().unwrap()).unwrap();
+    for rule in [
+        "*.txt filter=swap\n",
+        "# a comment\n*.txt eol=crlf\n",
+        "data.txt -text\n",
+        "*.txt ident\n",
+        "[attr]plain filter=swap\n",
+    ] {
+        std::fs::write(&info, rule).unwrap();
+        let r = sb.tollgate(&repo, &["check", "--wait", "--rerun"]);
+        assert_eq!(r.code, Some(1), "{rule}: {}", r.out);
+        assert!(
+            r.out.contains("cause checkout")
+                && r.out.contains("info/attributes")
+                && r.out.contains(".gitattributes"),
+            "{rule}: {}",
+            r.out
+        );
+    }
+    assert!(
+        !sandbox_pass_trees(&sb).contains(&tree),
+        "a pass for {tree}"
+    );
+    // Rules that change no content stay allowed.
+    std::fs::write(&info, "*.txt diff=plain -merge\n").unwrap();
+    sb.commit_file(&repo, "data.txt", "ok\n", "fixed");
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+}
+
+/// S58 (review note 13): cargo, clippy and rustfmt look up their config
+/// only in the dirs of tree files, step cwds and their ancestors, which
+/// the probe covers. An untracked or ignored dir is not tree content: a
+/// tool config there changes no check of the tree, and `clean -x`
+/// removes the dir before the next job (only `target`, `node_modules`,
+/// `.venv` and the policy's `cache_dirs` stay). This pins that clean: a
+/// step leaves an ignored dir that holds a workspace member and every
+/// tool config name, and the next job starts without it.
+#[test]
+fn s58_untracked_dirs_with_tool_configs_never_reach_the_next_job_note13() {
+    let (sb, repo) = content_lab(
+        "version = 1\n[[step]]\nname = \"gen\"\nkind = \"command\"\nrun = '''\ntest ! -e gen || exit 7\nmkdir -p gen/m/.cargo gen/m/src\nfor f in gen/m/clippy.toml gen/m/rustfmt.toml gen/m/.cargo/config.toml gen/m/src/lib.rs; do echo x > $f; done\nprintf '[package]\\nname = \"m\"\\n' > gen/m/Cargo.toml\n'''\n",
+    );
+    sb.commit_file(&repo, ".gitignore", "gen/\n", "ignore");
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    sb.commit_file(&repo, "data.txt", "ok\n", "next");
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(0), "the next job saw gen/: {}", r.out);
 }

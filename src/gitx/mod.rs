@@ -18,7 +18,10 @@
 //!   names the hook's own index explicitly (R17). `GIT_OPTIONAL_LOCKS=0`
 //!   keeps read-only calls from writing the agent's index.
 //! - [`Git::for_checkout`] (verify checkout): the job environment (R52) plus
-//!   explicit `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE`.
+//!   explicit `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE`, and
+//!   [`CHECKOUT_CONFIG`] as command-line config: the checkout shares the
+//!   agent's repo config, and no value there may change what the checkout
+//!   holds or run a program in it (review note 14).
 //!
 //! Item 39: the binary is [`program`], an absolute path fixed at install
 //! (`install.json`), never `git` looked up on `PATH`: git puts
@@ -43,6 +46,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::env::EnvSnapshot;
 use crate::runner::env::JobEnv;
+
+/// Config every git call in a verify checkout runs with (review note 14):
+/// no fsmonitor or hook program runs there; line endings, symlinks, modes
+/// and sparse checkout are git's defaults, never the repo config's; and
+/// no attributes file outside the tree is read (`info/attributes` is
+/// checked by [`crate::runner::checkout`]). Filter drivers have free names,
+/// so they cannot be pinned: the checkout proves the content of each
+/// filtered path instead.
+pub const CHECKOUT_CONFIG: &[(&str, &str)] = &[
+    ("core.fsmonitor", "false"),
+    ("core.hooksPath", "/dev/null"),
+    ("core.autocrlf", "false"),
+    ("core.eol", "lf"),
+    ("core.symlinks", "true"),
+    ("core.fileMode", "true"),
+    ("core.sparseCheckout", "false"),
+    ("index.sparse", "false"),
+    ("core.attributesFile", "/dev/null"),
+];
 
 pub use layout::RepoLayout;
 
@@ -284,7 +306,9 @@ impl Git {
     }
 
     /// Git for a verify checkout: the job environment plus explicit
-    /// `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` (R52).
+    /// `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` (R52), with
+    /// [`CHECKOUT_CONFIG`] pinned and `GIT_ATTR_NOSYSTEM=1` (R42, review
+    /// note 14).
     #[must_use]
     pub fn for_checkout(
         job_env: &JobEnv,
@@ -299,6 +323,18 @@ impl Git {
         vars.insert("GIT_DIR".into(), git_dir.as_os_str().to_owned());
         vars.insert("GIT_WORK_TREE".into(), worktree.as_os_str().to_owned());
         vars.insert("GIT_INDEX_FILE".into(), index_file.as_os_str().to_owned());
+        // Review note 14: the checkout shares the agent's repo config.
+        // Command-line config outranks every config file, so none of these
+        // can come from there; the system attributes file is not read.
+        vars.insert("GIT_ATTR_NOSYSTEM".into(), "1".into());
+        vars.insert(
+            "GIT_CONFIG_COUNT".into(),
+            CHECKOUT_CONFIG.len().to_string().into(),
+        );
+        for (i, (k, v)) in CHECKOUT_CONFIG.iter().enumerate() {
+            vars.insert(format!("GIT_CONFIG_KEY_{i}").into(), (*k).into());
+            vars.insert(format!("GIT_CONFIG_VALUE_{i}").into(), (*v).into());
+        }
         Self::with_env(vars, worktree.to_owned())
     }
 
@@ -363,6 +399,41 @@ impl Git {
         S: AsRef<OsStr>,
     {
         self.command(args).output().map_err(GitError::Spawn)
+    }
+
+    /// Runs `args` with `input` on stdin; non-zero exit is an error.
+    /// Returns stdout. stdin is written from another thread, so a large
+    /// output never blocks the write.
+    pub fn run_with_input<I, S>(&self, args: I, input: &[u8]) -> Result<Vec<u8>, GitError>
+    where
+        I: IntoIterator<Item = S> + Clone,
+        S: AsRef<OsStr>,
+    {
+        use std::io::Write as _;
+        let mut child = self
+            .command(args.clone())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(GitError::Spawn)?;
+        let mut stdin = child.stdin.take();
+        let out = std::thread::scope(|s| {
+            s.spawn(move || {
+                if let Some(w) = stdin.as_mut() {
+                    // A write error means git exited early; its status says why.
+                    let _ = w.write_all(input);
+                }
+                drop(stdin);
+            });
+            child.wait_with_output()
+        })
+        .map_err(GitError::Spawn)?;
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            Err(failed(args, &out))
+        }
     }
 
     /// Runs `args`; non-zero exit is an error. Returns stdout.
@@ -592,5 +663,26 @@ mod tests {
         );
         assert_eq!(g.env_var("GIT_NO_REPLACE_OBJECTS"), Some(OsStr::new("1")));
         assert_eq!(g.dir(), Path::new("/v/wt"));
+        // Review note 14: the pinned config, as command-line config.
+        assert_eq!(g.env_var("GIT_ATTR_NOSYSTEM"), Some(OsStr::new("1")));
+        let n: usize = g
+            .env_var("GIT_CONFIG_COUNT")
+            .and_then(OsStr::to_str)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let pinned: Vec<(String, String)> = (0..n)
+            .map(|i| {
+                let get = |k: String| g.env_var(&k).unwrap().to_string_lossy().into_owned();
+                (
+                    get(format!("GIT_CONFIG_KEY_{i}")),
+                    get(format!("GIT_CONFIG_VALUE_{i}")),
+                )
+            })
+            .collect();
+        for key in ["core.fsmonitor", "core.hooksPath", "core.attributesFile"] {
+            assert!(pinned.iter().any(|(k, _)| k == key), "{key}: {pinned:?}");
+        }
+        assert_eq!(pinned.len(), CHECKOUT_CONFIG.len());
     }
 }

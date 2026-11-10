@@ -27,7 +27,8 @@
 //!   is a finding (a step can write `../.cargo/config.toml`, and it would
 //!   apply to every later job), except the host's own config;
 //! - the host's own config (`$CARGO_HOME/config.toml`, rustfmt's home and
-//!   config dir files): one whose content the host config does not
+//!   config dir files, bun's global bunfig and uv's user config, review
+//!   note 20): one whose content the host config does not
 //!   approve (`[job.host_tool_configs]`), or that is not a plain file, is
 //!   a finding from the start (the session can write it, item 35, review
 //!   note 12), and so is a change since the job started.
@@ -877,6 +878,58 @@ mod tests {
         assert!(
             found.len() == 1
                 && found[0].ends_with(".rustfmt.toml: host tool config is not a regular file"),
+            "{found:?}"
+        );
+    }
+
+    /// Review note 20: bun's global bunfig and uv's user config count
+    /// like cargo's: a present one must be approved, an absent one costs
+    /// nothing, and `XDG_CONFIG_HOME` moves the config-dir ones.
+    #[test]
+    fn unapproved_bun_and_uv_user_configs_count_note20() {
+        let t = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(t.path()).unwrap().join("home");
+        let root = home.join("state/verify/r/fast/w");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let xdg = home.join("xdg");
+        std::fs::create_dir_all(xdg.join("uv")).unwrap();
+        let env = JobEnv::from_vars([
+            ("HOME", home.as_os_str()),
+            ("CARGO_HOME", home.join(".cargo").as_os_str()),
+            ("XDG_CONFIG_HOME", xdg.as_os_str()),
+        ]);
+        let run = |approved: &BTreeMap<String, String>| {
+            ToolProbe::new(
+                &root,
+                &[entry("src/lib.rs")],
+                &BTreeMap::new(),
+                [],
+                &env,
+                approved,
+            )
+            .findings()
+        };
+        assert_eq!(run(&BTreeMap::new()), Vec::<String>::new());
+        let text = "[install]\nregistry = \"https://registry.example\"\n";
+        std::fs::write(home.join(".bunfig.toml"), text).unwrap();
+        std::fs::write(xdg.join(".bunfig.toml"), text).unwrap();
+        std::fs::write(
+            xdg.join("uv/uv.toml"),
+            "index-url = \"https://index.example\"\n",
+        )
+        .unwrap();
+        let found = run(&BTreeMap::new());
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(
+            found
+                .iter()
+                .all(|f| f.contains("host tool config is not approved"))
+        );
+        let ok = approve(&[("~/.bunfig.toml", text), ("~/xdg/.bunfig.toml", text)]);
+        let found = run(&ok);
+        assert!(
+            found.len() == 1
+                && found[0].contains("xdg/uv/uv.toml: host tool config is not approved"),
             "{found:?}"
         );
     }

@@ -177,8 +177,7 @@ const RUSTFMT_NAMES: [&str; 2] = ["rustfmt.toml", ".rustfmt.toml"];
 /// The host tool configs cargo and rustfmt read in every job, wherever it
 /// runs: `config.toml` and `config` in `cargo_home`, and rustfmt's names in
 /// `home` and in `<config_home>/rustfmt` (item 35).
-#[must_use]
-pub fn host_tool_configs(home: &Path, cargo_home: &Path, config_home: &Path) -> Vec<PathBuf> {
+fn rust_tool_configs(home: &Path, cargo_home: &Path, config_home: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = crate::policy::CARGO_CONFIG_NAMES
         .iter()
         .map(|n| cargo_home.join(n))
@@ -189,18 +188,38 @@ pub fn host_tool_configs(home: &Path, cargo_home: &Path, config_home: &Path) -> 
     out
 }
 
+/// The host tool configs a job may read, wherever it runs: cargo's and
+/// rustfmt's ([`rust_tool_configs`], item 35), bun's global bunfig
+/// (`~/.bunfig.toml` and `<config_home>/.bunfig.toml`) and uv's user
+/// config (`<config_home>/uv/uv.toml`) (review note 20). The probe
+/// stamps each one and refuses a present one whose content the host
+/// config does not approve; an absent one costs nothing. `config_home`
+/// is `XDG_CONFIG_HOME` or `~/.config`.
+#[must_use]
+pub fn host_tool_configs(home: &Path, cargo_home: &Path, config_home: &Path) -> Vec<PathBuf> {
+    let mut out = rust_tool_configs(home, cargo_home, config_home);
+    out.extend([
+        home.join(".bunfig.toml"),
+        config_home.join(".bunfig.toml"),
+        config_home.join("uv/uv.toml"),
+    ]);
+    out
+}
+
 /// What jobs run, build from or read as tool config in the user's home,
 /// which a session may change only with a person's yes (item 35, review
 /// note 12): the user dirs of the job PATH, `CARGO_HOME` (tools,
 /// registry sources, config), `RUSTUP_HOME` (toolchains, overrides),
-/// `~/.bun`, uv's cache and data dirs, and the host tool configs. Jobs
-/// get no `XDG_*` variable, so these are the default dirs.
+/// `~/.bun`, uv's cache and data dirs, and cargo's and rustfmt's host
+/// configs. Jobs get no `XDG_*` variable, so these are the default dirs.
+/// bun's and uv's user configs are not here: the probe refuses an
+/// unapproved one (review note 20).
 #[must_use]
 pub fn guarded_tool_paths(dirs: &Dirs, job: &JobConfig) -> Vec<PathBuf> {
     let home = dirs.home();
     let (cargo_home, rustup_home) = tool_homes(dirs, job);
     let mut out = user_path_dirs(dirs, job);
-    out.extend(host_tool_configs(home, &cargo_home, &home.join(".config")));
+    out.extend(rust_tool_configs(home, &cargo_home, &home.join(".config")));
     out.extend([
         cargo_home,
         rustup_home,
@@ -558,5 +577,36 @@ mod tests {
         let b = EnvFile::read(&p).unwrap();
         assert_ne!(a.hash, b.hash);
         assert!(EnvFile::read(&tmp.path().join("missing")).is_err());
+    }
+
+    /// Review note 20: bun's global bunfig and uv's user config are host
+    /// tool configs (paths from the bun and uv docs); the guard list is
+    /// unchanged.
+    #[test]
+    fn bun_and_uv_user_configs_are_host_tool_configs_note20() {
+        let list = host_tool_configs(
+            Path::new("/h"),
+            Path::new("/h/.cargo"),
+            Path::new("/h/.config"),
+        );
+        for p in [
+            "/h/.cargo/config.toml",
+            "/h/.cargo/config",
+            "/h/rustfmt.toml",
+            "/h/.config/rustfmt/.rustfmt.toml",
+            "/h/.bunfig.toml",
+            "/h/.config/.bunfig.toml",
+            "/h/.config/uv/uv.toml",
+        ] {
+            assert!(list.contains(&PathBuf::from(p)), "{p}: {list:?}");
+        }
+        let f = fixture();
+        let guarded = guarded_tool_paths(&f.dirs, &f.job);
+        for p in [".bunfig.toml", ".config/.bunfig.toml", ".config/uv/uv.toml"] {
+            assert!(
+                !guarded.contains(&f.dirs.home().join(p)),
+                "{p}: {guarded:?}"
+            );
+        }
     }
 }

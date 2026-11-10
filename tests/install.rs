@@ -400,6 +400,16 @@ fn doctor_names_unapproved_host_tool_configs_item35() {
     let r = e.run(&bin, &["doctor"], &[]);
     let want = format!("ok   host tool config: {} approved", config.display());
     assert!(r.out.contains(&want), "no {want:?} in:\n{}", r.out);
+    // Review note 20: uv's user config is one too.
+    let uv = e.sb.home.join(".config/uv/uv.toml");
+    std::fs::create_dir_all(uv.parent().unwrap()).unwrap();
+    std::fs::write(&uv, text).unwrap();
+    let r = e.run(&bin, &["doctor"], &[]);
+    let want = format!(
+        "FAIL host tool config: {} is not approved (blake3 {hash})",
+        uv.display()
+    );
+    assert!(r.out.contains(&want), "no {want:?} in:\n{}", r.out);
 }
 
 /// Item 48: a remote that reaches a trusted mirror through a symlink (or
