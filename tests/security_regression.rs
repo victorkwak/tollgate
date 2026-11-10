@@ -319,13 +319,25 @@ impl Lab {
     }
 
     /// Runs each of `cmds` in the session; returns those that the guard
-    /// did not deny or that moved a ref (each moved ref is put back).
+    /// did not deny or that moved a ref (each moved ref is put back, each
+    /// new ref deleted, so the next command starts from the same refs).
     fn not_denied(&self, cmds: &[String]) -> Vec<String> {
         let mut bad = Vec::new();
         for cmd in cmds {
             let before = self.refs();
             let s = self.session(cmd);
-            if self.refs() != before {
+            let after = self.refs();
+            if after != before {
+                let old: Vec<&str> = before
+                    .lines()
+                    .filter_map(|l| l.split_once(' ').map(|(r, _)| r))
+                    .collect();
+                for line in after.lines() {
+                    let (r, _) = line.split_once(' ').unwrap();
+                    if !old.contains(&r) {
+                        self.plain(&["update-ref", "-d", r]);
+                    }
+                }
                 for line in before.lines() {
                     let (r, v) = line.split_once(' ').unwrap();
                     self.plain(&["update-ref", r, v]);
@@ -2565,6 +2577,10 @@ fn s28_remote_identity_and_ref_writes() {
         "printf '[remote \"origin\"]\\n\\turl = /tmp/x\\n' >> .git/config",
     ]));
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+    // Review note 6: a full_refs glob that is no anchor (`integration/*`)
+    // denies in its full name as in its short name.
+    let bad = lab.not_denied(&full_ref_writes("integration/x"));
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
     // Item 22, secreview note 7: the local repo in every spelling git
     // reads as it, destinations in every spelling git expands, and pushes
     // whose refspecs come from config.
@@ -2608,6 +2624,48 @@ fn s28_remote_identity_and_ref_writes() {
     });
     assert!(matches!(lab.guard_json(&write), Guarded::Denied(_)));
     let s = lab.session("git branch -f other feat");
+    assert_eq!(s.code(), Some(0), "{s:?}");
+}
+
+/// Writes of branch `b` (no anchor) by its short and full names, through
+/// each git command that writes a branch ref (review note 6).
+fn full_ref_writes(b: &str) -> Vec<String> {
+    let up = b.to_uppercase();
+    [
+        "git update-ref refs/heads/{b} feat",
+        "git update-ref refs/heads/{B} feat",
+        "git update-ref {b} feat",
+        "git update-ref --stdin <<'EOF'\ncreate refs/heads/{b} feat\nEOF",
+        "git push . feat:refs/heads/{b}",
+        "git push . +feat:refs/heads/{B}",
+        "git push . feat:heads/{b}",
+        "git push . feat:{b}",
+        "git fetch . feat:refs/heads/{b}",
+        "git fetch . feat:{b}",
+        "git branch -f {b} feat",
+        "git branch -C feat {b}",
+        "git checkout -B {b} feat",
+        "git switch -C {b} feat",
+    ]
+    .iter()
+    .map(|s| s.replace("{b}", b).replace("{B}", &up))
+    .collect()
+}
+
+/// S28c (G7, Q1, review note 6): a repo's own `tiers.full_refs` glob
+/// guards the branches it names in their full and short names.
+#[test]
+fn s28c_repo_full_refs_in_every_name() {
+    let lab = Lab::new(&format!(
+        "{BAD_FILE_POLICY}[tiers]\nfull_refs = [\"main\", \"master\", \"release/*\"]\n"
+    ));
+    lab.plain(&["checkout", "-q", "-b", "feat"]);
+    lab.stage_code_change("feat");
+    lab.plain(&["commit", "-q", "--no-verify", "-m", "feat"]);
+    let bad = lab.not_denied(&full_ref_writes("release/x"));
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    // A branch no glob names still moves (no false deny).
+    let s = lab.session("git update-ref refs/heads/topic/x feat");
     assert_eq!(s.code(), Some(0), "{s:?}");
 }
 
