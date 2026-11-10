@@ -20,28 +20,24 @@ fn deny_patterns_exit_2_and_reads_stay_open_t15_r23_r25() {
         "git --config-env=core.hooksPath=X commit".to_owned(),
         "git send-pack origin main".to_owned(),
         "git branch -M x main".to_owned(),
-        "tollgate waive --tree x".to_owned(),
+        "tollgate uninstall".to_owned(),
+        "tollgate remotes forget".to_owned(),
         format!("echo x | tee > {}/jobs/J/report.json", state.display()),
         "echo x > $XDG_STATE_HOME/tollgate/x".to_owned(),
         "rm -rf ~/../state/tollgate".to_owned(),
         "cd x && git commit -n -m y".to_owned(),
-        // git takes unambiguous prefixes of long options (R25).
-        "git commit --no-verif -m x".to_owned(),
-        "git push --no-ver origin feat".to_owned(),
-        "git am --no-v a.patch".to_owned(),
+        "git commit -anm x".to_owned(),
+        "git am -n a.patch".to_owned(),
+        "git push --no-verify origin feat".to_owned(),
         // Every way to start git with an empty environment (R25).
         "env --ignore-environment PATH=/usr/bin git commit -m x".to_owned(),
         "env - PATH=/usr/bin git commit -m x".to_owned(),
         "env -S '-i git commit -m x'".to_owned(),
         "exec -c git commit -m x".to_owned(),
-        // HOME and XDG decide where tollgate finds its config (R8).
-        "HOME=/tmp/x git commit -m x".to_owned(),
-        "XDG_CONFIG_HOME=/tmp/c git commit -m x".to_owned(),
         // In-place edits and git config --file write the file (R25).
+        "sed -i s/a/b/ $XDG_STATE_HOME/tollgate/x".to_owned(),
         "perl -pi -e 's/a/b/' $XDG_STATE_HOME/tollgate/x".to_owned(),
-        "gawk -i inplace 1 $XDG_STATE_HOME/tollgate/x".to_owned(),
         "git config --file $XDG_STATE_HOME/tollgate/x a.b c".to_owned(),
-        "git config --file \"$F\" a.b c".to_owned(),
     ] {
         let (code, out, err) = a.bash(&cmd);
         assert_eq!(code, Some(2), "{cmd}: {out}{err}");
@@ -89,9 +85,6 @@ fn ask_rules_return_an_ask_decision_t16_r26() {
         "git branch -m a b",
         "git config url./tmp/fake.git.insteadOf git@gitlab.example:v/r.git",
     ] {
-        // In the repo: the sandbox root holds `config`, the dir above
-        // tollgate's config dir, which no program may be given (review
-        // G7/R25).
         let cmd = format!("cd {} && {cmd}", repo.display());
         let (code, out, err) = a.bash(&cmd);
         assert_eq!(code, Some(0), "{cmd}: {err}");
@@ -108,7 +101,7 @@ fn ask_rules_return_an_ask_decision_t16_r26() {
         assert_eq!(code, Some(0), "{}: {err}", file.display());
         assert!(ask(&out), "{}: {out}", file.display());
     }
-    // G7: refs, remote config and hooks under .git deny.
+    // R25: refs, remote config and hooks under .git deny.
     for file in [
         repo.join(".git/config"),
         repo.join(".git/refs/heads/main"),

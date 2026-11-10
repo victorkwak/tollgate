@@ -1,4 +1,4 @@
-//! A bash parser for the guard's closed grammar (R25, G1-G8).
+//! A bash parser for the guard's walker (R25, R26).
 //!
 //! It builds the command tree bash would run: lists, and-or lists,
 //! pipelines, simple commands, subshells, groups, `if`, `while`, `until`,
@@ -11,15 +11,15 @@
 //! end of the substitution.
 //!
 //! The parser is strict: input it does not model (an unterminated quote,
-//! `coproc`, extended globs, a stray `(`) is a [`ParseError`], and the
-//! guard denies the call (the grammar is closed). ANSI-C strings
-//! (`$'...'`) are found as bash finds them (a backslash escapes the next
-//! character) and kept undecoded: they are never literal.
+//! `coproc`, extended globs, a stray `(`) is a [`ParseError`]. The walker
+//! then asks when the text names git, tollgate or `.claude`, and allows
+//! it otherwise. ANSI-C strings (`$'...'`) are found as bash finds them
+//! (a backslash escapes the next character) and kept undecoded.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Input the parser does not accept; the guard denies it.
+/// Input the parser does not accept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError(pub String);
 
@@ -173,6 +173,15 @@ pub(super) fn simple_param(text: &str) -> Option<&str> {
         .and_then(|t| t.strip_suffix('}'))
         .unwrap_or(text);
     is_name(name).then_some(name)
+}
+
+/// Every script that runs while bash expands `parts` (a heredoc body, an
+/// arithmetic header).
+#[must_use]
+pub(super) fn part_scripts(parts: &[Part]) -> Vec<&Script> {
+    let mut out = Vec::new();
+    collect_scripts(parts, &mut out);
+    out
 }
 
 fn collect_scripts<'a>(parts: &'a [Part], out: &mut Vec<&'a Script>) {
@@ -424,7 +433,7 @@ fn is_meta(c: char) -> bool {
 /// How deep lists, substitutions and quotes may nest.
 const MAX_DEPTH: usize = 64;
 
-/// Parses a Bash command (G1-G8).
+/// Parses a Bash command.
 ///
 /// # Errors
 /// Input bash would reject or the guard does not model.

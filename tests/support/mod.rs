@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 pub mod cpu;
+pub mod limits;
 pub mod pty;
 pub mod tools;
 

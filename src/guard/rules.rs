@@ -1,15 +1,20 @@
 //! The guard's verdicts (R25 deny, R26 ask, R28 rewrite trigger) and the
 //! context they need.
 //!
-//! Bash calls go through the closed grammar in [`super::walk`] (G1-G8):
-//! the command is parsed ([`super::shell`]) and every simple command must
-//! fit an allowed shape. Anything outside the grammar is denied with a
-//! message that shows the shape to use. There are no raw-text rules: a
-//! name or a flag counts only in the position where bash and git read it,
-//! so messages, grep patterns and file contents that mention
-//! `--no-verify` or `GIT_CONFIG_COUNT` stay allowed (item 42).
+//! The guard stops a careless agent, not a hostile one. Bash calls go
+//! through the open grammar in [`super::walk`]: the command is parsed
+//! ([`super::shell`]), and a rule fires only where bash, git or an
+//! ordinary tool reads the word that the rule is about. Every other
+//! command is allowed. There are no raw-text rules: messages, grep
+//! patterns and file contents that mention `--no-verify` or
+//! `GIT_CONFIG_COUNT` stay allowed. Text that names git, tollgate or
+//! `.claude` and that the walker cannot read (no parse, code made at run
+//! time) asks under the rule id `unclassified`.
 //!
-//! Write/Edit tool calls get the R25/R26 path rules ([`file_ruling`]).
+//! Each rule has an id ([`Reason::rule`]) that the metrics log records.
+//!
+//! Write/Edit tool calls get the path rules ([`file_ruling`]); the walker
+//! applies [`write_ruling`] to the files a Bash command writes.
 
 use std::path::{Path, PathBuf};
 
@@ -18,18 +23,53 @@ use globset::GlobSet;
 use super::shell;
 use super::walk;
 
+/// Why a rule fired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reason {
+    /// The rule's id, for the metrics log (`no-verify`, `state-dir-write`).
+    pub rule: &'static str,
+    /// One line for the agent or the person: what was found and what to
+    /// do.
+    pub why: String,
+}
+
 /// The guard's verdict on one tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ruling {
     /// No rule matched.
     Allow,
     /// `permissionDecision: "ask"` with this reason (R26).
-    Ask(String),
+    Ask(Reason),
     /// Exit 2 with this reason (R25).
-    Deny(String),
+    Deny(Reason),
 }
 
 impl Ruling {
+    #[must_use]
+    pub fn deny(rule: &'static str, why: impl Into<String>) -> Self {
+        Self::Deny(Reason {
+            rule,
+            why: why.into(),
+        })
+    }
+
+    #[must_use]
+    pub fn ask(rule: &'static str, why: impl Into<String>) -> Self {
+        Self::Ask(Reason {
+            rule,
+            why: why.into(),
+        })
+    }
+
+    /// The reason of an ask or a deny.
+    #[must_use]
+    pub fn reason(&self) -> Option<&Reason> {
+        match self {
+            Self::Allow => None,
+            Self::Ask(r) | Self::Deny(r) => Some(r),
+        }
+    }
+
     fn rank(&self) -> u8 {
         match self {
             Self::Allow => 0,
@@ -62,21 +102,21 @@ pub struct Context {
     pub vars: Vec<(String, String)>,
     /// tollgate's state, data and config dirs (R25: no writes).
     pub protected: Vec<PathBuf>,
-    /// The host config (R26: ask, not deny, for Write/Edit).
+    /// The host config (R26: ask, not deny).
     pub host_config: PathBuf,
     /// What gate jobs run, build from or read as host tool config (item
-    /// 35, review note 12): writes there ask. As spelled and canonical.
+    /// 35, review note 12): Write/Edit calls there ask. As spelled and
+    /// canonical.
     pub tool_paths: Vec<PathBuf>,
     /// `tiers.full_refs`, matched case-insensitively (R27).
     pub full_refs: GlobSet,
     /// Names the tollgate binary goes by (PATH name, installed copy).
     pub tollgate_names: Vec<String>,
-    /// The `TOLLGATE_INLINE_CAP` the guard exports for this call (G6): a
+    /// The `TOLLGATE_INLINE_CAP` the guard exports for this call: a
     /// client value may only lower it.
     pub inline_cap: u64,
-    /// The session variables that pick the config files git reads and the
-    /// config it carries (`HOME`, `XDG_CONFIG_HOME`, `GIT_*`): which repo a
-    /// fetch or push reaches (G7, item 22, secreview note 7).
+    /// The session variables that pick the config files git reads
+    /// (`HOME`, `XDG_CONFIG_HOME`, `GIT_*`).
     pub git_env: crate::env::EnvSnapshot,
     /// The Claude Code settings locations (R26), worked out on first use.
     pub claude: super::paths::ClaudePaths,
@@ -102,7 +142,7 @@ pub struct Assessment {
     pub long_timeout: bool,
 }
 
-/// R25/R26/R28 for a Bash command (G1-G8).
+/// R25/R26/R28 for a Bash command.
 #[must_use]
 pub fn assess(ctx: &Context, command: &str) -> Assessment {
     walk::assess(ctx, command)
@@ -178,7 +218,115 @@ pub fn is_repair_command(ctx: &Context, command: &str) -> bool {
             .is_some_and(|s| matches!(s.as_str(), "install" | "uninstall" | "doctor" | "status"))
 }
 
-/// R26, R25 and G7 for Write/Edit/MultiEdit/NotebookEdit.
+/// The path rules for a file that an ordinary tool of a Bash command
+/// writes (M3): a redirection, `cp`, `mv`, `rm`, `sed -i`, `tee` and the
+/// like. `spelled` is absolute, with `.` and `..` applied; `removal` is
+/// true when the tool removes the path or reaches what is under it.
+#[must_use]
+pub fn write_ruling(ctx: &Context, spelled: &Path, removal: bool, how: &str) -> Ruling {
+    use crate::guard::paths;
+    let text = paths::lower(spelled);
+    if text.starts_with("/dev/") || text.starts_with("/proc/") {
+        return Ruling::Allow;
+    }
+    // The path as spelled, then with its symlinks resolved: a link into
+    // tollgate's dirs, `.git` or `.claude` does not hide the target.
+    let resolved = paths::canon(spelled);
+    // git's global config files are looked up only for a path that can
+    // be one of them.
+    let near = [text.as_str(), paths::lower(&resolved).as_str()]
+        .iter()
+        .any(|t| t.contains("git"));
+    let mut seen: Option<&Path> = None;
+    for p in [spelled, resolved.as_path()] {
+        if seen == Some(p) {
+            break;
+        }
+        seen = Some(p);
+        if paths::lower(p) == paths::lower(&ctx.host_config) {
+            return Ruling::ask(
+                "host-config-edit",
+                format!(
+                    "{how} writes the tollgate host config {} (R26)",
+                    p.display()
+                ),
+            );
+        }
+        if let Some(dir) = paths::tollgate_dir(ctx, p, removal) {
+            return Ruling::deny(
+                "state-dir-write",
+                format!(
+                    "{how} writes {} in tollgate's dir {}: records, jobs and the installed hooks are only written by tollgate (R25)",
+                    p.display(),
+                    dir.display()
+                ),
+            );
+        }
+        if paths::claude_write(ctx, p, removal) {
+            return Ruling::ask("claude-settings-edit", paths::settings_write_reason(how, p));
+        }
+        let comps: Vec<String> = p
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect();
+        let dot_git = comps.iter().position(|c| c == ".git");
+        if let Some(what) = paths::git_internal(p) {
+            return Ruling::ask(
+                "git-dir-write",
+                format!(
+                    "{how} writes {what} of a repo ({}): it can move refs, remotes or hooks without a check (R26)",
+                    p.display()
+                ),
+            );
+        }
+        if let Some(k) = dot_git {
+            let under = &comps[k + 1..];
+            if under.is_empty() && removal || under == ["head"] {
+                return Ruling::ask(
+                    "git-dir-write",
+                    format!(
+                        "{how} removes or rewrites {} of a repo: refs and hooks go with it (R26)",
+                        p.display()
+                    ),
+                );
+            }
+            if removal && under.last().is_some_and(|n| n.ends_with(".lock")) {
+                return Ruling::ask(
+                    "git-lock-file",
+                    format!(
+                        "{how} removes the git lock file {}: another git process or a gate job can hold it (R26)",
+                        p.display()
+                    ),
+                );
+            }
+        }
+        if comps.iter().any(|c| c == ".githooks") {
+            return Ruling::ask(
+                "repo-hook-edit",
+                format!("{how} writes the repo hook {} (R26)", p.display()),
+            );
+        }
+        if near && let Some(f) = paths::git_global_config(ctx, p) {
+            return Ruling::ask(
+                "git-global-config-edit",
+                format!(
+                    "{how} writes git's config file {}, whose program keys every git command runs (R26)",
+                    f.display()
+                ),
+            );
+        }
+    }
+    // A removal alone puts nothing on a tool path.
+    if !removal && let Some(t) = paths::tool_path(ctx, spelled) {
+        return Ruling::ask("tool-path-edit", paths::tool_write_reason(how, spelled, t));
+    }
+    if let Some((rule, why)) = super::repo_rules(spelled) {
+        return Ruling::ask(rule, why);
+    }
+    Ruling::Allow
+}
+
+/// The path rules (R25, R26) for Write/Edit/MultiEdit/NotebookEdit.
 #[must_use]
 pub fn file_ruling(ctx: &Context, file: &str) -> Ruling {
     use crate::guard::paths;
@@ -187,22 +335,25 @@ pub fn file_ruling(ctx: &Context, file: &str) -> Ruling {
         Path::new(&expand_home(ctx, file)),
     ));
     if paths::lower(&p) == paths::lower(&ctx.host_config) {
-        return Ruling::Ask(format!(
-            "edit of the tollgate host config {} (R26)",
-            p.display()
-        ));
+        return Ruling::ask(
+            "host-config-edit",
+            format!("edit of the tollgate host config {} (R26)", p.display()),
+        );
     }
     if let Some(dir) = paths::tollgate_dir(ctx, &p, false) {
-        return Ruling::Deny(format!(
-            "write under tollgate's dir {} (R25, R26)",
-            dir.display()
-        ));
+        return Ruling::deny(
+            "state-dir-write",
+            format!("write under tollgate's dir {} (R25, R26)", dir.display()),
+        );
     }
     if let Some(what) = paths::git_internal(&p) {
-        return Ruling::Deny(format!(
-            "write into {what} of a repo ({}): it moves refs, remotes or hooks without a check (G7)",
-            p.display()
-        ));
+        return Ruling::deny(
+            "git-dir-write",
+            format!(
+                "write into {what} of a repo ({}): it moves refs, remotes or hooks without a check (R25)",
+                p.display()
+            ),
+        );
     }
     let comps: Vec<String> = p
         .components()
@@ -212,28 +363,37 @@ pub fn file_ruling(ctx: &Context, file: &str) -> Ruling {
     if let Some(s) =
         paths::claude_settings(ctx, &p).or_else(|| paths::claude_settings(ctx, &spelled))
     {
-        return Ruling::Ask(format!(
-            "edit of Claude Code settings {} (R26)",
-            s.display()
-        ));
+        return Ruling::ask(
+            "claude-settings-edit",
+            format!("edit of Claude Code settings {} (R26)", s.display()),
+        );
     }
     if comps.iter().any(|c| c == ".git") {
-        return Ruling::Ask(format!("write under .git/: {} (R26)", p.display()));
+        return Ruling::ask(
+            "git-dir-write",
+            format!("write under .git/: {} (R26)", p.display()),
+        );
     }
     if let Some(f) = paths::git_global_config(ctx, &p) {
-        return Ruling::Ask(format!(
-            "edit of git's config file {}, whose program keys every git command runs (item 21)",
-            f.display()
-        ));
+        return Ruling::ask(
+            "git-global-config-edit",
+            format!(
+                "edit of git's config file {}, whose program keys every git command runs (item 21)",
+                f.display()
+            ),
+        );
     }
     if let Some(t) = paths::tool_path(ctx, &p) {
-        return Ruling::Ask(paths::tool_write_reason("an edit", &p, t));
+        return Ruling::ask("tool-path-edit", paths::tool_write_reason("an edit", &p, t));
     }
     if comps.iter().any(|c| c == ".githooks") {
-        return Ruling::Ask(format!("edit of a repo hook {} (R26)", p.display()));
+        return Ruling::ask(
+            "repo-hook-edit",
+            format!("edit of a repo hook {} (R26)", p.display()),
+        );
     }
-    if let Some(why) = super::repo_rules(&p) {
-        return Ruling::Ask(why);
+    if let Some((rule, why)) = super::repo_rules(&p) {
+        return Ruling::ask(rule, why);
     }
     Ruling::Allow
 }

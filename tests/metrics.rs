@@ -41,6 +41,10 @@ fn guard_decisions_are_logged_with_a_keyed_hash_not_the_text() {
     let (code, out, _) = a.write(settings.to_str().unwrap());
     assert_eq!(code, Some(0));
     assert!(out.contains("\"ask\""), "{out}");
+    // Shell code made at run time that names git: the one ask rule.
+    let (code, out, _) = a.bash("eval \"$(printf 'git commit %s' \"$FLAGS\")\"");
+    assert_eq!(code, Some(0));
+    assert!(out.contains("\"ask\""), "{out}");
 
     let state = a.sb.state();
     let log = state.join("metrics.jsonl");
@@ -73,16 +77,14 @@ fn guard_decisions_are_logged_with_a_keyed_hash_not_the_text() {
     assert_eq!(
         got,
         [
-            // Unit 3 of the rescope: the real ids (`no-verify`, the
-            // branch-rename and settings-edit ids) replace the temporary
-            // `closed-grammar` and `file-path`.
             ("Bash", "allow", None),
-            ("Bash", "deny", Some("closed-grammar")),
-            ("Bash", "deny", Some("closed-grammar")),
-            ("Bash", "deny", Some("closed-grammar")),
-            ("Bash", "ask", Some("closed-grammar")),
+            ("Bash", "deny", Some("no-verify")),
+            ("Bash", "deny", Some("no-verify")),
+            ("Bash", "deny", Some("no-verify")),
+            ("Bash", "ask", Some("branch-move")),
             ("Bash", "allow", None),
-            ("Write", "ask", Some("file-path")),
+            ("Write", "ask", Some("claude-settings-edit")),
+            ("Bash", "ask", Some("unclassified")),
         ],
         "{g:#?}"
     );
@@ -92,7 +94,7 @@ fn guard_decisions_are_logged_with_a_keyed_hash_not_the_text() {
     for i in [0, 5] {
         assert!(g[i]["cmd"].is_null(), "{:?}", g[i]);
     }
-    let h: Vec<&str> = [1, 2, 3, 4, 6]
+    let h: Vec<&str> = [1, 2, 3, 4, 6, 7]
         .iter()
         .map(|&i| g[i]["cmd"].as_str().unwrap())
         .collect();
@@ -108,21 +110,26 @@ fn guard_decisions_are_logged_with_a_keyed_hash_not_the_text() {
     let r = a.sb.tollgate(&a.sb.root(), &["stats", "--json"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
     let v: Value = serde_json::from_str(&r.out).unwrap();
-    assert_eq!(v["guard"]["calls"], 7, "{v:#}");
+    assert_eq!(v["guard"]["calls"], 8, "{v:#}");
     assert_eq!(v["guard"]["deny"], 3, "{v:#}");
-    assert_eq!(v["guard"]["ask"], 2, "{v:#}");
+    assert_eq!(v["guard"]["ask"], 3, "{v:#}");
     assert_eq!(v["guard"]["rewrite"], 1, "{v:#}");
-    // Unit 3: `no-verify` again, 3 denies over 2 distinct commands.
-    assert_eq!(v["guard"]["rules"]["closed-grammar"]["deny"], 3, "{v:#}");
+    // 3 denies over 2 distinct commands; each ask under its own rule.
+    assert_eq!(v["guard"]["rules"]["no-verify"]["deny"], 3, "{v:#}");
+    assert_eq!(v["guard"]["rules"]["no-verify"]["distinct"], 2, "{v:#}");
+    assert_eq!(v["guard"]["rules"]["branch-move"]["ask"], 1, "{v:#}");
     assert_eq!(
-        v["guard"]["rules"]["closed-grammar"]["distinct"], 3,
+        v["guard"]["rules"]["claude-settings-edit"]["ask"], 1,
         "{v:#}"
     );
-    assert_eq!(v["guard"]["rules"]["closed-grammar"]["ask"], 1, "{v:#}");
-    assert_eq!(v["guard"]["rules"]["file-path"]["ask"], 1, "{v:#}");
+    assert_eq!(v["guard"]["rules"]["unclassified"]["ask"], 1, "{v:#}");
     let r = a.sb.tollgate(&a.sb.root(), &["stats"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
-    assert!(r.out.contains("closed-grammar"), "{}", r.out); // unit 3: no-verify
+    assert!(
+        r.out.contains("no-verify") && r.out.contains("unclassified"),
+        "{}",
+        r.out
+    );
 }
 
 /// What sits at the log path in place of a file.

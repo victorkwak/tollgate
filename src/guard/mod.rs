@@ -15,34 +15,32 @@
 //! installed copy, and every hook link shares its inode. A missing hooks
 //! dir or link is recreated first (L18) and logged to `repairs.log`.
 //!
-//! Bash commands go through a closed grammar (G1-G8, [`walk`]): the
-//! command is parsed as bash parses it ([`shell`]), and every simple
-//! command in it must fit an allowed shape; anything else is denied with
-//! the shape to use.
+//! The guard stops a careless agent, not a hostile one. A Bash command
+//! is parsed as bash parses it ([`shell`]) and walked ([`walk`]): the
+//! rules apply to the commands that run, each with its own rule id in
+//! the metrics log, and every other word is data. A command the walker
+//! cannot read asks (rule `unclassified`) when it names git, tollgate or
+//! a protected path, and is allowed otherwise. The hooks and the record
+//! check hold the real guarantee.
 //!
-//! R28 as changed by L17 and G6: for a command that runs a waiting git
+//! R28 as changed by L17: for a command that runs a waiting git
 //! command or `tollgate check|wait|merge`, `updatedInput` raises `timeout`
 //! to 600000 and puts `export TOLLGATE_INLINE_CAP=<n>; ` (540, or the
 //! `fast` budget for `run_in_background`) in front of the command exactly
 //! as it was checked; the guard never removes or changes client text
 //! (item 12). `export` instead of a bare assignment, so the cap reaches git
 //! also after `cd x &&` or in a pipeline. A client may only lower the cap,
-//! with a literal number in front of git or tollgate (G6). The output
+//! with a literal number in front of git or tollgate. The output
 //! carries no `permissionDecision` for a plain rewrite, so Claude Code's own
 //! permission rules still decide (UNVERIFIED that Claude Code applies
 //! `updatedInput` without one; if not, the 100 s default cap stands, R28).
 
-mod agents;
 mod cmds;
 mod git;
-mod gitopts;
 pub mod paths;
-mod progs;
-mod reach;
 pub mod rules;
 mod runners;
 pub mod shell;
-mod transfer;
 mod walk;
 
 use std::path::{Path, PathBuf};
@@ -108,18 +106,11 @@ struct Note {
 }
 
 impl Note {
-    /// `Ruling` carries no rule id yet: every ask and deny of the
-    /// closed-grammar walker logs the temporary id `closed-grammar`, and
-    /// every one of the Write/Edit path rules logs `file-path`. The
-    /// open-grammar walker gives each rule its own id.
-    fn ruling(&mut self, ruling: &Ruling, rule: &'static str) {
-        match ruling {
-            Ruling::Allow => {}
-            Ruling::Ask(_) => {
-                self.rule = Some(rule);
-                self.ask = true;
-            }
-            Ruling::Deny(_) => self.rule = Some(rule),
+    /// Records the id of the rule that asked or denied.
+    fn ruling(&mut self, ruling: &Ruling) {
+        if let Some(reason) = ruling.reason() {
+            self.rule = Some(reason.rule);
+            self.ask = matches!(ruling, Ruling::Ask(_));
         }
     }
 }
@@ -223,9 +214,9 @@ fn answer(
                 ));
             }
             let a = rules::assess(&ctx, command);
-            note.ruling(&a.ruling, "closed-grammar");
+            note.ruling(&a.ruling);
             if let Ruling::Deny(why) = &a.ruling {
-                return Answer::deny(format!("tollgate guard: denied: {}", one_line(why)));
+                return Answer::deny(format!("tollgate guard: denied: {}", one_line(&why.why)));
             }
             let updated = a.long_timeout.then(|| rewrite(tool_input, command, cap));
             note.rewrite = updated.is_some();
@@ -243,9 +234,9 @@ fn answer(
             };
             note.subject = Some(file.to_owned());
             let ruling = rules::file_ruling(&ctx, file);
-            note.ruling(&ruling, "file-path");
+            note.ruling(&ruling);
             if let Ruling::Deny(why) = &ruling {
-                return Answer::deny(format!("tollgate guard: denied: {}", one_line(why)));
+                return Answer::deny(format!("tollgate guard: denied: {}", one_line(&why.why)));
             }
             respond(&ruling, None)
         }
@@ -260,7 +251,7 @@ fn respond(ruling: &Ruling, updated: Option<Value>) -> Answer {
         out.insert("permissionDecision".into(), json!("ask"));
         out.insert(
             "permissionDecisionReason".into(),
-            json!(format!("tollgate: {why}")),
+            json!(format!("tollgate: {}", why.why)),
         );
     }
     if let Some(u) = updated {
@@ -347,7 +338,7 @@ fn context(
         vars.push((var.into(), v));
     }
     // Session values the rules may expand in paths, and CDPATH, which
-    // makes a relative `cd` unpredictable (G8). CLAUDE_CONFIG_DIR picks
+    // makes a relative `cd` unpredictable. CLAUDE_CONFIG_DIR picks
     // the user settings dir (R26).
     for var in ["TMPDIR", "CDPATH", "USER", "LOGNAME", "CLAUDE_CONFIG_DIR"] {
         if let Some(v) = env.get_str(var) {
@@ -426,16 +417,19 @@ fn context(
 }
 
 /// R26: policy files (R71) and the repo's own hooks dir ask.
-pub(crate) fn repo_rules(path: &Path) -> Option<String> {
+pub(crate) fn repo_rules(path: &Path) -> Option<(&'static str, String)> {
     let root = repo_root(path)?;
     let rel = path.strip_prefix(&root).ok()?;
     let config = repo_config(&root);
     if let Ok(m) = crate::policy::PolicyMatcher::new(&config)
         && m.is_policy_file(rel)
     {
-        return Some(format!(
-            "edit of policy file {} (R26, R71; it applies after it merges to a full ref)",
-            rel.display()
+        return Some((
+            "policy-file-edit",
+            format!(
+                "edit of policy file {} (R26, R71; it applies after it merges to a full ref)",
+                rel.display()
+            ),
         ));
     }
     let env = EnvSnapshot::default();
@@ -445,9 +439,12 @@ pub(crate) fn repo_rules(path: &Path) -> Option<String> {
         && d != layout.default_hooks_dir()
         && path.starts_with(&d)
     {
-        return Some(format!(
-            "edit of a repo hook in core.hooksPath {} (R26)",
-            d.display()
+        return Some((
+            "repo-hook-edit",
+            format!(
+                "edit of a repo hook in core.hooksPath {} (R26)",
+                d.display()
+            ),
         ));
     }
     None

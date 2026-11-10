@@ -1,1604 +1,350 @@
-//! Command tables of the grammar (G2, G3, G5): what each command name is
-//! to the guard, the options of the pass-through wrappers, the sensitive
-//! variables, and the scan of inline interpreter code.
+//! Tables of the programs the walker knows by name: shells, plain
+//! wrappers, and the ordinary tools that write the files they name (M3).
+//! A program that is not in a table is unknown: its arguments are data.
 
-/// What a command name is to the guard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Class {
-    /// G2a: runs its operand command with literal argv.
-    Wrapper(&'static str),
-    /// G2b: runs its command as another user, elsewhere or with another
-    /// environment.
-    Launcher(&'static str),
-    /// G3: a shell (`sh -c`, a script file, or a program on stdin).
-    /// A versioned name (`bash5.2`, `ksh93`, `zsh-5.9`) is its shell.
-    Shell(&'static str),
-    /// G3 (item 21/20, review G2): a shell or script host whose language
-    /// the guard does not read (`nu`, `pwsh`, `xonsh`, `osascript`, ...).
-    Opaque(&'static str),
-    /// G3: `eval`.
-    Eval,
-    /// G3: `source` and `.`.
-    Source,
-    /// G3: an interpreter whose inline code is scanned.
-    Interp(Lang),
-    /// G5: a builtin that writes shell variables.
-    VarWrite(&'static str),
-    /// G8: `cd`, `pushd`, `popd`.
-    Cd(&'static str),
-    /// `busybox <applet>`.
-    Busybox,
-    /// G2 (review "nested agent without hooks"): an agent CLI
-    /// ([`super::agents`]).
-    Agent(&'static str),
-    Other,
+/// One word of a command after expansion: its text, and whether a part
+/// of it is only known at run time (that part is `\u{1}` in the text).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arg {
+    pub s: String,
+    pub dynamic: bool,
 }
 
-/// Interpreter languages (G3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lang {
-    Python,
-    Perl,
-    Ruby,
-    Node,
-    Bun,
-    Deno,
-    Php,
-    Lua,
-    Awk,
+impl Arg {
+    #[must_use]
+    pub fn fixed(s: impl Into<String>) -> Self {
+        Self {
+            s: s.into(),
+            dynamic: false,
+        }
+    }
+
+    /// The word, when all of it is known.
+    #[must_use]
+    pub fn lit(&self) -> Option<&str> {
+        (!self.dynamic).then_some(self.s.as_str())
+    }
+
+    /// True for a word bash and the program read as an option.
+    #[must_use]
+    pub fn is_opt(&self) -> bool {
+        self.s.len() > 1 && self.s.starts_with('-')
+    }
 }
 
-/// Shells (G3).
-pub const SHELLS: &[&str] = &[
-    "sh", "bash", "rbash", "zsh", "dash", "ksh", "mksh", "ash", "fish", "yash", "csh", "tcsh",
-];
+/// The mark a run-time part leaves in [`Arg::s`].
+pub const DYNAMIC: char = '\u{1}';
 
-/// Shells and script hosts whose language the guard does not read (G3,
-/// item 21/20, review G2). Their code may run any command, so they run
-/// only to print their version or help, or interactively on the session's
-/// terminal; `osascript` also runs notification and dialog code.
-pub const OPAQUE: &[&str] = &[
-    "nu",
-    "nushell",
-    "pwsh",
-    "powershell",
-    "elvish",
-    "xonsh",
-    "rc",
-    "es",
-    "ysh",
-    "oil",
-    "murex",
-    "ion",
-    "scsh",
-    "tclsh",
-    "wish",
-    "expect",
-    "osascript",
-];
-
-/// POSIX-family shells the guard reads as bash reads `sh` (G3).
-const POSIX_SHELLS: &[(&str, &str)] = &[
-    ("oksh", "ksh"),
-    ("loksh", "ksh"),
-    ("pdksh", "ksh"),
-    ("lksh", "mksh"),
-    ("posh", "sh"),
-    ("hush", "ash"),
-    ("osh", "sh"),
-    ("bosh", "sh"),
-];
-
-/// The shell `base` names: a [`SHELLS`] entry, one with a version suffix
-/// (`bash5.2`, `ksh93`, `zsh-5.9`) or `-static`, or a POSIX-family shell
-/// under another name.
+/// The shells whose `-c` text, stdin and script files the walker reads.
 #[must_use]
-pub fn shell_of(base: &str) -> Option<&'static str> {
-    if let Some(s) = SHELLS.iter().find(|n| **n == base) {
-        return Some(s);
-    }
-    let stem = |name: &'static str| -> Option<&'static str> {
-        let rest = base.strip_prefix(name)?;
-        let rest = rest.strip_prefix('-').unwrap_or(rest);
-        let versioned = rest == "static"
-            || (rest.starts_with(|c: char| c.is_ascii_digit())
-                && rest.chars().all(|c| c.is_ascii_digit() || c == '.'));
-        versioned.then_some(name)
-    };
-    POSIX_SHELLS
-        .iter()
-        .find(|(n, _)| *n == base)
-        .map(|(_, s)| *s)
-        .or_else(|| {
-            // Longest stem first: `bash5` is bash, not a versioned `ba`.
-            let mut stems: Vec<&'static str> = SHELLS.to_vec();
-            stems.sort_by_key(|s| std::cmp::Reverse(s.len()));
-            stems.into_iter().find_map(stem)
-        })
+pub fn is_shell(name: &str) -> bool {
+    matches!(name, "sh" | "bash" | "zsh" | "dash")
 }
 
-const WRAPPERS: &[&str] = &[
-    "env", "command", "builtin", "exec", "nohup", "timeout", "nice", "ionice", "stdbuf", "time",
-    "taskset", "setsid", "flock", "chrt", "unbuffer", "xargs", "find", "parallel",
-];
-
-const LAUNCHERS: &[&str] = &[
-    "sudo",
-    "doas",
-    "su",
-    "runuser",
-    "setpriv",
-    "pkexec",
-    "systemd-run",
-    "machinectl",
-    "ssh",
-    "tmux",
-    "screen",
-    "at",
-    "batch",
-    "kitty",
-    "kitten",
-    "docker",
-    "podman",
-    "nsenter",
-    "unshare",
-    "chroot",
-    "bwrap",
-    "firejail",
-    "flatpak-spawn",
-    "busctl",
-    "dbus-send",
-    "script",
-    "watch",
-    // Item 40, review notes 11 and 1. pty runners: they also give a
-    // TTY-only command the terminal it checks for.
-    "dtach",
-    "abduco",
-    "empty",
-    "faketty",
-    "ttyd",
-    "gotty",
-    "rlwrap",
-    // Terminals (`-e CMD`) and what types into one.
-    "konsole",
-    "yakuake",
-    "xterm",
-    "uxterm",
-    "alacritty",
-    "gnome-terminal",
-    "kgx",
-    "ptyxis",
-    "xfce4-terminal",
-    "mate-terminal",
-    "lxterminal",
-    "qterminal",
-    "terminator",
-    "tilix",
-    "terminology",
-    "urxvt",
-    "rxvt",
-    "st",
-    "foot",
-    "footclient",
-    "wezterm",
-    "ghostty",
-    "zellij",
-    "x-terminal-emulator",
-    "wtype",
-    "ydotool",
-    "xdotool",
-    "dotool",
-    "dotoolc",
-    "qdbus",
-    "qdbus6",
-    "qdbus-qt6",
-    "gdbus",
-    // Another identity, root, environment or file system view.
-    "run0",
-    "sg",
-    "newgrp",
-    "capsh",
-    "fakeroot",
-    "fakechroot",
-    "faketime",
-    "proot",
-    "schroot",
-    "systemd-nspawn",
-    "lxc-attach",
-    "toolbox",
-    "distrobox",
-    "distrobox-enter",
-    "envdir",
-    "chpst",
-    "setuidgid",
-    "envuidgid",
-    "softlimit",
-    "ssh-agent",
-    "dbus-launch",
-    "dbus-run-session",
-    "torsocks",
-    "proxychains",
-    "proxychains4",
-    "tsocks",
-    // Supervisors, queues, watchers and benchmarks.
-    "tini",
-    "dumb-init",
-    "daemonize",
-    "start-stop-daemon",
-    "watchexec",
-    "entr",
-    "nodemon",
-    "hyperfine",
-    "pueue",
-    "tsp",
-    "nq",
-    "sem",
-    // macOS (item 21/20, review G2): launchd runs a job with its own
-    // environment; a sandbox profile changes what the command sees.
-    "launchctl",
-    "sandbox-exec",
-];
-
-const VAR_WRITERS: &[&str] = &[
-    "export",
-    "declare",
-    "typeset",
-    "local",
-    "readonly",
-    "unset",
-    "read",
-    "mapfile",
-    "readarray",
-    "printf",
-    "getopts",
-    "let",
-    "wait",
-];
-
-/// The class of command name `base` (a basename).
+/// Programs whose arguments are text or patterns and never a command:
+/// ASK case 5 does not read their words.
 #[must_use]
-pub fn classify(base: &str) -> Class {
-    if let Some(w) = WRAPPERS.iter().find(|n| **n == base) {
-        return Class::Wrapper(w);
-    }
-    if let Some(l) = LAUNCHERS.iter().find(|n| **n == base) {
-        return Class::Launcher(l);
-    }
-    if let Some(s) = shell_of(base) {
-        return Class::Shell(s);
-    }
-    if let Some(o) = OPAQUE.iter().find(|n| **n == base) {
-        return Class::Opaque(o);
-    }
-    if let Some(v) = VAR_WRITERS.iter().find(|n| **n == base) {
-        return Class::VarWrite(v);
-    }
-    if let Some(a) = super::agents::agent_of(base) {
-        return Class::Agent(a);
-    }
-    match base {
-        "eval" => Class::Eval,
-        "source" | "." => Class::Source,
-        "cd" => Class::Cd("cd"),
-        "pushd" => Class::Cd("pushd"),
-        "popd" => Class::Cd("popd"),
-        "busybox" => Class::Busybox,
-        _ => interp(base).map_or(Class::Other, Class::Interp),
-    }
-}
-
-/// The interpreter `base` names, if any (`python3.12` included).
-#[must_use]
-pub fn interp(base: &str) -> Option<Lang> {
-    let versioned = |stem: &str| {
-        base.strip_prefix(stem)
-            .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
-    };
-    if versioned("python") || versioned("pypy") {
-        return Some(Lang::Python);
-    }
-    if versioned("perl") {
-        return Some(Lang::Perl);
-    }
-    if versioned("ruby") {
-        return Some(Lang::Ruby);
-    }
-    if versioned("php") {
-        return Some(Lang::Php);
-    }
-    if versioned("lua") || base == "luajit" {
-        return Some(Lang::Lua);
-    }
-    match base {
-        "node" | "nodejs" => Some(Lang::Node),
-        "bun" => Some(Lang::Bun),
-        "deno" => Some(Lang::Deno),
-        "awk" | "gawk" | "mawk" | "nawk" => Some(Lang::Awk),
-        _ => None,
-    }
-}
-
-/// G1, G5 (review G5 PATH): bash builtins and keywords that can start a
-/// simple command. bash runs them without a PATH search, so a PATH the
-/// command changes does not change what they run (`enable -n`, which
-/// turns one off, denies).
-#[must_use]
-pub fn bash_builtin(name: &str) -> bool {
+pub fn takes_text(name: &str) -> bool {
     matches!(
         name,
-        "." | ":"
-            | "["
-            | "alias"
-            | "bg"
-            | "bind"
-            | "break"
-            | "builtin"
-            | "caller"
-            | "cd"
-            | "command"
-            | "compgen"
-            | "complete"
-            | "compopt"
-            | "continue"
-            | "declare"
-            | "dirs"
-            | "disown"
-            | "echo"
-            | "enable"
-            | "eval"
-            | "exec"
-            | "exit"
-            | "export"
-            | "false"
-            | "fc"
-            | "fg"
-            | "getopts"
-            | "hash"
-            | "help"
-            | "history"
-            | "jobs"
-            | "kill"
-            | "let"
-            | "local"
-            | "logout"
-            | "mapfile"
-            | "popd"
-            | "printf"
-            | "pushd"
-            | "pwd"
-            | "read"
-            | "readarray"
-            | "readonly"
-            | "return"
-            | "set"
-            | "shift"
-            | "shopt"
-            | "source"
-            | "suspend"
-            | "test"
-            | "time"
-            | "times"
-            | "trap"
-            | "true"
-            | "type"
-            | "typeset"
-            | "ulimit"
-            | "umask"
-            | "unalias"
-            | "unset"
-            | "wait"
+        "echo" | "printf" | "grep" | "egrep" | "fgrep" | "rg" | "sed" | "awk" | "gawk" | "jq"
     )
 }
 
-/// Names a function must not take: it would change what the guard thinks
-/// a command does.
-#[must_use]
-pub fn reserved_function_name(name: &str) -> bool {
-    classify(name) != Class::Other
-        || matches!(
-            name,
-            "git" | "tollgate" | "alias" | "hash" | "trap" | "enable" | "rm" | "mv" | "cp" | "ln"
-        )
-        || name.starts_with("git-")
-}
-
-/// Why writing variable `name` is denied (G5) in any position, except
-/// [`scoped`] ones and `TOLLGATE_INLINE_CAP` (G6).
-#[must_use]
-pub fn sensitive(name: &str) -> Option<&'static str> {
-    if matches!(name, "GIT_CONFIG_COUNT" | "GIT_CONFIG_PARAMETERS")
-        || name.starts_with("GIT_CONFIG_KEY_")
-        || name.starts_with("GIT_CONFIG_VALUE_")
-    {
-        return Some("carries the hook injection");
-    }
-    if name.starts_with("GIT_SSH") || name == "GIT_PROXY_COMMAND" {
-        return Some("picks the program git reaches a server with (X1)");
-    }
-    match name {
-        "GIT_EXEC_PATH" => Some("changes which git programs git and the gate hooks run (X1)"),
-        "BASH_ENV" | "ENV" | "PROMPT_COMMAND" | "SHELLOPTS" | "BASHOPTS" => {
-            Some("makes a shell run code the guard does not read (G3)")
-        }
-        "LESSOPEN" | "LESSCLOSE" => Some("makes less run a program on each file it shows (G3)"),
-        n if n.starts_with("LESSKEY") => {
-            Some("names a lesskey file, which can set LESS to run a command (G3)")
-        }
-        "UV_ENV_FILE" => {
-            Some("makes uv run load variables from a file the guard does not read (G5)")
-        }
-        "GIT_ALLOW_PROTOCOL" => {
-            Some("can turn on the ext:: transport, which runs a command (G3, item 21)")
-        }
-        "PS0" | "PS1" | "PS2" | "PS4" => Some(
-            "is a prompt bash expands with command substitution (PS4 on every `set -x` line) (G3)",
-        ),
-        n if n.starts_with("TOLLGATE_") && n != "TOLLGATE_INLINE_CAP" => {
-            Some("is tollgate's own setting")
-        }
-        _ => None,
-    }
-}
-
-/// Which commands a [`scoped`] variable matters to.
+/// A plain wrapper: it runs the command in its arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reach {
-    /// git and tollgate.
-    GitOrTollgate,
-    /// tollgate only: the hooks take their dirs from `install.json`.
-    Tollgate,
-    /// Agent CLIs only (review "nested agent without hooks").
-    Agent,
+pub enum Wrapper {
+    Env,
+    Command,
+    Exec,
+    Sudo,
+    Timeout,
+    Xargs,
+    Find,
+    /// `time`, `nice`, `nohup`: options, then the command.
+    Plain(&'static [&'static str]),
 }
 
-/// Variables denied only in a command that also runs git or tollgate
-/// (G5, R8): they choose the repo, the config files or the records those
-/// read, and nothing else. `GIT_INDEX_FILE` is not one: the gate hooks
-/// check the index git gives them (R17).
 #[must_use]
-pub fn scoped(name: &str) -> Option<(Reach, &'static str)> {
-    match name {
-        "HOME"
-        | "XDG_CONFIG_HOME"
-        | "GIT_CONFIG"
-        | "GIT_CONFIG_GLOBAL"
-        | "GIT_CONFIG_SYSTEM"
-        | "GIT_CONFIG_NOSYSTEM" => Some((
-            Reach::GitOrTollgate,
-            "decides which config files git and tollgate read",
-        )),
-        "GIT_DIR" | "GIT_WORK_TREE" | "GIT_COMMON_DIR" => Some((
-            Reach::GitOrTollgate,
-            "changes which repo and work tree git and the gate hooks use",
-        )),
-        "XDG_STATE_HOME" | "XDG_DATA_HOME" => Some((
-            Reach::Tollgate,
-            "changes which records and binary tollgate uses",
-        )),
-        // Review "nested agent without hooks": `CLAUDE_CONFIG_DIR` picks
-        // the user settings (and so tollgate's guard), `CLAUDE_CODE_SIMPLE`
-        // and `CLAUDE_CODE_SAFE_MODE` turn hooks off; the list of such
-        // variables is Claude Code's, so the whole prefix counts.
-        n if n.starts_with("CLAUDE") => Some((
-            Reach::Agent,
-            "decides which settings, and so which hooks, Claude Code loads",
-        )),
-        _ => None,
-    }
+pub fn wrapper(name: &str) -> Option<Wrapper> {
+    Some(match name {
+        "env" => Wrapper::Env,
+        "command" => Wrapper::Command,
+        "exec" => Wrapper::Exec,
+        "sudo" => Wrapper::Sudo,
+        "timeout" => Wrapper::Timeout,
+        "xargs" => Wrapper::Xargs,
+        "find" => Wrapper::Find,
+        "time" | "nohup" => Wrapper::Plain(&[]),
+        "nice" => Wrapper::Plain(&["-n", "--adjustment"]),
+        _ => return None,
+    })
 }
 
-/// Variables allowed in front of a gated git or tollgate command (G4).
-pub const GATED_ENV: &[&str] = &[
-    "GIT_EDITOR",
-    "GIT_SEQUENCE_EDITOR",
-    "EDITOR",
-    "VISUAL",
-    "GIT_PAGER",
-    "PAGER",
-    "LC_ALL",
-    "LANG",
-    "TZ",
-    "GIT_AUTHOR_NAME",
-    "GIT_AUTHOR_EMAIL",
-    "GIT_AUTHOR_DATE",
-    "GIT_COMMITTER_NAME",
-    "GIT_COMMITTER_EMAIL",
-    "GIT_COMMITTER_DATE",
-    "GIT_TERMINAL_PROMPT",
-    "GIT_INDEX_FILE",
-    "TOLLGATE_INLINE_CAP",
+/// Options of `sudo`, `timeout` and `xargs` that take the next word.
+pub const SUDO_VALUED: &[&str] = &[
+    "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "-D", "--chdir", "-r",
+    "-t", "-T", "-U",
+];
+pub const TIMEOUT_VALUED: &[&str] = &["-s", "--signal", "-k", "--kill-after"];
+pub const XARGS_VALUED: &[&str] = &[
+    "-I",
+    "-n",
+    "-P",
+    "-L",
+    "-d",
+    "-s",
+    "-a",
+    "-E",
+    "--max-args",
+    "--max-procs",
+    "--max-lines",
+    "--delimiter",
+    "--arg-file",
+    "--replace",
 ];
 
-/// How a program runs a value it reads from a variable, a config key or
-/// an option (G3, item 21).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Runs {
-    /// Shell code; `args`: the program appends arguments, as `"$@"`.
-    Shell { args: bool },
-    /// One program path, run with arguments and without a shell.
-    Program,
-    /// less options: `+cmd`, lesskey files and log files.
-    LessOpts,
-}
-
-/// Variables whose value a program runs (item 21): git's editors, pagers,
-/// askpass and external diff, and the editors and pagers other programs
-/// run (`man`, `crontab -e`, `systemctl`). Checked in front of every
-/// command and in every write position.
+/// The index of the first word of `args` that is not an option or the
+/// value of an option in `valued`. `--` ends the options.
 #[must_use]
-pub fn program_var(name: &str) -> Option<Runs> {
-    match name {
-        "GIT_EDITOR" | "GIT_SEQUENCE_EDITOR" | "EDITOR" | "VISUAL" | "GIT_EXTERNAL_DIFF" => {
-            Some(Runs::Shell { args: true })
-        }
-        "GIT_PAGER" | "PAGER" | "MANPAGER" | "SYSTEMD_PAGER" => Some(Runs::Shell { args: false }),
-        "GIT_ASKPASS" | "SSH_ASKPASS" | "SUDO_ASKPASS" => Some(Runs::Program),
-        "LESS" => Some(Runs::LessOpts),
-        _ => None,
-    }
-}
-
-/// Stands for the arguments a program appends to a value it runs (a file
-/// git made, a diff's paths, `get`): an absolute path that does not exist,
-/// so a value that runs its arguments (`env`, `sh`, `x=`) reads a script
-/// the guard cannot read and denies, while `sed -i` on it is allowed.
-pub const ARG_STAND_IN: &str = "/nonexistent/tollgate-guard-arg";
-
-/// `code` with the stand-in arguments appended, as git appends `"$@"`.
-#[must_use]
-pub fn with_args(code: &str) -> String {
-    format!("{code} {ARG_STAND_IN}")
-}
-
-/// The shell text a program runs for value `v` read as `r`, `None` when
-/// it runs nothing; `Err` (the reason) when the guard cannot read it as
-/// code.
-pub fn runs_code(r: Runs, v: &str) -> Result<Option<String>, String> {
-    let v = v.trim();
-    match r {
-        Runs::Shell { args } => {
-            Ok((!v.is_empty()).then(|| if args { with_args(v) } else { v.to_owned() }))
-        }
-        Runs::Program if v.is_empty() => Ok(None),
-        Runs::Program if program_path(v) => Ok(Some(with_args(v))),
-        Runs::Program => Err(format!(
-            "`{v}` is a program run without a shell; give a path of letters, digits and `/._+-@,:%` only"
-        )),
-        Runs::LessOpts if less_opts_ok(v) => Ok(None),
-        Runs::LessOpts => Err(format!(
-            "less options `{v}` run a command or name a lesskey or log file"
-        )),
-    }
-}
-
-/// A program path whose shell reading is the path itself: no blanks,
-/// quotes, expansions or operators, no `~` (an exec does not expand it)
-/// and no leading `-`.
-#[must_use]
-pub fn program_path(v: &str) -> bool {
-    !v.is_empty()
-        && !v.starts_with('-')
-        && v.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "/._+-@,:%".contains(c))
-}
-
-/// True when less options `v` (the `LESS` variable) run no command and
-/// write no file: no `+` initial command, no lesskey file (`-k`,
-/// `--lesskey-*`), no log file (`-o`, `-O`, `--log-file`), no shell text.
-#[must_use]
-pub fn less_opts_ok(v: &str) -> bool {
-    const RISKY_LONG: &[&str] = &["lesskey-file", "lesskey-src", "lesskey-content", "log-file"];
-    // Short options whose value is the rest of the word.
-    const VALUE: &str = "bhjpPtTxyzD#";
-    if v.contains(['!', '|', '$', '`', '\\', ';', '&']) {
-        return false;
-    }
-    v.split_whitespace().all(|t| {
-        if t.starts_with('+') {
-            return false;
-        }
-        if let Some(long) = t.strip_prefix("--") {
-            // less takes unambiguous prefixes of long names.
-            let name = long
-                .split('=')
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            return name.is_empty()
-                || !RISKY_LONG
-                    .iter()
-                    .any(|d| d.starts_with(&name) || name.starts_with(d));
-        }
-        for c in t.trim_start_matches(['-', '+']).chars() {
-            if matches!(c, 'k' | 'o' | 'O') {
-                return false;
-            }
-            if VALUE.contains(c) {
-                break;
-            }
-        }
-        true
-    })
-}
-
-/// Splits literal text into the words a shell or a launcher may run:
-/// blanks, shell operators, quotes and `=` separate them.
-pub fn tokens(text: &str) -> impl Iterator<Item = &str> {
-    text.split(|c: char| {
-        c.is_whitespace()
-            || matches!(
-                c,
-                ';' | '&' | '|' | '(' | ')' | '<' | '>' | '`' | '\'' | '"' | '$' | '=' | '{' | '}'
-            )
-    })
-    .filter(|t| !t.is_empty())
-}
-
-/// What a token runs, when it is git, tollgate, a shell or an interpreter
-/// (G2): the reason text.
-#[must_use]
-pub fn forbidden(token: &str, git_known: &[&str]) -> Option<&'static str> {
-    let base = token.rsplit('/').next().unwrap_or(token);
-    if base == "git"
-        || base
-            .strip_prefix("git-")
-            .is_some_and(|s| git_known.contains(&s))
-    {
-        return Some("git");
-    }
-    if base.eq_ignore_ascii_case("tollgate") {
-        return Some("tollgate");
-    }
-    if shell_of(base).is_some() || OPAQUE.contains(&base) || base == "busybox" {
-        return Some("a shell");
-    }
-    if interp(base).is_some() {
-        return Some("an interpreter");
-    }
-    if super::agents::agent_of(base).is_some() {
-        return Some("an agent CLI");
-    }
-    None
-}
-
-/// Why the tollgate subcommand starting `pos` (positional words in
-/// lowercase) is for a person only (R25), if it is.
-#[must_use]
-pub fn person_only(pos: &[&str]) -> Option<String> {
-    match pos {
-        ["waive", ..] => Some("tollgate waive is not for agents (R25)".into()),
-        ["remotes", "forget", ..] => {
-            Some("forgetting a lost trusted remote needs Victor's terminal (item 33, R25)".into())
-        }
-        ["policy", "approve", ..] => Some("policy approval is not for agents (R25)".into()),
-        // A pty wrapper (`script -c`, `unbuffer`) would give it the
-        // terminal it checks for and type the yes.
-        [s, ..] if matches!(*s, "install" | "uninstall") => Some(format!(
-            "tollgate {s} changes the Claude Code settings; it needs Victor's terminal (item 29, L10, R25)"
-        )),
-        ["baseline", "record", ..] => {
-            Some("baseline record needs Victor's terminal (R94, R25)".into())
-        }
-        _ => None,
-    }
-}
-
-/// Option grammar of a wrapper (getopt and getopt_long rules: short
-/// clusters, values glued or in the next word, long options as unique
-/// prefixes with `=` or the next word). Options it does not list are
-/// refused (the grammar is closed).
-#[derive(Debug, Clone, Copy)]
-pub struct Opts {
-    pub short_flags: &'static str,
-    pub short_val: &'static str,
-    /// Short options whose value is optional and only glued.
-    pub short_opt: &'static str,
-    pub long_flags: &'static [&'static str],
-    pub long_val: &'static [&'static str],
-    /// Long options whose value is optional and only after `=`.
-    pub long_opt: &'static [&'static str],
-}
-
-/// One parsed option: its name (`-x` or `--long`, long names in full) and
-/// its value (`Some` with the word index for a separate value).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Opt {
-    pub name: String,
-    pub value: Option<OptValue>,
-}
-
-/// Where an option's value is.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OptValue {
-    Glued(String),
-    Word(usize),
-}
-
-/// True when the literal options from `words[1]` on hold one of `no_run`
-/// (an option after which the wrapper runs nothing) before the first word
-/// bash builds at run time; only clusters of plain flags count.
-#[must_use]
-pub fn no_run_first(spec: &Opts, words: &[Option<String>], no_run: &[&str]) -> bool {
-    for w in words.iter().skip(1) {
-        let Some(a) = w.as_deref() else {
-            return false;
-        };
-        if a == "--" || a == "-" || !a.starts_with('-') {
-            return false;
-        }
-        if a.starts_with("--") {
-            if no_run.contains(&a.split('=').next().unwrap_or(a)) {
-                return true;
-            }
-            continue;
-        }
-        if !a[1..].chars().all(|c| spec.short_flags.contains(c)) {
-            return false;
-        }
-        if a[1..]
-            .chars()
-            .any(|c| no_run.contains(&format!("-{c}").as_str()))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Parses options from `words[start..]` (`None` for a non-literal word).
-/// Returns the options and the index of the first operand.
-///
-/// # Errors
-/// A non-literal word where an option may be, an unknown or ambiguous
-/// option, or a missing value.
-pub fn parse_opts(
-    spec: &Opts,
-    words: &[Option<String>],
-    start: usize,
-) -> Result<(Vec<Opt>, usize), String> {
-    let mut out = Vec::new();
-    let mut i = start;
-    while i < words.len() {
-        let Some(a) = words[i].as_deref() else {
-            return Err("a word bash builds at run time where options are read".into());
-        };
-        if a == "--" {
-            return Ok((out, i + 1));
-        }
-        if a == "-" || !a.starts_with('-') {
+pub fn operands_at(args: &[Arg], valued: &[&str]) -> usize {
+    let mut i = 0;
+    while let Some(a) = args.get(i) {
+        if a.dynamic || !a.is_opt() {
             break;
         }
-        if let Some(long) = a.strip_prefix("--") {
-            let (name, glued) = match long.split_once('=') {
-                Some((n, v)) => (n, Some(v.to_owned())),
-                None => (long, None),
-            };
-            let all = spec
-                .long_flags
-                .iter()
-                .chain(spec.long_val)
-                .chain(spec.long_opt);
-            let exact = all.clone().find(|n| **n == name);
-            let full = match exact {
-                Some(n) => *n,
-                None => {
-                    let hits: Vec<&&str> = all.filter(|n| n.starts_with(name)).collect();
-                    match hits.as_slice() {
-                        [one] if !name.is_empty() => **one,
-                        [] => return Err(format!("unknown option --{name}")),
-                        _ => return Err(format!("ambiguous option --{name}")),
-                    }
-                }
-            };
-            let value = if spec.long_val.contains(&full) {
-                match glued {
-                    Some(v) => Some(OptValue::Glued(v)),
-                    None => {
-                        i += 1;
-                        if i >= words.len() {
-                            return Err(format!("--{full} without its value"));
-                        }
-                        Some(OptValue::Word(i))
-                    }
-                }
-            } else if spec.long_opt.contains(&full) {
-                glued.map(OptValue::Glued)
-            } else if glued.is_some() {
-                return Err(format!("--{full} takes no value"));
-            } else {
-                None
-            };
-            out.push(Opt {
-                name: format!("--{full}"),
-                value,
-            });
+        i += 1;
+        if a.s == "--" {
+            break;
+        }
+        if valued.contains(&a.s.as_str()) {
             i += 1;
+        }
+    }
+    i
+}
+
+/// Which operands an ordinary tool writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    /// Every operand.
+    All,
+    /// Every operand, and the tool removes them (`rm`, `rmdir`).
+    Removed,
+    /// `mv`: the sources go away, the last operand is written.
+    Moved,
+    /// The last of two or more operands (`cp`, `ln`, `install`, `rsync`).
+    Last,
+    /// Every operand after the first (`chmod MODE`, `chown OWNER`); `-R`
+    /// reaches what is under them.
+    Rest,
+    /// `sed -i`: the files after the script.
+    Sed,
+    /// `perl -i`: the files after the code.
+    Perl,
+    /// `dd of=FILE`.
+    Dd,
+}
+
+/// The writer table (M3): name, how it picks its targets, and the options
+/// that take the next word.
+const WRITERS: &[(&str, Pick, &[&str])] = &[
+    ("rm", Pick::Removed, &[]),
+    ("rmdir", Pick::Removed, &[]),
+    ("mv", Pick::Moved, &["-S", "--suffix"]),
+    ("cp", Pick::Last, &["-S", "--suffix"]),
+    ("ln", Pick::Last, &["-S", "--suffix"]),
+    (
+        "install",
+        Pick::Last,
+        &["-m", "--mode", "-o", "--owner", "-g", "--group", "-S"],
+    ),
+    (
+        "rsync",
+        Pick::Last,
+        &["-e", "--rsh", "-f", "--filter", "--exclude", "--include"],
+    ),
+    ("tee", Pick::All, &[]),
+    ("unlink", Pick::Removed, &[]),
+    (
+        "touch",
+        Pick::All,
+        &["-d", "--date", "-r", "--reference", "-t"],
+    ),
+    (
+        "truncate",
+        Pick::All,
+        &["-s", "--size", "-r", "--reference"],
+    ),
+    ("chmod", Pick::Rest, &[]),
+    ("chown", Pick::Rest, &[]),
+    (
+        "sed",
+        Pick::Sed,
+        &["-e", "--expression", "-f", "--file", "-l"],
+    ),
+    ("perl", Pick::Perl, &["-I"]),
+    ("dd", Pick::Dd, &[]),
+];
+
+/// The words of `name args...` that the tool writes, each with "the tool
+/// removes it, or reaches what is under it"; `None` when `name` is not in
+/// the writer table.
+#[must_use]
+pub fn write_targets(name: &str, args: &[Arg]) -> Option<Vec<(Arg, bool)>> {
+    let (_, pick, valued) = WRITERS.iter().find(|(n, ..)| *n == name)?;
+    let mut ops: Vec<&Arg> = Vec::new();
+    let mut out: Vec<(Arg, bool)> = Vec::new();
+    // sed and perl: the option that edits in place, and the one that
+    // carries the script.
+    let (mut in_place, mut script_opt, mut recursive) = (false, false, false);
+    let mut i = 0;
+    let mut opts = true;
+    while let Some(a) = args.get(i) {
+        i += 1;
+        if !opts || a.dynamic || !a.is_opt() {
+            ops.push(a);
             continue;
         }
-        let cluster = &a[1..];
-        for (k, c) in cluster.char_indices() {
-            let rest = &cluster[k + c.len_utf8()..];
-            if spec.short_val.contains(c) {
-                let value = if rest.is_empty() {
-                    i += 1;
-                    if i >= words.len() {
-                        return Err(format!("-{c} without its value"));
-                    }
-                    OptValue::Word(i)
-                } else {
-                    OptValue::Glued(rest.to_owned())
-                };
-                out.push(Opt {
-                    name: format!("-{c}"),
-                    value: Some(value),
-                });
-                break;
-            }
-            if spec.short_opt.contains(c) {
-                out.push(Opt {
-                    name: format!("-{c}"),
-                    value: (!rest.is_empty()).then(|| OptValue::Glued(rest.to_owned())),
-                });
-                break;
-            }
-            if spec.short_flags.contains(c) {
-                out.push(Opt {
-                    name: format!("-{c}"),
-                    value: None,
-                });
-                continue;
-            }
-            return Err(format!("unknown option -{c}"));
-        }
-        i += 1;
-    }
-    Ok((out, i))
-}
-
-/// A wrapper's option grammar, its positional words before the command,
-/// and the options after which no command runs.
-#[must_use]
-pub fn wrapper_opts(name: &str) -> (Opts, usize, &'static [&'static str]) {
-    const NONE: Opts = Opts {
-        short_flags: "",
-        short_val: "",
-        short_opt: "",
-        long_flags: &["help", "version"],
-        long_val: &[],
-        long_opt: &[],
-    };
-    const HELP: &[&str] = &["--help", "--version"];
-    match name {
-        "command" => (
-            Opts {
-                short_flags: "pvV",
-                ..NONE
-            },
-            0,
-            &["-v", "-V"],
-        ),
-        "exec" => (
-            Opts {
-                short_flags: "cl",
-                short_val: "a",
-                ..NONE
-            },
-            0,
-            &[],
-        ),
-        "timeout" => (
-            Opts {
-                short_flags: "fpv",
-                short_val: "ks",
-                long_flags: &[
-                    "foreground",
-                    "preserve-status",
-                    "verbose",
-                    "help",
-                    "version",
-                ],
-                long_val: &["kill-after", "signal"],
-                ..NONE
-            },
-            1,
-            HELP,
-        ),
-        "nice" => (
-            Opts {
-                short_flags: "0123456789",
-                short_val: "n",
-                long_val: &["adjustment"],
-                ..NONE
-            },
-            0,
-            HELP,
-        ),
-        "ionice" => (
-            Opts {
-                short_flags: "t",
-                short_val: "cnpPu",
-                long_flags: &["ignore", "help", "version"],
-                long_val: &["class", "classdata", "pid", "pgid", "uid"],
-                ..NONE
-            },
-            0,
-            &[
-                "-p",
-                "-P",
-                "-u",
-                "--pid",
-                "--pgid",
-                "--uid",
-                "--help",
-                "--version",
-            ],
-        ),
-        "stdbuf" => (
-            Opts {
-                short_val: "ioe",
-                long_val: &["input", "output", "error"],
-                ..NONE
-            },
-            0,
-            HELP,
-        ),
-        "time" => (
-            Opts {
-                short_flags: "apqv",
-                short_val: "fo",
-                long_flags: &[
-                    "append",
-                    "portability",
-                    "quiet",
-                    "verbose",
-                    "help",
-                    "version",
-                ],
-                long_val: &["format", "output"],
-                ..NONE
-            },
-            0,
-            HELP,
-        ),
-        "taskset" => (
-            Opts {
-                short_flags: "acp",
-                long_flags: &["all-tasks", "cpu-list", "pid", "help", "version"],
-                ..NONE
-            },
-            1,
-            &["-p", "--pid", "--help", "--version"],
-        ),
-        "setsid" => (
-            Opts {
-                short_flags: "cfw",
-                long_flags: &["ctty", "fork", "wait", "help", "version"],
-                ..NONE
-            },
-            0,
-            HELP,
-        ),
-        "flock" => (
-            Opts {
-                short_flags: "sxeunoF",
-                short_val: "wE",
-                long_flags: &[
-                    "shared",
-                    "exclusive",
-                    "unlock",
-                    "nonblock",
-                    "nb",
-                    "close",
-                    "no-fork",
-                    "verbose",
-                    "help",
-                    "version",
-                ],
-                long_val: &["timeout", "wait", "conflict-exit-code"],
-                ..NONE
-            },
-            1,
-            HELP,
-        ),
-        "chrt" => (
-            Opts {
-                short_flags: "abdefioRrvmp",
-                short_val: "TPD",
-                long_flags: &[
-                    "all-tasks",
-                    "batch",
-                    "deadline",
-                    "ext",
-                    "fifo",
-                    "idle",
-                    "other",
-                    "rr",
-                    "reset-on-fork",
-                    "verbose",
-                    "max",
-                    "pid",
-                    "help",
-                    "version",
-                ],
-                long_val: &["sched-runtime", "sched-period", "sched-deadline"],
-                ..NONE
-            },
-            1,
-            &["-m", "-p", "--max", "--pid", "--help", "--version"],
-        ),
-        "unbuffer" => (
-            Opts {
-                short_flags: "p",
-                ..NONE
-            },
-            0,
-            &[],
-        ),
-        "xargs" => (
-            Opts {
-                short_flags: "0optrx",
-                short_val: "adEILnPs",
-                short_opt: "eil",
-                long_flags: &[
-                    "null",
-                    "open-tty",
-                    "interactive",
-                    "no-run-if-empty",
-                    "verbose",
-                    "exit",
-                    "show-limits",
-                    "help",
-                    "version",
-                ],
-                long_val: &[
-                    "arg-file",
-                    "delimiter",
-                    "max-args",
-                    "max-procs",
-                    "max-chars",
-                    "process-slot-var",
-                ],
-                long_opt: &["eof", "replace", "max-lines"],
-            },
-            0,
-            &["--show-limits", "--help", "--version"],
-        ),
-        // `nohup`, `builtin`, `setsid` without options.
-        _ => (NONE, 0, HELP),
-    }
-}
-
-/// The identifiers in `code`.
-pub fn identifiers(code: &str) -> impl Iterator<Item = &str> {
-    code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|t| t.chars().next().is_some_and(|c| !c.is_ascii_digit()))
-}
-
-/// Python names that run code or programs from data: dynamic imports,
-/// code from strings, deserializers that call functions, and modules
-/// that start programs (G3). Matched on the code outside string literals.
-const PY_SPAWN: &[&str] = &[
-    "__import__",
-    "importlib",
-    "eval",
-    "runpy",
-    "timeit",
-    "ctypes",
-    "cffi",
-    "pickle",
-    "cPickle",
-    "dill",
-    "cloudpickle",
-    "marshal",
-    "shelve",
-    "webbrowser",
-    "pydoc",
-    "pipepager",
-    "FunctionType",
-    "CodeType",
-    "InteractiveInterpreter",
-    "InteractiveConsole",
-    "create_subprocess_exec",
-    "create_subprocess_shell",
-    "pty",
-    "multiprocessing",
-    // The object graph reaches `os.system` without an import or a name:
-    // `().__class__.__base__.__subclasses__()`, a function's globals, a
-    // frame's.
-    "__subclasses__",
-    "__globals__",
-    "__code__",
-    "__closure__",
-    "__reduce__",
-    "__reduce_ex__",
-    "__loader__",
-    "_getframe",
-    "f_globals",
-    "f_locals",
-    "f_builtins",
-    "gi_frame",
-    "tb_frame",
-    "breakpoint",
-];
-
-/// Names in code of the other interpreters that run code built from a
-/// string or reach a function by a string (G3): `eval`, JavaScript's
-/// `Function` and constructor chain, Node's module loader and bindings,
-/// Ruby's `send`, Lua's `load`, PHP's callbacks.
-const DYNAMIC_CODE: &[&str] = &[
-    "eval",
-    "evaluate",
-    "Function",
-    "AsyncFunction",
-    "constructor",
-    "binding",
-    "_linkedBinding",
-    "dlopen",
-    "_load",
-    "runInThisContext",
-    "runInNewContext",
-    "runInContext",
-    "compileFunction",
-    "Worker",
-    "send",
-    "public_send",
-    "__send__",
-    "instance_eval",
-    "class_eval",
-    "module_eval",
-    "instance_exec",
-    "const_get",
-    "load",
-    "loadstring",
-    "dofile",
-    "loadfile",
-    "assert",
-    "create_function",
-    "call_user_func",
-    "call_user_func_array",
-    "preg_replace_callback",
-];
-
-/// Python names that reach an attribute by a string (G3) ...
-const PY_DYNAMIC: &[&str] = &[
-    "getattr",
-    "vars",
-    "globals",
-    "locals",
-    "__dict__",
-    "__getattribute__",
-    "modules",
-];
-
-/// ... of these modules.
-const PY_MODULES: &[&str] = &[
-    "os",
-    "posix",
-    "sys",
-    "builtins",
-    "__builtins__",
-    "subprocess",
-];
-
-/// Python `code` with string literals and comments removed (each literal
-/// becomes a blank), so names in text an edit script writes are not taken
-/// for calls. A program with an f- or t-string is returned whole: their
-/// replacement fields are code that may hold quotes of their own (3.12),
-/// which only a full parser follows. A backslash always escapes the next
-/// character (raw strings too: `r'\''` does not end at the second quote);
-/// a line break ends a one-line literal (Python refuses the program
-/// otherwise, so nothing in it runs).
-#[must_use]
-pub fn python_code(code: &str) -> String {
-    let c: Vec<char> = code.chars().collect();
-    let mut out = String::with_capacity(code.len());
-    let mut i = 0;
-    while i < c.len() {
-        match c[i] {
-            '#' => {
-                while i < c.len() && c[i] != '\n' {
-                    i += 1;
-                }
-            }
-            q @ ('\'' | '"') => {
-                // The letters right before an opening quote are its
-                // prefix when they start a token (`f'`, `rb"`), not the
-                // end of a name (`elif'`).
-                let prefix: Vec<char> = c[..i]
-                    .iter()
-                    .rev()
-                    .take_while(|p| p.is_alphanumeric() || **p == '_')
-                    .copied()
-                    .collect();
-                if prefix.len() <= 2
-                    && prefix.iter().any(|p| matches!(p, 'f' | 'F' | 't' | 'T'))
-                    && prefix
-                        .iter()
-                        .all(|p| matches!(p.to_ascii_lowercase(), 'f' | 't' | 'r' | 'b' | 'u'))
-                {
-                    return code.to_owned();
-                }
-                let triple = c.get(i + 1) == Some(&q) && c.get(i + 2) == Some(&q);
-                i += if triple { 3 } else { 1 };
-                while i < c.len() {
-                    if c[i] == '\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if triple {
-                        if c[i] == q && c.get(i + 1) == Some(&q) && c.get(i + 2) == Some(&q) {
-                            i += 3;
-                            break;
-                        }
-                    } else if c[i] == q || c[i] == '\n' {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-                out.push(' ');
-            }
-            ch => {
-                out.push(ch);
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
-/// Identifiers of process-spawning primitives in inline code (G3).
-const SPAWN: &[&str] = &[
-    "system",
-    "popen",
-    "Popen",
-    "subprocess",
-    "child_process",
-    "spawn",
-    "spawnSync",
-    "spawnl",
-    "spawnle",
-    "spawnlp",
-    "spawnlpe",
-    "spawnv",
-    "spawnve",
-    "spawnvp",
-    "spawnvpe",
-    "posix_spawn",
-    "posix_spawnp",
-    "exec",
-    "execSync",
-    "execFile",
-    "execFileSync",
-    "execl",
-    "execle",
-    "execlp",
-    "execlpe",
-    "execv",
-    "execve",
-    "execvp",
-    "execvpe",
-    "qx",
-    "proc_open",
-    "shell_exec",
-    "passthru",
-    "pcntl_exec",
-    "Open3",
-];
-
-/// Why inline code of `lang` may start a process (G3), or `None`.
-#[must_use]
-pub fn spawns(lang: Lang, code: &str) -> Option<String> {
-    if lang == Lang::Python {
-        let code = python_code(code);
-        let mut ids = identifiers(&code);
-        if let Some(id) = ids.find(|t| SPAWN.contains(t) || PY_SPAWN.contains(t)) {
-            return Some(format!("`{id}`"));
-        }
-        let dynamic = identifiers(&code).any(|t| PY_DYNAMIC.contains(&t));
-        let module = identifiers(&code).find(|t| PY_MODULES.contains(t));
-        return match (dynamic, module) {
-            (true, Some(m)) => Some(format!("dynamic attribute access with `{m}`")),
-            _ => None,
-        };
-    }
-    if let Some(id) = identifiers(code).find(|t| SPAWN.contains(t)) {
-        return Some(format!("`{id}`"));
-    }
-    if lang != Lang::Awk
-        && let Some(id) = identifiers(code).find(|t| DYNAMIC_CODE.contains(t))
-    {
-        return Some(format!(
-            "`{id}`, which runs code or calls a function named by a string,"
-        ));
-    }
-    match lang {
-        // `require(name)`, `import(name)` with a name built at run time.
-        Lang::Node | Lang::Bun | Lang::Deno if dynamic_module(code) => {
-            return Some("a module loaded by a name built at run time".into());
-        }
-        // `&{"name"}(...)`, `&$f(...)`: a sub called by a string.
-        Lang::Perl if code.contains("&{") || code.contains("&$") => {
-            return Some("a sub called by a name built at run time".into());
-        }
-        // `$f(...)`: a function called by a string.
-        Lang::Php if php_variable_call(code) => {
-            return Some("a function called by a variable".into());
-        }
-        _ => {}
-    }
-    match lang {
-        Lang::Perl | Lang::Ruby if code.contains('`') => Some("backquotes".into()),
-        Lang::Ruby if code.contains("%x") => Some("%x".into()),
-        Lang::Perl if code.contains('|') && identifiers(code).any(|t| t == "open") => {
-            Some("a pipe open".into())
-        }
-        Lang::Lua if identifiers(code).any(|t| t == "execute") => Some("os.execute".into()),
-        Lang::Deno if code.contains("Deno.run") || code.contains("Deno.Command") => {
-            Some("Deno.Command".into())
-        }
-        Lang::Awk => awk_pipe(code).then(|| "a pipe (print | cmd, cmd | getline)".into()),
-        _ => None,
-    }
-}
-
-/// True when JavaScript code loads a module whose name is not one string
-/// literal: `require(x)`, `require('a' + b)`, `import(x)`.
-fn dynamic_module(code: &str) -> bool {
-    for key in ["require", "import"] {
-        let mut rest = code;
-        while let Some(k) = rest.find(key) {
-            let before_ok = rest[..k]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '$' || c == '.'));
-            let after = rest[k + key.len()..].trim_start();
-            rest = &rest[k + key.len()..];
-            if !before_ok {
-                continue;
-            }
-            let Some(arg) = after.strip_prefix('(') else {
-                continue;
-            };
-            let arg = arg.trim_start();
-            let Some(q) = arg.chars().next().filter(|c| matches!(c, '\'' | '"')) else {
-                return true;
-            };
-            let body = &arg[1..];
-            let Some(end) = body.find(q) else {
-                return true;
-            };
-            if !body[end + 1..].trim_start().starts_with(')') {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// True when PHP code calls a variable as a function (`$f(...)`).
-fn php_variable_call(code: &str) -> bool {
-    let c: Vec<char> = code.chars().collect();
-    let mut k = 0;
-    while k < c.len() {
-        if c[k] == '$' {
-            let mut j = k + 1;
-            while j < c.len() && (c[j].is_alphanumeric() || c[j] == '_') {
-                j += 1;
-            }
-            while j < c.len() && c[j].is_whitespace() {
-                j += 1;
-            }
-            if j > k + 1 && c.get(j) == Some(&'(') {
-                return true;
-            }
-            k = j.max(k + 1);
+        let s = a.s.as_str();
+        // `chmod -x FILE`: a mode, not an option.
+        if name == "chmod" && s[1..].chars().all(|c| "rwxXstugo".contains(c)) {
+            ops.push(a);
             continue;
         }
-        k += 1;
-    }
-    false
-}
-
-/// True when an awk program has a `|` outside strings and regex literals
-/// (`print | "cmd"`, `"cmd" | getline`); `||` is a logical or.
-fn awk_pipe(code: &str) -> bool {
-    let c: Vec<char> = code.chars().collect();
-    let mut i = 0;
-    // The last significant character, to tell a regex `/` from division.
-    let mut prev = '\n';
-    while i < c.len() {
-        match c[i] {
-            '"' => {
+        if s == "--" {
+            opts = false;
+        } else if s == "-t" || s == "--target-directory" {
+            if *pick == Pick::Last || *pick == Pick::Moved {
+                out.extend(args.get(i).map(|t| (t.clone(), false)));
+            }
+            i += 1;
+        } else if let Some(t) = s.strip_prefix("--target-directory=") {
+            out.push((Arg::fixed(t), false));
+        } else if valued.contains(&s) {
+            script_opt |= matches!(s, "-e" | "--expression" | "-f" | "--file");
+            i += 1;
+        } else if s.starts_with("--") {
+            in_place |= s.starts_with("--in-place");
+            recursive |= s == "--recursive";
+            script_opt |= s.starts_with("--expression=") || s.starts_with("--file=");
+        } else {
+            // A short cluster: `-ni`, `-i.bak`, `-pi`, `-pie CODE`, `-R`.
+            let letters = &s[1..];
+            let before_i = letters.split('i').next().unwrap_or("");
+            in_place |=
+                letters.contains('i') && before_i.chars().all(|c| "pnlwsa0Eruz".contains(c));
+            recursive |= letters.contains('R');
+            let code = if *pick == Pick::Perl {
+                letters.ends_with(['e', 'E'])
+            } else {
+                *pick == Pick::Sed && letters.ends_with(['e', 'f'])
+            };
+            if code {
+                script_opt = true;
                 i += 1;
-                while i < c.len() && c[i] != '"' {
-                    if c[i] == '\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                prev = '"';
             }
-            '/' if "\n(,~!{};&|=".contains(prev) || prev.is_whitespace() => {
-                i += 1;
-                while i < c.len() && c[i] != '/' {
-                    if c[i] == '\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                prev = '/';
-            }
-            '|' => {
-                if c.get(i + 1) == Some(&'|') {
-                    i += 1;
-                    prev = '|';
-                } else {
-                    return true;
-                }
-            }
-            ch if ch.is_whitespace() => {}
-            ch => prev = ch,
         }
-        i += 1;
     }
-    false
+    let own = |a: &&Arg, removal: bool| ((*a).clone(), removal);
+    match pick {
+        Pick::All => out.extend(ops.iter().map(|a| own(a, false))),
+        Pick::Removed => out.extend(ops.iter().map(|a| own(a, true))),
+        Pick::Moved => {
+            let n = ops.len();
+            let sources = if out.is_empty() {
+                n.saturating_sub(1)
+            } else {
+                n
+            };
+            out.extend(ops.iter().enumerate().map(|(k, a)| own(a, k < sources)));
+        }
+        Pick::Last => {
+            if out.is_empty() && ops.len() >= 2 {
+                out.extend(ops.last().map(|a| own(a, false)));
+            }
+        }
+        Pick::Rest => out.extend(ops.iter().skip(1).map(|a| own(a, recursive))),
+        Pick::Sed | Pick::Perl => {
+            if in_place {
+                let skip = usize::from(!script_opt);
+                out.extend(ops.iter().skip(skip).map(|a| own(a, false)));
+            }
+        }
+        Pick::Dd => out.extend(ops.iter().filter_map(|a| {
+            let file = a.s.strip_prefix("of=")?;
+            Some((
+                Arg {
+                    s: file.to_owned(),
+                    dynamic: a.dynamic,
+                },
+                false,
+            ))
+        })),
+    }
+    Some(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn lits(v: &[&str]) -> Vec<Option<String>> {
-        v.iter().map(|s| Some((*s).to_owned())).collect()
-    }
-
-    /// Item 21/20 (review G2): versioned and other-named shells are
-    /// shells; names that only start like one are not.
-    #[test]
-    fn shell_names_item21_20() {
-        for (name, shell) in [
-            ("sh", "sh"),
-            ("bash5.2", "bash"),
-            ("bash-5.2", "bash"),
-            ("bash-static", "bash"),
-            ("ksh93", "ksh"),
-            ("zsh-5.9", "zsh"),
-            ("mksh", "mksh"),
-            ("oksh", "ksh"),
-            ("posh", "sh"),
-            ("dash0.5.12", "dash"),
-        ] {
-            assert_eq!(shell_of(name), Some(shell), "{name}");
-            assert_eq!(classify(name), Class::Shell(shell), "{name}");
-        }
-        for name in [
-            "ssh",
-            "shred",
-            "sha256sum",
-            "fish-lsp",
-            "fish_indent",
-            "bashrc",
-            "zshdb",
-            "shx",
-        ] {
-            assert_eq!(shell_of(name), None, "{name}");
-        }
-        for name in ["nu", "pwsh", "xonsh", "elvish", "rc", "osascript", "tclsh"] {
-            assert_eq!(classify(name), Class::Opaque(name), "{name}");
-            assert_eq!(forbidden(name, &[]), Some("a shell"), "{name}");
-        }
-        assert_eq!(forbidden("/usr/bin/bash5.2", &[]), Some("a shell"));
+    fn targets(cmd: &str) -> Vec<(String, bool)> {
+        let words: Vec<Arg> = cmd.split(' ').map(Arg::fixed).collect();
+        write_targets(&words[0].s, &words[1..])
+            .unwrap()
+            .into_iter()
+            .map(|(a, r)| (a.s, r))
+            .collect()
     }
 
     #[test]
-    fn getopt_rules() {
-        let (spec, pre, _) = wrapper_opts("timeout");
-        let w = lits(&["timeout", "-s", "KILL", "--kill-a=5", "10", "git"]);
-        let (opts, first) = parse_opts(&spec, &w, 1).unwrap();
-        assert_eq!(first + pre, 5);
-        assert_eq!(opts[0].value, Some(OptValue::Word(2)));
-        assert_eq!(opts[1].name, "--kill-after");
-        assert!(parse_opts(&spec, &lits(&["timeout", "--bogus", "1", "x"]), 1).is_err());
-        assert!(parse_opts(&spec, &[Some("timeout".into()), None], 1).is_err());
-        let (spec, _, _) = wrapper_opts("xargs");
-        let (opts, first) =
-            parse_opts(&spec, &lits(&["xargs", "-0rI{}", "git", "add"]), 1).unwrap();
-        assert_eq!(first, 2);
+    fn the_writer_table_picks_the_written_words() {
+        let t = |v: &[(&str, bool)]| -> Vec<(String, bool)> {
+            v.iter().map(|(s, r)| ((*s).to_owned(), *r)).collect()
+        };
+        assert_eq!(targets("rm -rf a b"), t(&[("a", true), ("b", true)]));
         assert_eq!(
-            opts.last().unwrap().value,
-            Some(OptValue::Glued("{}".into()))
+            targets("mv a b c"),
+            t(&[("a", true), ("b", true), ("c", false)])
         );
+        assert_eq!(targets("mv -t d a"), t(&[("d", false), ("a", true)]));
+        assert_eq!(targets("cp -r a b"), t(&[("b", false)]));
+        assert_eq!(targets("cp a"), t(&[]));
+        assert_eq!(targets("ln -sf a b"), t(&[("b", false)]));
+        assert_eq!(targets("install -m 755 a b"), t(&[("b", false)]));
+        assert_eq!(targets("tee -a a b"), t(&[("a", false), ("b", false)]));
+        assert_eq!(targets("chmod -R 700 a"), t(&[("a", true)]));
+        assert_eq!(targets("chown u:g a"), t(&[("a", false)]));
+        assert_eq!(targets("truncate -s 0 a"), t(&[("a", false)]));
+        assert_eq!(targets("dd if=a of=b"), t(&[("b", false)]));
+        // sed and perl write only with the in-place option.
+        assert_eq!(targets("sed -n 1,2p a"), t(&[]));
+        assert_eq!(targets("sed -i s/a/b/ a"), t(&[("a", false)]));
+        assert_eq!(targets("sed -i.bak -e s/a/b/ a"), t(&[("a", false)]));
+        assert_eq!(
+            targets("sed -ni -e p a b"),
+            t(&[("a", false), ("b", false)])
+        );
+        assert_eq!(targets("sed --in-place=.b s/a/b/ a"), t(&[("a", false)]));
+        assert_eq!(targets("sed -Ei s/a/b/ a"), t(&[("a", false)]));
+        assert_eq!(targets("perl -Mstrict -e 1 a"), t(&[]));
+        assert_eq!(targets("cp --target-directory=d a"), t(&[("d", false)]));
+        assert_eq!(targets("perl -ne print a"), t(&[]));
+        assert_eq!(targets("perl -pi -e s/a/b/ a"), t(&[("a", false)]));
+        assert_eq!(targets("perl -pie s/a/b/ a"), t(&[("a", false)]));
+        assert_eq!(targets("perl -i.bak -pe s/a/b/ a"), t(&[("a", false)]));
+        assert!(write_targets("cat", &[]).is_none());
     }
 
     #[test]
-    fn spawn_primitives_g3() {
-        for (lang, code) in [
-            (Lang::Python, "import os; os.system('git commit -n')"),
-            (Lang::Python, "import subprocess; subprocess.run(['git'])"),
-            (Lang::Perl, "print `git commit -n`"),
-            (Lang::Perl, "open(F, '|git commit -n')"),
-            (Lang::Ruby, "%x(git commit -n)"),
-            (
-                Lang::Node,
-                "require('child_process').execSync('git commit -n')",
-            ),
-            (Lang::Bun, "Bun.spawn(['git','commit','-n'])"),
-            (Lang::Lua, "os.execute('git commit -n')"),
-            (Lang::Php, "shell_exec('git commit -n');"),
-            (Lang::Awk, "BEGIN { system(\"git commit -n\") }"),
-            (Lang::Awk, "{ print | \"sh\" }"),
-            (Lang::Awk, "BEGIN { \"git commit -n\" | getline x }"),
-        ] {
-            assert!(spawns(lang, code).is_some(), "{code}");
-        }
-        for (lang, code) in [
-            (
-                Lang::Python,
-                "import json,sys; print(json.load(sys.stdin)[\"x\"])",
-            ),
-            (Lang::Awk, "/a|b/ { print $1 }"),
-            (Lang::Awk, "$1 == \"x|y\" || NR > 2 { print }"),
-            (Lang::Perl, "print if /fix/"),
-        ] {
-            assert_eq!(spawns(lang, code), None, "{code}");
-        }
-    }
-
-    /// Names in Python string literals and comments are text an edit
-    /// script writes, not calls (item 42); f- and t-strings hold code, so a
-    /// program with one is scanned whole.
-    #[test]
-    fn python_text_in_strings_is_not_a_call_g3() {
-        for code in [
-            r#"p='a.rs'; s=open(p).read()
-s=s.replace('Command::new("git").spawn()', 'x')
-open(p,'w').write(s)"#,
-            r#"s = '''
-fn run() { exec(cmd); system("x") }
-'''
-# subprocess is mentioned here
-print(len(s))"#,
-            r#"s = r'\\' + "os.system"
-print(s)"#,
-            r#"b = b'popen'; u = u"spawn"; print(b, u)"#,
-            r#"x = """a "quoted" exec""" ; print(x)"#,
-        ] {
-            assert_eq!(spawns(Lang::Python, code), None, "{code}");
-        }
-        for code in [
-            "import os\nos.system('git commit -n')",
-            "x = 'a' ; __import__('o' 's').system('x')",
-            "import importlib; importlib.import_module('os')",
-            "exec('print(1)')",
-            "eval(compile('1', 'f', 'eval'))",
-            "import timeit; timeit.timeit('x', setup='import os')",
-            r"s = '\'' ; os.system('git')",
-            r"s = 'abc\n' ; subprocess.run(['git'])",
-            "f'{x}' ; v = 'system'",
-            r#"f"{'"'}" ; v = 'x' ; os.system('git commit -n')"#,
-            "rf'{x}' 'exec'",
-            "t'{x}' 'spawn'",
-            "getattr(os, 'sys' + 'tem')('git commit -n')",
-            "import ctypes; ctypes.CDLL(None).system(b'x')",
-            "import pickle; pickle.loads(b'...')",
-            "import asyncio; asyncio.create_subprocess_exec('git')",
-            "import webbrowser; webbrowser.open('x')",
-        ] {
-            assert!(spawns(Lang::Python, code).is_some(), "{code}");
-        }
-    }
-
-    #[test]
-    fn tokens_and_forbidden_words_g2() {
-        let known = ["commit", "push"];
-        let t: Vec<&str> = tokens("journalctl -u app --since \"1 hour ago\"").collect();
-        assert_eq!(t[0], "journalctl");
-        assert!(tokens("cd /x && git commit -n").any(|t| forbidden(t, &known).is_some()));
-        assert!(tokens("--shell=/bin/bash").any(|t| forbidden(t, &known).is_some()));
-        assert!(forbidden("git-server", &known).is_none());
-        assert!(forbidden("git-commit", &known).is_some());
-        assert!(forbidden("python3.12", &known).is_some());
-        assert!(forbidden("psql", &known).is_none());
+    fn operands_start_after_the_options_and_their_values() {
+        let words: Vec<Arg> = "-k 5 --foreground 10 make"
+            .split(' ')
+            .map(Arg::fixed)
+            .collect();
+        assert_eq!(operands_at(&words, TIMEOUT_VALUED), 3);
+        let words: Vec<Arg> = "-- -x".split(' ').map(Arg::fixed).collect();
+        assert_eq!(operands_at(&words, &[]), 1);
     }
 }

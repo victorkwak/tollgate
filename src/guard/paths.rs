@@ -1,4 +1,4 @@
-//! Paths for the guard's write rules (R25, G7, G8, item 15).
+//! Paths for the guard's write rules (R25, R26, item 15).
 //!
 //! A path a command writes is made absolute against the tracked cwd,
 //! `.` and `..` are applied, and the longest existing prefix is resolved
@@ -90,171 +90,7 @@ pub fn tollgate_dir<'a>(ctx: &'a Context, path: &Path, removal: bool) -> Option<
     ctx.protected.iter().find(|d| touches(path, d, removal))
 }
 
-/// Review G7/R25: the tollgate dir that a program given `path` can write:
-/// `path` is in it, or `path` is a dir above it (`tar -x -C
-/// ~/.local/share`, `cp -r x/. ~`) and `spelled_as_path` (the text has a
-/// `/` or starts with `.` or `~`). `/` and the dirs above the home dir
-/// are left out, and so is a bare name (`config` in `git config`): `/` is
-/// a word in many commands that name no path (`tr / _`, `cut -d/`, `awk
-/// -F/`), `/home` and `/tmp` hold everyone's files, and a bare name
-/// reaches a dir above tollgate's only from a cwd that
-/// [`above_tollgate_dir`] covers.
-#[must_use]
-pub fn reaches_tollgate_dir<'a>(
-    ctx: &'a Context,
-    path: &Path,
-    spelled_as_path: bool,
-) -> Option<&'a PathBuf> {
-    if let Some(d) = tollgate_dir(ctx, path, false) {
-        return Some(d);
-    }
-    if !spelled_as_path {
-        return None;
-    }
-    let p = lower(path);
-    let p = p.trim_end_matches('/');
-    let d = tollgate_dir(ctx, path, true)?;
-    // Only now the home dir's real path: most paths are below no
-    // tollgate dir.
-    let home = lower(&canon(&ctx.home));
-    (!p.is_empty() && !home.starts_with(&format!("{p}/"))).then_some(d)
-}
-
-/// Review G7/R25: the tollgate dir that cwd `cwd` lies above, when `cwd`
-/// is not `/`, the home dir or a dir above it (`~/.local`,
-/// `~/.local/state`, `~/.config`): there a bare name (`share`, `state`)
-/// names a dir that holds tollgate's.
-#[must_use]
-pub fn above_tollgate_dir<'a>(ctx: &'a Context, cwd: &Path) -> Option<&'a PathBuf> {
-    let home = lower(&canon(&ctx.home));
-    let c = lower(cwd);
-    let c = c.trim_end_matches('/');
-    if c.is_empty() || home == c || home.starts_with(&format!("{c}/")) {
-        return None;
-    }
-    ctx.protected
-        .iter()
-        .find(|d| lower(d).starts_with(&format!("{c}/")))
-}
-
-/// Review G7/R25: true when `text` (a command, or a script it runs)
-/// spells one of tollgate's dirs: its path, or that path with the home dir
-/// as `~`, `$HOME` or `${HOME}`, or with an XDG base dir as
-/// `$XDG_..._HOME` or `${XDG_..._HOME}`, followed by the end, `/` or a
-/// character that cannot go on a dir name in a shell word (`tollgate-x`
-/// and `tollgate.bak` are other dirs). Case-insensitive.
-#[must_use]
-pub fn spells_tollgate_dir(ctx: &Context, text: &str) -> bool {
-    let low = text.to_lowercase();
-    if !low.contains("tollgate") {
-        return false;
-    }
-    let mut forms: Vec<String> = Vec::new();
-    for d in &ctx.protected {
-        let d = lower(d);
-        forms.push(d.clone());
-        for (var, value) in &ctx.vars {
-            let v = lower(Path::new(value));
-            let v = v.trim_end_matches('/');
-            if v.is_empty() {
-                continue;
-            }
-            if let Some(rest) = d.strip_prefix(&format!("{v}/")) {
-                let var = var.to_lowercase();
-                forms.push(format!("${var}/{rest}"));
-                forms.push(format!("${{{var}}}/{rest}"));
-                if var == "home" {
-                    forms.push(format!("~/{rest}"));
-                }
-            }
-        }
-    }
-    forms.iter().any(|f| {
-        low.match_indices(f.as_str()).any(|(k, _)| {
-            low[k + f.len()..]
-                .chars()
-                .next()
-                .is_none_or(|c| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.')))
-        })
-    })
-}
-
-/// Review G7/R25: true when `raw` (a word bash builds at run time, as
-/// written) holds the last two names of one of tollgate's dirs
-/// (`state/tollgate`, `share/tollgate`, `.config/tollgate`) or an XDG
-/// variable followed by `/tollgate` (`$X_HOME/tollgate`), then the end or
-/// a character that cannot go on a dir name. `target/debug/tollgate` and
-/// `~/Repos/tollgate` do not count.
-#[must_use]
-pub fn spells_tollgate_tail(ctx: &Context, raw: &str) -> bool {
-    let low = raw.to_lowercase();
-    if !low.contains("tollgate") {
-        return false;
-    }
-    let mut tails: Vec<String> = vec!["_home/tollgate".into(), "_home}/tollgate".into()];
-    for d in &ctx.protected {
-        if let (Some(n), Some(p)) = (d.file_name(), d.parent().and_then(Path::file_name)) {
-            tails.push(format!("{}/{}", p.to_string_lossy(), n.to_string_lossy()).to_lowercase());
-        }
-    }
-    tails.iter().any(|f| {
-        low.match_indices(f.as_str()).any(|(k, _)| {
-            low[k + f.len()..]
-                .chars()
-                .next()
-                .is_none_or(|c| !(c.is_alphanumeric() || matches!(c, '-' | '_' | '.')))
-        })
-    })
-}
-
-/// Review G7/R25: every text in argument `v` (its value as bash passes
-/// it) that a program may open as a path: the whole word (not an
-/// option), the value after each `=` (`--output=P`, `DESTDIR=P`), each
-/// part between `,` and `:` (`-Wl,-o,P`, `file://P`, `PATH`-like
-/// lists), and for a short option word every glued tail (`-oP`, `-uoP`).
-/// A leading `~` is also tried as the home dir: bash expands it after
-/// the `=` of a `NAME=` word and after `:` there, and a program may.
-#[must_use]
-pub fn path_candidates(v: &str, home: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut push = |t: &str| {
-        if t.is_empty() || t == "-" || t == "--" {
-            return;
-        }
-        if t == "~" {
-            out.push(home.to_owned());
-        } else if let Some(rest) = t.strip_prefix("~/") {
-            out.push(format!("{home}/{rest}"));
-        }
-        out.push(t.to_owned());
-    };
-    let option = v.starts_with('-');
-    if !option {
-        push(v);
-    }
-    for (k, c) in v.char_indices() {
-        if matches!(c, '=' | ',' | ':') {
-            let tail = &v[k + 1..];
-            push(tail);
-            push(tail.split([',', ':']).next().unwrap_or_default());
-        }
-    }
-    for part in v.split([',', ':', '=']) {
-        if !part.starts_with('-') {
-            push(part);
-        }
-    }
-    if option && !v.starts_with("--") {
-        for (k, _) in v.char_indices().skip(2) {
-            push(&v[k..]);
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
-/// G7: `.git/refs`, `.git/packed-refs`, `.git/config` or `.git/hooks`
+/// R26: `.git/refs`, `.git/packed-refs`, `.git/config` or `.git/hooks`
 /// (also inside them, and with `.git` of any case) when `path` is or is
 /// under one of them, or a worktree's `config.worktree` under `.git`
 /// (item 21); the name.
@@ -474,73 +310,15 @@ pub fn claude_settings(ctx: &Context, path: &Path) -> Option<PathBuf> {
     claude_hit(ctx, path).map(|_| path.to_owned())
 }
 
-/// R26 for a program that is not a known reader and may write any path
-/// it is given ([`claude_settings`] less a dir that only holds a
-/// settings dir: `fd x ~` writes nothing there, as R25 has it for
-/// tollgate's dirs).
+/// R26 for a file that an ordinary tool of a Bash command writes
+/// ([`claude_settings`]); a dir that only holds a settings dir counts
+/// when the tool removes it (`rm -rf ~`).
 #[must_use]
-pub fn claude_settings_word(ctx: &Context, path: &Path) -> bool {
-    claude_hit(ctx, path) == Some(ClaudeHit::Is)
-}
-
-/// A program run with `cwd` may write settings there: `cwd` is a dir
-/// named `.claude`, a user settings dir, or at or in a managed settings
-/// dir.
-#[must_use]
-pub fn claude_settings_dir(ctx: &Context, cwd: &Path) -> bool {
-    claude_hit(ctx, cwd) == Some(ClaudeHit::Is)
-}
-
-/// R26: `text` spells a Claude Code settings name (`.claude`, a managed
-/// settings name, the `$CLAUDE_CONFIG_DIR` path): a word bash builds at
-/// run time in a command that does may name a settings path.
-#[must_use]
-pub fn spells_claude(ctx: &Context, text: &str) -> bool {
-    let low = text.to_lowercase();
-    [".claude", "managed-settings", "claude-code", "claudecode"]
-        .iter()
-        .any(|n| low.contains(n))
-        || ctx
-            .var("CLAUDE_CONFIG_DIR")
-            .filter(|d| d.starts_with('/'))
-            .map(|d| d.trim_end_matches('/').to_lowercase())
-            .is_some_and(|d| !d.is_empty() && low.contains(&d))
-}
-
-/// R26, G7 (item 21 review): what interpreter code names that it may
-/// write: Claude Code settings (user, project, `$CLAUDE_CONFIG_DIR`,
-/// managed) or git's global config. `code` is lowercase. A raw-text
-/// match, so a read counts too.
-#[must_use]
-pub fn config_named(ctx: &Context, code: &str) -> Option<&'static str> {
-    let config_dir = ctx
-        .var("CLAUDE_CONFIG_DIR")
-        .filter(|d| d.starts_with('/'))
-        .map(|d| {
-            let d = PathBuf::from(d);
-            [lower(&d), lower(&canon(&d))]
-        });
-    let names_config_dir = config_dir.iter().flatten().any(|d| {
-        let d = d.trim_end_matches('/');
-        !d.is_empty() && code.contains(d)
-    });
-    if (code.contains(".claude") || names_config_dir) && code.contains("settings") {
-        Some("Claude Code settings")
-    } else if code.contains("claude_config_dir") {
-        Some("the Claude Code settings dir")
-    } else if code.contains("managed-settings")
-        || MANAGED_SETTINGS_DIRS
-            .iter()
-            .any(|d| code.contains(&d.to_lowercase()))
-    {
-        Some("Claude Code managed settings")
-    } else if code.contains("gitconfig")
-        || code.contains("git/config")
-        || code.contains("git_config_global")
-    {
-        Some("git's global config")
-    } else {
-        None
+pub fn claude_write(ctx: &Context, path: &Path, removal: bool) -> bool {
+    match claude_hit(ctx, path) {
+        Some(ClaudeHit::Is) => true,
+        Some(ClaudeHit::Holds) => removal,
+        None => false,
     }
 }
 
@@ -580,14 +358,6 @@ pub fn tool_write_reason(how: &str, path: &Path, tool: &Path) -> String {
     )
 }
 
-/// G7 for a removal: `rm -rf .git` (or a dir above it) removes the refs
-/// with it.
-#[must_use]
-pub fn holds_git_internals(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|n| n.eq_ignore_ascii_case(".git"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,29 +377,6 @@ mod tests {
         // `..` after a symlink applies to the link's target.
         let c = canon(&tmp.path().join("link/../real/z"));
         assert_eq!(c, std::fs::canonicalize(&real).unwrap().join("z"));
-    }
-
-    #[test]
-    fn path_candidates_find_glued_and_assigned_paths_review_g7() {
-        let has = |v: &str, want: &str| {
-            let c = path_candidates(v, "/h");
-            assert!(c.iter().any(|x| x == want), "{v}: {c:?} lacks {want}");
-        };
-        has("/s/tollgate/x", "/s/tollgate/x");
-        has("-o/s/tollgate/x", "/s/tollgate/x");
-        has("-uo/s/tollgate/x", "/s/tollgate/x");
-        has("-otollgate/x", "tollgate/x");
-        has("--output=/s/tollgate/x", "/s/tollgate/x");
-        has("--root=~/.local/share/tollgate", "/h/.local/share/tollgate");
-        has("DESTDIR=~/.local/share", "/h/.local/share");
-        has("PATH=/a:~/b", "/h/b");
-        has("-Wl,-o,/s/tollgate/x", "/s/tollgate/x");
-        has("file:///s/tollgate/x", "///s/tollgate/x");
-        has("~", "/h");
-        // An option word is no path; `--x` gets no glued tails.
-        let c = path_candidates("--verbose", "/h");
-        assert!(c.is_empty(), "{c:?}");
-        assert!(path_candidates("-", "/h").is_empty());
     }
 
     #[test]

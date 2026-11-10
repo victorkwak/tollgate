@@ -384,23 +384,25 @@ fn the_guard_reads_push_and_fetch_targets_in_under_10_ms_l19_item22() {
     );
 }
 
-/// Item 21/20 (review G2): shell, interpreter and wrapper words of a
-/// program the guard does not know are walked as the command it may run
-/// (a `PATH` lookup for a script name, once per word list, at most 4
-/// programs deep); the guard stays in budget, also for 100 such words
-/// (a walk per word would be exponential in their number).
+/// R26, `unclassified` case 5: the words of a program the guard does not
+/// know are read once as a command, from the first one that names git,
+/// tollgate or a shell; the guard stays in budget, also for 100 shell
+/// words and for 100 unknown programs in a row (a walk per word would be
+/// quadratic or worse in their number).
 #[test]
 fn the_guard_walks_words_of_unknown_programs_in_under_10_ms_l19_item21_20() {
     let meter = CpuMeter::new();
     let a = Armed::new();
-    let many = format!("frobnicate {}-c 'print(1)'", "python3 ".repeat(100));
+    let many = format!("frobnicate {}-c 'echo 1'", "sh ".repeat(100));
+    let chain = format!("{}git commit -n -m x", "frobnicate ".repeat(100));
     for (what, command, code) in [
         (
             "guard on words of unknown programs",
             "cargo test bash -- --nocapture && frobnicate sh -c 'git status && echo hi' && pytest -k sh tests/ && prlimit -n4096 cargo build".to_owned(),
             Some(0),
         ),
-        ("guard on 100 interpreter words", many, Some(2)),
+        ("guard on 100 shell words", many, Some(0)),
+        ("guard on 100 unknown programs", chain, Some(0)),
     ] {
         let input = serde_json::json!({
             "cwd": a.sb.root(),
@@ -567,15 +569,13 @@ fn pre_commit_cache_hit_with_a_full_remote_index_l19_item33() {
 }
 
 /// A 100 KB heredoc costs the guard about what reading the command costs
-/// (the same heredoc fed to `cat` next to a git command). Item 51: a
-/// python program next to git denies, and one in a command that runs no
-/// git passes once its text names no git or tollgate, both within 1.6x of
-/// `cat`, and a release build answers in the guard's 10 ms budget. A
-/// debug build reads any 100 KB command, `cat`'s too, in about 55 ms, so
-/// there only the ratio holds. Before (item 51 review, with the removed
-/// python check): `a.\n` 50000 times 1.95x `cat` in a debug build.
+/// (the same heredoc fed to `cat` next to a git command). Interpreter
+/// code is data: a python program is allowed next to git and alone, and
+/// the guard does not scan its text, so both stay within 1.6x of `cat`,
+/// and a release build answers in the guard's 10 ms budget. A debug
+/// build reads any 100 KB command, `cat`'s too, in tens of ms, so there
+/// only the ratio holds.
 #[test]
-#[ignore = "rescope unit 3: the closed-grammar guard allows a python heredoc next to git; the open-grammar walker enables this test again"]
 fn large_python_heredocs_cost_little_more_than_reading_them_l19() {
     let meter = CpuMeter::new();
     let a = Armed::new();
@@ -601,7 +601,7 @@ fn large_python_heredocs_cost_little_more_than_reading_them_l19() {
     ] {
         let body = line.repeat(100 * 1024 / line.len());
         let cat = guard("cat", &body, "\ngit status", 0);
-        for (case, tail, code) in [("next to git", "\ngit status", 2), ("no git", "", 0)] {
+        for (case, tail, code) in [("next to git", "\ngit status", 0), ("no git", "", 0)] {
             let python = guard("python3 -", &body, tail, code);
             let ratio = python.cpu.as_secs_f64() / cat.cpu.as_secs_f64();
             let what = format!("guard, 100 KB python heredoc of {what}, {case} ({ratio:.2}x cat)");
