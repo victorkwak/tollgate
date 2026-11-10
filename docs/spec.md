@@ -202,7 +202,7 @@ Reason: an agent can clone to `/tmp` and push from there. The remote is what han
 R6. Out-of-scope repos: gate hooks chain the repo's own hook (R7) and exit 0.
 
 R7. Chaining. For every installed hook name, tollgate must run the repo's own hook `<repo hooks path>/<name>` when it is executable, with the same arguments, the same stdin content (buffered, replayed) and the same cwd. Order: repo hook first for `pre-*` and message hooks, tollgate first for `reference-transaction`. A non-zero exit of the repo hook is the hook's exit. The repo hooks path is `core.hooksPath` from the repo's config files (worktree, local, global, system; parsed by tollgate without a subprocess; `include`/`includeIf` present -> fall back to `env -u GIT_CONFIG_* git rev-parse --git-path hooks`), else `<common dir>/hooks`.
-Reason: the injection replaces the repo's `core.hooksPath` (verified). agent_v's `.githooks` must still run. No subprocess on the hot path: a 60-commit rebase fires about 1300 `reference-transaction` calls (verified).
+Reason: the injection replaces the repo's `core.hooksPath` (verified). a repo's own `.githooks` must still run. No subprocess on the hot path: a 60-commit rebase fires about 1300 `reference-transaction` calls (verified).
 
 R8. tollgate must not read any environment variable to decide "enforce or not". There is no `TOLLGATE=0`.
 Reason: an env switch is a one-line bypass.
@@ -366,7 +366,7 @@ Note (the checkout equals the tree, review note 14): the checkout is a worktree 
 R43. The verify checkout owns its build outputs (`target/`, `node_modules/`, `.venv/`). It never shares `CARGO_TARGET_DIR` with agents' checkouts or with the other tier.
 Reason: workspace crates rebuild whenever the checkout path differs (verified); a stable path with its own target dir is the best incremental case and avoids build-dir lock contention.
 
-R44. Disk. Host config `verify.root`, `verify.min_free = "30G"`, `verify.max_target = "40G"` per checkout. Before a job, free space under `min_free` -> job `deferred`, no record, deny with the disk message. After a job, a target dir above `max_target` -> `cargo clean -p` of packages not in the current workspace, then full `cargo clean` if still above. `tollgate doctor` prints disk use per checkout. On the Mac, `cargo-guard.sh` must learn `verify.root` (change in agent_v `scripts/`, tracked in Q5).
+R44. Disk. Host config `verify.root`, `verify.min_free = "30G"`, `verify.max_target = "40G"` per checkout. Before a job, free space under `min_free` -> job `deferred`, no record, deny with the disk message. After a job, a target dir above `max_target` -> `cargo clean -p` of packages not in the current workspace, then full `cargo clean` if still above. `tollgate doctor` prints disk use per checkout. On the Mac, `cargo-guard.sh` must learn `verify.root` (change in notes-repo `scripts/`, tracked in Q5).
 Reason: myapp's target is 20 GB; `/home` has 83 GB free; cargo-guard refuses builds under 25 GB and cleans only `~/Repos/gatehouse*`.
 
 R45. Setup steps (`[[setup]]`, R70) run inside the verify checkout after R42 when any of their `when` paths' blob oids differ from `<checkout>/.tollgate-setup.json`. Detection (R72) adds `bun install --frozen-lockfile` per TS root and `uv sync --frozen` per Python root automatically.
@@ -558,7 +558,7 @@ R84. Host config `$XDG_CONFIG_HOME/tollgate/config.toml`:
 roots = ["~/Repos"]
 remotes = ["*gitlab.com:example-org/*", "*gitlab.com/example-org/*"]
 include = ["example-repo", "other-repo"]          # rollout; ["*"] = every repo under roots
-exclude = ["agent_v"]
+exclude = ["notes-repo"]
 
 [resources]
 cpu = 2

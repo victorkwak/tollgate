@@ -839,7 +839,7 @@ mod tests {
 roots = ["~/Repos"]
 remotes = ["*gitlab.com:example-org/*", "*gitlab.com/example-org/*"]
 include = ["example-repo", "other-repo"]
-exclude = ["agent_v"]
+exclude = ["notes-repo"]
 
 [resources]
 cpu = 2
@@ -1046,7 +1046,7 @@ SQLX_OFFLINE = "true"
             "https://gitlab.com/example-org/../evil/r.git",
             "https://gitlab.com/example-org/%2e%2e",
             "https://gitlab.com//example-org/r.git",
-            "https://gitlab.com/VictorKwak/r.git",
+            "https://gitlab.com/Example-Org/r.git",
         ] {
             assert!(!s.remote_trusted(url), "{url} trusted");
         }
@@ -1148,7 +1148,7 @@ SQLX_OFFLINE = "true"
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(home.join("Repos/example-repo/target/fixture")).unwrap();
-        std::fs::create_dir_all(home.join("Repos/agent_v")).unwrap();
+        std::fs::create_dir_all(home.join("Repos/notes-repo")).unwrap();
         std::fs::create_dir_all(home.join("elsewhere/clone")).unwrap();
         let dirs = Dirs::from_env(&EnvSnapshot::from_pairs([("HOME", home.as_os_str())])).unwrap();
         let scope = ScopeConfig {
@@ -1156,14 +1156,14 @@ SQLX_OFFLINE = "true"
             remotes: vec!["*gitlab.com:example-org/*".into()],
             trusted_paths: Vec::new(),
             include: vec!["*".into()],
-            exclude: vec!["agent_v".into()],
+            exclude: vec!["notes-repo".into()],
         };
         let s = CompiledScope::new(&scope, &dirs).unwrap();
         let none: [String; 0] = [];
         assert!(s.contains(&home.join("Repos/example-repo"), &none));
         // Depth exactly 1: a fixture repo nested in a checkout is out.
         assert!(!s.contains(&home.join("Repos/example-repo/target/fixture"), &none));
-        assert!(!s.contains(&home.join("Repos/agent_v"), &none));
+        assert!(!s.contains(&home.join("Repos/notes-repo"), &none));
         assert!(!s.contains(&home.join("elsewhere/clone"), &none));
         // A trusted remote puts a clone anywhere in scope (R5).
         let remote = ["git@GitLab.com:example-org/example-repo.git".to_owned()];
@@ -1178,9 +1178,9 @@ SQLX_OFFLINE = "true"
         // include/exclude still apply to remote matches: by the local name
         // or the project name; an excluded project in an excluded dir is
         // out, a clone of an allowed project is in whatever its dir name.
-        assert!(s.contains(&home.join("elsewhere/agent_v"), &remote));
-        let excluded = ["git@gitlab.com:example-org/agent_v.git".to_owned()];
-        assert!(!s.contains(&home.join("elsewhere/agent_v"), &excluded));
+        assert!(s.contains(&home.join("elsewhere/notes-repo"), &remote));
+        let excluded = ["git@gitlab.com:example-org/notes-repo.git".to_owned()];
+        assert!(!s.contains(&home.join("elsewhere/notes-repo"), &excluded));
         // Rollout: a renamed clone of an included project stays in scope by
         // its trusted remote's project name.
         let only = ScopeConfig {
