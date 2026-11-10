@@ -891,6 +891,30 @@ fn a_script_written_by_the_same_command_is_read_as_that_text() {
     ]);
 }
 
+/// An unquoted heredoc expands its parameters and substitutions, but the
+/// rest of its body is still the script's code.
+#[test]
+fn a_script_written_by_an_unquoted_heredoc_is_read_as_its_body() {
+    deny(
+        "no-verify",
+        &[
+            "cat <<EOF > t.sh\n#!/bin/bash\nset -e\ncd $HOME/src/app\ngit commit --no-verify -m \"wip\"\nEOF\nchmod +x t.sh && ./t.sh",
+            "cat > t.sh <<EOF\ncd $PWD\ngit push --no-verify origin main\nEOF\nbash t.sh",
+            "cat > t.sh <<EOF\ncd $(pwd)\ngit commit -n -m x\nEOF\nsh t.sh",
+            "cat <<EOF | bash\ncd $PWD\ngit commit -n -m x\nEOF",
+        ],
+    );
+    deny(
+        "env-i",
+        &["cat > t.sh <<EOF\nenv -i git commit -m \"$m\"\nEOF\nbash t.sh"],
+    );
+    allow(&[
+        "cat > t.sh <<EOF\ncd $PWD && cargo test\nEOF\nbash t.sh",
+        "cat > t.sh <<EOF\ncd $HOME/src/app\ngit commit -m \"$m\"\nEOF\nbash t.sh",
+        "cat <<EOF | bash\necho $PWD\nEOF",
+    ]);
+}
+
 #[test]
 fn bun_run_reads_the_script_from_package_json() {
     let tmp = tempfile::tempdir().unwrap();

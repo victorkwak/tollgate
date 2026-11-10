@@ -560,8 +560,11 @@ impl<'a> Walker<'a> {
                 .is_some_and(|n| n <= self.ctx.inline_cap)
     }
 
-    /// The text a literal `echo`, `printf` or `cat <<'EOF'` writes to its
-    /// stdout.
+    /// The text a literal `echo`, `printf` or `cat <<EOF` writes to its
+    /// stdout. An unquoted heredoc gives its body as written: its
+    /// expansions stay as the same `$...` code, which the walk of that
+    /// text then treats as words made at run time, and the rest is the
+    /// code the shell that reads it runs.
     fn output(args: &[Arg], redirs: &[Redir]) -> Option<String> {
         let name = args.first()?.lit()?;
         let rest = &args[1..];
@@ -571,7 +574,8 @@ impl<'a> Walker<'a> {
                 if r.op != Op::Here {
                     return None;
                 }
-                r.doc.as_ref()?.borrow().literal()
+                let doc = r.doc.as_ref()?.borrow();
+                Some(doc.literal().unwrap_or_else(|| doc.body.clone()))
             }
             "echo" => {
                 let mut words: Vec<&str> = rest.iter().map(Arg::lit).collect::<Option<_>>()?;

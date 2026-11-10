@@ -88,6 +88,8 @@ const HARMLESS: &[&str] = &[
     "cat >> notes.md <<'EOF'\nNever use git commit --no-verify. Do not run env -i git. GIT_CONFIG_COUNT stays set.\nEOF",
     "cat > tests/flag.rs <<'EOF'\n#[test] fn t() { assert!(deny(\"git commit --no-verify\")); }\nEOF",
     "cat > msg.txt <<'EOF'\ndocs: explain why --no-verify is denied\nEOF\ngit commit -F msg.txt",
+    "cat > t.sh <<EOF\ncd $PWD && cargo test\nEOF\nbash t.sh",
+    "cat > t.sh <<EOF\ncd $HOME/src/app\ngit status --short\nEOF\nbash t.sh",
     "printf 'run: tollgate install\\n' >> docs/setup.md",
     "echo \"see .claude/settings.json\" >> README.md",
     "sed -i 's/GIT_CONFIG_COUNT/GIT_CONFIG_KEY_0/' docs/spec.md",
@@ -240,6 +242,7 @@ const WRAPPERS: &[&str] = &[
     "find . -name x -exec {} \\;",
     "uv run {}",
     "cat > s.sh <<'EOF'\n{}\nEOF\nbash s.sh",
+    "cat > s.sh <<EOF\ncd $PWD\n{}\nEOF\nbash s.sh",
 ];
 
 /// More spellings of the deny rules.
@@ -266,6 +269,9 @@ const DENY: &[&str] = &[
     "tollgate remotes forget origin",
     "git checkout -B main",
     "git replace HEAD HEAD~1",
+    "cat <<EOF > t.sh\n#!/bin/bash\nset -e\ncd $HOME/src/app\ngit commit --no-verify -m \"wip\"\nEOF\nchmod +x t.sh && ./t.sh",
+    "cat > t.sh <<EOF\ncd $PWD\ngit push --no-verify origin main\nEOF\nbash t.sh",
+    "cat > t.sh <<EOF\nenv -i git commit -m \"$m\"\nEOF\nbash t.sh",
 ];
 
 /// One line for each case of the `unclassified` ask (R26), and other
