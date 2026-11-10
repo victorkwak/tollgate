@@ -1432,17 +1432,31 @@ mod tests {
     fn concurrent_writers_keep_every_remote_item33() {
         let tmp = tempfile::tempdir().unwrap();
         let d = records(tmp.path());
+        // A holder slower than LOCK_WAIT, as on a loaded host (in a gate
+        // job at load 40, 16 writers with four fsyncs each outran 2 s). A
+        // writer that waits too long denies (fail closed); its user runs
+        // the command again, so each writer here retries that deny only,
+        // and no write is lost.
+        let held = LockFile::acquire(&lock_path(&index_in(&d))).unwrap();
+        let write = |k: u8, r: TrustedRemote| {
+            for _ in 0..20 {
+                match at(&d, k, &Store(vec![oid(k)]), std::slice::from_ref(&r)) {
+                    Status::Broken(w) if w.contains("is held for more than") => {}
+                    Status::Broken(w) => panic!("writer {k}: {w}"),
+                    _ => return,
+                }
+            }
+            panic!("writer {k}: the lock stayed held");
+        };
         std::thread::scope(|s| {
+            s.spawn(move || {
+                std::thread::sleep(LOCK_WAIT + Duration::from_millis(300));
+                drop(held);
+            });
             for i in 0..8u8 {
-                let d = &d;
-                s.spawn(move || {
-                    let r = tr(&format!("r{i}"), &format!("/srv/r{i}.git"));
-                    let _ = at(d, 1, &Store(vec![oid(1)]), &[r]);
-                });
-                s.spawn(move || {
-                    let r = tr("origin", &format!("/srv/k{i}.git"));
-                    let _ = at(d, 10 + i, &Store(vec![oid(10 + i)]), &[r]);
-                });
+                let write = &write;
+                s.spawn(move || write(1, tr(&format!("r{i}"), &format!("/srv/r{i}.git"))));
+                s.spawn(move || write(10 + i, tr("origin", &format!("/srv/k{i}.git"))));
             }
         });
         let mut names: Vec<String> = read(&record_in(&d, &key(1)))
