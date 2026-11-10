@@ -176,8 +176,8 @@ pub struct Site<'a> {
 /// (git's `SHELL_PATH` default).
 const HOOK_SHELL: &str = "/bin/sh";
 
-/// Runs the repo's own hook `name` (R7) and returns its exit code; 0 when
-/// there is none. The hook runs directly, as git runs an executable hook
+/// Runs the repo's own hook `name` (R7) and returns its exit code; `None`
+/// when there is none. The hook runs directly, as git runs an executable hook
 /// file, on macOS and Linux alike. A file the kernel cannot exec (no `#!`
 /// line: ENOEXEC) runs as `/bin/sh <hook> <args>`, as git's run-command
 /// does.
@@ -186,9 +186,9 @@ pub fn run(
     args: &[OsString],
     input: Input<'_>,
     site: &Site<'_>,
-) -> Result<i32, String> {
+) -> Result<Option<i32>, String> {
     let Some(hook) = repo_hook(name, site.layout, site.env, site.dirs, site.exe)? else {
-        return Ok(0);
+        return Ok(None);
     };
     let command = |program: &Path, lead: Option<&Path>| {
         let mut cmd = Command::new(program);
@@ -225,5 +225,5 @@ pub fn run(
     let status = child
         .wait()
         .map_err(|e| format!("repo hook {}: {e}", hook.display()))?;
-    Ok(status.code().unwrap_or(1))
+    Ok(Some(status.code().unwrap_or(1)))
 }

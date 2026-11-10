@@ -27,6 +27,7 @@ pub mod ids;
 pub mod install;
 pub mod locks;
 pub mod merge;
+pub mod metrics;
 pub mod plan;
 pub mod policy;
 pub mod procs;

@@ -21,10 +21,23 @@ use crate::env::EnvSnapshot;
 use crate::gitx::{Git, Oid, RepoLayout};
 use crate::ids::JobId;
 use crate::locks::Priority;
+use crate::metrics::{self, HookOutcome};
 use crate::plan::{self, Base, Plan, PlanRequest, Settled, Started};
 use crate::policy;
 use crate::remote_refs::RemoteRefs;
 use crate::report::{self, JobReport};
+
+/// When a hook process started and how long the repo's own hook (R7)
+/// took. The logged hook time (item 50) runs from `started`, so process
+/// start, config, scope and remote loading and the staged-tree work are
+/// in it; `stats` leaves out `repo_hook`, which is not tollgate's time.
+#[derive(Debug, Clone, Copy)]
+pub struct HookClock {
+    /// Entry of `main` in the hook process.
+    pub started: Instant,
+    /// The repo hook's run time; `None` when the repo has none.
+    pub repo_hook: Option<Duration>,
+}
 
 /// What a gate hook needs, loaded once.
 #[derive(Debug)]
@@ -54,6 +67,8 @@ pub struct Gate<'a> {
     /// The trusted remotes' URLs and what their server reported (L2,
     /// R14(2)).
     pub remote_refs: RemoteRefs,
+    /// The hook's start, for the logged hook time.
+    pub clock: HookClock,
 }
 
 impl<'a> Gate<'a> {
@@ -65,6 +80,7 @@ impl<'a> Gate<'a> {
         exe: &'a Path,
         layout: RepoLayout,
         dirs: Dirs,
+        clock: HookClock,
     ) -> Result<Self, String> {
         let host = HostConfig::load(&dirs).map_err(|e| e.to_string())?;
         let v = host.config.validate();
@@ -93,6 +109,7 @@ impl<'a> Gate<'a> {
             trusted: trust.trusted,
             push_trusted: trust.push_trusted,
             remote_refs,
+            clock,
         })
     }
 
@@ -312,37 +329,57 @@ fn deny_record(gate: &Gate<'_>, check: &Check, found: &Lookup) {
     }
 }
 
-/// How one check ended, before printing.
+/// How one check ended, before printing; with what the metrics log
+/// keeps of it (item 50).
 enum Outcome {
-    Allowed,
-    Denied,
+    Allowed(HookOutcome, Option<JobId>),
+    Denied(HookOutcome, Option<JobId>),
     Running(JobId),
 }
 
-fn lookup_outcome(gate: &Gate<'_>, check: &Check, found: &Lookup) -> Outcome {
+impl Outcome {
+    fn allowed(&self) -> bool {
+        matches!(self, Self::Allowed(..))
+    }
+
+    fn metric(&self) -> (HookOutcome, Option<&JobId>) {
+        match self {
+            Self::Allowed(k, j) | Self::Denied(k, j) => (*k, j.as_ref()),
+            Self::Running(id) => (HookOutcome::RefusedCap, Some(id)),
+        }
+    }
+}
+
+/// `inline`: the record came from a job this hook waited for.
+fn lookup_outcome(gate: &Gate<'_>, check: &Check, found: &Lookup, inline: bool) -> Outcome {
     match found {
         Lookup::Pass(rec) => {
             allow_line(gate, check, &format!("record of job {}", rec.job_id));
-            Outcome::Allowed
+            let kind = if inline {
+                HookOutcome::Passed
+            } else {
+                HookOutcome::CacheHit
+            };
+            Outcome::Allowed(kind, Some(rec.job_id.clone()))
         }
         Lookup::Miss => {
             eprintln!("{}", header(gate, check, "none", None));
             eprintln!("tollgate: no record and no job");
-            Outcome::Denied
+            Outcome::Denied(HookOutcome::Error, None)
         }
-        other => {
-            deny_record(gate, check, other);
-            Outcome::Denied
+        Lookup::Fail(rec) | Lookup::Environmental(rec) => {
+            deny_record(gate, check, found);
+            Outcome::Denied(HookOutcome::Failed, Some(rec.job_id.clone()))
         }
     }
 }
 
 fn settled_outcome(gate: &Gate<'_>, check: &Check, settled: Settled) -> Outcome {
     match settled {
-        Settled::Record(found) => lookup_outcome(gate, check, &found),
+        Settled::Record(found) => lookup_outcome(gate, check, &found, true),
         Settled::Report(r) if r.passed() => {
             allow_line(gate, check, &format!("job {}", r.job_id));
-            Outcome::Allowed
+            Outcome::Allowed(HookOutcome::Passed, Some(r.job_id))
         }
         Settled::Report(r) => {
             let head = header(gate, check, &r.verdict_text(), Some(&r.job_id));
@@ -350,7 +387,7 @@ fn settled_outcome(gate: &Gate<'_>, check: &Check, settled: Settled) -> Outcome 
             if r.verdict.is_some_and(|v| v != Verdict::Pass) {
                 eprintln!("tollgate: to run the same tree again: {}", check.rerun_hint);
             }
-            Outcome::Denied
+            Outcome::Denied(HookOutcome::Failed, Some(r.job_id))
         }
         Settled::Running(id) => {
             eprintln!("{}", header(gate, check, "running", Some(&id)));
@@ -359,9 +396,48 @@ fn settled_outcome(gate: &Gate<'_>, check: &Check, settled: Settled) -> Outcome 
         Settled::Lost(m) => {
             eprintln!("{}", header(gate, check, "lost", None));
             eprintln!("tollgate: {m}");
-            Outcome::Denied
+            Outcome::Denied(HookOutcome::Error, None)
         }
     }
+}
+
+/// An id for one hook run (8 hex digits) from this process and `t`.
+fn run_id(t: jiff::Timestamp) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(&std::process::id().to_le_bytes());
+    h.update(&t.as_nanosecond().to_le_bytes());
+    h.finalize().to_hex()[..8].to_owned()
+}
+
+/// One metrics line per check (item 50); never fails the hook. The lines
+/// share `t`, `ms` and a run id, so `stats` takes one hook time per run.
+/// `ms` runs from the hook process's start ([`HookClock`]).
+fn record_metrics(gate: &Gate<'_>, checks: &[Check], outcomes: &[Outcome]) {
+    let ms_of = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let ms = ms_of(gate.clock.started.elapsed());
+    let repo_hook_ms = gate.clock.repo_hook.map(ms_of);
+    let t = jiff::Timestamp::now();
+    let repo = metrics::repo_name(&gate.layout.common_dir);
+    let run = run_id(t);
+    let events: Vec<metrics::Event> = outcomes
+        .iter()
+        .zip(checks)
+        .map(|(o, c)| {
+            let (outcome, job) = o.metric();
+            metrics::Event::Hook(metrics::HookEvent {
+                t,
+                hook: gate.hook.to_owned(),
+                repo: repo.clone(),
+                tier: c.tier,
+                outcome,
+                job: job.cloned(),
+                ms,
+                repo_hook_ms,
+                run: Some(run.clone()),
+            })
+        })
+        .collect();
+    metrics::record(&gate.dirs, &events);
 }
 
 /// Gates `checks`; returns the hook's exit code (0 allow, 1 deny).
@@ -391,20 +467,20 @@ pub fn decide(gate: &Gate<'_>, checks: &[Check], retry: &str, ask_remotes: &[Str
             Err(e) => {
                 eprintln!("{}", header(gate, check, "error", None));
                 eprintln!("tollgate: {e}");
-                outcomes.push(Outcome::Denied);
+                outcomes.push(Outcome::Denied(HookOutcome::Error, None));
                 continue;
             }
         };
         match plan::lookup(&gate.dirs, &p) {
             Ok(Lookup::Miss) => {}
             Ok(found) => {
-                outcomes.push(lookup_outcome(gate, check, &found));
+                outcomes.push(lookup_outcome(gate, check, &found, false));
                 continue;
             }
             Err(e) => {
                 eprintln!("{}", header(gate, check, "error", None));
                 eprintln!("tollgate: record store: {e}");
-                outcomes.push(Outcome::Denied);
+                outcomes.push(Outcome::Denied(HookOutcome::Error, None));
                 continue;
             }
         }
@@ -412,20 +488,21 @@ pub fn decide(gate: &Gate<'_>, checks: &[Check], retry: &str, ask_remotes: &[Str
             && let Some(how) = remote_verified(gate, check, ask_remotes)
         {
             allow_line(gate, check, &format!("remote-verified (R14): {how}"));
-            outcomes.push(Outcome::Allowed);
+            outcomes.push(Outcome::Allowed(HookOutcome::RemoteVerified, None));
             continue;
         }
         match plan::start(&gate.dirs, &p, gate.exe, gate.env) {
-            Ok(Started::Hit(found)) => outcomes.push(lookup_outcome(gate, check, &found)),
+            Ok(Started::Hit(found)) => outcomes.push(lookup_outcome(gate, check, &found, false)),
             Ok(s) => {
                 announce(gate, check, &s);
-                outcomes.push(Outcome::Allowed); // replaced after settle
+                // Replaced after settle.
+                outcomes.push(Outcome::Denied(HookOutcome::Error, None));
                 pending.push((i, p, s));
             }
             Err(e) => {
                 eprintln!("{}", header(gate, check, "error", None));
                 eprintln!("tollgate: {e}");
-                outcomes.push(Outcome::Denied);
+                outcomes.push(Outcome::Denied(HookOutcome::Error, None));
             }
         }
     }
@@ -455,7 +532,7 @@ pub fn decide(gate: &Gate<'_>, checks: &[Check], retry: &str, ask_remotes: &[Str
             Err(e) => {
                 eprintln!("{}", header(gate, check, "error", None));
                 eprintln!("tollgate: {e}");
-                Outcome::Denied
+                Outcome::Denied(HookOutcome::Error, None)
             }
         };
     }
@@ -483,11 +560,12 @@ pub fn decide(gate: &Gate<'_>, checks: &[Check], retry: &str, ask_remotes: &[Str
     // Item 17: trees a gate allowed count as checked, for the post hooks.
     let store = crate::cache::store::RecordStore::new(&gate.dirs);
     for (o, c) in outcomes.iter().zip(checks) {
-        if matches!(o, Outcome::Allowed) {
+        if o.allowed() {
             store.mark_passed_tree(&c.tree);
         }
     }
-    if outcomes.iter().all(|o| matches!(o, Outcome::Allowed)) {
+    record_metrics(gate, checks, &outcomes);
+    if outcomes.iter().all(Outcome::allowed) {
         crate::exit::OK
     } else {
         stale_lock_hint(gate);

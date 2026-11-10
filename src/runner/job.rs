@@ -1664,6 +1664,7 @@ impl Runner<'_> {
             }
         }
         self.flaky_log(now);
+        self.metrics(now);
         let from = [StateKind::Queued, StateKind::Running];
         if let Err(e) = self.store.transition(&self.spec.id, &from, state) {
             self.say(&format!("cannot write the final job state: {e}"));
@@ -1714,6 +1715,32 @@ impl Runner<'_> {
             }
             Err(e) => self.say(&format!("record not written: {e}")),
         }
+    }
+
+    /// The job's line in the metrics log (item 50).
+    fn metrics(&self, now: jiff::Timestamp) {
+        let r = &self.report;
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let event = crate::metrics::JobEvent {
+            t: now,
+            job: self.spec.id.clone(),
+            repo: crate::metrics::repo_name(&self.spec.common_dir),
+            tier: self.spec.tier,
+            by: match self.spec.priority {
+                Priority::Hook => "hook".into(),
+                Priority::Prewarm => "prewarm".into(),
+            },
+            verdict: r.verdict_text(),
+            wall_ms: crate::metrics::ms_between(r.created, now),
+            job_queue_ms: crate::metrics::ms_between(r.created, r.started.unwrap_or(now)),
+            slot_queue_ms: r.steps.iter().filter_map(|s| s.queue_ms).sum(),
+            checkout_wait_ms: r.checkout_wait_ms.unwrap_or(0),
+            steps: count(r.steps.len()),
+            steps_reused: count(r.steps.iter().filter(|s| s.reused_from.is_some()).count()),
+            flaky: count(r.flaky.len()),
+            quarantined: count(r.quarantined.len()),
+        };
+        crate::metrics::record(self.dirs, &[crate::metrics::Event::Job(event)]);
     }
 
     fn flaky_log(&self, now: jiff::Timestamp) {

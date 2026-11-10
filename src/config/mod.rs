@@ -15,7 +15,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-pub use host::{Budgets, CompiledScope, HostConfig, LoadedHost};
+pub use host::{Budgets, CompiledScope, HostConfig, LoadedHost, TrustedUrls};
 pub use repo::{RefRules, RepoConfig, ValidationContext};
 
 /// One validation finding, located by a config path such as `step[2] "tests"`.

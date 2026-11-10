@@ -172,7 +172,43 @@ pub fn reap_if_lost(dirs: &Dirs, id: &JobId) -> Result<bool, SchedError> {
         &[StateKind::Queued, StateKind::Running],
         JobState::Lost { reason },
     )?;
-    Ok(matches!(done, Transition::Done(_)))
+    let Transition::Done(meta) = done else {
+        return Ok(false);
+    };
+    lost_metrics(dirs, &meta);
+    Ok(true)
+}
+
+/// The lost job's line in the metrics log (item 50). Its runner died
+/// before it wrote one; without it, a cap refusal of the job would stay
+/// open in `tollgate stats`. Its run time is not known: only the time
+/// until the reap, which `stats` keeps out of the wall and queue samples.
+fn lost_metrics(dirs: &Dirs, meta: &JobMeta) {
+    let now = jiff::Timestamp::now();
+    let repo = crate::runner::job::JobSpec::read(dirs, &meta.id).map_or_else(
+        |_| "?".to_owned(),
+        |s| crate::metrics::repo_name(&s.common_dir),
+    );
+    let event = crate::metrics::JobEvent {
+        t: now,
+        job: meta.id.clone(),
+        repo,
+        tier: meta.tier,
+        by: match meta.priority {
+            Priority::Hook => "hook".into(),
+            Priority::Prewarm => "prewarm".into(),
+        },
+        verdict: crate::metrics::LOST.into(),
+        wall_ms: crate::metrics::ms_between(meta.created, now),
+        job_queue_ms: 0,
+        slot_queue_ms: 0,
+        checkout_wait_ms: 0,
+        steps: 0,
+        steps_reused: 0,
+        flaky: 0,
+        quarantined: 0,
+    };
+    crate::metrics::record(dirs, &[crate::metrics::Event::Job(event)]);
 }
 
 /// A waiting hook's registration (R89). Removed on drop or process death.

@@ -22,7 +22,7 @@ use crate::cache::toolcache::ToolCache;
 use crate::cache::{Fingerprint, record_key};
 use crate::config::host::JobConfig;
 use crate::config::repo::StepKind;
-use crate::config::{CompiledScope, LoadedHost, Platform, Tier};
+use crate::config::{CompiledScope, LoadedHost, Platform, Tier, TrustedUrls};
 use crate::dirs::Dirs;
 use crate::env::EnvSnapshot;
 use crate::gitx::{Git, GitError, Oid, RepoLayout};
@@ -564,6 +564,24 @@ pub fn remote_trust(git: &Git, scope: &CompiledScope) -> Result<RemoteTrust, Pla
     t.urls.sort();
     t.urls.dedup();
     Ok(t)
+}
+
+/// True when remote `name` alone has one fetch URL, as git uses it, that
+/// matches `scope.remotes`: one `git remote get-url` (item 37, L19).
+/// Whenever [`remote_trust`] succeeds, its `trusted` holds `name` exactly
+/// when this is true; where it fails (a URL with a control character, a
+/// configured URL a rewrite sends elsewhere), nothing that trusts its
+/// answer runs. An error (no such remote) is not trusted.
+pub fn remote_fetch_trusted(
+    git: &Git,
+    trusted: &TrustedUrls,
+    name: &str,
+) -> Result<bool, PlanError> {
+    let fetch = get_urls(git, name, false)?;
+    Ok(match fetch.as_slice() {
+        [url] => !has_control(url) && trusted.matches(url),
+        _ => false,
+    })
 }
 
 /// Remote names whose fetch URL, as git uses it, matches `scope.remotes`

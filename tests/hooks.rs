@@ -1204,6 +1204,131 @@ fn commits_made_without_the_gate_are_recorded_as_unverified_item17() {
     let json = sb.tollgate(&repo, &["status", "--json"]);
     let v: serde_json::Value = serde_json::from_str(&json.out).unwrap();
     assert_eq!(v["unverified"][0]["commit"], merge, "{v}");
+    // Security review note 1 (item 37): a fast-forward to a local branch
+    // made outside the hooks brings a commit no gate checked onto main; it
+    // is recorded like a commit made with --no-verify. Only the tip of a
+    // trusted remote's ref skips the record
+    // (fast_forwards_skip_the_record_only_for_a_trusted_remote_ref_item37).
+    sb.git(&repo, &["checkout", "-q", "-b", "up", "main"]);
+    let up = sb.commit_file(&repo, "u.txt", "1\n", "upstream");
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    let r = sb.hooked(&repo, &["merge", "--ff-only", "up"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(head(&sb, &repo), up);
+    assert!(
+        r.out.contains("WARNING") && r.out.contains(&up[..12]),
+        "{}",
+        r.out
+    );
+    // The same branch, merged without a fast-forward and without the gate,
+    // is still recorded: the merge commit is the tip of main only.
+    sb.git(&repo, &["checkout", "-q", "-b", "up2", "HEAD~1"]);
+    sb.commit_file(&repo, "u2.txt", "1\n", "upstream 2");
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    let r = sb.hooked(
+        &repo,
+        &["merge", "--no-ff", "--no-verify", "--no-edit", "up2"],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let merge2 = head(&sb, &repo);
+    assert!(
+        r.out.contains("WARNING") && r.out.contains(&merge2[..12]),
+        "{}",
+        r.out
+    );
+    // Detached HEAD: a --no-verify merge is recorded too.
+    sb.git(&repo, &["checkout", "-q", "--detach", "HEAD~1"]);
+    let r = sb.hooked(
+        &repo,
+        &["merge", "--no-ff", "--no-verify", "--no-edit", "up2"],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let merge3 = head(&sb, &repo);
+    assert!(
+        r.out.contains("WARNING") && r.out.contains(&merge3[..12]),
+        "{}",
+        r.out
+    );
+    sb.git(&repo, &["checkout", "-q", "main"]);
+}
+
+/// Item 37, security review note 1: `post-merge` skips the item 17 record
+/// for a fast-forward only when the new `HEAD` is the tip of a
+/// remote-tracking ref of a trusted remote, which the full check accepts
+/// too (a trusted remote has the commit). A local branch, a tag or a ref
+/// of an untrusted remote made at a commit no gate checked is recorded.
+#[test]
+fn fast_forwards_skip_the_record_only_for_a_trusted_remote_ref_item37() {
+    let sb = Sandbox::new();
+    let (repo, _bare) = trusted_repo(&sb, PASS);
+    let recorded = |commit: &str| {
+        let st = sb.tollgate(&repo, &["status"]);
+        st.out.contains(&format!("  {} ", &commit[..12]))
+    };
+    // Fetched from the trusted remote (`git pull`): nothing recorded,
+    // although no gate checked the commit here.
+    let other = sb.root().join("other-clone");
+    sb.git(
+        sb.root().as_path(),
+        &[
+            "clone",
+            "-q",
+            sb.root().join("remotes/trusted.git").to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    let pulled = sb.commit_file(&other, "p.txt", "1\n", "from another machine");
+    sb.git(&other, &["push", "-q", "origin", "main"]);
+    let r = sb.hooked(&repo, &["pull", "-q", "--ff-only", "origin", "main"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(head(&sb, &repo), pulled);
+    assert!(!r.out.contains("WARNING"), "{}", r.out);
+    assert!(
+        !recorded(&pulled),
+        "{}",
+        sb.tollgate(&repo, &["status"]).out
+    );
+    // A local branch made at a commit no gate checked.
+    sb.git(&repo, &["checkout", "-q", "-b", "side", "main"]);
+    let side = sb.commit_file(&repo, "s.txt", "1\n", "side");
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    let r = sb.hooked(&repo, &["merge", "--ff-only", "side"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(head(&sb, &repo), side);
+    assert!(
+        r.out.contains("WARNING") && r.out.contains(&side[..12]),
+        "{}",
+        r.out
+    );
+    assert!(recorded(&side));
+    // A tag at such a commit, with no branch at it.
+    sb.git(&repo, &["checkout", "-q", "--detach", "main"]);
+    let tagged = sb.commit_file(&repo, "t.txt", "1\n", "tagged");
+    sb.git(&repo, &["tag", "v1"]);
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    let r = sb.hooked(&repo, &["merge", "--ff-only", "v1"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(head(&sb, &repo), tagged);
+    assert!(r.out.contains(&tagged[..12]), "{}", r.out);
+    assert!(recorded(&tagged));
+    // The ref of a remote that scope.remotes does not trust.
+    let untrusted = sb.root().join("remotes/other.git");
+    std::fs::create_dir_all(&untrusted).unwrap();
+    sb.git(&untrusted, &["init", "-q", "--bare"]);
+    sb.git(
+        &repo,
+        &["remote", "add", "other", untrusted.to_str().unwrap()],
+    );
+    sb.git(&repo, &["checkout", "-q", "-b", "x", "main"]);
+    let foreign = sb.commit_file(&repo, "x.txt", "1\n", "foreign");
+    sb.git(&repo, &["push", "-q", "other", "x"]);
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    sb.git(&repo, &["branch", "-q", "-D", "x"]);
+    let r = sb.hooked(&repo, &["merge", "--ff-only", "other/x"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(head(&sb, &repo), foreign);
+    assert!(r.out.contains(&foreign[..12]), "{}", r.out);
+    assert!(recorded(&foreign));
 }
 
 /// Item 30: the unverified record keeps the git subcommand and a fixed

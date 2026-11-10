@@ -1201,6 +1201,40 @@ pub fn flaky(ctx: &Ctx, days: u32) -> u8 {
     }
 }
 
+/// `tollgate stats [--since D] [--json]` (item 50): the metrics log per
+/// repo and tier, and guard asks and denies by rule.
+pub fn stats(ctx: &Ctx, since_arg: Option<&str>, json: bool) -> u8 {
+    let dirs = match ctx.dirs() {
+        Ok(d) => d,
+        Err(e) => return fail(e),
+    };
+    let from = match since_arg.map(since).transpose() {
+        Ok(f) => f,
+        Err(e) => return fail(e),
+    };
+    let events = match crate::metrics::read(&dirs, from) {
+        Ok(log) => {
+            for m in &log.skipped {
+                eprintln!("tollgate: metrics log: {m}");
+            }
+            log.events
+        }
+        Err(e) => return fail(format!("metrics log: {e}")),
+    };
+    let s = crate::metrics::stats(&events, from);
+    if json {
+        match serde_json::to_string_pretty(&s) {
+            Ok(t) => println!("{t}"),
+            Err(e) => return fail(e),
+        }
+    } else {
+        for l in crate::metrics::render(&s) {
+            println!("{l}");
+        }
+    }
+    exit::OK
+}
+
 /// The hidden runner entry (`tollgate __run-job <id> --lock-fd 3`).
 pub fn run_job(ctx: &Ctx, job: &str, lock_fd: Option<i32>) -> u8 {
     let _lock = match lock_fd.map(crate::runner::spawn::adopt_lock).transpose() {

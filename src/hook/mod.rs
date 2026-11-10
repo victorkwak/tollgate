@@ -16,6 +16,7 @@ pub mod unverified;
 use std::ffi::{OsStr, OsString};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::dirs::Dirs;
 use crate::env::EnvSnapshot;
@@ -70,6 +71,9 @@ pub struct HookCtx {
     pub cwd: PathBuf,
     /// The running binary (a hook link).
     pub exe: PathBuf,
+    /// When the hook process started (`main`): the logged hook time runs
+    /// from here (item 50).
+    pub started: Instant,
 }
 
 /// tollgate's dirs for a hook running as `exe` (R8).
@@ -157,27 +161,39 @@ pub fn run(name: &'static str, args: &[OsString], ctx: &HookCtx) -> u8 {
     let input = stdin
         .as_deref()
         .map_or(chain::Input::Inherit, chain::Input::Replay);
-    match chain::run(name, args, input, &site) {
-        Ok(0) => {}
-        Ok(code) => return u8::try_from(code).unwrap_or(exit::FAIL),
+    let chain_started = Instant::now();
+    let repo_hook = match chain::run(name, args, input, &site) {
+        Ok(None) => None,
+        Ok(Some(0)) => Some(chain_started.elapsed()),
+        Ok(Some(code)) => return u8::try_from(code).unwrap_or(exit::FAIL),
         Err(e) => {
             eprintln!("tollgate: {name}: {e}");
             return exit::FAIL;
         }
-    }
+    };
     if !gate_hook {
-        // Item 17: a commit no gate hook of this git command allowed.
-        if let (true, Ok(d)) = (matches!(name, "post-commit" | "post-merge"), &dirs) {
-            unverified::detect(
-                &unverified::PostHook {
-                    name,
-                    args,
-                    layout: &layout,
-                    env: &ctx.env,
-                    exe: &ctx.exe,
-                },
-                d,
-            );
+        let clock = gate::HookClock {
+            started: ctx.started,
+            repo_hook,
+        };
+        if let Ok(d) = &dirs {
+            // Item 17: a commit no gate hook of this git command allowed.
+            let taken = if matches!(name, "post-commit" | "post-merge") {
+                unverified::detect(
+                    &unverified::PostHook {
+                        name,
+                        args,
+                        layout: &layout,
+                        env: &ctx.env,
+                        exe: &ctx.exe,
+                        clock,
+                    },
+                    d,
+                )
+            } else {
+                crate::metrics::ChainedExit::Chain
+            };
+            unverified::record_chained(d, name, &layout, clock, taken);
         }
         return exit::OK;
     }
@@ -191,7 +207,11 @@ pub fn run(name: &'static str, args: &[OsString], ctx: &HookCtx) -> u8 {
     };
     // R8: git calls and the runner see the install's dirs, not git's env.
     let env = dirs.env_for(&ctx.env);
-    let gate = match gate::Gate::open(name, &env, &ctx.exe, layout, dirs) {
+    let clock = gate::HookClock {
+        started: ctx.started,
+        repo_hook,
+    };
+    let gate = match gate::Gate::open(name, &env, &ctx.exe, layout, dirs, clock) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("tollgate: DENIED {name}: {e}");

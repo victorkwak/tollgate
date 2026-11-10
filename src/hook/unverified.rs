@@ -16,7 +16,9 @@
 //!   ([`crate::cache::store::RecordStore::tree_passed`]) and that no
 //!   trusted remote-tracking ref
 //!   contains is recorded in `<state>/unverified/<repo key>.json`, with a
-//!   loud warning.
+//!   loud warning. A `post-merge` fast-forward to the tip of a trusted
+//!   remote's ref (a `git pull`) is the cheap case of that rule (item
+//!   37); a fast-forward to a local branch or a tag is checked in full.
 //!
 //! `tollgate status` lists them, and every deny names them. Nothing is
 //! undone (a `reset` from a hook could lose work); the push gate, CI and
@@ -29,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::dirs::Dirs;
 use crate::fsx;
 use crate::gitx::{Git, Oid, RepoLayout};
+use crate::metrics::{self, ChainedExit};
 
 /// Entries kept per repo.
 const KEEP: usize = 200;
@@ -271,51 +274,59 @@ pub struct PostHook<'a> {
     pub env: &'a crate::env::EnvSnapshot,
     /// The running binary.
     pub exe: &'a Path,
+    /// The hook's start and its repo hook's time.
+    pub clock: super::gate::HookClock,
 }
 
 /// Item 17 in `post-commit` and `post-merge`; prints a warning when it
-/// records a commit. Never fails the hook.
-pub fn detect(hook: &PostHook<'_>, dirs: &Dirs) {
+/// records a commit. Never fails the hook. Returns the exit it took, for
+/// the metrics log.
+pub fn detect(hook: &PostHook<'_>, dirs: &Dirs) -> ChainedExit {
     if take_gate_run(dirs) {
-        return;
+        return ChainedExit::Marker;
     }
     // `post-merge 1` follows a squash merge, which makes no commit.
     if hook.name == "post-merge" && hook.args.first().is_some_and(|a| a == "1") {
-        return;
+        return ChainedExit::Squash;
     }
     let gd = &hook.layout.git_dir;
     if SEQUENCER_STATE.iter().any(|f| gd.join(f).exists()) {
-        return;
+        return ChainedExit::Sequencer;
     }
     let parent = super::argv::parent_git_args();
     if let Some(sub) = parent.as_deref().and_then(subcommand)
         && SEQUENCER_COMMANDS.contains(&sub.as_str())
     {
-        return;
-    }
-    // Item 37: cheap checks before Gate::open (L19, 5 ms). A fast-forward
-    // merge (a `git pull`) makes no commit: its new HEAD is the tip of
-    // another ref. Read from the git dir files, no subprocess.
-    if hook.name == "post-merge" && fast_forward(hook.layout) {
-        return;
+        return ChainedExit::Sequencer;
     }
     let env = dirs.env_for(hook.env);
+    // Item 37: cheap checks before Gate::open (L19, 5 ms). A `git pull`
+    // fast-forwards to the tip of a trusted remote's ref, which the full
+    // check accepts too.
+    if hook.name == "post-merge" && trusted_fast_forward(hook.layout, dirs, &env) {
+        return ChainedExit::FastForward;
+    }
     // A HEAD whose tree passed has nothing to record: one rev-parse.
     if let Ok(Some(tree)) = Git::scrubbed(&env, hook.layout.hooks_cwd()).tree_of("HEAD")
         && tree_passed(dirs, &tree)
     {
-        return;
+        return ChainedExit::TreePassed;
     }
-    let Ok(gate) =
-        super::gate::Gate::open(hook.name, &env, hook.exe, hook.layout.clone(), dirs.clone())
-    else {
-        return;
+    let Ok(gate) = super::gate::Gate::open(
+        hook.name,
+        &env,
+        hook.exe,
+        hook.layout.clone(),
+        dirs.clone(),
+        hook.clock,
+    ) else {
+        return ChainedExit::Full;
     };
     if !gate.in_scope() {
-        return;
+        return ChainedExit::Full;
     }
     let Some(entry) = unverified_head(&gate.git, dirs, &gate.trusted) else {
-        return;
+        return ChainedExit::Full;
     };
     eprintln!(
         "tollgate: WARNING: commit {} on {} was made without the gate ({} ran, but no pre-commit or pre-merge-commit of this git command allowed it: --no-verify?). It is recorded as unverified; tollgate status lists it. Check it with: tollgate check --rev {}",
@@ -333,22 +344,85 @@ pub fn detect(hook: &PostHook<'_>, dirs: &Dirs) {
             ..entry
         },
     );
+    ChainedExit::Recorded
 }
 
-/// Item 37: `HEAD` is the tip of a ref other than its own branch, so the
-/// merge before this `post-merge` was a fast-forward and made no commit.
-/// False when the git dir files cannot tell (the caller then checks).
-fn fast_forward(layout: &RepoLayout) -> bool {
+/// One metrics line for a chained hook run that exits 0 (L19, item 37):
+/// its time from the hook process's start and the exit it took. Never
+/// fails the hook.
+pub fn record_chained(
+    dirs: &Dirs,
+    name: &str,
+    layout: &RepoLayout,
+    clock: super::gate::HookClock,
+    exit: ChainedExit,
+) {
+    let us_of = |d: std::time::Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+    let us = us_of(clock.started.elapsed());
+    metrics::record(
+        dirs,
+        &[metrics::Event::Chained(metrics::ChainedEvent {
+            t: jiff::Timestamp::now(),
+            hook: name.to_owned(),
+            repo: metrics::repo_name(&layout.common_dir),
+            exit,
+            us,
+            repo_hook_us: clock.repo_hook.map(us_of),
+        })],
+    );
+}
+
+/// Remotes [`trusted_fast_forward`] asks about before it leaves the answer
+/// to the full check.
+const FF_REMOTES: usize = 4;
+
+/// Item 37, security review note 1: `HEAD` is the tip of a remote-tracking
+/// ref `refs/remotes/<remote>/...` of a trusted remote, so the merge
+/// before this `post-merge` fast-forwarded to a commit that remote has
+/// and made no commit. [`unverified_head`] would record nothing either:
+/// that ref contains `HEAD`. Any other ref at `HEAD` (a local branch, a
+/// tag, another namespace, an untrusted remote) can be made at a commit no
+/// gate checked, so it does not count. Refs come from the git dir files;
+/// the trust of each remote named there takes the host config and one
+/// `git remote get-url`. False when that cannot tell (the full check then
+/// runs).
+fn trusted_fast_forward(layout: &RepoLayout, dirs: &Dirs, env: &crate::env::EnvSnapshot) -> bool {
     use crate::gitx::ref_files::{self, Head};
-    let (oid, own) = match ref_files::head(layout) {
+    let oid = match ref_files::head(layout) {
         Some(Head::Symbolic(r)) => match ref_files::resolve(layout, &r) {
-            Some(oid) => (oid, Some(r)),
+            Some(oid) => oid,
             None => return false,
         },
-        Some(Head::Detached(oid)) => (oid, None),
+        Some(Head::Detached(oid)) => oid,
         None => return false,
     };
-    ref_files::other_ref_points_at(layout, &oid, own.as_deref()) == Some(true)
+    let Some(refs) = ref_files::remote_refs_at(layout, &oid) else {
+        return false;
+    };
+    // The remote is the first part after `refs/remotes/`, as the full
+    // check's `refs/remotes/<trusted>/` prefix reads it.
+    let mut remotes: Vec<&str> = refs
+        .iter()
+        .filter_map(|r| r.strip_prefix("refs/remotes/")?.split_once('/'))
+        .map(|(remote, _)| remote)
+        .collect();
+    remotes.dedup();
+    if remotes.is_empty() {
+        return false;
+    }
+    // A host config the full check would refuse records nothing there
+    // either, so it is not validated here (L19).
+    let Ok(host) = crate::config::HostConfig::load(dirs) else {
+        return false;
+    };
+    let Ok(trusted) = crate::config::TrustedUrls::new(&host.config.scope) else {
+        return false;
+    };
+    let git = Git::scrubbed(env, layout.hooks_cwd());
+    remotes
+        .iter()
+        .take(FF_REMOTES)
+        .any(|r| crate::plan::remote_fetch_trusted(&git, &trusted, r).unwrap_or(false))
 }
 
 /// `HEAD` when its tree never passed and no trusted remote-tracking ref

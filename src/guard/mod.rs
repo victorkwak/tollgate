@@ -55,6 +55,7 @@ use crate::dirs::Dirs;
 use crate::env::EnvSnapshot;
 use crate::exit;
 use crate::install::{self, InstallRecord};
+use crate::metrics;
 use rules::{Context, Ruling};
 
 /// The guard's answer.
@@ -95,15 +96,91 @@ const CAP_PREFIX: &str = "export TOLLGATE_INLINE_CAP=";
 /// Default `tiers.full_refs` (L7).
 const DEFAULT_FULL_REFS: &[&str] = &["main", "master", "integration/*"];
 
-/// Runs the guard on PreToolUse input `input` (R23).
+/// What the metrics log keeps of one guard call (item 50).
+#[derive(Debug, Default)]
+struct Note {
+    tool: Option<String>,
+    /// The command or file path; only its keyed hash is logged.
+    subject: Option<String>,
+    rule: Option<&'static str>,
+    ask: bool,
+    rewrite: bool,
+}
+
+impl Note {
+    /// `Ruling` carries no rule id yet: every ask and deny of the
+    /// closed-grammar walker logs the temporary id `closed-grammar`, and
+    /// every one of the Write/Edit path rules logs `file-path`. The
+    /// open-grammar walker gives each rule its own id.
+    fn ruling(&mut self, ruling: &Ruling, rule: &'static str) {
+        match ruling {
+            Ruling::Allow => {}
+            Ruling::Ask(_) => {
+                self.rule = Some(rule);
+                self.ask = true;
+            }
+            Ruling::Deny(_) => self.rule = Some(rule),
+        }
+    }
+}
+
+/// Runs the guard on PreToolUse input `input` (R23), and logs the
+/// decision to the metrics log (item 50). The log never changes the
+/// answer: [`metrics::record`] drops every error.
 #[must_use]
 pub fn guard(env: &EnvSnapshot, input: &[u8], exe: &Path, process_cwd: &Path) -> Answer {
+    let start = std::time::Instant::now();
+    let mut note = Note::default();
+    let answer = answer(env, input, exe, process_cwd, &mut note);
+    let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+    if let Ok(dirs) = Dirs::from_env(env) {
+        let decision = if answer.code != exit::OK {
+            metrics::Decision::Deny
+        } else if note.ask {
+            metrics::Decision::Ask
+        } else {
+            metrics::Decision::Allow
+        };
+        // Only asks and denies carry the hash: it serves the false-deny
+        // review (distinct commands per rule), and skipping it keeps the
+        // key read off the common allow path (about 25 µs of the 55 µs
+        // the log costs) and leaves fewer hashes to guess against.
+        let cmd = note
+            .subject
+            .as_deref()
+            .filter(|_| decision != metrics::Decision::Allow)
+            .and_then(|s| metrics::keyed_hash(&dirs, s));
+        metrics::record(
+            &dirs,
+            &[metrics::Event::Guard(metrics::GuardEvent {
+                t: jiff::Timestamp::now(),
+                tool: note.tool.unwrap_or_else(|| "?".into()),
+                decision,
+                rule: note.rule.map(str::to_owned),
+                rewrite: note.rewrite,
+                us,
+                cmd,
+            })],
+        );
+    }
+    answer
+}
+
+fn answer(
+    env: &EnvSnapshot,
+    input: &[u8],
+    exe: &Path,
+    process_cwd: &Path,
+    note: &mut Note,
+) -> Answer {
+    note.rule = Some("malformed-input");
     let Ok(v) = serde_json::from_slice::<Value>(input) else {
         return Answer::deny("tollgate guard: malformed hook input (not JSON)");
     };
     let Some(tool) = v.get("tool_name").and_then(Value::as_str) else {
         return Answer::deny("tollgate guard: malformed hook input (no tool_name)");
     };
+    note.tool = Some(tool.chars().take(64).collect());
     let Some(tool_input) = v.get("tool_input").and_then(Value::as_object) else {
         return Answer::deny("tollgate guard: malformed hook input (no tool_input)");
     };
@@ -115,6 +192,7 @@ pub fn guard(env: &EnvSnapshot, input: &[u8], exe: &Path, process_cwd: &Path) ->
         Ok(d) => d,
         Err(e) => return Answer::deny(format!("tollgate guard: {e}")),
     };
+    note.rule = None;
     let record = InstallRecord::read(&dirs);
     let background = tool_input.get("run_in_background").and_then(Value::as_bool) == Some(true);
     let cap = inline_cap(&dirs, background);
@@ -122,12 +200,15 @@ pub fn guard(env: &EnvSnapshot, input: &[u8], exe: &Path, process_cwd: &Path) ->
     match tool {
         "Bash" => {
             let Some(command) = tool_input.get("command").and_then(Value::as_str) else {
+                note.rule = Some("malformed-input");
                 return Answer::deny("tollgate guard: malformed Bash input (no command)");
             };
+            note.subject = Some(command.to_owned());
             if let Err(reason) = self_check(env, &dirs, exe, record.as_ref()) {
                 if rules::is_repair_command(&ctx, command) {
                     return Answer::allow();
                 }
+                note.rule = Some("not-armed");
                 return Answer::deny(format!(
                     "tollgate: gate not armed ({reason}); run: tollgate install"
                 ));
@@ -136,15 +217,18 @@ pub fn guard(env: &EnvSnapshot, input: &[u8], exe: &Path, process_cwd: &Path) ->
             // checked text and never removes any, so a command that
             // already starts with it imitates the guard.
             if command.trim_start().starts_with(CAP_PREFIX) {
+                note.rule = Some("cap-prefix");
                 return Answer::deny(format!(
                     "tollgate guard: denied: the command starts with `{CAP_PREFIX}`, which only the guard adds; send the command without it"
                 ));
             }
             let a = rules::assess(&ctx, command);
+            note.ruling(&a.ruling, "closed-grammar");
             if let Ruling::Deny(why) = &a.ruling {
                 return Answer::deny(format!("tollgate guard: denied: {}", one_line(why)));
             }
             let updated = a.long_timeout.then(|| rewrite(tool_input, command, cap));
+            note.rewrite = updated.is_some();
             respond(&a.ruling, updated)
         }
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
@@ -154,9 +238,12 @@ pub fn guard(env: &EnvSnapshot, input: &[u8], exe: &Path, process_cwd: &Path) ->
                 "file_path"
             };
             let Some(file) = tool_input.get(key).and_then(Value::as_str) else {
+                note.rule = Some("malformed-input");
                 return Answer::deny(format!("tollgate guard: malformed {tool} input (no {key})"));
             };
+            note.subject = Some(file.to_owned());
             let ruling = rules::file_ruling(&ctx, file);
+            note.ruling(&ruling, "file-path");
             if let Ruling::Deny(why) = &ruling {
                 return Answer::deny(format!("tollgate guard: denied: {}", one_line(why)));
             }

@@ -636,13 +636,55 @@ allow_ssh_agent = false
     }
 }
 
+/// The trusted remotes of `[scope]` (item 34, R14(2), R56, L2 anchors): a
+/// parsed https or ssh URL that a `scope.remotes` pattern names exactly
+/// (host, port, path by segment), or a local path or `file://` URL that is
+/// one of `scope.trusted_paths`. [`CompiledScope::remote_trusted`] and the
+/// post hook's cheap check (item 37) read trust through this one type, so
+/// they never disagree on a URL.
+#[derive(Debug, Clone)]
+pub struct TrustedUrls {
+    trust: Vec<super::trust::TrustPattern>,
+    trusted_paths: Vec<PathBuf>,
+}
+
+impl TrustedUrls {
+    /// Compiles the trust part of `scope` alone, without the rest of it
+    /// (item 37: a post hook needs only this).
+    pub fn new(scope: &ScopeConfig) -> Result<Self, String> {
+        Ok(Self {
+            trust: scope
+                .remotes
+                .iter()
+                .filter_map(|p| super::trust::TrustPattern::parse(p))
+                .collect(),
+            // Item 48: a trusted path that does not exist, or is not its own
+            // canonical path (a symlink part could be moved), trusts nothing.
+            trusted_paths: scope
+                .trusted_paths
+                .iter()
+                .filter(|p| !p.starts_with("file:"))
+                .filter_map(|p| super::trust::local_path(p))
+                .collect(),
+        })
+    }
+
+    /// True when `url` is a trusted remote.
+    #[must_use]
+    pub fn matches(&self, url: &str) -> bool {
+        if let Some(u) = super::trust::parse_url(url) {
+            return self.trust.iter().any(|p| p.matches(&u));
+        }
+        super::trust::local_path(url).is_some_and(|p| self.trusted_paths.contains(&p))
+    }
+}
+
 /// `[scope]` compiled for matching (L4).
 #[derive(Debug, Clone)]
 pub struct CompiledScope {
     roots: Vec<PathBuf>,
     remotes: GlobSet,
-    trust: Vec<super::trust::TrustPattern>,
-    trusted_paths: Vec<PathBuf>,
+    trusted: TrustedUrls,
     noncanonical_paths: Vec<(String, PathBuf)>,
     include: GlobSet,
     exclude: GlobSet,
@@ -658,7 +700,7 @@ impl CompiledScope {
             .filter_map(|r| std::fs::canonicalize(dirs.expand_tilde(r)).ok())
             .collect();
         // Remote URLs: case-insensitive and `*` crosses `/`, so a URL spelled
-        // differently still counts as trusted (errs toward gating).
+        // differently still counts as in scope (errs toward gating).
         let loose_ci = GlobOpts {
             case_insensitive: true,
             literal_separator: false,
@@ -670,19 +712,7 @@ impl CompiledScope {
         Ok(Self {
             roots,
             remotes: glob::compile(&scope.remotes, loose_ci)?,
-            trust: scope
-                .remotes
-                .iter()
-                .filter_map(|p| super::trust::TrustPattern::parse(p))
-                .collect(),
-            // Item 48: a trusted path that does not exist, or is not its own
-            // canonical path (a symlink part could be moved), trusts nothing.
-            trusted_paths: scope
-                .trusted_paths
-                .iter()
-                .filter(|p| !p.starts_with("file:"))
-                .filter_map(|p| super::trust::local_path(p))
-                .collect(),
+            trusted: TrustedUrls::new(scope)?,
             noncanonical_paths: scope
                 .trusted_paths
                 .iter()
@@ -703,7 +733,7 @@ impl CompiledScope {
         if super::trust::local_path(url).is_some() {
             return None;
         }
-        super::trust::canonical_local(url).filter(|c| self.trusted_paths.contains(c))
+        super::trust::canonical_local(url).filter(|c| self.trusted.trusted_paths.contains(c))
     }
 
     /// Item 48: `scope.trusted_paths` entries that exist but are not their
@@ -713,16 +743,10 @@ impl CompiledScope {
         self.noncanonical_paths.clone()
     }
 
-    /// Item 34: `url` is a trusted remote: a parsed https or ssh URL that a
-    /// `scope.remotes` pattern names exactly (host, port, path by segment),
-    /// or a local path or `file://` URL that is one of
-    /// `scope.trusted_paths` (R14(2), R56, L2 anchors).
+    /// Item 34: `url` is a trusted remote ([`TrustedUrls`]).
     #[must_use]
     pub fn remote_trusted(&self, url: &str) -> bool {
-        if let Some(u) = super::trust::parse_url(url) {
-            return self.trust.iter().any(|p| p.matches(&u));
-        }
-        super::trust::local_path(url).is_some_and(|p| self.trusted_paths.contains(&p))
+        self.trusted.matches(url)
     }
 
     /// `url` puts a repo in scope and gates pushes to it (L4, R5, R20):

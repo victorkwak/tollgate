@@ -10,7 +10,7 @@ use std::path::Path;
 
 use super::{Oid, RepoLayout};
 
-/// Loose ref files [`other_ref_points_at`] reads before it gives up.
+/// Loose ref files [`remote_refs_at`] reads before it gives up.
 const LOOSE_BUDGET: usize = 4096;
 
 /// What `HEAD` holds.
@@ -90,16 +90,36 @@ pub fn resolve(layout: &RepoLayout, refname: &str) -> Option<Oid> {
     }
 }
 
-/// Whether a ref other than `except` (under `refs/`, in the common dir)
-/// points at `oid`. `None` when the files cannot say for sure.
+/// True when `name` is a ref name git reads as written: ASCII letters,
+/// digits and `-_.+/` only, no empty part, no part that starts with `.`
+/// or ends with `.lock`, no `..`. Narrower than `git check-ref-format`;
+/// a file whose name git would refuse (git ignores it) never counts.
+fn plain_ref_name(name: &str) -> bool {
+    !name.contains("..")
+        && name.split('/').all(|part| {
+            !part.is_empty()
+                && !part.starts_with('.')
+                && !part.ends_with(".lock")
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'))
+        })
+}
+
+/// The remote-tracking refs (`refs/remotes/...`, in the common dir) whose
+/// value is `oid`: loose files, and packed values no loose file
+/// overrides. A file that is not a plain value (the symref
+/// `refs/remotes/origin/HEAD`) and a name git would not read do not
+/// count. `None` when the files cannot say for sure.
 #[must_use]
-pub fn other_ref_points_at(layout: &RepoLayout, oid: &Oid, except: Option<&str>) -> Option<bool> {
+pub fn remote_refs_at(layout: &RepoLayout, oid: &Oid) -> Option<Vec<String>> {
     if reftable(layout) {
         return None;
     }
+    let mut found = Vec::new();
     let mut loose = std::collections::BTreeSet::new();
     let mut budget = LOOSE_BUDGET;
-    let mut stack = vec![layout.common_dir.join("refs")];
+    let mut stack = vec![layout.common_dir.join("refs/remotes")];
     while let Some(dir) = stack.pop() {
         let rd = match fs::read_dir(&dir) {
             Ok(rd) => rd,
@@ -110,31 +130,41 @@ pub fn other_ref_points_at(layout: &RepoLayout, oid: &Oid, except: Option<&str>)
             let e = e.ok()?;
             budget = budget.checked_sub(1)?;
             let path = e.path();
+            // Not followed: a symlink (a legacy symref, or a dir elsewhere)
+            // makes the answer git's.
             let ft = e.file_type().ok()?;
             if ft.is_dir() {
                 stack.push(path);
                 continue;
+            }
+            if !ft.is_file() {
+                return None;
             }
             let rel = path.strip_prefix(&layout.common_dir).ok()?;
             let name = rel.to_str()?.to_owned();
             if name.ends_with(".lock") {
                 continue;
             }
-            // A ref file that is not a value (a symref such as
-            // `refs/remotes/origin/HEAD`) names another ref, which counts
-            // on its own.
-            let value = loose_value(&path).flatten();
-            if value.as_ref() == Some(oid) && Some(name.as_str()) != except {
-                return Some(true);
+            if loose_value(&path).flatten().as_ref() == Some(oid) && plain_ref_name(&name) {
+                found.push(name.clone());
             }
             loose.insert(name);
         }
     }
-    Some(
+    found.extend(
         packed(layout)?
-            .iter()
-            .any(|(n, o)| o == oid && Some(n.as_str()) != except && !loose.contains(n)),
-    )
+            .into_iter()
+            .filter(|(n, o)| {
+                o == oid
+                    && n.starts_with("refs/remotes/")
+                    && !loose.contains(n)
+                    && plain_ref_name(n)
+            })
+            .map(|(n, _)| n),
+    );
+    found.sort();
+    found.dedup();
+    Some(found)
 }
 
 #[cfg(test)]
@@ -176,35 +206,55 @@ mod tests {
             Some(Head::Symbolic("refs/heads/main".into()))
         );
         assert_eq!(resolve(&layout, "refs/heads/main"), Some(a.clone()));
-        // Only main points at a.
-        assert_eq!(
-            other_ref_points_at(&layout, &a, Some("refs/heads/main")),
-            Some(false)
-        );
+        // A local branch or a tag at a is not a remote-tracking ref.
         git(&repo, &["branch", "side"]);
-        assert_eq!(
-            other_ref_points_at(&layout, &a, Some("refs/heads/main")),
-            Some(true)
+        git(&repo, &["tag", "t1"]);
+        assert_eq!(remote_refs_at(&layout, &a), Some(vec![]));
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/main", a.as_str()],
         );
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        let origin_main = vec!["refs/remotes/origin/main".to_owned()];
+        assert_eq!(remote_refs_at(&layout, &a), Some(origin_main.clone()));
         // Packed: the packed value counts, unless a loose file overrides it.
         git(&repo, &["pack-refs", "--all"]);
         assert_eq!(resolve(&layout, "refs/heads/main"), Some(a.clone()));
-        assert_eq!(
-            other_ref_points_at(&layout, &a, Some("refs/heads/main")),
-            Some(true)
-        );
+        assert_eq!(remote_refs_at(&layout, &a), Some(origin_main.clone()));
         git(&repo, &["commit", "-q", "--allow-empty", "-m", "b"]);
         let b = Oid::parse(&git(&repo, &["rev-parse", "HEAD"])).unwrap();
-        git(&repo, &["branch", "-f", "side", b.as_str()]);
-        assert_eq!(
-            other_ref_points_at(&layout, &a, Some("refs/heads/main")),
-            Some(false),
-            "side's packed value is stale"
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/main", b.as_str()],
         );
         assert_eq!(
-            other_ref_points_at(&layout, &b, Some("refs/heads/main")),
-            Some(true)
+            remote_refs_at(&layout, &a),
+            Some(vec![]),
+            "origin/main's packed value is stale"
         );
+        assert_eq!(remote_refs_at(&layout, &b), Some(origin_main));
+        // A symlink: git's answer, not the files'.
+        std::os::unix::fs::symlink(
+            "../../heads/side",
+            repo.join(".git/refs/remotes/origin/link"),
+        )
+        .unwrap();
+        assert_eq!(remote_refs_at(&layout, &a), None);
+        std::fs::remove_file(repo.join(".git/refs/remotes/origin/link")).unwrap();
+        // A name git would not read does not count.
+        std::fs::write(
+            repo.join(".git/refs/remotes/origin/.hidden"),
+            format!("{a}\n"),
+        )
+        .unwrap();
+        assert_eq!(remote_refs_at(&layout, &a), Some(vec![]));
         git(&repo, &["checkout", "-q", "--detach", a.as_str()]);
         assert_eq!(head(&layout), Some(Head::Detached(a)));
     }

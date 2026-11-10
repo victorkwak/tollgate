@@ -21,6 +21,8 @@
 //! - `steps/<key[..2]>/<key>.json`: stored step passes (L16)
 //! - `metadata/<key>.json`: workspace maps for selection without cargo
 //! - `flaky.jsonl` (R93)
+//! - `metrics.jsonl` (+ `.1`..`.3`), `metrics.key`, `metrics.lock`: guard,
+//!   hook and job metrics for `tollgate stats` (item 50)
 //! - `verify/` (default `verify.root`, R41)
 //!
 //! A verify root holds `<repo key>/<tier>/<worktree key>`: one sticky
@@ -294,6 +296,24 @@ impl Dirs {
     #[must_use]
     pub fn repairs_log(&self) -> PathBuf {
         self.state_dir().join("repairs.log")
+    }
+
+    /// The metrics log (item 50); rotated copies get `.1`, `.2`, ...
+    #[must_use]
+    pub fn metrics_log(&self) -> PathBuf {
+        self.state_dir().join("metrics.jsonl")
+    }
+
+    /// The key of the metrics log's command hashes (item 50).
+    #[must_use]
+    pub fn metrics_key(&self) -> PathBuf {
+        self.state_dir().join("metrics.key")
+    }
+
+    /// The lock one metrics log rotation holds (item 50).
+    #[must_use]
+    pub fn metrics_lock(&self) -> PathBuf {
+        self.state_dir().join("metrics.lock")
     }
 }
 
