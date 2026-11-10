@@ -2377,6 +2377,131 @@ fn s23_launchers_cannot_run_git_tollgate_or_a_shell() {
     }
 }
 
+/// S23b (G2, G3, review note 9 follow-up): a launcher that drops or
+/// replaces the environment (`env -i`, `env -`, `env -u`, `exec -c`) may
+/// not run a script the guard does not read, by any path spelling, and
+/// neither may a program under it that runs another (`nice`, `timeout`,
+/// `env PATH=.`, `env -C dir`), another launcher with a dir or a `PATH`
+/// in its words, or `find -exec`/`xargs -I` with the file they find or
+/// read as the program. The direct forms the review named were denied
+/// already (S44); the nested ones moved a ref. A binary, and a reader of
+/// `{}`, still run.
+#[test]
+fn s23b_launchers_and_feeders_never_run_an_unread_script() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.stage_bad_file("1");
+    let body = "#!/bin/sh\nPATH=/usr/bin:/bin\n\
+                git -c user.name=a -c user.email=a@b.invalid commit --no-verify -q -m bad\n";
+    write_exe(&lab.repo.join("evil.sh"), body);
+    write_exe(&lab.repo.join("sub/e5.sh"), body);
+    let abs = lab.repo.join("evil.sh").display().to_string();
+    let bad = lab.not_denied(&[
+        // Nested runners and launchers: the PATH or dir they set.
+        "env -i PATH=.:/usr/bin nice evil.sh".to_owned(),
+        "env -i PATH=.:/usr/bin timeout 5 evil.sh".to_owned(),
+        "env -i PATH=/usr/bin:/bin:. nohup evil.sh".to_owned(),
+        "env -i env -C sub ./e5.sh".to_owned(),
+        "env -i env --chdir=sub ./e5.sh".to_owned(),
+        "env -i nice env -C sub ./e5.sh".to_owned(),
+        "env -i timeout 5 env PATH=. evil.sh".to_owned(),
+        "exec -c env PATH=. evil.sh".to_owned(),
+        "exec -c env -C sub ./e5.sh".to_owned(),
+        "env -u HOME env PATH=. evil.sh".to_owned(),
+        "env -i find . -name e5.sh -execdir ./e5.sh \\;".to_owned(),
+        "env -i find sub -name e5.sh -execdir ./e5.sh \\;".to_owned(),
+        "env -i find . -name e5.sh -exec {} \\;".to_owned(),
+        "setpriv --nnp find . -name e5.sh -execdir ./e5.sh \\;".to_owned(),
+        "setpriv --nnp find . -name e5.sh -exec {} \\;".to_owned(),
+        "sudo -n -D sub ./e5.sh".to_owned(),
+        "setpriv --nnp env -Csub ./e5.sh".to_owned(),
+        "setpriv --nnp env 'PATH=.' evil.sh".to_owned(),
+        "setpriv --nnp env PATH=/usr/bin: evil.sh".to_owned(),
+        "setpriv --nnp env -C sub PATH=. e5.sh".to_owned(),
+        "setpriv --nnp env PATH=. evil.sh".to_owned(),
+        "setpriv --nnp env -C sub ./e5.sh".to_owned(),
+        // find and xargs run what they find or read.
+        "find . -name e5.sh -exec {} \\;".to_owned(),
+        "find sub -name e5.sh -exec {} +".to_owned(),
+        "find . -name e5.sh -exec nice {} \\;".to_owned(),
+        "find . -name e5.sh -exec env -i {} \\;".to_owned(),
+        "echo ./sub/e5.sh | xargs nice".to_owned(),
+        "echo ./sub/e5.sh | xargs -I{} {}".to_owned(),
+        "echo ./sub/e5.sh | xargs -I@ nice @".to_owned(),
+        "echo ./sub/e5.sh | xargs -i nice {}".to_owned(),
+        "echo ./sub/e5.sh | xargs --replace=@ timeout 5 @".to_owned(),
+        "echo e5.sh | xargs -I@ find sub -name @ -exec nice {} \\;".to_owned(),
+        "echo ./sub/e5.sh | xargs env -i".to_owned(),
+        "echo ./sub/e5.sh | xargs -I@ env -i @".to_owned(),
+        "parallel ::: ./sub/e5.sh".to_owned(),
+        "setpriv --nnp nice env PATH=.:/usr/bin evil.sh".to_owned(),
+        "env -i ./evil.sh".to_owned(),
+        "env -i -- ./evil.sh".to_owned(),
+        "env --ignore-environment ./evil.sh".to_owned(),
+        "env --ignore-environment -- ./evil.sh".to_owned(),
+        "env - ./evil.sh".to_owned(),
+        "env -u PATH ./evil.sh".to_owned(),
+        "env --unset=PATH ./evil.sh".to_owned(),
+        "env -i PATH=/usr/bin ./evil.sh".to_owned(),
+        "env -iuHOME ./evil.sh".to_owned(),
+        "env -i PATH=. evil.sh".to_owned(),
+        "env -i PATH=: evil.sh".to_owned(),
+        "env -i \"./evil.sh\"".to_owned(),
+        "env -i ./'evil'.sh".to_owned(),
+        "env -i ./evil.s\\h".to_owned(),
+        format!("env -i {abs}"),
+        "exec -c ./evil.sh".to_owned(),
+        "exec -c -- ./evil.sh".to_owned(),
+        "exec -a x ./evil.sh".to_owned(),
+        "exec -cl ./evil.sh".to_owned(),
+        "env -i sh ./evil.sh".to_owned(),
+        "env -i /bin/sh evil.sh".to_owned(),
+        "env -i bash -c ./evil.sh".to_owned(),
+        "env -i -- PATH=. evil.sh".to_owned(),
+        "env -i env ./evil.sh".to_owned(),
+        "env -i env PATH=. evil.sh".to_owned(),
+        "env -i nice ./evil.sh".to_owned(),
+        "env -i timeout 5 ./evil.sh".to_owned(),
+        "env -i nohup ./evil.sh".to_owned(),
+        "env -i xargs ./evil.sh </dev/null".to_owned(),
+        "env -i ./ev*.sh".to_owned(),
+        "env -i ./evil.s?".to_owned(),
+        "env -i ./{evil,x}.sh".to_owned(),
+        "env -i \"$PWD/evil.sh\"".to_owned(),
+        "env -i \"$PWD\"/evil.sh".to_owned(),
+        "mkdir -p sub && cd sub && env -i ../evil.sh".to_owned(),
+        "exec -c -a x ./evil.sh".to_owned(),
+        "exec -c -l ./evil.sh".to_owned(),
+        "exec -c env ./evil.sh".to_owned(),
+        "exec -c nice ./evil.sh".to_owned(),
+        "env -u PATH -- ./evil.sh".to_owned(),
+        "env -i PATH=\"$PWD\" evil.sh".to_owned(),
+        "env -i 'PATH=.' evil.sh".to_owned(),
+        "env -i PATH=./ evil.sh".to_owned(),
+        "env -i PATH=/nonexistent: evil.sh".to_owned(),
+        "env -i \\env ./evil.sh".to_owned(),
+        "env -i /usr/bin/env ./evil.sh".to_owned(),
+        "/usr/bin/env -i ./evil.sh".to_owned(),
+        "\\env -i ./evil.sh".to_owned(),
+        "builtin exec -c ./evil.sh".to_owned(),
+    ]);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    for cmd in [
+        "env -i /usr/bin/true",
+        "env -u HOME true",
+        "env - /usr/bin/true",
+        "env -i PATH=/usr/bin:/bin nice -n 5 true",
+        "env -i timeout 5 /usr/bin/true",
+        "env -i env -C sub /usr/bin/true",
+        "setpriv --nnp ls sub",
+        "find . -name e5.sh -exec cat {} \\;",
+        "find sub -name '*.sh' -exec ls -l {} +",
+        "echo sub | xargs -I@ ls @",
+    ] {
+        let s = lab.session(cmd);
+        assert_eq!(s.code(), Some(0), "{cmd}: {s:?}");
+    }
+}
+
 /// S24 (G3): code in arguments (`sh -c`, `eval`) and script files are
 /// checked as if typed; code the guard cannot read (a variable, a process
 /// substitution, a script written in the same call, one nested in a

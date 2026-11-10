@@ -364,6 +364,14 @@ pub struct Walker<'a> {
     /// How many runners ([`runners`]) the command being walked runs
     /// under: git, tollgate and shells may not run there (item 40).
     pub(super) runner_depth: usize,
+    /// G2, G3 (review note 9): the launchers that drop or replace the
+    /// session environment (`env -i`, `env -u`, `exec -c`) the command
+    /// being walked runs under, innermost last: git there runs without
+    /// the hook injection, so git, tollgate and shells may not run there.
+    pub(super) dropped: Vec<String>,
+    /// Review note 9: the strings xargs (`-I`) and find (`{}`) replace
+    /// with words from elsewhere in the command being walked.
+    repl: Vec<String>,
     /// G2 (item 21/20, review G2): the programs the guard does not know
     /// whose words are being walked as a command they may run, innermost
     /// last. git under one may run with another environment.
@@ -474,6 +482,8 @@ impl<'a> Walker<'a> {
             returns: Vec::new(),
             unrolled_walks: 0,
             runner_depth: 0,
+            dropped: Vec::new(),
+            repl: Vec::new(),
             foreign: Vec::new(),
             run_depth: 0,
             namerefs: BTreeSet::new(),
@@ -1690,6 +1700,16 @@ impl<'a> Walker<'a> {
                 "`{name}` is run by more than {MAX_RUN_DEPTH} commands in a chain; too deep to check (G2)"
             ));
         }
+        // Review note 9: a program named by what xargs or find replaces is
+        // a file found or read at run time (`find -exec {} ;`, `xargs -I@
+        // nice @`), which the guard cannot read.
+        if via == Via::Elsewhere
+            && let Some(r) = self.repl.iter().find(|r| name.contains(r.as_str()))
+        {
+            return Err(format!(
+                "`{name}`: xargs or find -exec runs `{r}`, a program it finds or reads at run time, which the guard cannot read; name the program (G2, G3)"
+            ));
+        }
         self.run_depth += 1;
         let r = self.run_command(argv, name, env, f, via, certain);
         self.run_depth -= 1;
@@ -1771,6 +1791,18 @@ impl<'a> Walker<'a> {
                     .is_some_and(|a| self.runs_nothing(&a, &env)),
                 _ => false,
             };
+        if let Some(l) = self.dropped.last()
+            && (gitish
+                || tollgate
+                || matches!(
+                    class,
+                    Class::Shell(_) | Class::Opaque(_) | Class::Busybox | Class::Agent(_)
+                ))
+        {
+            return Err(format!(
+                "`{name}` under {l}, which drops or replaces the session environment: git there runs without the gate hooks; run it directly in the session (G2, G3)"
+            ));
+        }
         if self.runner_depth > 0
             && !inert_word
             && (gitish
@@ -2279,18 +2311,41 @@ impl<'a> Walker<'a> {
                 None => None,
             }
         };
+        // xargs -I/-i: what it replaces with the words it reads.
+        let mut repl = Vec::new();
         // Option values that are code, files written or variables set.
         for o in &opts {
             match (name, o.name.as_str()) {
+                ("xargs", "-I" | "-i" | "--replace") => match value(o) {
+                    None => repl.push("{}".to_owned()),
+                    Some(w) => match w.literal().filter(|r| !r.is_empty()) {
+                        Some(r) => repl.push(r),
+                        None => {
+                            return Err(format!(
+                                "xargs {} with `{}`, a replace string that is not literal (G2)",
+                                o.name, w.raw
+                            ));
+                        }
+                    },
+                },
                 ("exec", "-c" | "-a") => {
                     // bash finds the program on its own PATH, then runs
                     // it with the environment cleared (-c).
                     let what = "exec -c/-a (a changed environment or argv[0])";
                     self.launch_tokens(what, &argv[first..])?;
-                    return match argv.get(first).and_then(|c| c.literal_home(&self.home)) {
-                        Some(n) => self.launched_name(what, &n, &env, false),
-                        None => Ok(()),
+                    if let Some(n) = argv.get(first).and_then(|c| c.literal_home(&self.home)) {
+                        self.launched_name(what, &n, &env, false)?;
+                    }
+                    // Review note 9: walked as typed too, with no git,
+                    // tollgate or shell at any depth ([`Self::dropped`]).
+                    let Some(cmd) = argv.get(first) else {
+                        return Ok(());
                     };
+                    let inner_name = self.command_word(cmd)?;
+                    self.dropped.push(format!("exec {}", o.name));
+                    let r = self.run(&argv[first..], &inner_name, env, f, via, certain);
+                    self.dropped.pop();
+                    return r;
                 }
                 ("time", "-o" | "--output") => {
                     if let Some(w) = value(o) {
@@ -2342,7 +2397,11 @@ impl<'a> Walker<'a> {
             return self.env_check(&env, Target::Other);
         };
         let inner_name = self.command_word(cmd)?;
-        self.run(&argv[inner..], &inner_name, env, f, via, certain)
+        let n = repl.len();
+        self.repl.extend(repl);
+        let r = self.run(&argv[inner..], &inner_name, env, f, via, certain);
+        self.repl.truncate(self.repl.len() - n);
+        r
     }
 
     fn env_wrapper(
@@ -2370,6 +2429,8 @@ impl<'a> Walker<'a> {
         ];
         let lits = self.lits(argv);
         let mut losing: Option<&str> = None;
+        let mut clears = false;
+        let mut split = false;
         let mut chdir: Option<Word> = None;
         let mut i = 1;
         let bad = |what: &str| {
@@ -2387,6 +2448,7 @@ impl<'a> Walker<'a> {
             }
             if a == "-" {
                 losing = Some("env -");
+                clears = true;
                 i += 1;
                 break;
             }
@@ -2412,7 +2474,10 @@ impl<'a> Walker<'a> {
                     glued.map(lit_word)
                 };
                 match full {
-                    "ignore-environment" => losing = Some("env -i"),
+                    "ignore-environment" => {
+                        losing = Some("env -i");
+                        clears = true;
+                    }
                     "unset" => {
                         losing = Some("env -u");
                         self.env_unset(value_word.as_ref())?;
@@ -2420,6 +2485,7 @@ impl<'a> Walker<'a> {
                     "split-string" => {
                         self.split_string(value_word.as_ref())?;
                         losing = Some("env -S");
+                        split = true;
                     }
                     "chdir" => chdir = value_word,
                     "help" | "version" | "list-signal-handling" => {
@@ -2435,7 +2501,10 @@ impl<'a> Walker<'a> {
             for (k, c) in cluster.char_indices() {
                 let rest = &cluster[k + 1..];
                 match c {
-                    'i' => losing = Some("env -i"),
+                    'i' => {
+                        losing = Some("env -i");
+                        clears = true;
+                    }
                     '0' | 'v' => {}
                     'u' | 'S' | 'C' | 'a' => {
                         let value_word = if rest.is_empty() {
@@ -2452,6 +2521,7 @@ impl<'a> Walker<'a> {
                             'S' => {
                                 self.split_string(value_word.as_ref())?;
                                 losing = Some("env -S");
+                                split = true;
                             }
                             'C' => chdir = value_word,
                             _ => {}
@@ -2507,7 +2577,6 @@ impl<'a> Walker<'a> {
             let what = format!(
                 "{what} (it drops or replaces the session environment, the hook injection included)"
             );
-            let clears = matches!(losing, Some("env -i" | "env -"));
             let check = |w: &mut Self| {
                 w.launch_tokens(&what, &argv[i..])?;
                 match argv.get(i).and_then(|c| c.literal_home(&w.home)) {
@@ -2516,10 +2585,10 @@ impl<'a> Walker<'a> {
                 }
             };
             // `-C DIR`: paths in the command are relative to DIR.
-            return match chdir {
+            match &chdir {
                 None => check(self),
                 Some(d) => {
-                    let dir = self.resolve(&d);
+                    let dir = self.resolve(d);
                     self.isolated(|w| {
                         w.scope.cwd = match dir.and_then(|t| w.abs_path(&t)) {
                             Some(p) => Cwd::Known(p),
@@ -2528,7 +2597,34 @@ impl<'a> Walker<'a> {
                         check(w)
                     })
                 }
+            }?;
+            // Review note 9: the command is also walked as typed, with no
+            // git, tollgate or shell at any depth, so a runner or launcher
+            // in it (`nice x`, `env PATH=. x`, `env -C dir ./x`) is
+            // followed as in a direct call. The program of `env -S` is in
+            // its string, which the check above holds to the launcher rule.
+            if argv.get(i).is_none() && via == Via::Elsewhere {
+                return Err(format!(
+                    "{what} under xargs or find -exec gets its command from elsewhere (G2)"
+                ));
+            }
+            let Some(cmd) = argv.get(i).filter(|_| !split) else {
+                return Ok(());
             };
+            let inner_name = self.command_word(cmd)?;
+            let given = env[inherited..].iter().rev().find(|e| e.name == "PATH");
+            // An empty environment has no PATH: execvp searches the system
+            // dirs, the session's programs.
+            let path = match given {
+                Some(e) => Some(self.env_path(e)),
+                None if clears => Some(PathVal::Session),
+                None => None,
+            };
+            let label = losing.unwrap_or("env").to_owned();
+            self.dropped.push(label);
+            let r = self.env_command(argv, i, &inner_name, path, chdir, env, f, via, certain);
+            self.dropped.pop();
+            return r;
         }
         let Some(cmd) = argv.get(i) else {
             if via == Via::Elsewhere {
@@ -2545,9 +2641,26 @@ impl<'a> Walker<'a> {
             .rev()
             .find(|e| e.name == "PATH")
             .map(|e| self.env_path(e));
+        self.env_command(argv, i, &inner_name, path, chdir, env, f, via, certain)
+    }
+
+    /// env runs `argv[i..]` with `path` as its PATH and `chdir` as its dir.
+    #[allow(clippy::too_many_arguments)]
+    fn env_command(
+        &mut self,
+        argv: &[Word],
+        i: usize,
+        inner_name: &str,
+        path: Option<PathVal>,
+        chdir: Option<Word>,
+        env: Vec<EnvSet>,
+        f: &Frame,
+        via: Via,
+        certain: bool,
+    ) -> W {
         match chdir {
             None => self.with_path(path, |w| {
-                w.run(&argv[i..], &inner_name, env, f, via, certain)
+                w.run(&argv[i..], inner_name, env, f, via, certain)
             }),
             Some(d) => {
                 let dir = self.resolve(&d);
@@ -2559,7 +2672,7 @@ impl<'a> Walker<'a> {
                     if let Some(p) = path {
                         w.scope.path = p;
                     }
-                    w.run(&argv[i..], &inner_name, env, f, via, certain)
+                    w.run(&argv[i..], inner_name, env, f, via, certain)
                 })
             }
         }
@@ -2653,6 +2766,7 @@ impl<'a> Walker<'a> {
     /// G2b: `what` runs `args` elsewhere or with another environment: no
     /// git, tollgate, shell or interpreter in them, all literal.
     pub(super) fn launch_tokens(&self, what: &str, args: &[Word]) -> W {
+        let mut texts = Vec::with_capacity(args.len());
         for w in args {
             let Some(t) = w.literal_home(&self.home) else {
                 return Err(format!(
@@ -2667,8 +2781,85 @@ impl<'a> Walker<'a> {
                     "{what} runs {kind} (`{t}`) where the guard cannot follow it; run it directly in the session (G2)"
                 ));
             }
-            for tok in cmds::tokens(&t).filter(|tok| tok.contains('/')) {
-                self.launched_file(what, tok, false)?;
+            texts.push(t);
+        }
+        // Review note 9: a program in the launch may run the next one from
+        // another dir (`env -C sub ./x`, `sudo -D sub ./x`) or on a PATH it
+        // sets (`env PATH=. x`). Every dir a word names is such a dir, and
+        // every `PATH=` value such a PATH: relative paths are checked from
+        // each dir, and bare names on each PATH.
+        // find -exec under a launcher: `{}` is a file it finds, and a
+        // wrapper there may run it (`-exec nice {} ;`).
+        for pair in texts.windows(2) {
+            if matches!(pair[0].as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
+                let p = pair[1].as_str();
+                let base = basename(p);
+                if p.contains("{}")
+                    || matches!(cmds::classify(base), Class::Wrapper(_) | Class::Launcher(_))
+                    || runners::is_runner(base)
+                {
+                    return Err(format!(
+                        "{what} with find {} {p}: it may run a file find finds, which the guard cannot read there; name the program and run find directly in the session (G2, G3)",
+                        pair[0]
+                    ));
+                }
+            }
+        }
+        let mut dirs: Vec<&str> = Vec::new();
+        let mut path_dirs: Vec<&str> = Vec::new();
+        let mut execdir = false;
+        for t in &texts {
+            let mut toks = cmds::tokens(t).peekable();
+            while let Some(tok) = toks.next() {
+                if tok.ends_with("PATH")
+                    && t.contains(&format!("{tok}="))
+                    && let Some(v) = toks.peek()
+                {
+                    path_dirs.extend(v.split(':').map(|d| if d.is_empty() { "." } else { d }));
+                }
+                // find runs an -execdir command in each dir it visits.
+                execdir |= matches!(tok, "-execdir" | "-okdir");
+                let glued = tok
+                    .strip_prefix('-')
+                    .filter(|r| !r.starts_with('-'))
+                    .and_then(|r| r.get(1..))
+                    .filter(|r| !r.is_empty());
+                for c in std::iter::once(tok).chain(glued) {
+                    if !dirs.contains(&c) && self.abs_path(c).is_some_and(|p| p.is_dir()) {
+                        dirs.push(c);
+                    }
+                }
+            }
+        }
+        for t in &texts {
+            for tok in cmds::tokens(t) {
+                if tok.contains('/') {
+                    self.launched_file(what, tok, false)?;
+                    if tok.starts_with('/') {
+                        continue;
+                    }
+                    if execdir {
+                        return Err(format!(
+                            "{what} with find -execdir and {tok}: find runs it in each dir it visits, where the guard cannot read it; give the program's absolute path (G2, G3)"
+                        ));
+                    }
+                    for d in &dirs {
+                        self.launched_file(what, &format!("{d}/{tok}"), false)?;
+                    }
+                } else if !tok.starts_with(['-', '+']) {
+                    for pd in &path_dirs {
+                        let pd = match pd.strip_prefix('~') {
+                            Some(rest) => format!("{}{rest}", self.home),
+                            None => (*pd).to_owned(),
+                        };
+                        self.launched_file(what, &format!("{pd}/{tok}"), false)?;
+                        if !pd.starts_with('/') {
+                            for d in &dirs {
+                                self.launched_file(what, &format!("{d}/{pd}/{tok}"), false)?;
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -4793,7 +4984,10 @@ impl<'a> Walker<'a> {
                             "find -exec {name} on tollgate's dirs: `{{}}` names their files, and {name} is not a known reader (cat, grep, ...) (R25, G7)"
                         ));
                     }
-                    self.run(inner, &name, Vec::new(), f, Via::Elsewhere, false)?;
+                    self.repl.push("{}".to_owned());
+                    let r = self.run(inner, &name, Vec::new(), f, Via::Elsewhere, false);
+                    self.repl.pop();
+                    r?;
                     i = end;
                 }
                 Some("-fprint" | "-fprint0" | "-fls" | "-fprintf") => {

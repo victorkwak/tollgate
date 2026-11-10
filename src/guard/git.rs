@@ -1816,6 +1816,9 @@ impl Walker<'_> {
                 if self.runner_depth > 0 {
                     return deny("git under a runner");
                 }
+                if !self.dropped.is_empty() {
+                    return deny("git with the session environment dropped");
+                }
                 let globals = parse_globals(&argv[i..], &values[i..]);
                 match globals.as_ref().ok().and_then(|g| g.sub.clone()) {
                     Some((_, sub)) if GATED.contains(&sub.as_str()) => {
