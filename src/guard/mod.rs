@@ -32,6 +32,7 @@
 //! permission rules still decide (UNVERIFIED that Claude Code applies
 //! `updatedInput` without one; if not, the 100 s default cap stands, R28).
 
+mod agents;
 mod cmds;
 mod git;
 mod gitopts;

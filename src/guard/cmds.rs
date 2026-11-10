@@ -28,6 +28,9 @@ pub enum Class {
     Cd(&'static str),
     /// `busybox <applet>`.
     Busybox,
+    /// G2 (review "nested agent without hooks"): an agent CLI
+    /// ([`super::agents`]).
+    Agent(&'static str),
     Other,
 }
 
@@ -270,6 +273,9 @@ pub fn classify(base: &str) -> Class {
     if let Some(v) = VAR_WRITERS.iter().find(|n| **n == base) {
         return Class::VarWrite(v);
     }
+    if let Some(a) = super::agents::agent_of(base) {
+        return Class::Agent(a);
+    }
     match base {
         "eval" => Class::Eval,
         "source" | "." => Class::Source,
@@ -441,6 +447,8 @@ pub enum Reach {
     GitOrTollgate,
     /// tollgate only: the hooks take their dirs from `install.json`.
     Tollgate,
+    /// Agent CLIs only (review "nested agent without hooks").
+    Agent,
 }
 
 /// Variables denied only in a command that also runs git or tollgate
@@ -466,6 +474,14 @@ pub fn scoped(name: &str) -> Option<(Reach, &'static str)> {
         "XDG_STATE_HOME" | "XDG_DATA_HOME" => Some((
             Reach::Tollgate,
             "changes which records and binary tollgate uses",
+        )),
+        // Review "nested agent without hooks": `CLAUDE_CONFIG_DIR` picks
+        // the user settings (and so tollgate's guard), `CLAUDE_CODE_SIMPLE`
+        // and `CLAUDE_CODE_SAFE_MODE` turn hooks off; the list of such
+        // variables is Claude Code's, so the whole prefix counts.
+        n if n.starts_with("CLAUDE") => Some((
+            Reach::Agent,
+            "decides which settings, and so which hooks, Claude Code loads",
         )),
         _ => None,
     }
@@ -638,6 +654,9 @@ pub fn forbidden(token: &str, git_known: &[&str]) -> Option<&'static str> {
     }
     if interp(base).is_some() {
         return Some("an interpreter");
+    }
+    if super::agents::agent_of(base).is_some() {
+        return Some("an agent CLI");
     }
     None
 }

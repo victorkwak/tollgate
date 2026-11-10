@@ -1880,6 +1880,10 @@ impl Walker<'_> {
                     self.launch_tokens(l, &argv[i + 1..])?;
                     false
                 }
+                cmds::Class::Agent(a) => {
+                    self.named_agent(a, &argv[i + 1..], env)?;
+                    false
+                }
                 cmds::Class::Shell(_)
                 | cmds::Class::Opaque(_)
                 | cmds::Class::Interp(_)

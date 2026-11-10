@@ -148,6 +148,9 @@ pub enum Target {
     Tollgate,
     /// A shell, `eval` or `source`: the variables reach the code it runs.
     Code,
+    /// An agent CLI: the variables reach the settings it loads and every
+    /// git and tollgate it runs (review "nested agent without hooks").
+    Agent,
     Other,
 }
 
@@ -335,6 +338,9 @@ pub struct Walker<'a> {
     moded: Vec<PathBuf>,
     pub(super) saw_git: bool,
     pub(super) saw_tollgate: bool,
+    /// The command runs an agent CLI ([`super::agents`]): it runs git and
+    /// tollgate too, with the variables the command set.
+    pub(super) saw_agent: bool,
     /// [`cmds::scoped`] variables written for the rest of the shell, and
     /// how.
     scoped_writes: Vec<(String, String)>,
@@ -458,6 +464,7 @@ impl<'a> Walker<'a> {
             moded: Vec::new(),
             saw_git: false,
             saw_tollgate: false,
+            saw_agent: false,
             scoped_writes: Vec::new(),
             cd_uncertain: false,
             anchors: HashMap::new(),
@@ -493,11 +500,14 @@ impl<'a> Walker<'a> {
                 continue;
             };
             let hit = match reach {
-                cmds::Reach::GitOrTollgate => self.saw_git || self.saw_tollgate,
-                cmds::Reach::Tollgate => self.saw_tollgate,
+                cmds::Reach::GitOrTollgate => self.saw_git || self.saw_tollgate || self.saw_agent,
+                cmds::Reach::Tollgate => self.saw_tollgate || self.saw_agent,
+                cmds::Reach::Agent => self.saw_agent,
             };
             if hit {
-                let who = if reach == cmds::Reach::Tollgate {
+                let who = if self.saw_agent {
+                    "an agent CLI"
+                } else if reach == cmds::Reach::Tollgate {
                     "tollgate"
                 } else {
                     "git or tollgate"
@@ -1653,7 +1663,13 @@ impl<'a> Walker<'a> {
             && let Ok(real) = std::fs::canonicalize(&p)
             && let Some(b) = real.file_name()
         {
-            base = b.to_string_lossy().into_owned();
+            // Claude Code's own install (`.../claude/versions/<v>`) is
+            // claude under any name a link gives it.
+            base = if super::agents::installed_claude(&real) {
+                "claude".to_owned()
+            } else {
+                b.to_string_lossy().into_owned()
+            };
         }
         let class = cmds::classify(&base);
         (base, class)
@@ -1759,7 +1775,10 @@ impl<'a> Walker<'a> {
             && !inert_word
             && (gitish
                 || tollgate
-                || matches!(class, Class::Shell(_) | Class::Opaque(_) | Class::Busybox))
+                || matches!(
+                    class,
+                    Class::Shell(_) | Class::Opaque(_) | Class::Busybox | Class::Agent(_)
+                ))
         {
             return Err(format!(
                 "`{name}` under a runner (uv run, npx, strace, ...): the runner may find another program by that name, or trace or detach it; run it directly in the session (G2, item 40)"
@@ -1795,6 +1814,10 @@ impl<'a> Walker<'a> {
                 self.shell(sh, argv, env, f, via)
             }
             Class::Opaque(o) => self.opaque(o, argv, env, f, via),
+            Class::Agent(a) => {
+                self.path_words(name, &argv[1..], &env, Some(via))?;
+                self.agent(a, argv, &env, via)
+            }
             Class::Eval => {
                 self.no_elsewhere(via, "eval")?;
                 self.env_check(&env, Target::Code)?;
@@ -1886,12 +1909,18 @@ impl<'a> Walker<'a> {
             }
             if let Some((reach, why)) = cmds::scoped(&e.name) {
                 let hit = match reach {
-                    cmds::Reach::GitOrTollgate => gitish,
-                    cmds::Reach::Tollgate => t == Target::Tollgate,
+                    cmds::Reach::GitOrTollgate => gitish || t == Target::Agent,
+                    cmds::Reach::Tollgate => matches!(t, Target::Tollgate | Target::Agent),
+                    cmds::Reach::Agent => t == Target::Agent,
                 };
                 if hit {
+                    let who = if t == Target::Agent {
+                        "an agent CLI"
+                    } else {
+                        "git or tollgate"
+                    };
                     return Err(format!(
-                        "`{}` sets {} for git or tollgate; {} {why} (G5, R8)",
+                        "`{}` sets {} for {who}; {} {why} (G5, R8)",
                         e.raw, e.name, e.name
                     ));
                 }
@@ -2857,6 +2886,38 @@ impl<'a> Walker<'a> {
             ));
         }
         Ok(())
+    }
+
+    /// G2 (review "nested agent without hooks"): agent CLI `a` run with
+    /// `argv` ([`super::agents::check`]). It runs git and tollgate itself,
+    /// so the variables that choose their config, records or Claude Code's
+    /// settings count as they do for git and tollgate (G5).
+    fn agent(&mut self, a: &str, argv: &[Word], env: &[EnvSet], via: Via) -> W {
+        self.no_elsewhere(via, a)?;
+        self.saw_agent = true;
+        self.env_check(env, Target::Agent)?;
+        let lits = self.lits(&argv[1..]);
+        self.agent_verdict(super::agents::check(a, &lits))
+    }
+
+    /// Agent CLI `a` named in the words of a program the guard does not
+    /// know, which may run it with `words` (item 21/20).
+    pub(super) fn named_agent(&mut self, a: &str, words: &[Word], env: &[EnvSet]) -> W {
+        self.saw_agent = true;
+        self.env_check(env, Target::Agent)?;
+        let lits = self.lits(words);
+        self.agent_verdict(super::agents::check_named(a, &lits))
+    }
+
+    fn agent_verdict(&self, v: super::agents::Verdict) -> W {
+        match v {
+            super::agents::Verdict::Allow => Ok(()),
+            super::agents::Verdict::Ask(why) => {
+                self.ask(why);
+                Ok(())
+            }
+            super::agents::Verdict::Deny(why) => Err(why),
+        }
     }
 
     /// Non-launching docker/podman commands: only literal-word checks.
