@@ -234,6 +234,32 @@ impl Script {
         let body = r.doc.as_ref()?.borrow().literal()?;
         Some(body.trim_end_matches('\n').to_owned())
     }
+
+    /// `pwd` alone (or `pwd -L`): the code prints the current dir.
+    #[must_use]
+    pub fn is_pwd(&self) -> bool {
+        let [ao] = self.items.as_slice() else {
+            return false;
+        };
+        if !ao.rest.is_empty() || ao.background || ao.first.negate {
+            return false;
+        }
+        let [c] = ao.first.cmds.as_slice() else {
+            return false;
+        };
+        let Kind::Simple(s) = &c.kind else {
+            return false;
+        };
+        if !s.assigns.is_empty() || !c.redirs.is_empty() {
+            return false;
+        }
+        let words: Vec<_> = s.words.iter().map(Word::literal).collect();
+        match words.as_slice() {
+            [Some(p)] => p == "pwd",
+            [Some(p), Some(o)] => p == "pwd" && o == "-L",
+            _ => false,
+        }
+    }
 }
 
 /// Pipelines joined by `&&` and `||`.

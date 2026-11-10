@@ -78,6 +78,8 @@ const CORPUS: &[&str] = &[
     // Script files the guard reads, for the latency budget too.
     "bash scripts/check.sh",
     "./scripts/check.sh && git push origin feat",
+    "bash \"$PWD/scripts/check.sh\" && git push origin feat",
+    "\"$(pwd)/scripts/check.sh\" && git status",
 ];
 
 /// The false-deny corpus: harmless commands that a rule of the closed
@@ -262,6 +264,11 @@ const DENY: &[&str] = &[
     "echo x > $XDG_STATE_HOME/tollgate/x",
     "sed -i s/a/b/ $XDG_STATE_HOME/tollgate/install.json",
     "bash scripts/bad.sh",
+    // A script path made absolute from the cwd.
+    "bash \"$PWD/scripts/bad.sh\"",
+    "bash ${PWD}/scripts/bad.sh",
+    "bash $(pwd)/scripts/bad.sh",
+    "\"$(pwd)\"/scripts/bad.sh",
     "GIT_CONFIG_COUNT=0 git commit -m x",
     "export GIT_CONFIG_PARAMETERS=x",
     "unset GIT_CONFIG_COUNT",

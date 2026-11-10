@@ -312,23 +312,38 @@ impl<'a> Walker<'a> {
 
     // ---- words ----
 
-    fn lookup(&self, name: &str) -> Option<String> {
+    /// A variable's value; `PWD` is the walker's cwd, as bash keeps it.
+    fn lookup(&self, name: &str, st: &State) -> Option<String> {
         match self.vars.get(name) {
             Some(v) => v.clone(),
+            None if name == "PWD" => Self::pwd(st),
             None => self.ctx.var(name).map(str::to_owned),
         }
     }
 
-    fn param(&self, name: &str, subs: &[Script]) -> Option<String> {
+    fn pwd(st: &State) -> Option<String> {
+        st.cwd.as_ref().map(|d| d.to_string_lossy().into_owned())
+    }
+
+    /// `$(pwd)` gives the cwd; any other command substitution gives what
+    /// a quoted `cat` heredoc holds, or nothing known.
+    fn cmd_sub(sc: &Script, st: &State) -> Option<String> {
+        if sc.is_pwd() {
+            return Self::pwd(st);
+        }
+        sc.cat_heredoc()
+    }
+
+    fn param(&self, name: &str, subs: &[Script], st: &State) -> Option<String> {
         if !subs.is_empty() {
             return None;
         }
-        self.lookup(shell::simple_param(name)?)
+        self.lookup(shell::simple_param(name)?, st)
     }
 
     /// The word bash passes; a part that is only known at run time
     /// becomes [`DYNAMIC`].
-    fn arg(&self, w: &Word) -> Arg {
+    fn arg(&self, w: &Word, st: &State) -> Arg {
         let mut s = String::new();
         let mut dynamic = w.brace;
         let mut put = |s: &mut String, v: Option<String>| match v {
@@ -345,13 +360,14 @@ impl<'a> Walker<'a> {
                     for q in inner {
                         match q {
                             Part::Lit(t) => s.push_str(t),
-                            Part::Param(name, subs) => put(&mut s, self.param(name, subs)),
-                            Part::CmdSub(sc) => put(&mut s, sc.cat_heredoc()),
+                            Part::Param(name, subs) => put(&mut s, self.param(name, subs, st)),
+                            Part::CmdSub(sc) => put(&mut s, Self::cmd_sub(sc, st)),
                             _ => put(&mut s, None),
                         }
                     }
                 }
-                Part::Param(name, subs) => put(&mut s, self.param(name, subs)),
+                Part::Param(name, subs) => put(&mut s, self.param(name, subs, st)),
+                Part::CmdSub(sc) if sc.is_pwd() => put(&mut s, Self::pwd(st)),
                 Part::Tilde(user) if k == 0 && user.is_empty() => {
                     s.push_str(&self.ctx.home.to_string_lossy());
                 }
@@ -366,15 +382,15 @@ impl<'a> Walker<'a> {
     /// The words of a simple command. A word that is one unquoted
     /// parameter with a known value is split on blanks, as bash does
     /// (`cmd="git status"; $cmd`).
-    fn words(&self, words: &[Word]) -> Vec<Arg> {
+    fn words(&self, words: &[Word], st: &State) -> Vec<Arg> {
         let mut out = Vec::with_capacity(words.len());
         for w in words {
             if let [Part::Param(name, subs)] = w.parts.as_slice()
-                && let Some(v) = self.param(name, subs)
+                && let Some(v) = self.param(name, subs, st)
             {
                 out.extend(v.split_whitespace().map(Arg::fixed));
             } else {
-                out.push(self.arg(w));
+                out.push(self.arg(w, st));
             }
         }
         out
@@ -446,7 +462,7 @@ impl<'a> Walker<'a> {
                 }
             }
             if r.writes_file() {
-                let t = self.arg(&r.target);
+                let t = self.arg(&r.target, st);
                 self.write(&t, false, "a redirection", st.cwd.as_deref());
             }
         }
@@ -474,7 +490,7 @@ impl<'a> Walker<'a> {
                         self.subs(w.scripts(), st);
                     }
                     if let [one] = items.as_slice() {
-                        value = self.arg(one).lit().map(str::to_owned);
+                        value = self.arg(one, st).lit().map(str::to_owned);
                     }
                 }
                 if let Some(name) = var.literal() {
@@ -513,14 +529,14 @@ impl<'a> Walker<'a> {
         {
             self.subs(w.scripts(), st);
         }
-        let args = self.words(&s.words);
+        let args = self.words(&s.words, st);
         let saved = st.taint.clone();
         let mut prefix_taint = false;
         for a in &s.assigns {
             let plain = !a.array && a.raw.starts_with(&format!("{}=", a.name));
             let value = match a.value.as_slice() {
                 [] if plain => Some(String::new()),
-                [w] if plain => self.arg(w).lit().map(str::to_owned),
+                [w] if plain => self.arg(w, st).lit().map(str::to_owned),
                 _ => None,
             };
             if config_var(&a.name) {
@@ -610,7 +626,7 @@ impl<'a> Walker<'a> {
             {
                 continue;
             }
-            let t = self.arg(&r.target);
+            let t = self.arg(&r.target, st);
             let (Some(name), Some(cwd)) = (t.lit(), st.cwd.as_deref()) else {
                 continue;
             };
@@ -855,14 +871,14 @@ impl<'a> Walker<'a> {
                     }
                 }
                 Op::HereStr => {
-                    let a = self.arg(&r.target);
+                    let a = self.arg(&r.target, st);
                     match a.lit() {
                         Some(text) => self.code(text, &mut sub),
                         None => self.runtime(&format!("{} {}", a.s, r.target.raw)),
                     }
                 }
                 Op::In => {
-                    let a = self.arg(&r.target);
+                    let a = self.arg(&r.target, st);
                     self.run_file(&a, &mut sub, false, false, io.detached());
                 }
                 _ => {}
@@ -878,7 +894,7 @@ impl<'a> Walker<'a> {
             let text = self.text;
             return self.runtime(text);
         };
-        let args = self.words(&s.words);
+        let args = self.words(&s.words, st);
         if let Some(text) = Self::output(&args, &feeder.redirs) {
             return self.code(&text, &mut sub);
         }
@@ -922,7 +938,7 @@ impl<'a> Walker<'a> {
                 // bash looks in CDPATH first for a relative name.
                 Some(p)
                     if !p.starts_with('.')
-                        && self.lookup("CDPATH").is_some_and(|v| !v.is_empty()) =>
+                        && self.lookup("CDPATH", st).is_some_and(|v| !v.is_empty()) =>
                 {
                     None
                 }

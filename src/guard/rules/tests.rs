@@ -351,6 +351,10 @@ fn git_dir_lock_hook_and_host_config_writes_ask() {
             "sed -i s/a/b/ .git/packed-refs",
             "echo 'ref: refs/heads/x' > .git/HEAD",
             "rm -rf .git",
+            // `$PWD` and `$(pwd)` are the walker's cwd.
+            "cp x $(pwd)/.git/config",
+            "echo x > \"$PWD/.git/config\"",
+            "cd sub && echo x > \"${PWD}/../.git/config\"",
         ],
     );
     ask(
@@ -726,7 +730,7 @@ fn unclassified_asks_for_what_the_walker_cannot_read() {
             // 6: a write target with a part made at run time.
             "echo x > \"$d/.claude/settings.json\"",
             "rm \"$REPO/.git/hooks/pre-commit\"",
-            "cp x $(pwd)/.git/config",
+            "cd \"$d\" && cp x \"$PWD/.git/config\"",
         ],
     );
     // The same shapes with no needle and no marker, or with a command no
