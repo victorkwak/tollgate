@@ -494,6 +494,16 @@ fn item_22_force_create_in_every_spelling() {
         "git checkout $'-Bmain' HEAD~3",
         "git checkout \"-\"B main HEAD~3",
         "git -C . switch -fC MAIN HEAD~3",
+        // Review note 5 spellings, as reported.
+        "git checkout -fB main HEAD~3",
+        "git switch -qC main HEAD~3",
+        "git switch -Cmain HEAD~3",
+        "git branch --for main HEAD~3",
+        "git branch --mov feat main",
+        "git branch --cop feat main",
+        "git branch --for=x main HEAD~3",
+        "git worktree add -fBmain ../wt HEAD~3",
+        "git switch --force-cr main HEAD~3",
     ]
     .into_iter()
     .filter(|cmd| !matches!(bash_ruling(&c, cmd), Ruling::Deny(_)))
