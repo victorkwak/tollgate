@@ -342,11 +342,12 @@ R56. Base trust. Selection relative to a base is sound only when the base was ch
 Reason: an empty diff on top of an unchecked commit must not produce a pass for a tree nothing checked (critique).
 
 R57. Rust selection (workspace root: `Cargo.toml` with `[workspace]` or a single package):
-  a. Global triggers mark the whole workspace: root `Cargo.toml`, `Cargo.lock`, `.cargo/**`, `rust-toolchain`, `rust-toolchain.toml`, `.config/nextest.toml`, `tollgate.toml`, `.sqlx/**`, `clippy.toml`, `rustfmt.toml`, `build.rs` of any package, plus `select.global` globs.
+  a. Global triggers mark the whole workspace: root `Cargo.toml`, `Cargo.lock`, `.cargo/**`, `rust-toolchain`, `rust-toolchain.toml`, `.config/nextest.toml`, `tollgate.toml`, `clippy.toml`, `rustfmt.toml`, `build.rs` of any package, plus `select.global` globs.
   b. `select.owners` maps globs to packages (`"migrations/**" = ["gatehouse-core"]`). A package name that is not in the `cargo metadata` of `T` marks the whole workspace and prints `WARN owners: unknown package <name>`.
   c. Any other path maps to the package whose manifest dir is its longest prefix.
   d. A path under no rule and no package marks the whole workspace. Deletions count.
   e. Affected `A` = reverse-dependency closure of the marked packages including dev-dependency edges (`guppy` on the full `cargo metadata` of `T`).
+  f. Query cache: a change under `.sqlx/**` of the workspace root sets `A` to every member and marks no package. The `sqlx` macros of any member can read the cache at compile time, so every member is built and linted; nothing reads it at run time, so the tests that run are those of the packages that the other changed paths mark (R58). A change that marks no package marks the whole workspace. To run every test on each query cache change, add `.sqlx/**` to `select.global`. The `full` tier runs every test in all cases. Limit: a query file that changes while the member that uses it does not (for example, a column type changed by a migration) is compiled and linted in `fast`, but the tests of that member run only if an owner entry or the rdeps rule selects them.
 Decision D7: `determinator` is reserved for a later version (`select.engine = "determinator"`). Reason: its base-graph behavior for new crates and offline was left open. The prefix rule errs toward running more.
 
 R58. Rust step kinds (fast uses `A`, full uses the workspace):
@@ -691,7 +692,7 @@ Verify checkout and job env:
 
 Tiers, selection, policy:
 - T29 (R27, R53): `full_refs` globs case-insensitive; `fast` lookup accepts `full`; `full` rejects `fast`.
-- T30 (R55-R57): change in crate `a` selects `rdeps(a)` incl. the dev-dependent; `Cargo.lock` change selects the workspace; a path under no package selects the workspace; an unknown owner package selects the workspace with a WARN; an untrusted base selects the workspace; an empty diff is not docs-only.
+- T30 (R55-R57): change in crate `a` selects `rdeps(a)` incl. the dev-dependent; `Cargo.lock` change selects the workspace; a `.sqlx` change with a change in crate `a` builds every member and tests as for `a`, and alone selects the workspace; a path under no package selects the workspace; an unknown owner package selects the workspace with a WARN; an untrusted base selects the workspace; an empty diff is not docs-only.
 - T31 (R58): filtersets checked with `cargo nextest list -E`; `--no-tests pass` present; doctests run.
 - T32 (R61): a `.png` under `tests/fixtures` is not docs-only; a root `README.md` is; a `prompts/*.md` with `select.global` is not.
 - T33 (R66-R68): a commit that deletes the `nextest` step still runs it (base policy); a commit that adds a `[[quarantine]]` for its own broken test fails `full`; after `tollgate policy approve` at a pty (test uses a pty via `openpty`) the own policy applies; approve without a TTY exits non-zero; a second commit on top of an unapproved policy change still uses the base policy.

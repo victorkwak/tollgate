@@ -225,6 +225,41 @@ fn full_tier_flaky_quarantine_and_fast_selection_t41_t30_l2() {
     );
     sb.git(&repo, &["reset", "-q", "--hard"]);
 
+    // R57f: a query cache change with a change in `a` builds every member
+    // and tests as for `a` alone.
+    std::fs::create_dir(repo.join(".sqlx")).unwrap();
+    std::fs::write(repo.join(".sqlx/query-1.json"), "{}\n").unwrap();
+    std::fs::write(
+        repo.join("crates/a/src/extra.rs"),
+        "/// Extra.\npub fn extra() {}\n",
+    )
+    .unwrap();
+    sb.git(&repo, &["add", "-A"]);
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let rep = sb.report(&job_id(&r.out));
+    assert_eq!(
+        rep["selection"]["subset"]["packages"],
+        serde_json::json!(["a", "b"]),
+        "{rep}"
+    );
+    assert_eq!(
+        rep["selection"]["subset"]["marked"],
+        serde_json::json!(["a"]),
+        "{rep}"
+    );
+    let cmd = rep["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "tests")
+        .unwrap()["command"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(cmd.contains("-p a -p b -E '(rdeps(=a))'"), "{cmd}");
+    sb.git(&repo, &["reset", "-q", "--hard"]);
+
     // Docs-only with cached workspace maps: the runner passes at once, with
     // no checkout and no cargo (R61, L19).
     std::fs::write(repo.join("NOTES.md"), "notes\n").unwrap();

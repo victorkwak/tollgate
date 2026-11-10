@@ -566,6 +566,79 @@ tiers = ["full"]
     }
 
     #[test]
+    fn query_cache_change_builds_all_and_tests_the_marked_r57f() {
+        let c = config(STEPS);
+        let m = map("", &[("a", "crates/a", &["b"]), ("b", "crates/b", &[])]);
+        let p = picked(&[".sqlx/query-1.json", "crates/a/src/lib.rs"]);
+        let planned = plan(&c, Tier::Fast, Some(&p), Platform::Linux);
+        let scope = Scope::Packages {
+            affected: ["a".into(), "b".into()].into(),
+            marked: ["a".into()].into(),
+        };
+        assert_eq!(planned[0].decision, Decision::Run(Scope::All), "fmt");
+        for step in &planned[1..=3] {
+            assert_eq!(
+                step.decision,
+                Decision::Run(scope.clone()),
+                "{}",
+                step.step.name
+            );
+        }
+        let ctx = InvocationCtx {
+            tier: Tier::Fast,
+            fast_tests: FastTests::RdepsUnitChangedIntegration,
+            nextest_config: Path::new("/j/nextest.toml"),
+            tool_config: Path::new("/j/tool.toml"),
+            map: Some(&m),
+            lang: None,
+        };
+        let line = |i: usize| {
+            invocation(&c.steps[i], &scope, &ctx)
+                .unwrap()
+                .unwrap()
+                .display()
+        };
+        assert_eq!(
+            line(1),
+            "cargo clippy -p a -p b --all-targets -- -D warnings"
+        );
+        assert!(
+            line(2).ends_with(
+                "-p a -p b -E '((rdeps(=a)) & !kind(test)) | ((package(=a)) & kind(test))'"
+            ),
+            "{}",
+            line(2)
+        );
+        // The record states what ran: every member built, `a` tested.
+        let maps: std::collections::BTreeMap<PathBuf, Option<WorkspaceMap>> =
+            [(PathBuf::new(), Some(m.clone()))].into();
+        let changes: Vec<ChangedPath> = [".sqlx/query-1.json", "crates/a/src/lib.rs"]
+            .iter()
+            .map(|p| ChangedPath {
+                path: PathBuf::from(p),
+                status: 'M',
+            })
+            .collect();
+        let f = fast_plan(
+            &c,
+            &crate::gitx::Oid::parse(&"0".repeat(40)).unwrap(),
+            &changes,
+            &maps,
+            &[],
+            Platform::Linux,
+        )
+        .unwrap();
+        let crate::cache::record::Selection::Subset(sel) = &f.selection else {
+            panic!("fast selection")
+        };
+        assert_eq!(sel.packages, ["a".to_owned(), "b".to_owned()].into());
+        assert_eq!(sel.marked, ["a".to_owned()].into());
+        // The query cache alone: every test runs.
+        let alone = picked(&[".sqlx/query-1.json"]);
+        let planned = plan(&c, Tier::Fast, Some(&alone), Platform::Linux);
+        assert_eq!(planned[2].decision, Decision::Run(Scope::All));
+    }
+    #[test]
     fn full_runs_every_step_on_everything_r54() {
         let c = config(STEPS);
         let got = decisions(&plan(&c, Tier::Full, None, Platform::Macos));
