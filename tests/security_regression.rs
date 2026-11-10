@@ -2997,6 +2997,20 @@ fn s38_program_arguments_that_run_commands_are_denied() {
         // and expect).
         "socat - SYSTEM:'git commit -n -m x'".to_owned(),
         "socat -u /dev/null EXEC:'git commit -n -m x'".to_owned(),
+        // Review note 10: a dual address in a word that starts with `-`
+        // (stdio with options, then SYSTEM), and socat's own quoting
+        // and escaping around the address type (socat 1.8.1.3 runs all).
+        "socat - '-,ignoreeof!!SYSTEM:git commit -n -m x'".to_owned(),
+        "socat '-,ignoreeof!!EXEC:git commit -n -m x' /dev/null".to_owned(),
+        "socat -d -d /dev/null '-,ign\\oreeof!!system:git commit -n -m x'".to_owned(),
+        "socat /dev/null '\\SYSTEM:git commit -n -m x'".to_owned(),
+        "socat /dev/null 'SYS\\TEM:git commit -n -m x'".to_owned(),
+        "socat /dev/null '\"SYSTEM\":git commit -n -m x'".to_owned(),
+        "socat /dev/null \"'Sys'tem:git commit -n -m x\"".to_owned(),
+        "socat /dev/null 'S\"YS\"TEM:git commit -n -m x'".to_owned(),
+        // socat 1.8 installs the program as `socat1` (`socat` links to it).
+        "socat1 /dev/null 'SYSTEM:git commit -n -m x'".to_owned(),
+        "env TZ=UTC /usr/bin/socat1 -'-!!EXEC:git commit -n -m x'".to_owned(),
         "echo 'exec git commit -n -m x' | tclsh".to_owned(),
         "expect -c 'spawn git commit -n -m x; expect eof'".to_owned(),
         "vim -es -c '!git commit -n -m x' -c q bad".to_owned(),

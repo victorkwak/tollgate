@@ -2,7 +2,8 @@
 //! `sed` (the `e` command, the `e` and `w` flags of `s`, `w` and `W`),
 //! `tar` (`--to-command`, `-I`, checkpoint actions, volume scripts),
 //! `rg --pre`, `less +!cmd`, the vim family's command options, `gdb`
-//! scripts, socat's `EXEC`/`SYSTEM`/`SHELL` addresses; Tcl (`tclsh`,
+//! scripts, socat's `EXEC`/`SYSTEM`/`SHELL` addresses (its `socat-*.sh`
+//! helper scripts are refused whole); Tcl (`tclsh`,
 //! `wish`, `expect`) is refused whole (item 29). A program not listed here
 //! runs as it is; its arguments are data to the guard.
 
@@ -96,7 +97,10 @@ pub fn check(base: &str, lits: &[Option<String>]) -> Result<Effects, String> {
             }
             Ok(Effects::default())
         }
-        "socat" => socat_args(lits).map(|()| Effects::default()),
+        b if versioned(b, "socat") => socat_args(lits).map(|()| Effects::default()),
+        b if b.starts_with("socat-") && b.ends_with(".sh") => Err(format!(
+            "{base} passes its words to socat after the shell splits them again; the guard cannot tell whether an address runs a program (G3, review note 10)"
+        )),
         b if tcl(b) => Err(format!(
             "{base} runs Tcl code, which can run any program (`exec`, and `spawn` at a terminal it makes); the guard cannot read it (G3, item 29)"
         )),
@@ -109,16 +113,30 @@ pub fn check(base: &str, lits: &[Option<String>]) -> Result<Effects, String> {
 fn tcl(base: &str) -> bool {
     ["tclsh", "wish", "expectk", "expect", "jimsh"]
         .iter()
-        .any(|stem| {
-            base.strip_prefix(stem)
-                .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
-        })
+        .any(|stem| versioned(base, stem))
+}
+
+/// `base` is `stem` or `stem` with a version (`tclsh8.6`, `socat1`).
+fn versioned(base: &str, stem: &str) -> bool {
+    base.strip_prefix(stem)
+        .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
 }
 
 /// socat (item 29): an `EXEC`, `SYSTEM` or `SHELL` address runs a program,
 /// with a pty when asked, so it could give a TTY-only command the
 /// terminal it checks for. Address types are case-insensitive; a dual
 /// address (`A!!B`) has two. A word built at run time is refused.
+///
+/// Every word is read as an address, options too (review note 10): a word
+/// that starts with `-` can be a dual address (`-,ignoreeof!!SYSTEM:..`),
+/// and an option or its value never starts with a program address type.
+/// socat removes its own quotes and backslashes from the type
+/// (`"SYSTEM"`, `SYS\TEM`, `'Sys'tem` all run), so the guard removes every
+/// `'`, `"` and `\` before it reads the type. That only ever finds more:
+/// a quoted or escaped `!!`, `:` or `,` does not split in socat, but it
+/// does here. A `|` splits too: socat 2 chains addresses with it.
+/// socat 1.8 installs the program as `socat1`; a version suffix is the
+/// same program.
 fn socat_args(lits: &[Option<String>]) -> Result<(), String> {
     for a in lits.iter().skip(1) {
         let Some(a) = a else {
@@ -127,10 +145,11 @@ fn socat_args(lits: &[Option<String>]) -> Result<(), String> {
                     .into(),
             );
         };
-        if a.starts_with('-') && !a.starts_with("-!!") && a != "-" {
-            continue;
-        }
-        for part in a.split("!!") {
+        let bare: String = a
+            .chars()
+            .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+            .collect();
+        for part in bare.split("!!").flat_map(|p| p.split('|')) {
             let kind = part
                 .split([':', ','])
                 .next()
@@ -564,6 +583,55 @@ fn delimited_text(c: &[char], i: &mut usize, delim: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socat_program_addresses_are_found_in_every_word() {
+        let l = |v: &[&str]| -> Vec<Option<String>> {
+            v.iter().map(|s| Some((*s).to_owned())).collect()
+        };
+        for args in [
+            &["socat", "-", "SYSTEM:id"][..],
+            &["socat", "-u", "/dev/null", "exec:id,pty"],
+            &["socat", "-", "SHELL"],
+            &["socat", "-", "STDIN!!SYSTEM:id"],
+            &["socat", "-", "-!!SYSTEM:id"],
+            // Review note 10: a word that looks like an option.
+            &["socat", "-", "-,ignoreeof!!SYSTEM:id"],
+            &["socat", "-,ignoreeof!!EXEC:id", "/dev/null"],
+            &["socat", "-d", "-d", "-,ign\\oreeof!!a!!Shell:id", "-"],
+            // socat's own quoting and escaping.
+            &["socat", "-", "\\SYSTEM:id"],
+            &["socat", "-", "SYS\\TEM:id"],
+            &["socat", "-", "\"SYSTEM\":id"],
+            &["socat", "-", "'Sys'tem:id"],
+            &["socat", "-", "-!'!'EXEC:id"],
+            &["socat", "-", "-!\\!EXEC:id"],
+        ] {
+            assert!(check("socat", &l(args)).is_err(), "{args:?}");
+        }
+        for args in [
+            &["socat", "-d", "-d", "-u", "/dev/null", "OPEN:out,creat"][..],
+            &["socat", "-", "TCP:localhost:80"],
+            &["socat", "-lf", "exec.log", "-", "UNIX-CONNECT:/tmp/s"],
+            &["socat", "-,ignoreeof", "/dev/null"],
+            &["socat", "-T", "5", "-", "OPEN:shell.txt"],
+        ] {
+            assert!(check("socat", &l(args)).is_ok(), "{args:?}");
+        }
+        assert!(check("socat", &[Some("socat".into()), Some("-".into()), None]).is_err());
+        // Other names of the same program, and socat 2 address chains.
+        assert!(check("socat1", &l(&["socat1", "-", "SYSTEM:id"])).is_err());
+        assert!(check("socat2", &l(&["socat2", "-", "TCP:h:1|EXEC:id"])).is_err());
+        assert!(check("socat1", &l(&["socat1", "-", "TCP:h:1"])).is_ok());
+        assert!(check("socatx", &l(&["socatx", "-", "SYSTEM:id"])).is_ok());
+        // The helper scripts split their option words again in a shell.
+        for b in ["socat-chain.sh", "socat-mux.sh", "socat-broker.sh"] {
+            assert!(
+                check(b, &l(&[b, "-d -d", "TCP-L:1", "TCP:h:1"])).is_err(),
+                "{b}"
+            );
+        }
+    }
 
     #[test]
     fn sed_scripts_that_run_commands_are_denied() {
