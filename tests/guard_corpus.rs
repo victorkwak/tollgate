@@ -162,7 +162,7 @@ const HARMLESS: &[&str] = &[
     "tollgate wait {JOB} && git commit -m x",
     "cat ~/.claude/settings.json",
     "ls .git/hooks",
-    // What the removed rules of the closed grammar denied or asked about:
+    // What the rules of earlier guard versions denied or asked about:
     // remote changes, programs it did not know, names bash sets without
     // an assignment word, PATH and HOME changes, git values that name a
     // program, other spellings of a local repo, code on a shell's stdin.

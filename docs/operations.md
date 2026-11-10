@@ -16,7 +16,7 @@ The detailed reference for tollgate: what each gate does, the languages it detec
 - **Policy from a protected commit (L2).** `tollgate.toml`, `.config/nextest.toml`, the Python baselines, cargo, clippy and rustfmt configs come from the merge-base of the commit with `main` (or `master`) of the trusted remote. A branch cannot weaken the checks that judge it; its own policy changes apply after it merges. Reports print a `POLICY:` line when a branch changes policy files.
 - **Shared resources.** Steps take host-wide slots (`cpu`, `pg`, ...) with `flock(2)` in a fair queue (R85, R86). CI jobs on the workstation take the same slots.
 - **Reports an agent can act on.** A deny prints at most about 80 lines: the failing step, the failing tests or new diagnostics, one rerun command, and `tollgate log <job> <step>` for the full log (R91).
-- **A guard.** `tollgate guard` is a Claude Code PreToolUse hook. It denies every Bash call while the gate is not armed (R24, L8), denies text that removes or evades the hooks (`--no-verify`, `-c core.hooksPath`, ...), and asks before edits to policy files and settings (R25, R26).
+- **A guard.** `tollgate guard` is a Claude Code PreToolUse hook. It denies every Bash call while the gate is not armed (R24, L8), denies the direct, documented ways round the hooks (`--no-verify`, `-c core.hooksPath`, ...), and asks before edits to policy files and settings (R25, R26). It defends against a careless agent, not a hostile one (see [Same-user limitation](#same-user-limitation)).
 
 ## Languages
 
@@ -116,6 +116,19 @@ In the hook table, `retry` counts allows that ended a commit refused at the inli
 
 Use the rule table for false-deny review: a rule with many denies over few distinct commands means agents retried the same command; many distinct commands means the rule fires often.
 
+### Reading `tollgate stats`
+
+The guard line gives the calls, allows (and how many got the R28 rewrite), asks and denies, and the guard's own time p50/p90. Below it, `asks and denies by rule` has one row per rule id, most hits first: `deny`, `ask`, `distinct` (distinct command hashes) and `last` (time of the last hit). The ids are the ones in spec R25 and R26, plus three of the guard itself:
+
+| Id | Means | A high count means |
+|---|---|---|
+| `unclassified` | Ask: a part of a command the guard cannot read names git, tollgate, `.claude` or `.githooks` (six cases, R26) | Agents build git commands at run time (`eval "$x"`, `sh -c "$cmd"`, `$tool commit`). Give them the literal form. Many distinct commands that are harmless: a guard case to look at |
+| `not-armed` | Deny of every Bash call: the R24 self-check failed (hooks dir missing, a hook that is not a link to the guard binary, the session `env` injection missing or changed) | The gate is broken, not the agent. Run `tollgate doctor`, then `tollgate install` from your own terminal |
+| `malformed-input` | Deny: the hook input was not the JSON the guard expects | A Claude Code change of the hook input format. Check the Claude Code version |
+| `cap-prefix` | Deny: a command that already starts with `export TOLLGATE_INLINE_CAP=` (R28 note) | Agents copy the rewritten command back. Harmless, but tell them to drop the prefix |
+
+A deny rule with many denies over many distinct commands is a candidate false deny: read the commands it hit (the log holds hashes, so compare with the session transcript) and, when they are harmless, add them to the allow corpus with the fix.
+
 ## CI
 
 `tollgate ci-snippet --gitlab` prints a `.gitlab-ci.yml` job (R73). It runs `tollgate run --tier full --here --report junit`, which runs the setup steps and every step in the CI clone, writes `tollgate-report/report.json` and `tollgate-report/junit.xml` (one test case per step, plus the nextest test suites), and exits non-zero on a failure (R47). On a runner that shares the workstation's test services, the job takes the host resource slots. On hosted runners, add `--no-host-locks`.
@@ -124,9 +137,10 @@ Use the rule table for false-deny review: a rule with many denies over few disti
 
 ### Same-user limitation
 
-tollgate runs as the same user as the agents. Code that runs as one user cannot reliably stop other code that runs as the same user. An agent that wants to bypass tollgate can edit files, kill processes, or write records. tollgate does not protect against a hostile agent. It stops accidental and lazy bypass, and it makes a bypass visible:
+tollgate runs as the same user as the agents. Code that runs as one user cannot reliably stop other code that runs as the same user. An agent that wants to bypass tollgate can edit files, kill processes, or write records. tollgate does not protect against a hostile agent. Its guard defends against a careless agent: one that, under pressure to finish, reaches for the direct, documented way round the gate, typed with ordinary tools and everyday wrappers. Deliberate evasion (obscure launchers, renamed binaries, `PATH` changes, pty tricks, interpreter code, races) is out of scope: parsing bash does not stop it. The guarantee is the hooks, the tree-keyed record check at commit, merge and push, and the trusted anchor for policy, and tollgate makes a bypass visible:
 
-- Records are written only by the job runner, and the guard denies writes under the state dir (R83). `tollgate audit` lists records with their duration, log size and tollgate version, so a 0-second pass or an old-version record stands out.
+- When the guard cannot read a part of a command that names git, tollgate or `.claude`, it asks you (rule `unclassified`, R26) instead of guessing; a command that names none of them is allowed at once. `tollgate stats` shows the denies and asks by rule (see [Reading `tollgate stats`](#reading-tollgate-stats)).
+- Records are written only by the job runner, and the guard denies writes under the state dir by ordinary tools and editor calls (R83). `tollgate audit` lists records with their duration, log size and tollgate version, so a 0-second pass or an old-version record stands out.
 - Your own terminal is not gated (L3). You are the override.
 - The last line is GitLab: protect `main` (no direct push, merge through a merge request, pipelines must succeed) and run the CI job on every merge request. A tree that leaves the machine is checked there again.
 
@@ -162,7 +176,7 @@ v1 installs no `reference-transaction` hook. Commits that `cherry-pick`, `revert
 - macOS (L13) builds and passes its tests except `a_dead_runner_leaves_no_step_and_no_free_slot_behind_r35_r85` and `waiting_on_a_dead_runner_reaps_its_steps_r35`. It has no parent-death signal, so a step outlives a SIGKILLed runner, and `KERN_PROCARGS2` shows an unprivileged caller no environment, so `reap_if_lost` cannot find the lost job's processes by their `TMPDIR` entry. Those processes keep their resource slots until they exit. Also on macOS: no subreaper, so a process a step had already orphaned is out of the walk, and `doctor` only warns about an old git lock, because it cannot tell whether a live git owns it (R39).
 - The settings `env` reaches the Bash calls of subagents (R3; checked with Claude Code 2.1.317). The guard denies every Bash call when the injection is missing, so a gap in another version fails closed.
 - A Python root without `uv.lock` gets no `uv sync` setup step: its tools must be on the job `PATH`.
-- In a command that names git or tollgate, the guard denies what it does not check instead of decoding it: ANSI-C quoting (`$'...'`), a `\c` escape, and text fed to a shell (or to python or perl) through a pipe, a heredoc, a here-string or an input redirection (item 31). Give a multi-line commit message with `-F <file>` or `-m "$(cat <<'EOF' ... EOF)"`. The guard is still a parser: a command name built from a variable (`${x}t commit`) or arguments that `xargs` reads from a pipe are not seen. A commit made that way without the hooks is marked unverified by `post-commit`, and the push gate and CI check it.
+- The guard reads literal words only (R25). A literal heredoc, here-string or `echo`/`printf`/`cat` pipe into a shell is read as shell code; text fed to python, node or perl is data. A word bash builds at run time (`$'...'` with escapes, `"$x"`, `$(...)`) is data in an argument position. As a command name or as shell code (`$tool commit`, `eval "$x"`, `sh -c "$cmd"`, a pipe that is not literal into a shell) it is an ask when its text names git, tollgate or `.claude` (`unclassified`, R26), and allowed otherwise. Arguments that `xargs` reads from a pipe are not seen. A commit made without the hooks this way has no result record: `post-commit` marks it unverified, and the push gate, `tollgate merge` and CI check it.
 
 ## Rollout
 
