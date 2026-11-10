@@ -166,7 +166,8 @@ pub struct RustPick {
     pub whole: bool,
     /// Marked members (R57).
     pub marked: BTreeSet<String>,
-    /// Their reverse-dependency closure; every member when `whole`.
+    /// What is built: their reverse-dependency closure, or every member
+    /// when `whole` or when the query cache changed (R57f).
     pub affected: BTreeSet<String>,
 }
 
@@ -221,11 +222,18 @@ fn rust_global(path: &Path, root: &Path) -> bool {
                 | ".config/nextest.toml"
         )
     ) || first == Some(OsStr::new(".cargo"))
-        || first == Some(OsStr::new(".sqlx"))
         || matches!(
             name,
             "clippy.toml" | ".clippy.toml" | "rustfmt.toml" | ".rustfmt.toml" | "build.rs"
         )
+}
+
+/// The `sqlx` offline query cache of one Rust workspace (R57f). A macro of
+/// any member can read it at compile time, and nothing reads it at run time.
+fn query_cache(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root).is_ok_and(|rel| {
+        rel.components().next().map(|c| c.as_os_str()) == Some(OsStr::new(".sqlx"))
+    })
 }
 
 /// Maps the changes of a `fast` job to affected packages and roots (R57).
@@ -245,6 +253,7 @@ pub fn pick(
     }
     let mut out = Picked::default();
     let mut whole = vec![false; rust.len()];
+    let mut build_all = vec![false; rust.len()];
     let mut marked: Vec<BTreeSet<String>> = vec![BTreeSet::new(); rust.len()];
     let mut unknown_owner = BTreeSet::new();
     for c in changes {
@@ -264,6 +273,9 @@ pub fn pick(
         for (i, r) in rust.iter().enumerate() {
             if rust_global(p, r.dir) {
                 whole[i] = true;
+                matched = true;
+            } else if query_cache(p, r.dir) {
+                build_all[i] = true;
                 matched = true;
             }
         }
@@ -286,6 +298,11 @@ pub fn pick(
             }
         }
         for (i, r) in rust.iter().enumerate() {
+            // R57f: the query cache belongs to no member, also when the
+            // workspace root is a package.
+            if query_cache(p, r.dir) {
+                continue;
+            }
             if let Some(pkg) = r.map.and_then(|m| m.package_for(p)) {
                 marked[i].insert(pkg.to_owned());
                 matched = true;
@@ -325,9 +342,11 @@ pub fn pick(
         }
     }
     for (i, r) in rust.iter().enumerate() {
-        let whole = whole[i] || r.map.is_none();
+        // R57f: a query cache change with no marked member does not say
+        // which tests to run, so every test runs.
+        let whole = whole[i] || r.map.is_none() || (build_all[i] && marked[i].is_empty());
         let affected = match r.map {
-            Some(m) if whole => m.all(),
+            Some(m) if whole || build_all[i] => m.all(),
             Some(m) => m.closure(&marked[i]),
             None => BTreeSet::new(),
         };
@@ -382,6 +401,112 @@ mod tests {
             }],
             &other,
         )
+    }
+
+    #[test]
+    fn query_cache_builds_everything_and_tests_the_marked_r57f() {
+        let c = RepoConfig::default();
+        // With a marked member: every member is built, `a` alone is a
+        // filterset root.
+        let p = run(&c, &[".sqlx/query-1.json", "crates/a/src/lib.rs"], &[]);
+        assert!(!p.rust[0].whole);
+        assert_eq!(p.rust[0].affected, set(&["a", "b"]));
+        assert_eq!(p.rust[0].marked, set(&["a"]));
+        // The order of the paths does not matter, and a deletion counts.
+        let mut ch = changes(&["crates/a/src/lib.rs", ".sqlx/query-1.json"]);
+        ch[1].status = 'D';
+        let m = ws();
+        let roots = [RustRoot {
+            dir: Path::new(""),
+            map: Some(&m),
+        }];
+        let p = pick(&ch, &Rules::new(&c).unwrap(), &roots, &[]);
+        assert!(!p.rust[0].whole);
+        assert_eq!(p.rust[0].affected, set(&["a", "b"]));
+        assert_eq!(p.rust[0].marked, set(&["a"]));
+        // An owner entry marks too.
+        let owned = config("[select.owners]\n\"migrations/**\" = [\"a\"]\n");
+        let p = run(&owned, &[".sqlx/query-1.json", "migrations/1.sql"], &[]);
+        assert!(!p.rust[0].whole);
+        assert_eq!(p.rust[0].marked, set(&["a"]));
+        assert_eq!(p.rust[0].affected, set(&["a", "b"]));
+        // No marked member: nothing says which tests to run, so all run.
+        let p = run(&c, &[".sqlx/query-1.json"], &[]);
+        assert!(p.rust[0].whole);
+        assert_eq!(p.rust[0].affected, set(&["a", "b"]));
+        let p = run(&c, &[".sqlx/query-1.json", "docs/x.md"], &[]);
+        assert!(p.rust[0].whole);
+        // A global trigger in the same change still wins.
+        let p = run(
+            &c,
+            &[".sqlx/query-1.json", "crates/a/src/lib.rs", "Cargo.lock"],
+            &[],
+        );
+        assert!(p.rust[0].whole);
+        // `select.global` restores the whole-workspace rule.
+        let global = config("[select]\nglobal = [\".sqlx/**\"]\n");
+        let p = run(&global, &[".sqlx/query-1.json", "crates/a/src/lib.rs"], &[]);
+        assert!(p.rust[0].whole);
+        // Only the query cache of the workspace counts.
+        let m = map(
+            "svc",
+            &[("a", "svc/crates/a", &["b"]), ("b", "svc/crates/b", &[])],
+        );
+        let roots = [RustRoot {
+            dir: Path::new("svc"),
+            map: Some(&m),
+        }];
+        let p = pick(
+            &changes(&["svc/.sqlx/query-1.json", "svc/crates/a/src/lib.rs"]),
+            &Rules::new(&c).unwrap(),
+            &roots,
+            &[],
+        );
+        assert!(!p.rust[0].whole);
+        assert_eq!(p.rust[0].affected, set(&["a", "b"]));
+        assert_eq!(p.rust[0].marked, set(&["a"]));
+        // A root package does not own the query cache: alone, the change
+        // still runs every test, and with `a` it does not mark `app`.
+        let m = map(
+            "",
+            &[
+                ("app", "", &[]),
+                ("a", "crates/a", &["b"]),
+                ("b", "crates/b", &[]),
+            ],
+        );
+        let roots = [RustRoot {
+            dir: Path::new(""),
+            map: Some(&m),
+        }];
+        let rules = Rules::new(&c).unwrap();
+        let p = pick(&changes(&[".sqlx/query-1.json"]), &rules, &roots, &[]);
+        assert!(p.rust[0].whole);
+        let p = pick(
+            &changes(&[".sqlx/query-1.json", "crates/a/src/lib.rs"]),
+            &rules,
+            &roots,
+            &[],
+        );
+        assert!(!p.rust[0].whole);
+        assert_eq!(p.rust[0].marked, set(&["a"]));
+        assert_eq!(p.rust[0].affected, set(&["a", "app", "b"]));
+        // A second workspace with no change of its own is not touched.
+        let n = map("svc", &[("s", "svc/crates/s", &[])]);
+        let two = [
+            roots[0],
+            RustRoot {
+                dir: Path::new("svc"),
+                map: Some(&n),
+            },
+        ];
+        let p = pick(
+            &changes(&[".sqlx/query-1.json", "crates/a/src/lib.rs"]),
+            &rules,
+            &two,
+            &[],
+        );
+        assert!(p.rust[1].is_empty());
     }
 
     #[test]
