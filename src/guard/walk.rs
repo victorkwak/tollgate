@@ -1146,9 +1146,9 @@ impl<'a> Walker<'a> {
                 let script = serde_json::from_str::<serde_json::Value>(&text.0)
                     .ok()
                     .and_then(|v| v["scripts"][name.as_str()].as_str().map(str::to_owned));
-                if let Some(code) = script
-                    && (has_needle(&code) || self.has_marker(&code))
-                {
+                // A script that names nothing can still run a script file
+                // that does, as in `run_file`.
+                if let Some(code) = script {
                     self.code(&code, &mut st.clone());
                 }
             }

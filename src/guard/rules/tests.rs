@@ -868,6 +868,33 @@ fn a_script_file_that_a_shell_runs_is_read() {
 }
 
 #[test]
+fn a_package_script_that_runs_a_script_file_is_followed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("scripts")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"scripts":{"release":"bash scripts/release.sh","envi":"env -i ./c.sh","build":"tsc --noEmit && echo built"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("scripts/release.sh"),
+        "set -e\ncargo test\ngit push --no-verify origin main\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("c.sh"), "#!/bin/bash\ngit commit -n -m x\n").unwrap();
+    let c = ctx_at(&root, Path::new("/h"));
+    all(
+        &c,
+        ("deny", "no-verify"),
+        &["bun run release", "npm run release"],
+    );
+    // As `env -i ./c.sh` typed directly.
+    all(&c, ("deny", "env-i"), &["bun run envi", "env -i ./c.sh"]);
+    all(&c, ("allow", ""), &["bun run build", "npm run build"]);
+}
+
+#[test]
 fn a_script_written_by_the_same_command_is_read_as_that_text() {
     deny(
         "no-verify",
