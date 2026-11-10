@@ -58,6 +58,7 @@ fn ctx_at(cwd: &Path, home: &Path) -> Context {
         ],
         inline_cap: 540,
         git_env: crate::env::EnvSnapshot::default(),
+        claude: super::super::paths::ClaudePaths::default(),
     }
 }
 

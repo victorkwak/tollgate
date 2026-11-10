@@ -168,6 +168,12 @@ impl Lab {
 
     /// The installed guard on Bash `command` with cwd `dir`.
     fn guard_in(&self, dir: &Path, command: &str) -> Guarded {
+        self.guard_env(dir, command, &[])
+    }
+
+    /// The installed guard on Bash `command` with cwd `dir`, in a session
+    /// that also has `extra` in its environment.
+    fn guard_env(&self, dir: &Path, command: &str, extra: &[(&str, &Path)]) -> Guarded {
         let input = serde_json::json!({
             "session_id": "s",
             "hook_event_name": "PreToolUse",
@@ -175,12 +181,17 @@ impl Lab {
             "tool_name": "Bash",
             "tool_input": {"command": command, "description": "d"},
         });
-        self.guard_json(&input)
+        self.guard_json_env(&input, extra)
     }
 
     fn guard_json(&self, input: &serde_json::Value) -> Guarded {
+        self.guard_json_env(input, &[])
+    }
+
+    fn guard_json_env(&self, input: &serde_json::Value, extra: &[(&str, &Path)]) -> Guarded {
         let mut child = self
             .cmd(self.a.bin(), &self.repo)
+            .envs(extra.iter().copied())
             .arg("guard")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -3458,6 +3469,15 @@ fn s49_bash_writes_of_session_settings_and_global_git_config_are_never_silent() 
         format!("python3 -c \"open('{h}/.claude/settings.json', 'w').write('{{}}')\""),
         "python3 - <<'EOF'\nimport os\nopen(os.path.expanduser('~/.claude/settings.json'), 'w').write('{}')\nEOF".to_owned(),
         "node -e \"require('fs').writeFileSync(require('os').homedir() + '/.claude/settings.local.json', '{}')\"".to_owned(),
+        // The reviewer's forms (review of item 21, R26 for Bash).
+        "sed -i 's/tollgate/x/' ~/.claude/settings.json".to_owned(),
+        "echo '{}' > ~/.claude/settings.json".to_owned(),
+        "perl -pi -e 's/tollgate/x/' ~/.claude/settings.json".to_owned(),
+        "ln -sf /tmp/x ~/.claude/settings.json".to_owned(),
+        "cp -t ~/.claude /tmp/settings.json".to_owned(),
+        "cd ~/.claude && echo '{}' > settings.json".to_owned(),
+        "echo '{}' > ~/.claude/settings.local.json".to_owned(),
+        "echo '{}' > .claude/settings.local.json".to_owned(),
     ];
     let mut bad = silent(&settings);
     // A plain write asks, as Write/Edit of the file does (R26).
@@ -3520,6 +3540,137 @@ fn s49_bash_writes_of_session_settings_and_global_git_config_are_never_silent() 
         "printf x > settings.json".to_owned(),
     ] {
         let g = lab.guard(&cmd);
+        assert!(matches!(g, Guarded::Allowed(_)), "{cmd}: {g:?}");
+    }
+}
+
+/// S53 (R26, review of item 21): Claude Code reads settings from more
+/// places than `~/.claude`: the user settings dir `$CLAUDE_CONFIG_DIR`
+/// names, and the managed settings (`/etc/claude-code`, on macOS
+/// `/Library/Application Support/ClaudeCode`: `managed-settings.json` and
+/// the `managed-settings.d` drop-ins), which outrank every other file and
+/// can turn all user hooks off (`disableAllHooks`,
+/// `allowManagedHooksOnly`). One write there removes the guard for every
+/// later session, so a Bash write of any of them asks, as Write/Edit of
+/// `.claude/settings*.json` does. Only the guard runs here.
+#[test]
+fn s53_bash_writes_of_the_config_dir_and_managed_settings_ask() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    let root = lab.root();
+    let r = root.display().to_string();
+    let cfg = root.join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("settings.json"), "{}\n").unwrap();
+    std::fs::write(root.join("x.json"), "{}\n").unwrap();
+    std::os::unix::fs::symlink(&cfg, root.join("cfglink")).unwrap();
+    let mut bad = Vec::new();
+    // `sudo` with a `-s`/`-i` cluster in its words denies (G2), which is
+    // never silent either; every other form asks.
+    let mut want_ask = |cmd: &str, env: &[(&str, &Path)]| match lab.guard_env(&lab.repo, cmd, env) {
+        Guarded::Asked(_) => {}
+        Guarded::Denied(why) if cmd.starts_with("sudo") && why.contains("(G2)") => {}
+        g => bad.push(format!("{cmd}  {env:?} => not an ask: {g:?}")),
+    };
+    // $CLAUDE_CONFIG_DIR, as spelled and through a link to it.
+    for dir in [cfg.clone(), root.join("cfglink")] {
+        let env = [("CLAUDE_CONFIG_DIR", dir.as_path())];
+        for cmd in [
+            format!("printf '{{}}' > {r}/cfg/settings.json"),
+            format!("echo '{{}}' > {r}/cfglink/settings.local.json"),
+            format!("sed -i 's/tollgate/x/' {r}/cfg/settings.json"),
+            format!("perl -pi -e 's/a/b/' {r}/cfg/settings.json"),
+            format!("cp -t {r}/cfg {r}/x.json"),
+            format!("cp {r}/x.json {r}/cfg/settings.json"),
+            format!("ln -sf /tmp/x {r}/cfg/settings.json"),
+            format!("rm {r}/cfg/settings.json"),
+            format!("rm -rf {r}/cfg"),
+            format!("mv {r}/cfg {r}/cfg-old"),
+            format!("cd {r}/cfg && echo '{{}}' > settings.json"),
+            format!("python3 -c \"open('{r}/cfg/settings.json', 'w').write('{{}}')\""),
+            format!("python3 w.py {r}/cfg/settings.json"),
+            format!("frobnicate {r}/cfglink/settings.json"),
+        ] {
+            want_ask(&cmd, &env);
+        }
+    }
+    // A program that is not a known reader may write any path it is
+    // given, as R25 has it for tollgate's dirs: launchers that need no
+    // password, unknown programs, interpreters whose code writes an
+    // argument without naming it, globs and variables.
+    for cmd in [
+        "setpriv cp /tmp/x ~/.claude/settings.json".to_owned(),
+        "systemd-run --user --pipe cp /tmp/x ~/.claude/settings.json".to_owned(),
+        "systemd-run --user rm ~/.claude/settings.json".to_owned(),
+        "tmux new -d cp /tmp/x ~/.claude/settings.json".to_owned(),
+        "screen -dm cp /tmp/x ~/.claude/settings.json".to_owned(),
+        "sudo cp /tmp/x ~/.claude/settings.json".to_owned(),
+        "echo '{}' | sudo tee ~/.claude/settings.json".to_owned(),
+        "frobnicate cp /tmp/x ~/.claude/settings.json".to_owned(),
+        "frobnicate --out=~/.claude/settings.local.json".to_owned(),
+        "awk '{print > FILENAME}' ~/.claude/settings.json".to_owned(),
+        "perl -e 'open F, \">\", $ARGV[0]; print F \"{}\"' ~/.claude/settings.json".to_owned(),
+        "python3 -c 'import sys; open(sys.argv[1], \"w\").write(\"{}\")' ~/.claude/settings.json"
+            .to_owned(),
+        "frobnicate ~/.claude/settings*.json".to_owned(),
+        "frobnicate ~/.cl*/settings.json".to_owned(),
+        "frobnicate ~/.claude/{settings,x}.json".to_owned(),
+        "frobnicate ~/.claude".to_owned(),
+        "frobnicate .claude/settings.local.json".to_owned(),
+        "frobnicate */.claude/settings.local.json".to_owned(),
+        "f=~/.claude/settings.json; frobnicate \"$f\"".to_owned(),
+        "export F=~/.claude/settings.json; frobnicate".to_owned(),
+        "OUT=~/.claude/settings.json frobnicate".to_owned(),
+        "frobnicate \"$(echo ~/.claude)/settings.json\"".to_owned(),
+        "d=$(echo ~/.claude); frobnicate \"$d/settings.json\"".to_owned(),
+        "cd \"$(echo ~/.claude)\" && frobnicate settings.json".to_owned(),
+        "frobnicate ~/.CLAUDE/Settings.JSON".to_owned(),
+        "cd ~/.claude && frobnicate".to_owned(),
+        "cd /etc/claude-code && frobnicate".to_owned(),
+        "frobnicate /etc/claude-code/managed-settings.d/x.json".to_owned(),
+    ] {
+        want_ask(&cmd, &[]);
+    }
+    // Managed settings, on both platforms, any case on macOS.
+    for cmd in [
+        "printf '{}' > /etc/claude-code/managed-settings.json",
+        "echo '{\"disableAllHooks\": true}' | sudo tee /etc/claude-code/managed-settings.json",
+        "echo '{\"allowManagedHooksOnly\": true}' | sudo tee /etc/claude-code/managed-settings.d/10-x.json",
+        "sudo mkdir -p /etc/claude-code/managed-settings.d && sudo cp /tmp/x.json /etc/claude-code/managed-settings.d/",
+        "sudo cp /tmp/x.json /etc/claude-code/",
+        "sudo cp -t /etc/claude-code /tmp/managed-settings.json",
+        "sudo install -D -m 644 /tmp/x.json /etc/claude-code/managed-settings.d/x.json",
+        "sudo sed -i 's/a/b/' /etc/claude-code/managed-settings.json",
+        "sudo ln -sf /tmp/x.json /etc/claude-code/managed-settings.json",
+        "sudo ln -sfn /tmp/cc /etc/claude-code",
+        "sudo rm -rf /etc/claude-code",
+        "sudo mv /etc/claude-code /etc/claude-code.old",
+        "cd /etc/claude-code && sudo tee managed-settings.json < /tmp/x.json",
+        "cd /etc && sudo tee claude-code/managed-settings.json < /tmp/x.json",
+        "printf '{}' > '/Library/Application Support/ClaudeCode/managed-settings.json'",
+        "sudo cp /tmp/x.json '/Library/Application Support/claudecode/Managed-Settings.json'",
+        "sudo rm -rf '/Library/Application Support/ClaudeCode'",
+        "python3 -c \"open('/etc/claude-code/managed-settings.json', 'w').write('{}')\"",
+        "sudo python3 -c \"open('/Library/Application Support/ClaudeCode/managed-settings.d/x.json', 'w').write('{}')\"",
+    ] {
+        want_ask(cmd, &[]);
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    // Reads with known readers, writes of other files, and programs given
+    // a dir that only holds a settings dir, stay open.
+    for cmd in [
+        "cat /etc/claude-code/managed-settings.json".to_owned(),
+        "jq .hooks ~/.claude/settings.json".to_owned(),
+        "mkdir -p .claude/commands && touch .claude/settings.local.json".to_owned(),
+        "frobnicate ~ /etc".to_owned(),
+        "frobnicate ~/.claude/projects/x.jsonl ~/.claude/notes.md".to_owned(),
+        "find ~/.claude/projects -name '*.jsonl'".to_owned(),
+        "frobnicate ~/*.md".to_owned(),
+        "ls /etc/claude-code/managed-settings.d".to_owned(),
+        format!("cp {r}/cfg/settings.json {r}/backup.json"),
+        "printf x > /tmp/claude-code-notes.txt".to_owned(),
+        format!("printf x > {r}/settings.json"),
+    ] {
+        let g = lab.guard_env(&lab.repo, &cmd, &[("CLAUDE_CONFIG_DIR", cfg.as_path())]);
         assert!(matches!(g, Guarded::Allowed(_)), "{cmd}: {g:?}");
     }
 }

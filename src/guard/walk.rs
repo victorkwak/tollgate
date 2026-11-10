@@ -301,12 +301,26 @@ enum Reach {
     TooMany,
 }
 
+/// How a word stands to the Claude Code settings (R26).
+enum SettingsReach {
+    /// It names this settings path.
+    Hit(PathBuf),
+    /// No settings path.
+    Clear,
+    /// A part only known at run time.
+    Unknown,
+    /// Too many brace results or glob entries to check.
+    TooMany,
+}
+
 /// The walk's state.
 pub struct Walker<'a> {
     pub(super) ctx: &'a Context,
     pub(super) home: String,
     scope: Scope,
-    ask: Option<String>,
+    /// The first ask reason (a cell: checks that only read the walk ask
+    /// too).
+    ask: RefCell<Option<String>>,
     pub(super) long: bool,
     depth: usize,
     in_script: bool,
@@ -361,8 +375,13 @@ pub struct Walker<'a> {
     /// Review G7/R25: the command, or a script it runs, spells one of
     /// tollgate's dirs ([`paths::spells_tollgate_dir`]).
     tollgate_named: bool,
+    /// R26: the command, or a script it runs, spells a Claude Code
+    /// settings name ([`paths::spells_claude`]).
+    claude_named: bool,
     /// [`Walker::candidate_reach`] per lexical path and spelling.
     reach_memo: RefCell<HashMap<(PathBuf, bool), Option<Reached>>>,
+    /// [`Self::settings_candidate`] results, keyed as `reach_memo`.
+    settings_memo: RefCell<HashMap<(PathBuf, bool), Option<PathBuf>>>,
     /// [`Walker::names_tollgate_dir`] per cwd and value.
     value_memo: RefCell<HashMap<ValueKey, Option<Reached>>>,
     /// [`Walker::canon_cached`]: the real path of each dir looked up.
@@ -394,6 +413,7 @@ pub struct Walker<'a> {
 pub fn assess(ctx: &Context, command: &str) -> Assessment {
     let mut w = Walker::new(ctx);
     w.tollgate_named = paths::spells_tollgate_dir(ctx, command);
+    w.claude_named = paths::spells_claude(ctx, command);
     let r = match shell::parse(command) {
         Err(e) => Err(format!(
             "the guard cannot parse this command ({e}); write it as plain commands (G1)"
@@ -429,7 +449,7 @@ impl<'a> Walker<'a> {
                 opaque: false,
                 ints: BTreeSet::new(),
             },
-            ask: None,
+            ask: RefCell::new(None),
             long: false,
             depth: 0,
             in_script: false,
@@ -452,7 +472,9 @@ impl<'a> Walker<'a> {
             namerefs: BTreeSet::new(),
             loose_for: BTreeSet::new(),
             tollgate_named: false,
+            claude_named: false,
             reach_memo: RefCell::new(HashMap::new()),
+            settings_memo: RefCell::new(HashMap::new()),
             value_memo: RefCell::new(HashMap::new()),
             dir_memo: RefCell::new(HashMap::new()),
             checked_tails: Vec::new(),
@@ -528,8 +550,8 @@ impl<'a> Walker<'a> {
     }
 
     /// Records an ask (R26); the first reason is kept.
-    pub(super) fn ask(&mut self, why: String) {
-        self.ask.get_or_insert(why);
+    pub(super) fn ask(&self, why: String) {
+        self.ask.borrow_mut().get_or_insert(why);
     }
 
     pub(super) fn cwd(&self) -> &Cwd {
@@ -1744,7 +1766,7 @@ impl<'a> Walker<'a> {
             ));
         }
         if gitish {
-            self.tollgate_dir_words(name, &argv[1..], &env, Some(via))?;
+            self.path_words(name, &argv[1..], &env, Some(via))?;
             if let Some(prog) = self.foreign.last().cloned() {
                 return self.foreign_git(&prog, argv, env, f, via);
             }
@@ -1765,11 +1787,11 @@ impl<'a> Walker<'a> {
         match class {
             Class::Wrapper(w) => self.wrapper(w, argv, env, f, via, certain),
             Class::Launcher(l) => {
-                self.tollgate_dir_words(name, &argv[1..], &env, Some(via))?;
+                self.path_words(name, &argv[1..], &env, Some(via))?;
                 self.launcher(l, argv, env, f, via)
             }
             Class::Shell(sh) => {
-                self.tollgate_dir_words(name, &argv[1..], &env, Some(via))?;
+                self.path_words(name, &argv[1..], &env, Some(via))?;
                 self.shell(sh, argv, env, f, via)
             }
             Class::Opaque(o) => self.opaque(o, argv, env, f, via),
@@ -1792,7 +1814,7 @@ impl<'a> Walker<'a> {
             Class::Source => {
                 self.no_elsewhere(via, name)?;
                 self.env_check(&env, Target::Code)?;
-                self.tollgate_dir_words(name, &argv[1..], &env, Some(via))?;
+                self.path_words(name, &argv[1..], &env, Some(via))?;
                 let mut i = 1;
                 if argv.get(1).and_then(Word::literal).as_deref() == Some("--") {
                     i = 2;
@@ -1803,7 +1825,7 @@ impl<'a> Walker<'a> {
                 self.script_file(file, false, env, f, name)
             }
             Class::Interp(lang) => {
-                self.tollgate_dir_words(name, &argv[1..], &env, Some(via))?;
+                self.path_words(name, &argv[1..], &env, Some(via))?;
                 self.interp(lang, &base, argv, env, f, via)
             }
             Class::VarWrite(b) => self.var_writer(b, argv, &env),
@@ -2279,7 +2301,7 @@ impl<'a> Walker<'a> {
             return self.code(&code, true, &frame, "flock -c");
         }
         let inner = first + pre;
-        self.tollgate_dir_words(name, &argv[1..inner.min(argv.len())], &[], None)?;
+        self.path_words(name, &argv[1..inner.min(argv.len())], &[], None)?;
         let via = if name == "xargs" { Via::Elsewhere } else { via };
         let Some(cmd) = argv.get(inner) else {
             // No command: xargs runs echo; the others run nothing (or fail).
@@ -2575,12 +2597,12 @@ impl<'a> Walker<'a> {
         let (at, prefix, moved) = match l {
             Launch::Deny(why) => return Err(why),
             Launch::Strict { from } => {
-                self.tollgate_dir_words(base, &argv[1..], &env, Some(via))?;
+                self.path_words(base, &argv[1..], &env, Some(via))?;
                 return self.launch_tokens(base, &argv[from..]);
             }
             Launch::Walk { at, prefix, moved } => (at, prefix, moved),
         };
-        self.tollgate_dir_words(base, &argv[1..at.min(argv.len())], &[], None)?;
+        self.path_words(base, &argv[1..at.min(argv.len())], &[], None)?;
         let Some(cmd) = argv.get(at) else {
             return Ok(());
         };
@@ -3149,6 +3171,7 @@ impl<'a> Walker<'a> {
                 .map_err(|_| format!("{shown} is not UTF-8 text; the guard cannot check it (G3)"))?
         };
         self.tollgate_named |= paths::spells_tollgate_dir(self.ctx, &text);
+        self.claude_named |= paths::spells_claude(self.ctx, &text);
         let s = shell::parse(&text)
             .map_err(|e| format!("the guard cannot parse the script {shown} ({e}) (G3)"))?;
         if self.depth >= MAX_CODE_DEPTH {
@@ -3205,7 +3228,7 @@ impl<'a> Walker<'a> {
             return self.other(name, base, argv, &env, f, via);
         }
         // A script gets its arguments as `$1`...: it is no reader.
-        self.tollgate_dir_words(name, &argv[1..], &env, Some(via))?;
+        self.path_words(name, &argv[1..], &env, Some(via))?;
         let interp = shebang(&head);
         match interp.as_deref() {
             Some(prog) if cmds::interp(prog).is_some() => {
@@ -3294,20 +3317,7 @@ impl<'a> Walker<'a> {
     /// and the guard does not follow file calls in code: a person
     /// decides. A raw-text match, so a read asks too.
     fn config_names(&mut self, base: &str, code: &str) {
-        let c = code.to_lowercase();
-        let names = if c.contains(".claude") && c.contains("settings") {
-            Some("Claude Code settings")
-        } else if c.contains("claude_config_dir") {
-            Some("the Claude Code settings dir")
-        } else if c.contains("gitconfig")
-            || c.contains("git/config")
-            || c.contains("git_config_global")
-        {
-            Some("git's global config")
-        } else {
-            None
-        };
-        if let Some(what) = names {
+        if let Some(what) = paths::config_named(self.ctx, &code.to_lowercase()) {
             self.ask(format!(
                 "{base} code names {what}, which it may write; those files decide what every later session and git command runs, so a person decides (R26, G7)"
             ));
@@ -4003,16 +4013,7 @@ impl<'a> Walker<'a> {
         env: &[EnvSet],
         leaf: Option<Via>,
     ) -> W {
-        if leaf.is_some()
-            && self.checked_tails.iter().any(|(cwd, raws)| {
-                *cwd == self.scope.cwd
-                    && raws.len() >= words.len()
-                    && raws[raws.len() - words.len()..]
-                        .iter()
-                        .zip(words)
-                        .all(|(r, w)| *r == w.raw)
-            })
-        {
+        if leaf.is_some() && self.tail_checked(words) {
             return Ok(());
         }
         let named = self.tollgate_named;
@@ -4119,6 +4120,207 @@ impl<'a> Walker<'a> {
         Ok(())
     }
 
+    /// L19: `words` are the tail of an unknown program's words already
+    /// checked with this cwd (each word is checked again as a command
+    /// with the words after it).
+    fn tail_checked(&self, words: &[Word]) -> bool {
+        self.checked_tails.iter().any(|(cwd, raws)| {
+            *cwd == self.scope.cwd
+                && raws.len() >= words.len()
+                && raws[raws.len() - words.len()..]
+                    .iter()
+                    .zip(words)
+                    .all(|(r, w)| *r == w.raw)
+        })
+    }
+
+    /// The words of a program that is not a known reader, which may write
+    /// any path it is given: R25 for tollgate's dirs (deny,
+    /// [`Self::tollgate_dir_words`]), then R26 for Claude Code settings
+    /// (ask, [`Self::settings_words`]).
+    pub(super) fn path_words(
+        &self,
+        what: &str,
+        words: &[Word],
+        env: &[EnvSet],
+        leaf: Option<Via>,
+    ) -> W {
+        if leaf.is_some() && self.tail_checked(words) {
+            return Ok(());
+        }
+        self.tollgate_dir_words(what, words, env, leaf)?;
+        if let Some(why) = self.settings_words(what, words, env, leaf.is_some()) {
+            self.ask(why);
+        }
+        Ok(())
+    }
+
+    /// R26 (review of item 21): the Claude Code settings files register
+    /// the guard and the hook injection for every later session, and a
+    /// program that is not a known reader may write any path it is given
+    /// (`setpriv cp x ~/.claude/settings.json`, `systemd-run --user rm
+    /// ...`, `tmux new -d ...`, `python3 w.py ~/.claude/settings.json`), as
+    /// R25 has it for tollgate's dirs. The ask reason when a word, an
+    /// option's value, a glob or brace result, an environment value or (for
+    /// the program itself, `leaf`) a variable this command set names a
+    /// settings path ([`paths::claude_settings_word`]), when a word bash
+    /// builds at run time spells a settings name, or when the program runs
+    /// in a settings dir.
+    fn settings_words(
+        &self,
+        what: &str,
+        words: &[Word],
+        env: &[EnvSet],
+        leaf: bool,
+    ) -> Option<String> {
+        // They make a dir, an empty file or an attribute, never settings
+        // text (as `write_target` has it).
+        if matches!(basename(what), "mkdir" | "touch" | "setfattr") {
+            return None;
+        }
+        let given = |shown: String| {
+            Some(format!(
+                "`{what}` is given {shown}, Claude Code settings, which register the guard and the hook injection for every later session; it is not a known reader (cat, grep, jq, ls, ...), and a program may write any path it is given, so a person decides (R26)"
+            ))
+        };
+        match &self.scope.cwd {
+            Cwd::Known(c) if leaf && paths::claude_settings_dir(self.ctx, c) => {
+                return Some(format!(
+                    "`{what}` runs in {}, a Claude Code settings dir, and it is not a known reader (cat, grep, ls, ...); a program may write its cwd, so a person decides (R26)",
+                    c.display()
+                ));
+            }
+            Cwd::Unknown if leaf && self.claude_named => {
+                return Some(format!(
+                    "`{what}` runs in a cwd the guard cannot know, in a command that names Claude Code settings; it is not a known reader (cat, grep, ls, ...), and a program may write its cwd, so a person decides (R26)"
+                ));
+            }
+            _ => {}
+        }
+        let built = |raw: &str| self.claude_named || paths::spells_claude(self.ctx, raw);
+        for w in words {
+            match self.settings_reach(w) {
+                SettingsReach::Hit(p) => return given(format!("the path {}", p.display())),
+                SettingsReach::TooMany => {
+                    return given(format!(
+                        "`{}`, whose brace lists or globs give too many paths to check against",
+                        w.raw
+                    ));
+                }
+                SettingsReach::Unknown if built(&w.raw) => {
+                    return given(format!(
+                        "`{}`, a word bash builds at run time that may name",
+                        w.raw
+                    ));
+                }
+                SettingsReach::Unknown | SettingsReach::Clear => {}
+            }
+        }
+        for e in env {
+            let v = e.value.clone().or_else(|| {
+                let (_, t) = e.raw.split_once('=')?;
+                (!t.contains(['$', '`', '"', '\'', '\\'])).then(|| t.to_owned())
+            });
+            match v {
+                Some(v) => {
+                    if let Some(p) = self.settings_value(&v) {
+                        return given(format!("{} = {} in its environment", e.name, p.display()));
+                    }
+                }
+                None if built(&e.raw) => {
+                    return given(format!(
+                        "`{}`, a value bash builds at run time that may name",
+                        e.raw
+                    ));
+                }
+                None => {}
+            }
+        }
+        if !leaf {
+            return None;
+        }
+        let mut vars: Vec<(&String, &String)> = self
+            .scope
+            .vars
+            .iter()
+            .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
+            .collect();
+        vars.sort();
+        vars.into_iter().find_map(|(name, v)| {
+            self.settings_value(v).map(|p| {
+                format!(
+                    "`{what}` runs while variable {name} = {} names Claude Code settings, which register the guard and the hook injection for every later session; a program may write a path from its environment, so a person decides (R26)",
+                    p.display()
+                )
+            })
+        })
+    }
+
+    /// [`Self::settings_words`] for one word: the settings path it names.
+    fn settings_reach(&self, w: &Word) -> SettingsReach {
+        if let Some(v) = self.arg_value(w) {
+            return self
+                .settings_value(&v)
+                .map_or(SettingsReach::Clear, SettingsReach::Hit);
+        }
+        let lookup = |n: &str| self.lookup(n);
+        let Some(toks) = reach::tokens(w, &self.home, &lookup) else {
+            return SettingsReach::Unknown;
+        };
+        let Some(all) = reach::braces(&toks) else {
+            return SettingsReach::TooMany;
+        };
+        let cwd = match &self.scope.cwd {
+            Cwd::Known(c) => Some(c.as_path()),
+            Cwd::Unknown => None,
+        };
+        for t in all {
+            for c in paths::path_candidates(&reach::text(&t), &self.home) {
+                if reach::has_glob(&c) {
+                    match reach::glob_claude(self.ctx, cwd, &c) {
+                        Ok(Some(p)) => return SettingsReach::Hit(p),
+                        Ok(None) => {}
+                        Err(()) => return SettingsReach::TooMany,
+                    }
+                } else if let Some(p) = self.settings_candidate(&c) {
+                    return SettingsReach::Hit(p);
+                }
+            }
+        }
+        if cwd.is_none() {
+            return SettingsReach::Unknown;
+        }
+        SettingsReach::Clear
+    }
+
+    /// The settings path a literal value names (its path candidates).
+    fn settings_value(&self, v: &str) -> Option<PathBuf> {
+        paths::path_candidates(v, &self.home)
+            .iter()
+            .find_map(|c| self.settings_candidate(c))
+    }
+
+    /// [`paths::claude_settings_word`] for one candidate path, resolved
+    /// and as spelled (a link to the settings dir resolves away from its
+    /// name), kept for the call.
+    fn settings_candidate(&self, c: &str) -> Option<PathBuf> {
+        let l = self.lexical_path(c)?;
+        let spelled = c.contains('/') || c.starts_with(['.', '~']);
+        let key = match &self.scope.cwd {
+            Cwd::Known(cwd) => (cwd.join(c), spelled),
+            Cwd::Unknown => (PathBuf::from(c), spelled),
+        };
+        if let Some(r) = self.settings_memo.borrow().get(&key) {
+            return r.clone();
+        }
+        let r = self
+            .canon_cached(&key.0)
+            .filter(|p| paths::claude_settings_word(self.ctx, p))
+            .or_else(|| paths::claude_settings_word(self.ctx, &l).then_some(l));
+        self.settings_memo.borrow_mut().insert(key, r.clone());
+        r
+    }
+
     /// Review G7/R25: `name` is a known reader ([`TOLLGATE_DIR_READERS`])
     /// as the system has it: found on the session's `PATH` (no `PATH` set
     /// in the command), or named by its path in `/usr/bin` or `/bin`.
@@ -4180,7 +4382,7 @@ impl<'a> Walker<'a> {
         let function = self.scope.funcs.contains(name);
         if function {
             // A function gets its arguments as `$1`...: it is no reader.
-            self.tollgate_dir_words(name, &argv[1..], env, Some(via))?;
+            self.path_words(name, &argv[1..], env, Some(via))?;
             // G1, G5 (review G5 PATH): its body found its commands on the
             // PATH that held where it was defined.
             if let Some(p) = self.func_paths.get(name)
@@ -4224,7 +4426,7 @@ impl<'a> Walker<'a> {
                 .filter(|(k, _)| !sources.contains(k))
                 .map(|(_, w)| w.clone())
                 .collect();
-            self.tollgate_dir_words(name, &words, env, Some(via))?;
+            self.path_words(name, &words, env, Some(via))?;
             all_checked = sources.is_empty();
         }
         match base {

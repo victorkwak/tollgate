@@ -78,6 +78,8 @@ pub struct Context {
     /// config it carries (`HOME`, `XDG_CONFIG_HOME`, `GIT_*`): which repo a
     /// fetch or push reaches (G7, item 22, secreview note 7).
     pub git_env: crate::env::EnvSnapshot,
+    /// The Claude Code settings locations (R26), worked out on first use.
+    pub claude: super::paths::ClaudePaths,
 }
 
 impl Context {

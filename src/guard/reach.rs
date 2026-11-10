@@ -294,6 +294,75 @@ pub fn glob_reach(
     Ok(None)
 }
 
+/// R26: the Claude Code settings path ([`paths::claude_settings_word`])
+/// a glob candidate `text` (absolute, or relative to `cwd`) can expand
+/// to. A dir named `.claude` can be anywhere, so a step keeps every match
+/// while a later component can be `.claude`; otherwise only matches that
+/// lead to a user or managed settings dir or a `.claude` dir. `Err` when
+/// the glob reads more than [`MAX_ENTRIES`] entries.
+pub fn glob_claude(ctx: &Context, cwd: Option<&Path>, text: &str) -> Result<Option<PathBuf>, ()> {
+    let (start, rest) = match text.strip_prefix('/') {
+        Some(r) => (PathBuf::from("/"), r),
+        None => match cwd {
+            Some(c) => (c.to_owned(), text),
+            None => return Ok(None),
+        },
+    };
+    let comps: Vec<&str> = rest.split('/').filter(|c| !c.is_empty()).collect();
+    let may_be_claude = |c: &str| {
+        c.eq_ignore_ascii_case(".claude")
+            || (has_glob(c) && component_glob(c).is_some_and(|m| m.is_match(".claude")))
+    };
+    let mut cur = vec![paths::canon(&start)];
+    let mut read = 0usize;
+    for (i, comp) in comps.iter().enumerate() {
+        let last = i + 1 == comps.len();
+        let later_claude = comps[i + 1..].iter().any(|c| may_be_claude(c));
+        let mut next = Vec::new();
+        for dir in &cur {
+            match *comp {
+                "." => next.push(dir.clone()),
+                ".." => {
+                    let mut p = dir.clone();
+                    p.pop();
+                    next.push(p);
+                }
+                c if !has_glob(c) => next.push(paths::canon(&dir.join(c))),
+                c => {
+                    let Some(m) = component_glob(c) else {
+                        continue;
+                    };
+                    let Ok(entries) = std::fs::read_dir(dir) else {
+                        continue;
+                    };
+                    for e in entries.flatten() {
+                        read += 1;
+                        if read > MAX_ENTRIES {
+                            return Err(());
+                        }
+                        if m.is_match(e.file_name()) {
+                            next.push(paths::canon(&e.path()));
+                        }
+                    }
+                }
+            }
+        }
+        if last {
+            return Ok(next
+                .into_iter()
+                .find(|p| paths::claude_settings_word(ctx, p)));
+        }
+        cur = next
+            .into_iter()
+            .filter(|p| later_claude || paths::claude_settings(ctx, p).is_some())
+            .collect();
+        if cur.is_empty() {
+            return Ok(None);
+        }
+    }
+    Ok(None)
+}
+
 /// The text of `$'...'` as bash decodes it (`\c` is decoded as bash
 /// does for letters; an escape it does not know stays as written).
 #[must_use]

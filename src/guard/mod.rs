@@ -333,6 +333,7 @@ fn context(
                 })
                 .map(|(k, v)| (k.to_owned(), v.to_owned())),
         ),
+        claude: paths::ClaudePaths::default(),
     }
 }
 

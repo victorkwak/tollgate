@@ -56,10 +56,11 @@ const CORPUS: &[&str] = &[
     // runs, with or without git in the same call.
     "python3 - <<'PY'\np = 'notes.md'\ns = 'run git commit --no-verify, then tollgate status'\nopen(p, 'w').write(s)\nPY",
     "cd {ABS} && python3 -I - <<'PY'\nimport json\nprint(json.dumps({'cmd': 'git push origin main'}))\nPY\ngit status --short",
-    // Reading the session settings and git's global config (R26 asks
-    // only on writes).
+    // Reading the session settings and git's global config with known
+    // readers (R26 asks on writes, and when a program that may write a
+    // path it is given, such as awk or perl, gets a settings path: S53).
     "jq '.hooks' ~/.claude/settings.json ; grep -n PreToolUse ~/.claude/settings.json ; git config --global --get user.name",
-    "awk '/hooks/' ~/.claude/settings.json ; perl -ne 'print if /env/' ~/.claude/settings.json",
+    "cat ~/.claude/settings.json | awk '/hooks/' ; perl -ne 'print if /env/' < ~/.claude/settings.json",
     // Item 44: reading text that names tollgate's test variable.
     "grep -rn -i tollgate_test_install src tests ; rg TOLLGATE_TEST_INSTALL docs",
     // Lookups and syntax checks run nothing.
