@@ -35,7 +35,12 @@ impl Sandbox {
             "[user]\n\tname = Test\n\temail = test@example.invalid\n[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n",
         )
         .unwrap();
-        Self { tmp, home }
+        let sb = Self { tmp, home };
+        // As `tollgate install` leaves it (item 33): with no index of
+        // trusted-remote records, every gated command denies.
+        let dirs = tollgate::dirs::Dirs::from_env(&sb.env()).unwrap();
+        tollgate::remote_record::ensure_index(&dirs, true).unwrap();
+        sb
     }
 
     /// The sandbox root (canonical).

@@ -537,6 +537,12 @@ pub fn bench(ctx: &Ctx, a: &BenchArgs) -> u8 {
             return exit::BLOCK;
         }
     };
+    // Its own state dir starts as an install's does (item 33: a missing
+    // index of trusted-remote records denies every gated command).
+    if let Err(e) = crate::remote_record::ensure_index(&dirs, true) {
+        eprintln!("tollgate bench: {e}");
+        return exit::BLOCK;
+    }
     let mut run = Run::default();
     let result = execute(ctx, a, &prep, &layout, &env, &dirs, &mut run);
     let mut cleanup = cleanup_jobs(&env, &dirs, &layout, &prep.head);

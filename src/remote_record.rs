@@ -25,7 +25,9 @@
 //! a commit of another indexed repo is a copy, a move or a clone of it:
 //! it takes over that repo's recorded remotes, so removing the remote in
 //! the new path is a loss too. A key the index lists whose record is gone
-//! is unusable, never "no record".
+//! is unusable, never "no record". A missing index is unusable too
+//! (secreview note 27): `tollgate install` makes it once, and only
+//! `tollgate remotes forget` makes it again, from the records left.
 //!
 //! A lost remote, or a record or index that cannot be read, parsed or
 //! written, denies (no policy anchor) and keeps the repo in scope: this
@@ -182,9 +184,11 @@ impl Checked {
                     first.url,
                 ))
             }
-            Status::Broken(why) if why.contains(INDEX_FIX) => Some(format!(
-                "no policy anchor (L2, item 33): {why}; until then a lost trusted remote cannot be told apart"
-            )),
+            Status::Broken(why) if why.contains(INDEX_FIX) || why.contains(INDEX_MISSING_FIX) => {
+                Some(format!(
+                    "no policy anchor (L2, item 33): {why}; until then a lost trusted remote cannot be told apart"
+                ))
+            }
             Status::Broken(why) => Some(format!(
                 "no policy anchor (L2, item 33): the record of this repo's trusted remotes is unusable ({why}), so a lost trusted remote cannot be told apart; run tollgate remotes forget in this repo from your own terminal to start a new record (record: {file})"
             )),
@@ -363,18 +367,21 @@ fn write(file: &Path, r: &Record) -> Result<(), String> {
 
 /// An unusable index is not for `forget` of one repo to replace: it is
 /// what tells every repo that had trusted remotes.
-const INDEX_FIX: &str =
-    "it lists every repo that had trusted remotes; repair or remove it from your own terminal";
+const INDEX_FIX: &str = "it lists every repo that had trusted remotes; repair it, or remove it and run tollgate remotes forget in a repo, from your own terminal";
 
-fn read_index(file: &Path) -> Result<Index, String> {
+/// A missing index is never "no repo had trusted remotes" (secreview
+/// note 27): deleting it with a record would make that record's repo
+/// read as new. `tollgate install` makes it once; after that only
+/// `tollgate remotes forget` starts a new one, from the records left.
+const INDEX_MISSING_FIX: &str = "without it a deleted record cannot be told from none; to start a new index from the records left, run tollgate remotes forget in a repo from your own terminal";
+
+/// The index; `None` when there is none.
+fn load_index(file: &Path) -> Result<Option<Index>, String> {
     let shown = file.display();
     let Some(bytes) = fsx::read_optional(file)
         .map_err(|e| format!("cannot read the index {shown}: {e}; {INDEX_FIX}"))?
     else {
-        return Ok(Index {
-            version: INDEX_VERSION,
-            repos: BTreeMap::new(),
-        });
+        return Ok(None);
     };
     let i: Index = serde_json::from_slice(&bytes)
         .map_err(|e| format!("cannot parse the index {shown}: {e}; {INDEX_FIX}"))?;
@@ -384,7 +391,100 @@ fn read_index(file: &Path) -> Result<Index, String> {
             i.version
         ));
     }
-    Ok(i)
+    Ok(Some(i))
+}
+
+/// The index; a missing one is unusable.
+fn read_index(file: &Path) -> Result<Index, String> {
+    load_index(file)?.ok_or_else(|| {
+        format!(
+            "the index {} is missing; it lists every repo that had trusted remotes, and {INDEX_MISSING_FIX}",
+            file.display()
+        )
+    })
+}
+
+/// A new index from the records in `dir`: every `<repo key>.json` with
+/// the commits it holds. A record that cannot be read is listed with no
+/// commits, so its repo still denies.
+fn rebuild_index(dir: &Path) -> Result<Index, String> {
+    let mut repos = BTreeMap::new();
+    let entries = match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("cannot list {}: {e}", dir.display())),
+        Ok(it) => it
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("cannot list {}: {e}", dir.display()))?,
+    };
+    for e in entries {
+        let name = e.file_name();
+        let Some(key) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".json"))
+            .and_then(|k| RepoKey::parse(k).ok())
+        else {
+            continue;
+        };
+        let path = e.path();
+        let commits = read(&path)
+            .ok()
+            .flatten()
+            .map(|r| r.commits)
+            .unwrap_or_default();
+        repos.insert(
+            key,
+            IndexEntry {
+                dir: format!("the repo of the record {}", path.display()),
+                commits,
+            },
+        );
+    }
+    Ok(Index {
+        version: INDEX_VERSION,
+        repos,
+    })
+}
+
+/// What [`ensure_index`] found or did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexSetup {
+    /// The index is there (usable or not: a check reads it).
+    Present,
+    /// It was missing and is made now from this many records.
+    Created(usize),
+    /// It is missing and `may_create` was false.
+    Missing(PathBuf),
+}
+
+/// `tollgate install` (and the bench, for its own state dir): makes the
+/// index when it is missing and `may_create` (no earlier install made
+/// it). A later install never makes it again: a missing index then
+/// means records were deleted with it, which only `tollgate remotes
+/// forget` accepts.
+pub fn ensure_index(dirs: &Dirs, may_create: bool) -> Result<IndexSetup, String> {
+    ensure_index_in(&records_dir(dirs), may_create)
+}
+
+fn ensure_index_in(dir: &Path, may_create: bool) -> Result<IndexSetup, String> {
+    let file = index_in(dir);
+    let exists = |f: &Path| match std::fs::symlink_metadata(f) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("cannot read the index {}: {e}", f.display())),
+    };
+    if exists(&file)? {
+        return Ok(IndexSetup::Present);
+    }
+    if !may_create {
+        return Ok(IndexSetup::Missing(file));
+    }
+    let _held = lock(&file)?;
+    if exists(&file)? {
+        return Ok(IndexSetup::Present);
+    }
+    let index = rebuild_index(dir)?;
+    write_index(&file, &index)?;
+    Ok(IndexSetup::Created(index.repos.len()))
 }
 
 fn write_index(file: &Path, i: &Index) -> Result<(), String> {
@@ -697,6 +797,9 @@ pub struct View {
     pub record: Result<Option<Record>, String>,
     /// The index lists the repo.
     pub indexed: bool,
+    /// The index is missing (its path): `forget` starts a new one from
+    /// this many records left.
+    pub index_missing: Option<(PathBuf, usize)>,
     /// Other repos whose commits this one has: dir and their remotes (or
     /// why their record is unusable).
     pub matches: Vec<(String, Result<Vec<SeenRemote>, String>)>,
@@ -711,16 +814,23 @@ impl View {
             Ok(Some(r)) => !r.remotes.is_empty(),
             Err(_) => true,
         };
-        !own && self
-            .matches
-            .iter()
-            .all(|(_, m)| m.as_ref().is_ok_and(Vec::is_empty))
+        !own && self.index_missing.is_none()
+            && self
+                .matches
+                .iter()
+                .all(|(_, m)| m.as_ref().is_ok_and(Vec::is_empty))
     }
 
     /// The lines the confirmation lists.
     #[must_use]
     pub fn lines(&self) -> String {
         let mut s = String::new();
+        if let Some((file, n)) = &self.index_missing {
+            s.push_str(&format!(
+                "  (the index {} of repos that had trusted remotes is missing, so a repo whose record was deleted with it cannot be told; forget starts a new index from the {n} records left)\n",
+                file.display()
+            ));
+        }
         match &self.record {
             Ok(Some(r)) => {
                 for x in &r.remotes {
@@ -764,7 +874,18 @@ pub fn inspect(dirs: &Dirs, git: &dyn Objects, repo: &RepoKey, repo_dir: &Path) 
     };
     let file = r.file();
     let record = read(&file);
-    let index = read_index(&r.index_file());
+    let index_file = r.index_file();
+    let (index, index_missing) = match load_index(&index_file) {
+        Ok(Some(i)) => (Ok(i), None),
+        Ok(None) => match rebuild_index(&dir) {
+            Ok(i) => {
+                let n = i.repos.len();
+                (Ok(i), Some((index_file, n)))
+            }
+            Err(e) => (Err(e), None),
+        },
+        Err(e) => (Err(e), None),
+    };
     let indexed = index.as_ref().is_ok_and(|i| i.repos.contains_key(repo));
     let skip = record
         .as_ref()
@@ -799,6 +920,7 @@ pub fn inspect(dirs: &Dirs, git: &dyn Objects, repo: &RepoKey, repo_dir: &Path) 
         file,
         record,
         indexed,
+        index_missing,
         matches,
     }
 }
@@ -806,7 +928,8 @@ pub fn inspect(dirs: &Dirs, git: &dyn Objects, repo: &RepoKey, repo_dir: &Path) 
 /// `tollgate remotes forget`: empties the record of `repo`, a broken or
 /// missing one too (a tombstone; the index keeps the repo). The remotes
 /// it held and those of the repos whose commits it has now are not taken
-/// over again.
+/// over again. A missing index is made again from the records left (an
+/// unusable one is an error: it is for a person to repair or remove).
 pub fn forget(dirs: &Dirs, git: &dyn Objects, repo: &RepoKey, repo_dir: &Path) -> io::Result<()> {
     let dir = records_dir(dirs);
     Repo {
@@ -825,7 +948,10 @@ impl Repo<'_> {
         let _held = lock(&file).map_err(io::Error::other)?;
         let _held_index = lock(&index_file).map_err(io::Error::other)?;
         let before = read(&file).ok().flatten().unwrap_or_default();
-        let mut index = read_index(&index_file).map_err(io::Error::other)?;
+        let mut index = match load_index(&index_file).map_err(io::Error::other)? {
+            Some(i) => i,
+            None => rebuild_index(self.dir).map_err(io::Error::other)?,
+        };
         let mut tomb = Record {
             remotes: Vec::new(),
             forgotten: before.forgotten,
@@ -908,6 +1034,13 @@ mod tests {
         fn identity(&self, _: &[TrustedRemote]) -> Result<Vec<Oid>, String> {
             panic!("asked the object store")
         }
+    }
+
+    /// A records dir in `tmp` with the index install makes.
+    fn records(tmp: &Path) -> PathBuf {
+        let d = tmp.join("trusted-remotes");
+        assert_eq!(ensure_index_in(&d, true), Ok(IndexSetup::Created(0)));
+        d
     }
 
     fn key(n: u8) -> RepoKey {
@@ -1005,11 +1138,14 @@ mod tests {
     #[test]
     fn a_recorded_remote_is_lost_only_when_its_url_is_gone_item33() {
         let tmp = tempfile::tempdir().unwrap();
-        let d = tmp.path().join("trusted-remotes");
+        let d = records(tmp.path());
         let s = Store(vec![oid(1)]);
         let gl = "https://gitlab.com/victorkwak/r.git";
         assert_eq!(at(&d, 1, &s, &[]), Status::Kept);
-        assert!(!d.exists(), "nothing to record: no file");
+        assert!(
+            !record_in(&d, &key(1)).exists(),
+            "nothing to record: no file"
+        );
         assert_eq!(at(&d, 1, &s, &[tr("origin", gl)]), Status::Kept);
         // Renamed, and spelled another way: kept.
         assert_eq!(
@@ -1058,7 +1194,7 @@ mod tests {
     #[test]
     fn a_copy_takes_over_the_recorded_remotes_note2() {
         let tmp = tempfile::tempdir().unwrap();
-        let d = tmp.path().join("trusted-remotes");
+        let d = records(tmp.path());
         let gl = [tr("origin", "https://gitlab.com/victorkwak/r.git")];
         let s = Store(vec![oid(1), oid(2)]);
         assert_eq!(at(&d, 1, &s, &gl), Status::Kept);
@@ -1097,7 +1233,7 @@ mod tests {
     #[test]
     fn a_missing_record_of_a_known_repo_denies_note3() {
         let tmp = tempfile::tempdir().unwrap();
-        let d = tmp.path().join("trusted-remotes");
+        let d = records(tmp.path());
         let gl = [tr("origin", "https://gitlab.com/victorkwak/r.git")];
         let s = Store(vec![oid(1)]);
         let broken = |st: Status, what: &str| {
@@ -1117,6 +1253,80 @@ mod tests {
         broken(at(&d, 3, &Store(vec![oid(7)]), &[]), "index");
     }
 
+    /// Item 33, secreview note 27: a missing index never reads as "no
+    /// repo had trusted remotes". Deleted with a record (or with every
+    /// record), it denies every repo that needs it; install makes it only
+    /// once; `forget` makes it again from the records left, so a repo
+    /// whose record survived still tells its copies.
+    #[test]
+    fn a_missing_index_denies_until_forget_makes_it_again_note27() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = records(tmp.path());
+        let gl = [tr("origin", "https://gitlab.com/victorkwak/r.git")];
+        let other = [tr("o2", "https://gitlab.com/victorkwak/other.git")];
+        let missing = |st: Status| {
+            assert!(
+                matches!(&st, Status::Broken(w) if w.contains("is missing") && w.contains(INDEX_MISSING_FIX)),
+                "{st:?}"
+            );
+            let c = Checked {
+                file: PathBuf::new(),
+                status: st,
+            };
+            assert!(c.deny_message().unwrap().contains("remotes forget"));
+        };
+        let (s1, s5) = (Store(vec![oid(1)]), Store(vec![oid(5)]));
+        assert_eq!(at(&d, 1, &s1, &gl), Status::Kept);
+        assert_eq!(at(&d, 5, &s5, &other), Status::Kept);
+        // An install with a present index (usable or not) leaves it.
+        assert_eq!(ensure_index_in(&d, true), Ok(IndexSetup::Present));
+        std::fs::remove_file(index_in(&d)).unwrap();
+        std::fs::remove_file(record_in(&d, &key(1))).unwrap();
+        // Repo 1 lost its record and origin: denied, not "new".
+        missing(at(&d, 1, &s1, &[]));
+        // A repo with no record and no remote, a copy of 5: denied too.
+        missing(at(&d, 6, &Store(vec![oid(5), oid(6)]), &[]));
+        // A repo whose own record holds its trusted remote reads no index.
+        assert_eq!(at(&d, 5, &Unasked, &other), Status::Kept);
+        // Nothing was written meanwhile.
+        assert!(!index_in(&d).exists());
+        // A later install does not make it again.
+        assert_eq!(
+            ensure_index_in(&d, false),
+            Ok(IndexSetup::Missing(index_in(&d)))
+        );
+        missing(at(&d, 1, &s1, &[]));
+        // A dangling symlink in its place is missing too, and install
+        // does not write through it.
+        let target = tmp.path().join("elsewhere.json");
+        std::os::unix::fs::symlink(&target, index_in(&d)).unwrap();
+        missing(at(&d, 1, &s1, &[]));
+        assert_eq!(ensure_index_in(&d, true), Ok(IndexSetup::Present));
+        assert!(!target.exists());
+        std::fs::remove_file(index_in(&d)).unwrap();
+        // A dir in its place is unusable.
+        std::fs::create_dir(index_in(&d)).unwrap();
+        assert!(matches!(at(&d, 1, &s1, &[]), Status::Broken(_)));
+        std::fs::remove_dir(index_in(&d)).unwrap();
+        // `forget` in repo 1 accepts the loss: a new index from the
+        // records left, so repo 5 still tells its copies.
+        forget_at(&d, 1, &s1);
+        assert_eq!(at(&d, 1, &s1, &[]), Status::Kept);
+        assert_eq!(
+            lost_names(&at(&d, 6, &Store(vec![oid(5), oid(6)]), &[])),
+            ["o2"]
+        );
+        // An unusable record left is listed with no commits, so its repo
+        // still denies after the index is made again.
+        std::fs::remove_file(index_in(&d)).unwrap();
+        std::fs::write(record_in(&d, &key(7)), "{not json").unwrap();
+        assert_eq!(ensure_index_in(&d, true), Ok(IndexSetup::Created(4)));
+        assert!(matches!(
+            at(&d, 7, &Store(vec![oid(7)]), &[]),
+            Status::Broken(_)
+        ));
+    }
+
     /// Item 33, secreview note 3: `forget` leaves a tombstone. The repo
     /// is not taken as unknown, the remotes it accepted are not taken over
     /// again from the repo it is a copy of, and a new trusted remote is
@@ -1125,7 +1335,7 @@ mod tests {
     #[test]
     fn forget_leaves_a_tombstone_note3() {
         let tmp = tempfile::tempdir().unwrap();
-        let d = tmp.path().join("trusted-remotes");
+        let d = records(tmp.path());
         let gl = [tr("origin", "https://gitlab.com/victorkwak/r.git")];
         let s = Store(vec![oid(1)]);
         assert_eq!(at(&d, 1, &s, &gl), Status::Kept);
@@ -1160,8 +1370,7 @@ mod tests {
     #[test]
     fn an_unusable_record_denies_item33() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("trusted-remotes");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = records(tmp.path());
         let gl = [tr("origin", "https://gitlab.com/victorkwak/r.git")];
         let s = Store(vec![oid(1)]);
         let broken = |st: Status| matches!(st, Status::Broken(_));
@@ -1202,7 +1411,7 @@ mod tests {
     #[test]
     fn a_held_record_lock_denies_after_a_bounded_wait_item33() {
         let tmp = tempfile::tempdir().unwrap();
-        let d = tmp.path().join("trusted-remotes");
+        let d = records(tmp.path());
         std::fs::create_dir_all(&d).unwrap();
         let s = Store(vec![oid(1)]);
         let held = LockFile::acquire(&lock_path(&record_in(&d, &key(1)))).unwrap();
@@ -1222,7 +1431,7 @@ mod tests {
     #[test]
     fn concurrent_writers_keep_every_remote_item33() {
         let tmp = tempfile::tempdir().unwrap();
-        let d = tmp.path().join("trusted-remotes");
+        let d = records(tmp.path());
         std::thread::scope(|s| {
             for i in 0..8u8 {
                 let d = &d;

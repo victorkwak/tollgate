@@ -74,6 +74,29 @@ fn repo_state(sb: &Sandbox, repo: &Path) -> String {
     .join("\n")
 }
 
+/// Every file under the caller's state dir, with its bytes: the sandbox
+/// starts it as an install does (the index of trusted-remote records), and
+/// the bench must leave it as it found it.
+fn state_files(sb: &Sandbox) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else {
+                out.push((p.clone(), std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&sb.state(), &mut out);
+    out.sort();
+    out
+}
+
 /// Processes whose environment names the bench's state dir (Linux): its
 /// runners. Killed here so a failing test leaves none behind.
 fn bench_processes(scratch: &str) -> usize {
@@ -102,6 +125,7 @@ fn bench_replays_concurrent_commits_through_the_hooks_l20() {
     let sb = Sandbox::new();
     let repo = workspace(&sb, "");
     let before = repo_state(&sb, &repo);
+    let state_before = state_files(&sb);
     let scenarios = sb.root().join("scenarios.toml");
     std::fs::write(
         &scenarios,
@@ -298,7 +322,7 @@ edit = [{ path = "docs/guide.md", write = "# Guide {worktree}\n" }]
     assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
     assert_eq!(repo_state(&sb, &repo), before);
     assert!(
-        !sb.state().exists(),
+        state_files(&sb) == state_before,
         "the bench used the caller's state dir"
     );
 }
@@ -387,6 +411,7 @@ fn bench_cancels_the_jobs_it_leaves_running_and_removes_its_scratch_l20() {
 fn bench_refuses_bad_scenarios_before_it_creates_anything_l20() {
     let sb = Sandbox::new();
     let repo = workspace(&sb, "");
+    let state_before = state_files(&sb);
     let parent = scratch_parent();
     let run = |text: &str, n: &str| {
         let scenarios = sb.root().join("bad.toml");
@@ -444,7 +469,7 @@ fn bench_refuses_bad_scenarios_before_it_creates_anything_l20() {
     assert_eq!(code, Some(2), "{err}");
     assert!(err.contains("inside the source repo"), "{err}");
     assert_eq!(sb.git(&repo, &["status", "--porcelain", "--ignored"]), "");
-    assert!(!sb.state().exists());
+    assert!(state_files(&sb) == state_before);
 }
 
 #[test]

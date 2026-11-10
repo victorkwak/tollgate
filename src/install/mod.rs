@@ -76,6 +76,12 @@ pub struct InstallRecord {
     /// builds (doctor asks for `tollgate install`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<PathBuf>,
+    /// An install made or found the index of repos with trusted-remote
+    /// records (item 33, secreview note 27). A later install never makes
+    /// it again: a missing index then means records were deleted with
+    /// it, which only `tollgate remotes forget` accepts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trust_index: bool,
 }
 
 impl InstallRecord {
@@ -414,6 +420,32 @@ pub fn install(ctx: &Ctx) -> u8 {
         Err(e) => return fail(e),
     }
     let previous = InstallRecord::read(&dirs).ok();
+    let mut status = exit::OK;
+    // The index of repos with trusted-remote records (item 33): made by
+    // the first install only.
+    let made_index = previous.as_ref().is_some_and(|p| p.trust_index);
+    let trust_index = match crate::remote_record::ensure_index(&dirs, !made_index) {
+        Ok(crate::remote_record::IndexSetup::Present) => true,
+        Ok(crate::remote_record::IndexSetup::Created(n)) => {
+            println!(
+                "trusted remotes: started the index of repos with trusted-remote records ({n} records)"
+            );
+            true
+        }
+        Ok(crate::remote_record::IndexSetup::Missing(file)) => {
+            eprintln!(
+                "tollgate install: the index {} of repos with trusted-remote records is missing (an earlier install made it), so every gated command denies: a repo whose record was deleted with it cannot be told from a new one. Install does not make it again; to accept the loss, run tollgate remotes forget in a repo from your own terminal (item 33)",
+                file.display()
+            );
+            status = exit::FAIL;
+            true
+        }
+        Err(e) => {
+            eprintln!("tollgate install: trusted remotes: {e}");
+            status = exit::FAIL;
+            made_index
+        }
+    };
     let env = injection(&hooks_dir);
     // Item 39: the git the hooks and jobs run, fixed now.
     let prepend: Vec<PathBuf> = HostConfig::load(&dirs)
@@ -440,10 +472,10 @@ pub fn install(ctx: &Ctx) -> u8 {
         settings: previous.as_ref().and_then(|p| p.settings.clone()),
         dirs: Some(dirs.clone()),
         git: Some(git),
+        trust_index,
     };
     // (c) the settings edit, on the file resolved once (item 29).
     let path = settings_path(&ctx.env, &dirs);
-    let mut status = exit::OK;
     match SettingsFile::open(&path).and_then(|f| parse_settings(&f).map(|p| (f, p))) {
         Err(e) => {
             eprintln!("tollgate install: {e}");

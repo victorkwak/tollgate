@@ -2093,6 +2093,101 @@ fn s48_a_copied_moved_or_unrecorded_repo_keeps_its_lost_trusted_remote() {
     }
 }
 
+/// S48b (item 33, secreview notes 2, 3 and 27): the index of repos with
+/// trusted-remote records is what tells a deleted record from no record,
+/// so a missing index must never read as "no repo had trusted remotes".
+/// The attack: after a gated commit recorded `origin`, every record and
+/// the index are deleted (`git init` in the records dir, then `git clean
+/// -fxq`, both plain git commands), `origin` is removed, and local `main`
+/// (weakened by a script) would be the policy anchor. It must be refused,
+/// also after `tollgate install` runs again (an upgrade): only `tollgate
+/// remotes forget` at a terminal starts a new index, from the records
+/// left on disk.
+#[test]
+fn s48b_a_deleted_trusted_remote_index_never_reads_as_empty() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    let commit = |file: &str| {
+        std::fs::write(lab.repo.join(file), "x\n").unwrap();
+        lab.plain(&["add", file]);
+        let before = lab.refs();
+        let tree = lab.plain(&["write-tree"]);
+        let s = lab.session(&format!("git commit -q -m {file}"));
+        if s.code() != Some(0) {
+            assert_eq!(lab.refs(), before, "{file}: a ref moved: {s:?}");
+            assert!(
+                !lab.pass_trees(None).contains(&tree.trim().to_owned()),
+                "{file}: its tree got a pass"
+            );
+            lab.plain(&["rm", "-q", "--cached", file]);
+            std::fs::remove_file(lab.repo.join(file)).unwrap();
+        }
+        s
+    };
+    let refused = |label: &str| {
+        let s = commit("bad");
+        assert!(
+            s.out().contains("DENIED pre-commit")
+                && s.out().contains("item 33")
+                && s.out().contains("index"),
+            "{label}: {s:?}"
+        );
+    };
+    // The record and the index are written by the first gated commit.
+    assert_eq!(commit("ok.txt").code(), Some(0));
+    let records = lab.sb().state().join("trusted-remotes");
+    assert!(records.join("index.json").is_file());
+    std::fs::write(lab.repo.join("tollgate.toml"), WEAK_POLICY).unwrap();
+    lab.plain(&["commit", "-q", "--no-verify", "-am", "weaken"]);
+    // Every record and the index go.
+    lab.plain_in(&records, &["init", "-q", "."]);
+    lab.plain_in(&records, &["clean", "-fxq"]);
+    assert!(!records.join("index.json").exists());
+    lab.plain(&["remote", "remove", "origin"]);
+    refused("index and records deleted");
+    // A repo out of scope that never had a trusted remote is refused too:
+    // with no index, a deleted record cannot be told from none.
+    let other = lab.root().join("ws-other");
+    lab.plain_in(&lab.root(), &["init", "-q", "ws-other"]);
+    for (i, f) in ["a.txt", "b.txt"].into_iter().enumerate() {
+        std::fs::write(other.join(f), "a\n").unwrap();
+        lab.plain_in(&other, &["add", f]);
+        if i == 0 {
+            lab.plain_in(&other, &["commit", "-q", "-m", f]);
+        }
+    }
+    let s = lab.session_in(&other, "git commit -q -m b");
+    assert!(
+        s.out().contains("DENIED pre-commit") && s.out().contains("index"),
+        "a repo with no remote: {s:?}"
+    );
+    // An install that runs again does not start a new index, and says so
+    // with a failing exit.
+    let (code, out) = lab.a.install();
+    assert_ne!(code, Some(0), "{out}");
+    assert!(
+        out.contains("index") && out.contains("remotes forget"),
+        "install names the missing index: {out}"
+    );
+    assert!(!records.join("index.json").exists());
+    refused("after a new install");
+    // A person accepts at their own terminal: the confirmation says the index
+    // is missing; forget starts a new one; the repo commits on its own
+    // policy then.
+    let mut cmd = lab
+        .a
+        .cmd(Path::new(support::BIN), &["remotes", "forget"], &[]);
+    cmd.current_dir(&lab.repo);
+    let r = pty::run(cmd, pty::Streams::All, &["y"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        r.out.contains("index") && r.out.contains("missing") && r.out.contains("forgot"),
+        "{}",
+        r.out
+    );
+    assert!(records.join("index.json").is_file());
+    assert_eq!(commit("ok2.txt").code(), Some(0));
+}
+
 /// S35 (item 47, X5): a URL whose authority ends at `?` or `#` names the
 /// host before it: `https://evil.invalid?@gitlab.com/...` is a request to
 /// `evil.invalid` for curl and git. A real `url.<x>.insteadOf` turns the
