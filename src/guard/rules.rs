@@ -291,7 +291,7 @@ pub fn write_ruling(ctx: &Context, spelled: &Path, removal: bool, how: &str) -> 
                 return Ruling::ask(
                     "git-lock-file",
                     format!(
-                        "{how} removes the git lock file {}: another git process or a gate job can hold it (R26)",
+                        "{how} removes the git lock file {}: another git process or a gate job can hold it. Check first: `tollgate status` in the repo lists running gate jobs, and `tollgate doctor --repo <repo>` reports the lock stale when no git process works there (R26, R39)",
                         p.display()
                     ),
                 );

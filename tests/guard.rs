@@ -116,6 +116,23 @@ fn ask_rules_return_an_ask_decision_t16_r26() {
 }
 
 #[test]
+fn lock_removal_ask_says_how_to_check_the_lock_is_free_r26_r39() {
+    // One ask must be enough: the reason names the commands that show
+    // whether a git process or a gate job still holds the lock.
+    let a = Armed::new();
+    let repo = a.sb.repo("r");
+    let cmd = format!("cd {} && rm -f .git/index.lock", repo.display());
+    let (code, out, err) = a.bash(&cmd);
+    assert_eq!(code, Some(0), "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    let h = &v["hookSpecificOutput"];
+    assert_eq!(h["permissionDecision"], "ask", "{out}");
+    let reason = h["permissionDecisionReason"].as_str().unwrap_or_default();
+    assert!(reason.contains("tollgate doctor --repo"), "{reason}");
+    assert!(reason.contains("tollgate status"), "{reason}");
+}
+
+#[test]
 fn waiting_commands_get_the_long_timeout_and_the_cap_t17_r28_l17() {
     let a = Armed::new();
     let (code, out, err) = a.bash("cd r && git commit -m x");
