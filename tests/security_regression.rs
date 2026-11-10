@@ -2611,6 +2611,79 @@ fn s28_remote_identity_and_ref_writes() {
     assert_eq!(s.code(), Some(0), "{s:?}");
 }
 
+/// S28b (G7, item 22, review note 7 follow-up): forced refspecs, `--repo`,
+/// and every relative or absolute path spelling of this repo, for push,
+/// fetch and pull. Each command really runs in the session: a moved ref
+/// fails the test even when the guard said nothing.
+#[test]
+fn s28b_local_repo_spellings_forced_and_relative() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    lab.plain(&["checkout", "-q", "-b", "feat"]);
+    lab.stage_code_change("feat");
+    lab.plain(&["commit", "-q", "--no-verify", "-m", "feat"]);
+    let repo = lab.repo.display().to_string();
+    let base = lab.repo.file_name().unwrap().to_str().unwrap().to_owned();
+    let root = lab.root().display().to_string();
+    let mut cmds: Vec<String> = Vec::new();
+    for sub in ["push", "fetch", "pull"] {
+        for r in [
+            ".",
+            "./",
+            ".git",
+            "./.git",
+            ".git/",
+            "{r}",
+            "{r}/",
+            "{r}/.git",
+            "file://{r}",
+            "file://{r}/.git",
+            "crates/..",
+            "../{b}",
+            "../{b}/.git",
+            "./crates/../",
+            "~/../../../../../../..{r}",
+        ] {
+            for spec in [
+                "feat:main",
+                "+feat:main",
+                "feat:refs/heads/main",
+                "+feat:heads/main",
+            ] {
+                let r = r.replace("{r}", &repo).replace("{b}", &base);
+                cmds.push(format!("git {sub} {r} {spec}"));
+            }
+        }
+        // A bare relative name that is no remote: git reads it as a path.
+        cmds.push(format!(
+            "ln -s {repo} self_{sub} && git {sub} self_{sub} +feat:main"
+        ));
+        cmds.push(format!(
+            "ln -s {repo} {root}/l_{sub} && git {sub} {root}/l_{sub} +feat:main"
+        ));
+        cmds.push(format!("cd {root} && git -C {base} {sub} . +feat:main"));
+        cmds.push(format!(
+            "cd {root} && git -C {base} {sub} ../{base} +feat:main"
+        ));
+        cmds.push(format!(
+            "cd {root} && git --git-dir={base}/.git {sub} {base} +feat:main"
+        ));
+    }
+    // `--repo` counts only with no positional words: with a refspec git
+    // reads the first word as the repository (`--repo=. +feat:main` asks
+    // ssh host `+feat`), so these push what config names: feat's upstream.
+    lab.plain(&["branch", "-q", "--set-upstream-to=main"]);
+    for r in [".", "./", ".git", "{r}", "file://{r}", "crates/.."] {
+        let r = r.replace("{r}", &repo);
+        cmds.push(format!(
+            "git -c push.default=upstream push --repo={r} --force"
+        ));
+        cmds.push(format!("git -c push.default=upstream push --repo {r} -f"));
+        cmds.push(format!("git -c push.default=upstream push --rep={r} -f"));
+    }
+    let bad = lab.not_denied(&cmds);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 /// S29 (G8, item 15): cwd tracking follows cd, pushd and popd; after a
 /// change the guard cannot follow, relative writes deny; symlinks into
 /// tollgate's dirs do not hide them.
