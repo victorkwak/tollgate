@@ -104,10 +104,6 @@ pub struct Context {
     pub protected: Vec<PathBuf>,
     /// The host config (R26: ask, not deny).
     pub host_config: PathBuf,
-    /// What gate jobs run, build from or read as host tool config (item
-    /// 35, review note 12): Write/Edit calls there ask. As spelled and
-    /// canonical.
-    pub tool_paths: Vec<PathBuf>,
     /// `tiers.full_refs`, matched case-insensitively (R27).
     pub full_refs: GlobSet,
     /// Names the tollgate binary goes by (PATH name, installed copy).
@@ -115,11 +111,6 @@ pub struct Context {
     /// The `TOLLGATE_INLINE_CAP` the guard exports for this call: a
     /// client value may only lower it.
     pub inline_cap: u64,
-    /// The session variables that pick the config files git reads
-    /// (`HOME`, `XDG_CONFIG_HOME`, `GIT_*`).
-    pub git_env: crate::env::EnvSnapshot,
-    /// The Claude Code settings locations (R26), worked out on first use.
-    pub claude: super::paths::ClaudePaths,
 }
 
 impl Context {
@@ -262,8 +253,14 @@ pub fn write_ruling(ctx: &Context, spelled: &Path, removal: bool, how: &str) -> 
                 ),
             );
         }
-        if paths::claude_write(ctx, p, removal) {
-            return Ruling::ask("claude-settings-edit", paths::settings_write_reason(how, p));
+        if paths::claude_settings(ctx, p) {
+            return Ruling::ask(
+                "claude-settings-edit",
+                format!(
+                    "{how} changes Claude Code settings at {}, which register the guard and the hook injection; a person decides (R26)",
+                    p.display()
+                ),
+            );
         }
         let comps: Vec<String> = p
             .components()
@@ -316,83 +313,78 @@ pub fn write_ruling(ctx: &Context, spelled: &Path, removal: bool, how: &str) -> 
             );
         }
     }
-    // A removal alone puts nothing on a tool path.
-    if !removal && let Some(t) = paths::tool_path(ctx, spelled) {
-        return Ruling::ask("tool-path-edit", paths::tool_write_reason(how, spelled, t));
-    }
     if let Some((rule, why)) = super::repo_rules(spelled) {
         return Ruling::ask(rule, why);
     }
     Ruling::Allow
 }
 
-/// The path rules (R25, R26) for Write/Edit/MultiEdit/NotebookEdit.
+/// The path rules (R25, R26) for Write/Edit/MultiEdit/NotebookEdit: deny
+/// under tollgate's dirs; ask for the host config, Claude Code settings,
+/// `.git/`, `.githooks/`, git's global config, a repo's `core.hooksPath`
+/// dir and a policy file. The path is checked as spelled and with its
+/// symlinks resolved.
 #[must_use]
 pub fn file_ruling(ctx: &Context, file: &str) -> Ruling {
     use crate::guard::paths;
-    let p = paths::canon(&paths::lexical(
-        &ctx.cwd,
-        Path::new(&expand_home(ctx, file)),
-    ));
-    if paths::lower(&p) == paths::lower(&ctx.host_config) {
+    let spelled = paths::lexical(&ctx.cwd, Path::new(&expand_home(ctx, file)));
+    let resolved = paths::canon(&spelled);
+    let mut out = Ruling::Allow;
+    for p in [&resolved, &spelled] {
+        out = out.max(file_rule(ctx, p));
+        if matches!(out, Ruling::Deny(_)) || spelled == resolved {
+            break;
+        }
+    }
+    out
+}
+
+fn file_rule(ctx: &Context, p: &Path) -> Ruling {
+    use crate::guard::paths;
+    if paths::lower(p) == paths::lower(&ctx.host_config) {
         return Ruling::ask(
             "host-config-edit",
             format!("edit of the tollgate host config {} (R26)", p.display()),
         );
     }
-    if let Some(dir) = paths::tollgate_dir(ctx, &p, false) {
+    if let Some(dir) = paths::tollgate_dir(ctx, p, false) {
         return Ruling::deny(
             "state-dir-write",
             format!("write under tollgate's dir {} (R25, R26)", dir.display()),
         );
     }
-    if let Some(what) = paths::git_internal(&p) {
-        return Ruling::deny(
-            "git-dir-write",
-            format!(
-                "write into {what} of a repo ({}): it moves refs, remotes or hooks without a check (R25)",
-                p.display()
-            ),
-        );
-    }
-    let comps: Vec<String> = p
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    let spelled = paths::lexical(&ctx.cwd, Path::new(&expand_home(ctx, file)));
-    if let Some(s) =
-        paths::claude_settings(ctx, &p).or_else(|| paths::claude_settings(ctx, &spelled))
-    {
+    if paths::claude_settings(ctx, p) {
         return Ruling::ask(
             "claude-settings-edit",
-            format!("edit of Claude Code settings {} (R26)", s.display()),
+            format!("edit of Claude Code settings {} (R26)", p.display()),
         );
     }
-    if comps.iter().any(|c| c == ".git") {
+    let in_dir = |d: &str| {
+        p.components()
+            .any(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case(d))
+    };
+    if in_dir(".git") {
         return Ruling::ask(
             "git-dir-write",
             format!("write under .git/: {} (R26)", p.display()),
         );
     }
-    if let Some(f) = paths::git_global_config(ctx, &p) {
-        return Ruling::ask(
-            "git-global-config-edit",
-            format!(
-                "edit of git's config file {}, whose program keys every git command runs (item 21)",
-                f.display()
-            ),
-        );
-    }
-    if let Some(t) = paths::tool_path(ctx, &p) {
-        return Ruling::ask("tool-path-edit", paths::tool_write_reason("an edit", &p, t));
-    }
-    if comps.iter().any(|c| c == ".githooks") {
+    if in_dir(".githooks") {
         return Ruling::ask(
             "repo-hook-edit",
             format!("edit of a repo hook {} (R26)", p.display()),
         );
     }
-    if let Some((rule, why)) = super::repo_rules(&p) {
+    if let Some(f) = paths::git_global_config(ctx, p) {
+        return Ruling::ask(
+            "git-global-config-edit",
+            format!(
+                "edit of git's config file {}, which every git command reads (R26)",
+                f.display()
+            ),
+        );
+    }
+    if let Some((rule, why)) = super::repo_rules(p) {
         return Ruling::ask(rule, why);
     }
     Ruling::Allow

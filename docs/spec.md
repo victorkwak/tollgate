@@ -277,7 +277,7 @@ Out of scope (deliberate evasion; parsing bash does not stop a hostile agent): l
 
 X1 reason: the transport variables pick the program that answers for the trusted remote (S20), and `GIT_EXEC_PATH` the git that tollgate runs (S33).
 
-L19: the guard's p95 CPU time over the corpus stays under 10 ms (`tests/guard_corpus.rs`: 300 commands, the allow corpus, each deny and ask rule alone and through each wrapper, script-file reads included). Debug build on a loaded host: p50 6.3 ms, p95 7.5 ms, most of it process start and the R24 self-check. The allow corpus holds the commands agents run every day and the harmless commands that earlier text rules and the closed grammar denied; no line of it is denied or asked about.
+L19: the guard's p95 CPU time over the corpus stays under 10 ms (`tests/guard_corpus.rs`: 308 commands, the allow corpus, each deny and ask rule alone and through each wrapper, script-file reads included). Debug build on a loaded host: p50 5.2-5.7 ms, p95 6.3-6.9 ms, most of it process start and the R24 self-check. The allow corpus holds the commands agents run every day and the harmless commands that earlier text rules and the closed grammar denied; no line of it is denied or asked about.
 
 R26. Ask rules (`permissionDecision: "ask"`; a person decides).
 
@@ -286,15 +286,14 @@ R26. Ask rules (`permissionDecision: "ask"`; a person decides).
 | `git-config-write` | `git config` (also `--global`, `--system`, `--file`) that writes `core.hooksPath`, `include*`, `alias.*`, `url.*`, `core.sshCommand`, `core.gitProxy`, `ssh.*`, and `git config --edit` |
 | `branch-move` | `git branch -m/-M/-c/-C` when no full ref is named |
 | `git-lock-file` | `rm` or `mv` of `.git/**/*.lock` |
-| `claude-settings-edit` | A Write/Edit call or a write by an ordinary tool to any `.claude/settings*.json`, a settings file of the user settings dir (`~/.claude`, `$CLAUDE_CONFIG_DIR`) or a managed settings dir (`/etc/claude-code`, `/Library/Application Support/ClaudeCode`), the file one of them links to, or a removal or move of such a dir |
-| `git-dir-write` | A write by an ordinary tool to `.git/config`, `.git/hooks/`, `.git/refs/`, `.git/packed-refs`, `.git/HEAD`, or a removal of `.git`; a Write/Edit call under `.git/` (it denies for `.git/config`, `.git/refs`, `.git/packed-refs` and `.git/hooks`) |
+| `claude-settings-edit` | A Write/Edit call or a write by an ordinary tool to a `settings*.json` in a dir named `.claude` or in `$CLAUDE_CONFIG_DIR`, or a move, link or removal of such a dir |
+| `git-dir-write` | A write by an ordinary tool to `.git/config`, `.git/hooks/`, `.git/refs/`, `.git/packed-refs`, `.git/HEAD`, or a removal of `.git`; a Write/Edit call under `.git/` |
 | `repo-hook-edit` | A write to `.githooks/` or to a repo's `core.hooksPath` dir |
-| `git-global-config-edit` | A write to git's global or system config file (`~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`, `/etc/gitconfig`, `$GIT_CONFIG_GLOBAL`, `$GIT_CONFIG_SYSTEM`) |
+| `git-global-config-edit` | A write to git's global or system config file (`~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`, `~/.config/git/config`, `/etc/gitconfig`, `$GIT_CONFIG_GLOBAL`, `$GIT_CONFIG_SYSTEM`), as spelled or through a symlink |
 | `host-config-edit`, `policy-file-edit` | A write to the tollgate host config, or to a policy file (R71) |
-| `tool-path-edit` | A write to a path that gate jobs run, build from or read as host tool config (item 35) |
 | `unclassified` | A fragment of the command that the guard cannot read and that names a needle or carries a marker (below) |
 
-Write/Edit under the tollgate state, data or config dirs deny (`state-dir-write`).
+Write/Edit under the tollgate state, data or config dirs deny (`state-dir-write`). A Write/Edit path is checked as spelled and with its symlinks resolved; the rows above are the whole list. Writes to tool homes (`CARGO_HOME`, `RUSTUP_HOME`, `~/.local/bin`, bun and uv dirs), host tool configs, the managed settings dirs, and dirs that only hold a protected path are not asked about: the job refuses an unapproved host tool config (R71 note, S46), and the rest is out of scope (R25).
 
 The one ask rule for what the walker cannot classify, `unclassified`. A needle is `git` as a word (not `digit`, `github`, `.gitignore`), `tollgate`, `.claude` or `.githooks`. A marker is the hook-skip option, a `core.hooksPath` key, a `GIT_CONFIG_` name, the tail of a protected path, or a person-only subcommand. The test is on the fragment that cannot be read, not on the whole command, so a repo path that holds the word `tollgate` does not make `eval "$(ssh-agent -s)"` ask. The case number is in the reason:
 

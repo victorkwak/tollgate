@@ -193,6 +193,17 @@ const HARMLESS: &[&str] = &[
     "sh scripts/check.sh && git status",
     "sqlite3 app.db '.tables'; git status",
     "make --eval 'all: ; @echo ok'; git status",
+    // Unit 4: writes that the removed tool-path, managed-settings and
+    // ancestor asks caught. The job refuses an unapproved host tool
+    // config (S46).
+    "echo 'x' >> ~/.cargo/config.toml && git status",
+    "cargo build --release && cp target/release/mytool ~/.local/bin/mytool",
+    "ln -sf \"$PWD/target/release/mytool\" ~/.local/bin/mytool && git status",
+    "chmod +x ~/.local/bin/mytool; git log --oneline -1",
+    "printf 'max_width = 100\\n' > ~/.rustfmt.toml && cargo fmt && git diff",
+    "cp -r dist/. ~/.local && git status",
+    "rm -rf ~/.cargo/registry/cache ~/.cache/uv && git status",
+    "mkdir -p ~/.config/rustfmt && cp rustfmt.toml ~/.config/rustfmt/ && git status",
 ];
 
 /// One command for each deny rule (R25), in a form that every wrapper of

@@ -339,8 +339,17 @@ fn context(
     }
     // Session values the rules may expand in paths, and CDPATH, which
     // makes a relative `cd` unpredictable. CLAUDE_CONFIG_DIR picks
-    // the user settings dir (R26).
-    for var in ["TMPDIR", "CDPATH", "USER", "LOGNAME", "CLAUDE_CONFIG_DIR"] {
+    // the user settings dir, GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM
+    // git's config files (R26).
+    for var in [
+        "TMPDIR",
+        "CDPATH",
+        "USER",
+        "LOGNAME",
+        "CLAUDE_CONFIG_DIR",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+    ] {
         if let Some(v) = env.get_str(var) {
             vars.push((var.into(), v.to_owned()));
         }
@@ -379,40 +388,15 @@ fn context(
     if let Some(r) = record {
         names.push(r.binary.to_string_lossy().into_owned());
     }
-    // Item 35: the host config picks the tool homes and PATH dirs jobs
-    // use; when it does not parse, jobs fail anyway, and the defaults
-    // still count.
-    let job = HostConfig::load(dirs)
-        .map(|h| h.config.job)
-        .unwrap_or_default();
-    let mut tool_paths = Vec::new();
-    for t in crate::runner::env::guarded_tool_paths(dirs, &job) {
-        let c = paths::canon(&t);
-        if c != t {
-            tool_paths.push(c);
-        }
-        tool_paths.push(t);
-    }
     Context {
         cwd: cwd.to_owned(),
         home,
         vars,
         protected,
         host_config: dirs.host_config_file(),
-        tool_paths,
         full_refs,
         tollgate_names: names,
         inline_cap,
-        git_env: EnvSnapshot::from_pairs(
-            env.iter()
-                .filter(|(k, _)| {
-                    k.to_str().is_some_and(|k| {
-                        k == "HOME" || k == "XDG_CONFIG_HOME" || k.starts_with("GIT_")
-                    })
-                })
-                .map(|(k, v)| (k.to_owned(), v.to_owned())),
-        ),
-        claude: paths::ClaudePaths::default(),
     }
 }
 

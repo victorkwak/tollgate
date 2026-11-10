@@ -26,7 +26,6 @@ fn ctx_at(cwd: &Path, home: &Path) -> Context {
             h.join(".config/tollgate"),
         ],
         host_config: h.join(".config/tollgate/config.toml"),
-        tool_paths: Vec::new(),
         full_refs: glob::compile(
             &["main", "master", "integration/*"],
             GlobOpts {
@@ -41,8 +40,6 @@ fn ctx_at(cwd: &Path, home: &Path) -> Context {
                 .to_string(),
         ],
         inline_cap: 540,
-        git_env: crate::env::EnvSnapshot::default(),
-        claude: super::super::paths::ClaudePaths::default(),
     }
 }
 
@@ -380,6 +377,146 @@ fn git_dir_lock_hook_and_host_config_writes_ask() {
         "echo x > .git/info/exclude",
         "rm -rf target",
     ]);
+}
+
+/// The writer table (M3) against each protected kind: tollgate's dirs
+/// deny, Claude Code settings and git internals ask.
+#[test]
+fn ordinary_writer_matrix() {
+    let writers = [
+        "echo x > {}",
+        "echo x >> {}",
+        "cp /tmp/x {}",
+        "mv /tmp/x {}",
+        "rm -f {}",
+        "echo x | tee {}",
+        "sed -i s/a/b/ {}",
+        "perl -pi -e s/a/b/ {}",
+        "truncate -s 0 {}",
+        "ln -sf /tmp/x {}",
+    ];
+    for (target, want) in [
+        (
+            "~/.local/state/tollgate/index.json",
+            ("deny", "state-dir-write"),
+        ),
+        (
+            "~/.local/share/tollgate/hooks/pre-push",
+            ("deny", "state-dir-write"),
+        ),
+        ("~/.claude/settings.json", ("ask", "claude-settings-edit")),
+        (
+            ".claude/settings.local.json",
+            ("ask", "claude-settings-edit"),
+        ),
+        (".git/config", ("ask", "git-dir-write")),
+        ("~/.gitconfig", ("ask", "git-global-config-edit")),
+    ] {
+        let cmds: Vec<String> = writers.iter().map(|w| w.replace("{}", target)).collect();
+        let cmds: Vec<&str> = cmds.iter().map(String::as_str).collect();
+        all(&ctx(), want, &cmds);
+    }
+}
+
+/// Unit 4 cut: writes that only an out-of-scope rule asked about are
+/// allowed. Tool homes and host tool configs are the job's matter (the
+/// core check refuses an unapproved host tool config, S46); managed
+/// settings need a person's sudo; a dir that only holds `.claude` or a
+/// git config is not a settings write.
+#[test]
+fn writes_outside_the_careless_list_are_allowed() {
+    allow(&[
+        "echo 'x' >> ~/.cargo/config.toml",
+        "cp target/release/mytool ~/.local/bin/mytool",
+        "ln -sf /w/repo/target/release/mytool ~/.local/bin/mytool",
+        "chmod +x ~/.local/bin/mytool",
+        "printf 'max_width = 100\\n' > ~/.rustfmt.toml",
+        "cp -r dist/. ~/.local",
+        "rm -rf ~/.cargo/registry/cache ~/.cache/uv",
+        "mv /tmp/x ~/.bun/bin/bun-old",
+        "cp x.json /etc/claude-code/managed-settings.json",
+        "cp -r /tmp/home/. ~",
+        "mv /tmp/x ~/.config",
+        "echo x > ~/.claude/notes.md",
+        "echo x > ~/.claude/projects/settings.json",
+    ]);
+}
+
+/// R26 for Write/Edit/MultiEdit/NotebookEdit: the path list of
+/// `origin/main` plus git's global config, as spelled and resolved.
+#[test]
+fn file_ruling_matrix_r26() {
+    let c = ctx();
+    let verdict = |f: &str| match file_ruling(&c, f) {
+        Ruling::Allow => ("allow", ""),
+        Ruling::Ask(r) => ("ask", r.rule),
+        Ruling::Deny(r) => ("deny", r.rule),
+    };
+    for (f, want) in [
+        (
+            "/h/.local/state/tollgate/index.json",
+            ("deny", "state-dir-write"),
+        ),
+        (
+            "~/.local/share/tollgate/bin/tollgate",
+            ("deny", "state-dir-write"),
+        ),
+        (
+            "/h/.config/tollgate/other.toml",
+            ("deny", "state-dir-write"),
+        ),
+        (
+            "/h/.config/tollgate/config.toml",
+            ("ask", "host-config-edit"),
+        ),
+        ("~/.claude/settings.json", ("ask", "claude-settings-edit")),
+        (
+            ".claude/settings.local.json",
+            ("ask", "claude-settings-edit"),
+        ),
+        (
+            "/w/other/.Claude/Settings.json",
+            ("ask", "claude-settings-edit"),
+        ),
+        (".git/config", ("ask", "git-dir-write")),
+        (".git/hooks/pre-commit", ("ask", "git-dir-write")),
+        (".git/refs/heads/main", ("ask", "git-dir-write")),
+        (".git/info/exclude", ("ask", "git-dir-write")),
+        (".githooks/pre-push", ("ask", "repo-hook-edit")),
+        ("~/.gitconfig", ("ask", "git-global-config-edit")),
+        ("/h/.config/git/config", ("ask", "git-global-config-edit")),
+        ("/etc/gitconfig", ("ask", "git-global-config-edit")),
+        ("src/main.rs", ("allow", "")),
+        (".gitignore", ("allow", "")),
+        ("~/.claude/notes.md", ("allow", "")),
+        ("~/.cargo/config.toml", ("allow", "")),
+        ("~/.local/bin/mytool", ("allow", "")),
+        ("/etc/claude-code/managed-settings.json", ("allow", "")),
+    ] {
+        assert_eq!(verdict(f), want, "{f}");
+    }
+    // A symlink into a protected dir does not hide it.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().canonicalize().unwrap();
+    let state = home.join(".local/state/tollgate");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(home.join("w")).unwrap();
+    std::os::unix::fs::symlink(&state, home.join("w/lnk")).unwrap();
+    let c = ctx_at(&home.join("w"), &home);
+    assert!(matches!(file_ruling(&c, "lnk/x.json"), Ruling::Deny(_)));
+    // $GIT_CONFIG_GLOBAL and $CLAUDE_CONFIG_DIR name the files too.
+    let mut c = ctx();
+    c.vars
+        .push(("GIT_CONFIG_GLOBAL".into(), "/cfg/git.conf".into()));
+    c.vars
+        .push(("CLAUDE_CONFIG_DIR".into(), "/cfg/claude".into()));
+    for f in ["/cfg/git.conf", "/cfg/claude/settings.json"] {
+        assert!(matches!(file_ruling(&c, f), Ruling::Ask(_)), "{f}");
+    }
+    assert!(matches!(
+        file_ruling(&c, "/cfg/claude/notes.md"),
+        Ruling::Allow
+    ));
 }
 
 #[test]

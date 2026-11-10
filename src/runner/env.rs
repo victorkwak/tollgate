@@ -206,30 +206,6 @@ pub fn host_tool_configs(home: &Path, cargo_home: &Path, config_home: &Path) -> 
     out
 }
 
-/// What jobs run, build from or read as tool config in the user's home,
-/// which a session may change only with a person's yes (item 35, review
-/// note 12): the user dirs of the job PATH, `CARGO_HOME` (tools,
-/// registry sources, config), `RUSTUP_HOME` (toolchains, overrides),
-/// `~/.bun`, uv's cache and data dirs, and cargo's and rustfmt's host
-/// configs. Jobs get no `XDG_*` variable, so these are the default dirs.
-/// bun's and uv's user configs are not here: the probe refuses an
-/// unapproved one (review note 20).
-#[must_use]
-pub fn guarded_tool_paths(dirs: &Dirs, job: &JobConfig) -> Vec<PathBuf> {
-    let home = dirs.home();
-    let (cargo_home, rustup_home) = tool_homes(dirs, job);
-    let mut out = user_path_dirs(dirs, job);
-    out.extend(rust_tool_configs(home, &cargo_home, &home.join(".config")));
-    out.extend([
-        cargo_home,
-        rustup_home,
-        home.join(".bun"),
-        home.join(".cache/uv"),
-        home.join(".local/share/uv"),
-    ]);
-    out
-}
-
 /// A built job environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobEnv {
@@ -599,14 +575,6 @@ mod tests {
             "/h/.config/uv/uv.toml",
         ] {
             assert!(list.contains(&PathBuf::from(p)), "{p}: {list:?}");
-        }
-        let f = fixture();
-        let guarded = guarded_tool_paths(&f.dirs, &f.job);
-        for p in [".bunfig.toml", ".config/.bunfig.toml", ".config/uv/uv.toml"] {
-            assert!(
-                !guarded.contains(&f.dirs.home().join(p)),
-                "{p}: {guarded:?}"
-            );
         }
     }
 }

@@ -2301,55 +2301,16 @@ fn s45_a_bracket_in_the_userinfo_never_trusts_the_host_after_it() {
 }
 
 /// S46 (item 35, review note 12): cargo reads `$CARGO_HOME/config.toml`
-/// (the job's is `<home>/.cargo`) and the job PATH starts with
-/// `$CARGO_HOME/bin` and `~/.local/bin`, so a session that writes a
-/// runner into that config, or a fake cargo into those dirs, would make
-/// the next gated commit run every test binary through `true`. The guard
-/// asks a person before a Bash or Write call writes there. A host config
-/// written anyway (interpreter code the guard does not read) fails every
-/// job until the host config approves its exact content
-/// (`[job.host_tool_configs]`, which the guard also asks for).
+/// (the job's is `<home>/.cargo`), so a session that writes a runner into
+/// that config would make the next gated commit run every test binary
+/// through `true`. The guard does not read these writes (an ordinary
+/// edit of a tool config is not a bypass); the job fails closed instead:
+/// a host tool config fails every job until the host config approves its
+/// exact content (`[job.host_tool_configs]`, which the guard asks for).
 #[test]
 fn s46_a_host_tool_config_the_session_writes_never_passes() {
     let lab = Lab::new(RUST_POLICY);
     let home = lab.sb().home.clone();
-    let mut not_asked = Vec::new();
-    for c in [
-        "printf '[target.x86_64-unknown-linux-gnu]\\nrunner = \"true\"\\n' >> ~/.cargo/config.toml",
-        "printf '[build]\\n' > $HOME/.cargo/config",
-        "cp /bin/true ~/.cargo/bin/cargo",
-        "install -m 755 /bin/true ~/.cargo/bin/cargo-nextest",
-        "ln -sf /bin/true ~/.local/bin/cargo",
-        "cd ~/.local/bin && ln -sf /bin/true uv",
-        "mv /tmp/x ~/.bun/bin/bun",
-        "echo 'max_width = 1' | tee ~/.rustfmt.toml",
-        "sed -i s/a/b/ ~/.config/rustfmt/rustfmt.toml",
-        "cp -r /tmp/evil/. ~/.local",
-        "chmod +x ~/.local/bin/x",
-        "cp /tmp/x ~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc",
-        "cp /tmp/x ~/.cargo/registry/src/index/serde-1.0.0/src/lib.rs",
-    ] {
-        if !matches!(lab.guard(c), Guarded::Asked(_)) {
-            not_asked.push(c);
-        }
-    }
-    assert!(not_asked.is_empty(), "not asked: {not_asked:?}");
-    for c in [
-        "rm -rf ~/.cargo/registry/cache",
-        "cat ~/.cargo/config.toml",
-        "ls ~/.local/bin > /tmp/list",
-    ] {
-        assert!(matches!(lab.guard(c), Guarded::Allowed(_)), "{c}");
-    }
-    for f in [".cargo/config.toml", ".local/bin/cargo", ".rustfmt.toml"] {
-        let write = serde_json::json!({
-            "tool_name": "Write",
-            "cwd": lab.repo,
-            "tool_input": {"file_path": home.join(f), "content": "x"},
-        });
-        assert!(matches!(lab.guard_json(&write), Guarded::Asked(_)), "{f}");
-    }
-
     let config = home.join(".cargo/config.toml");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(&config, "[target.'cfg(all())']\nrunner = \"true\"\n").unwrap();
@@ -2724,7 +2685,7 @@ fn s28_ref_writes_onto_full_refs() {
         "cwd": lab.repo,
         "tool_input": {"file_path": lab.repo.join(".git/refs/heads/main"), "content": "x"},
     });
-    assert!(matches!(lab.guard_json(&write), Guarded::Denied(_)));
+    assert!(matches!(lab.guard_json(&write), Guarded::Asked(_)));
     let s = lab.session("git branch -f other feat");
     assert_eq!(s.code(), Some(0), "{s:?}");
 }
@@ -3057,7 +3018,6 @@ fn s49_bash_writes_of_session_settings_and_global_git_config_are_never_silent() 
         format!("cp {r}/evil/settings.json ~/.claude/"),
         format!("cp {r}/evil/settings.json ~/.claude"),
         format!("cp -t ~/.claude {r}/evil/settings.json"),
-        format!("cp -r {r}/evil/.claude ~/"),
         "mv ~/.claude/settings.json ~/.claude/settings.bak".to_owned(),
         format!("mv {r}/evil/settings.json ~/.claude/settings.json"),
         "mv ~/.claude ~/.claude-old".to_owned(),
@@ -3110,14 +3070,6 @@ fn s49_bash_writes_of_session_settings_and_global_git_config_are_never_silent() 
             .to_owned(),
     ];
     bad.extend(silent(&git));
-    // A settings file that links to a dotfiles copy: that copy too.
-    let dot = root.join("dot/claude-settings.json");
-    std::fs::create_dir_all(dot.parent().unwrap()).unwrap();
-    std::fs::rename(home.join(".claude/settings.json"), &dot).unwrap();
-    std::os::unix::fs::symlink(&dot, home.join(".claude/settings.json")).unwrap();
-    bad.extend(silent(&[format!("printf '{{}}' > {}", dot.display())]));
-    std::fs::remove_file(home.join(".claude/settings.json")).unwrap();
-    std::fs::rename(&dot, home.join(".claude/settings.json")).unwrap();
     assert!(bad.is_empty(), "{}", bad.join("\n"));
     // Reads, and writes of other files, stay open.
     for cmd in [
@@ -3142,16 +3094,13 @@ fn s49_bash_writes_of_session_settings_and_global_git_config_are_never_silent() 
     }
 }
 
-/// S53 (R26, review of item 21): Claude Code reads settings from more
-/// places than `~/.claude`: the user settings dir `$CLAUDE_CONFIG_DIR`
-/// names, and the managed settings (`/etc/claude-code`, on macOS
-/// `/Library/Application Support/ClaudeCode`), which outrank every other
-/// file and can turn all user hooks off. A write of any of them by an
-/// ordinary tool asks, as Write/Edit of `.claude/settings*.json` does.
-/// A program the guard does not know is not read. Only the guard runs
-/// here.
+/// S53 (R26, review of item 21): Claude Code reads the user settings
+/// from the dir `$CLAUDE_CONFIG_DIR` names when it is set. A write of a
+/// settings file there by an ordinary tool, or a move or removal of the
+/// dir, asks, as Write/Edit of `.claude/settings*.json` does. A program
+/// the guard does not know is not read. Only the guard runs here.
 #[test]
-fn s53_bash_writes_of_the_config_dir_and_managed_settings_ask() {
+fn s53_bash_writes_of_the_claude_config_dir_ask() {
     let lab = Lab::new(BAD_FILE_POLICY);
     let root = lab.root();
     let r = root.display().to_string();
@@ -3165,9 +3114,9 @@ fn s53_bash_writes_of_the_config_dir_and_managed_settings_ask() {
         Guarded::Asked(_) => {}
         g => bad.push(format!("{cmd}  {env:?} => not an ask: {g:?}")),
     };
-    // $CLAUDE_CONFIG_DIR, as spelled and through a link to it.
-    for dir in [cfg.clone(), root.join("cfglink")] {
-        let env = [("CLAUDE_CONFIG_DIR", dir.as_path())];
+    // $CLAUDE_CONFIG_DIR, written as spelled and through a link to it.
+    {
+        let env = [("CLAUDE_CONFIG_DIR", cfg.as_path())];
         for cmd in [
             format!("printf '{{}}' > {r}/cfg/settings.json"),
             format!("echo '{{}}' > {r}/cfglink/settings.local.json"),
@@ -3184,31 +3133,10 @@ fn s53_bash_writes_of_the_config_dir_and_managed_settings_ask() {
             want_ask(&cmd, &env);
         }
     }
-    // Managed settings, on both platforms, any case on macOS.
-    for cmd in [
-        "printf '{}' > /etc/claude-code/managed-settings.json",
-        "echo '{\"disableAllHooks\": true}' | sudo tee /etc/claude-code/managed-settings.json",
-        "echo '{\"allowManagedHooksOnly\": true}' | sudo tee /etc/claude-code/managed-settings.d/10-x.json",
-        "sudo mkdir -p /etc/claude-code/managed-settings.d && sudo cp /tmp/x.json /etc/claude-code/managed-settings.d/",
-        "sudo cp /tmp/x.json /etc/claude-code/",
-        "sudo cp -t /etc/claude-code /tmp/managed-settings.json",
-        "sudo install -D -m 644 /tmp/x.json /etc/claude-code/managed-settings.d/x.json",
-        "sudo sed -i 's/a/b/' /etc/claude-code/managed-settings.json",
-        "sudo ln -sf /tmp/x.json /etc/claude-code/managed-settings.json",
-        "sudo ln -sfn /tmp/cc /etc/claude-code",
-        "sudo rm -rf /etc/claude-code",
-        "sudo mv /etc/claude-code /etc/claude-code.old",
-        "cd /etc/claude-code && sudo tee managed-settings.json < /tmp/x.json",
-        "cd /etc && sudo tee claude-code/managed-settings.json < /tmp/x.json",
-        "printf '{}' > '/Library/Application Support/ClaudeCode/managed-settings.json'",
-        "sudo cp /tmp/x.json '/Library/Application Support/claudecode/Managed-Settings.json'",
-        "sudo rm -rf '/Library/Application Support/ClaudeCode'",
-    ] {
-        want_ask(cmd, &[]);
-    }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
-    // Reads with known readers, writes of other files, and programs given
-    // a dir that only holds a settings dir, stay open.
+    // Reads with known readers, writes of other files, programs given a
+    // dir that only holds a settings dir, and the managed settings dirs
+    // (a person's sudo, out of scope), stay open.
     for cmd in [
         "cat /etc/claude-code/managed-settings.json".to_owned(),
         "jq .hooks ~/.claude/settings.json".to_owned(),
@@ -3220,6 +3148,7 @@ fn s53_bash_writes_of_the_config_dir_and_managed_settings_ask() {
         "find ~/.claude/projects -name '*.jsonl'".to_owned(),
         "frobnicate ~/*.md".to_owned(),
         "ls /etc/claude-code/managed-settings.d".to_owned(),
+        "printf '{}' > /tmp/managed-settings.json".to_owned(),
         format!("cp {r}/cfg/settings.json {r}/backup.json"),
         "printf x > /tmp/claude-code-notes.txt".to_owned(),
         format!("printf x > {r}/settings.json"),
