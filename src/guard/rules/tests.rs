@@ -959,7 +959,12 @@ fn bun_run_reads_the_script_from_package_json() {
     all(
         &c,
         ("deny", "no-verify"),
-        &["bun run ship", "npm run ship", "bun run --silent ship"],
+        &[
+            "bun run ship",
+            "npm run ship",
+            "bun run --silent ship",
+            "bun ship",
+        ],
     );
     all(&c, ("deny", "person-only"), &["npm test"]);
     all(
@@ -968,6 +973,8 @@ fn bun_run_reads_the_script_from_package_json() {
         &[
             "bun run build",
             "bun run missing",
+            "bun missing",
+            "bun build",
             "bun test",
             "bun install",
         ],

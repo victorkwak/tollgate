@@ -1,6 +1,6 @@
 //! Script runners the walker follows: the tools that run the command in
 //! their arguments (`uv run`, `uvx`, `bunx`, `npx`) or a script of
-//! `package.json` (`bun run`, `npm run`).
+//! `package.json` (`bun run`, `bun <script>`, `npm run`).
 
 use super::cmds::{Arg, operands_at};
 
@@ -31,6 +31,46 @@ const UV_VALUED: &[&str] = &[
     "--from",
 ];
 const NPX_VALUED: &[&str] = &["-p", "--package", "-c", "--call"];
+/// The subcommands of `bun` (and their aliases). Any other word is a
+/// `package.json` script (`bun build` is the bundler, `bun ship` runs the
+/// script `ship`): a built-in wins over a script of the same name.
+const BUN_BUILTINS: &[&str] = &[
+    "run",
+    "test",
+    "check",
+    "fmt",
+    "x",
+    "repl",
+    "exec",
+    "install",
+    "i",
+    "add",
+    "a",
+    "remove",
+    "rm",
+    "update",
+    "audit",
+    "dedupe",
+    "prune",
+    "outdated",
+    "link",
+    "unlink",
+    "publish",
+    "patch",
+    "patch-commit",
+    "pm",
+    "info",
+    "why",
+    "build",
+    "init",
+    "create",
+    "c",
+    "upgrade",
+    "help",
+    "completions",
+    "discord",
+    "feedback",
+];
 
 /// The runner `name args...`; `None` when `name` is not a runner.
 #[must_use]
@@ -56,6 +96,9 @@ pub fn runner(name: &str, args: &[Arg]) -> Option<Runner> {
             }
         }
         ("npm" | "pnpm" | "yarn", Some(s @ ("test" | "start"))) => Runner::Script(s.to_owned()),
+        ("bun", Some(s)) if !s.starts_with('-') && !BUN_BUILTINS.contains(&s) => {
+            Runner::Script(s.to_owned())
+        }
         ("uv" | "bun" | "npm" | "pnpm" | "yarn", _) => Runner::Data,
         _ => return None,
     })
@@ -83,6 +126,9 @@ mod tests {
         assert_eq!(run("npm run -s lint"), Some(Runner::Script("lint".into())));
         assert_eq!(run("npm test"), Some(Runner::Script("test".into())));
         assert_eq!(run("bun test"), Some(Runner::Data));
+        assert_eq!(run("bun ship"), Some(Runner::Script("ship".into())));
+        assert_eq!(run("bun build"), Some(Runner::Data));
+        assert_eq!(run("bun --version"), Some(Runner::Data));
         assert_eq!(run("uv sync"), Some(Runner::Data));
         assert_eq!(run("cargo run"), None);
     }
