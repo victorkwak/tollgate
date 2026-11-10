@@ -609,6 +609,7 @@ tiers = ["full"]
             "{}",
             line(2)
         );
+        assert_eq!(line(3), "cargo test --doc -p a -p b", "doctests follow A");
         // The record states what ran: every member built, `a` tested.
         let maps: std::collections::BTreeMap<PathBuf, Option<WorkspaceMap>> =
             [(PathBuf::new(), Some(m.clone()))].into();

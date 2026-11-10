@@ -298,6 +298,11 @@ pub fn pick(
             }
         }
         for (i, r) in rust.iter().enumerate() {
+            // R57f: the query cache belongs to no member, also when the
+            // workspace root is a package.
+            if query_cache(p, r.dir) {
+                continue;
+            }
             if let Some(pkg) = r.map.and_then(|m| m.package_for(p)) {
                 marked[i].insert(pkg.to_owned());
                 matched = true;
@@ -460,6 +465,48 @@ mod tests {
         assert!(!p.rust[0].whole);
         assert_eq!(p.rust[0].affected, set(&["a", "b"]));
         assert_eq!(p.rust[0].marked, set(&["a"]));
+        // A root package does not own the query cache: alone, the change
+        // still runs every test, and with `a` it does not mark `app`.
+        let m = map(
+            "",
+            &[
+                ("app", "", &[]),
+                ("a", "crates/a", &["b"]),
+                ("b", "crates/b", &[]),
+            ],
+        );
+        let roots = [RustRoot {
+            dir: Path::new(""),
+            map: Some(&m),
+        }];
+        let rules = Rules::new(&c).unwrap();
+        let p = pick(&changes(&[".sqlx/query-1.json"]), &rules, &roots, &[]);
+        assert!(p.rust[0].whole);
+        let p = pick(
+            &changes(&[".sqlx/query-1.json", "crates/a/src/lib.rs"]),
+            &rules,
+            &roots,
+            &[],
+        );
+        assert!(!p.rust[0].whole);
+        assert_eq!(p.rust[0].marked, set(&["a"]));
+        assert_eq!(p.rust[0].affected, set(&["a", "app", "b"]));
+        // A second workspace with no change of its own is not touched.
+        let n = map("svc", &[("s", "svc/crates/s", &[])]);
+        let two = [
+            roots[0],
+            RustRoot {
+                dir: Path::new("svc"),
+                map: Some(&n),
+            },
+        ];
+        let p = pick(
+            &changes(&[".sqlx/query-1.json", "crates/a/src/lib.rs"]),
+            &rules,
+            &two,
+            &[],
+        );
+        assert!(p.rust[1].is_empty());
     }
 
     #[test]
