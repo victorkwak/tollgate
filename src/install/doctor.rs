@@ -738,8 +738,8 @@ mod tests {
     #[test]
     fn gitlab_project_paths_r97() {
         assert_eq!(
-            gitlab_project("git@gitlab.com:victorkwak/myapp.git").as_deref(),
-            Some("victorkwak/myapp")
+            gitlab_project("git@gitlab.com:example-org/myapp.git").as_deref(),
+            Some("example-org/myapp")
         );
         assert_eq!(gitlab_project("/srv/x.git"), None);
     }

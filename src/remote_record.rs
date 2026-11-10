@@ -1140,7 +1140,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = records(tmp.path());
         let s = Store(vec![oid(1)]);
-        let gl = "https://gitlab.com/victorkwak/r.git";
+        let gl = "https://gitlab.com/example-org/r.git";
         assert_eq!(at(&d, 1, &s, &[]), Status::Kept);
         assert!(
             !record_in(&d, &key(1)).exists(),
@@ -1153,13 +1153,13 @@ mod tests {
                 &d,
                 1,
                 &s,
-                &[tr("upstream", "https://GitLab.com/victorkwak/r")]
+                &[tr("upstream", "https://GitLab.com/example-org/r")]
             ),
             Status::Kept
         );
         // Gone, or only another trusted remote left: lost.
         assert_eq!(lost_names(&at(&d, 1, &s, &[])), ["origin"]);
-        let other = tr("mirror", "git@gitlab.com:victorkwak/other.git");
+        let other = tr("mirror", "git@gitlab.com:example-org/other.git");
         assert_eq!(
             lost_names(&at(&d, 1, &s, std::slice::from_ref(&other))),
             ["origin"]
@@ -1195,7 +1195,7 @@ mod tests {
     fn a_copy_takes_over_the_recorded_remotes_note2() {
         let tmp = tempfile::tempdir().unwrap();
         let d = records(tmp.path());
-        let gl = [tr("origin", "https://gitlab.com/victorkwak/r.git")];
+        let gl = [tr("origin", "https://gitlab.com/example-org/r.git")];
         let s = Store(vec![oid(1), oid(2)]);
         assert_eq!(at(&d, 1, &s, &gl), Status::Kept);
         // Moved or copied, origin removed: lost, named with where it was
@@ -1210,7 +1210,7 @@ mod tests {
         // A copy that keeps origin: kept.
         assert_eq!(at(&d, 3, &Store(vec![oid(1)]), &gl), Status::Kept);
         // Another URL in its place: lost.
-        let evil = [tr("origin", "https://gitlab.com/victorkwak/evil.git")];
+        let evil = [tr("origin", "https://gitlab.com/example-org/evil.git")];
         assert_eq!(
             lost_names(&at(&d, 4, &Store(vec![oid(1)]), &evil)),
             ["origin"]
@@ -1234,7 +1234,7 @@ mod tests {
     fn a_missing_record_of_a_known_repo_denies_note3() {
         let tmp = tempfile::tempdir().unwrap();
         let d = records(tmp.path());
-        let gl = [tr("origin", "https://gitlab.com/victorkwak/r.git")];
+        let gl = [tr("origin", "https://gitlab.com/example-org/r.git")];
         let s = Store(vec![oid(1)]);
         let broken = |st: Status, what: &str| {
             assert!(
@@ -1262,8 +1262,8 @@ mod tests {
     fn a_missing_index_denies_until_forget_makes_it_again_note27() {
         let tmp = tempfile::tempdir().unwrap();
         let d = records(tmp.path());
-        let gl = [tr("origin", "https://gitlab.com/victorkwak/r.git")];
-        let other = [tr("o2", "https://gitlab.com/victorkwak/other.git")];
+        let gl = [tr("origin", "https://gitlab.com/example-org/r.git")];
+        let other = [tr("o2", "https://gitlab.com/example-org/other.git")];
         let missing = |st: Status| {
             assert!(
                 matches!(&st, Status::Broken(w) if w.contains("is missing") && w.contains(INDEX_MISSING_FIX)),
@@ -1336,7 +1336,7 @@ mod tests {
     fn forget_leaves_a_tombstone_note3() {
         let tmp = tempfile::tempdir().unwrap();
         let d = records(tmp.path());
-        let gl = [tr("origin", "https://gitlab.com/victorkwak/r.git")];
+        let gl = [tr("origin", "https://gitlab.com/example-org/r.git")];
         let s = Store(vec![oid(1)]);
         assert_eq!(at(&d, 1, &s, &gl), Status::Kept);
         // A copy with origin removed is lost; forgetting accepts it.
@@ -1359,7 +1359,7 @@ mod tests {
         assert_eq!(lost_names(&at(&d, 2, &copy, &[])), ["origin"]);
         // Another repo (with its own record) moved into a forgotten path
         // takes over its own remotes.
-        let other = [tr("o2", "https://gitlab.com/victorkwak/other.git")];
+        let other = [tr("o2", "https://gitlab.com/example-org/other.git")];
         assert_eq!(at(&d, 5, &Store(vec![oid(5)]), &other), Status::Kept);
         assert_eq!(lost_names(&at(&d, 4, &Store(vec![oid(5)]), &[])), ["o2"]);
     }
@@ -1371,7 +1371,7 @@ mod tests {
     fn an_unusable_record_denies_item33() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = records(tmp.path());
-        let gl = [tr("origin", "https://gitlab.com/victorkwak/r.git")];
+        let gl = [tr("origin", "https://gitlab.com/example-org/r.git")];
         let s = Store(vec![oid(1)]);
         let broken = |st: Status| matches!(st, Status::Broken(_));
         let f = record_in(&dir, &key(1));
@@ -1390,7 +1390,7 @@ mod tests {
         // A version 1 record reads, and gets its commits.
         std::fs::write(
             &f,
-            r#"{"version":1,"remotes":[{"name":"origin","url":"https://gitlab.com/victorkwak/r.git","since":"2026-11-05T00:00:00Z"}]}"#,
+            r#"{"version":1,"remotes":[{"name":"origin","url":"https://gitlab.com/example-org/r.git","since":"2026-11-05T00:00:00Z"}]}"#,
         )
         .unwrap();
         assert_eq!(at(&dir, 1, &s, &gl), Status::Kept);

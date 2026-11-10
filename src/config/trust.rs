@@ -346,31 +346,31 @@ mod tests {
     #[test]
     fn url_identity_is_the_parsed_server_and_path_item33() {
         let id = url_identity;
-        let r = id("https://gitlab.com/victorkwak/r.git");
+        let r = id("https://gitlab.com/example-org/r.git");
         for same in [
-            "https://GitLab.com/victorkwak/r",
-            "https://user@gitlab.com/victorkwak/r.git/",
+            "https://GitLab.com/example-org/r",
+            "https://user@gitlab.com/example-org/r.git/",
         ] {
             assert_eq!(id(same), r, "{same}");
         }
         for other in [
             // Item 47: git runs `HTTPS://` through another helper, and
             // curl connects to `evil` for `evil?@gitlab.com`.
-            "HTTPS://gitlab.com/victorkwak/r.git",
-            "https://evil?@gitlab.com/victorkwak/r.git",
-            "ssh://gitlab.com/victorkwak/r.git",
-            "https://gitlab.com:8443/victorkwak/r.git",
-            "https://gitlab.com.evil.example/victorkwak/r.git",
-            "https://gitlab.com/victorkwak/R.git",
-            "https://gitlab.com/victorkwak/r.git.git",
-            "https://evil.example/gitlab.com/victorkwak/r.git",
-            "/tmp/gitlab.com/victorkwak/r.git",
+            "HTTPS://gitlab.com/example-org/r.git",
+            "https://evil?@gitlab.com/example-org/r.git",
+            "ssh://gitlab.com/example-org/r.git",
+            "https://gitlab.com:8443/example-org/r.git",
+            "https://gitlab.com.evil.example/example-org/r.git",
+            "https://gitlab.com/example-org/R.git",
+            "https://gitlab.com/example-org/r.git.git",
+            "https://evil.example/gitlab.com/example-org/r.git",
+            "/tmp/gitlab.com/example-org/r.git",
         ] {
             assert_ne!(id(other), r, "{other}");
         }
-        let s = id("git@gitlab.com:victorkwak/r.git");
-        assert_eq!(id("ssh://git@gitlab.com/victorkwak/r"), s);
-        assert_eq!(id("git+ssh://gitlab.com/victorkwak/r.git"), s);
+        let s = id("git@gitlab.com:example-org/r.git");
+        assert_eq!(id("ssh://git@gitlab.com/example-org/r"), s);
+        assert_eq!(id("git+ssh://gitlab.com/example-org/r.git"), s);
         let l = id("/srv/mirror/r.git");
         for same in ["file:///srv/mirror/r.git", "/srv//mirror/./r.git/"] {
             assert_eq!(id(same), l, "{same}");
@@ -390,54 +390,54 @@ mod tests {
     /// trusted). `https://evil?@gitlab.com/g/r` connects to `evil`.
     #[test]
     fn authority_ends_at_query_or_fragment_item47() {
-        let p = TrustPattern::parse("*gitlab.com/victorkwak/*").unwrap();
+        let p = TrustPattern::parse("*gitlab.com/example-org/*").unwrap();
         let trusted = |u: &str| parse_url(u).is_some_and(|u| p.matches(&u));
         for url in [
-            "https://evil?@gitlab.com/victorkwak/r",
-            "https://evil#@gitlab.com/victorkwak/r",
-            "https://evil.example?x@gitlab.com/victorkwak/r",
-            "https://evil\\@gitlab.com/victorkwak/r",
-            "https://evil%40@gitlab.com/victorkwak/r",
-            "https://evil%2f@gitlab.com/victorkwak/r",
-            "https://a@b@gitlab.com/victorkwak/r",
-            "https://ev il@gitlab.com/victorkwak/r",
-            "https://evil\t@gitlab.com/victorkwak/r",
-            "https://evil\n@gitlab.com/victorkwak/r",
-            "https://gitlab.com/victorkwak/r?x",
-            "https://gitlab.com/victorkwak/r#x",
-            "https://gitlab.com/victorkwak/r?@evil/x",
-            "ssh://evil?@gitlab.com/victorkwak/r",
-            "ssh://evil#@gitlab.com/victorkwak/r",
-            "evil?@gitlab.com:victorkwak/r",
-            "evil#@gitlab.com:victorkwak/r",
-            "evil\\@gitlab.com:victorkwak/r",
-            "evil%40@gitlab.com:victorkwak/r",
-            "a@b@gitlab.com:victorkwak/r",
-            "gitlab.com:victorkwak/r?x",
+            "https://evil?@gitlab.com/example-org/r",
+            "https://evil#@gitlab.com/example-org/r",
+            "https://evil.example?x@gitlab.com/example-org/r",
+            "https://evil\\@gitlab.com/example-org/r",
+            "https://evil%40@gitlab.com/example-org/r",
+            "https://evil%2f@gitlab.com/example-org/r",
+            "https://a@b@gitlab.com/example-org/r",
+            "https://ev il@gitlab.com/example-org/r",
+            "https://evil\t@gitlab.com/example-org/r",
+            "https://evil\n@gitlab.com/example-org/r",
+            "https://gitlab.com/example-org/r?x",
+            "https://gitlab.com/example-org/r#x",
+            "https://gitlab.com/example-org/r?@evil/x",
+            "ssh://evil?@gitlab.com/example-org/r",
+            "ssh://evil#@gitlab.com/example-org/r",
+            "evil?@gitlab.com:example-org/r",
+            "evil#@gitlab.com:example-org/r",
+            "evil\\@gitlab.com:example-org/r",
+            "evil%40@gitlab.com:example-org/r",
+            "a@b@gitlab.com:example-org/r",
+            "gitlab.com:example-org/r?x",
             // Trailing-dot host (another name to a string matcher), and a
             // scheme in capitals: git runs a `git-remote-HTTPS` helper
             // found on PATH, not its https transport.
-            "https://gitlab.com./victorkwak/r",
-            "gitlab.com.:victorkwak/r",
-            "HTTPS://gitlab.com/victorkwak/r",
-            "Ssh://gitlab.com/victorkwak/r",
+            "https://gitlab.com./example-org/r",
+            "gitlab.com.:example-org/r",
+            "HTTPS://gitlab.com/example-org/r",
+            "Ssh://gitlab.com/example-org/r",
         ] {
             assert!(!trusted(url), "{url:?} trusted");
         }
         for url in [
-            "https://GITLAB.COM/victorkwak/r",
-            "https://oauth2:tok-en_1.x~@gitlab.com/victorkwak/r",
-            "ssh://git@GitLab.com/victorkwak/r.git",
-            "git@GITLAB.com:victorkwak/r.git",
+            "https://GITLAB.COM/example-org/r",
+            "https://oauth2:tok-en_1.x~@gitlab.com/example-org/r",
+            "ssh://git@GitLab.com/example-org/r.git",
+            "git@GITLAB.com:example-org/r.git",
         ] {
             assert!(trusted(url), "{url:?} not trusted");
         }
         // A pattern spelled with the same tricks names no host.
         for pat in [
-            "*evil?@gitlab.com/victorkwak/*",
-            "*evil#@gitlab.com/victorkwak/*",
-            "*a@b@gitlab.com/victorkwak/*",
-            "*evil%40@gitlab.com:victorkwak/*",
+            "*evil?@gitlab.com/example-org/*",
+            "*evil#@gitlab.com/example-org/*",
+            "*a@b@gitlab.com/example-org/*",
+            "*evil%40@gitlab.com:example-org/*",
         ] {
             assert!(TrustPattern::parse(pat).is_none(), "{pat:?}");
         }
@@ -450,45 +450,45 @@ mod tests {
     /// in it parses as nothing.
     #[test]
     fn userinfo_with_a_bracket_or_other_character_is_never_trusted_item47() {
-        let p = TrustPattern::parse("*gitlab.com/victorkwak/*").unwrap();
+        let p = TrustPattern::parse("*gitlab.com/example-org/*").unwrap();
         let trusted = |u: &str| parse_url(u).is_some_and(|u| p.matches(&u));
         for url in [
-            "ssh://[evil.com]x@gitlab.com/victorkwak/r",
-            "ssh://[evil.com]@gitlab.com/victorkwak/r",
-            "git+ssh://[evil.com]x@gitlab.com/victorkwak/r",
-            "[evil.com]x@gitlab.com:victorkwak/r",
-            "[evil.com]@gitlab.com:victorkwak/r",
-            "https://[evil.com]x@gitlab.com/victorkwak/r",
-            "ssh://u[x@gitlab.com/victorkwak/r",
-            "ssh://u]x@gitlab.com/victorkwak/r",
-            "u]x@gitlab.com:victorkwak/r",
-            "ssh://@gitlab.com/victorkwak/r",
-            "@gitlab.com:victorkwak/r",
-            "ssh://-oProxyCommand=x@gitlab.com/victorkwak/r",
-            "ssh://a:b@gitlab.com/victorkwak/r",
-            "ssh://a!b@gitlab.com/victorkwak/r",
-            "ssh://a;b@gitlab.com/victorkwak/r",
-            "ssh://a$b@gitlab.com/victorkwak/r",
-            "ssh://\u{e9}@gitlab.com/victorkwak/r",
-            "https://a'b@gitlab.com/victorkwak/r",
-            "https://a+b@gitlab.com/victorkwak/r",
+            "ssh://[evil.com]x@gitlab.com/example-org/r",
+            "ssh://[evil.com]@gitlab.com/example-org/r",
+            "git+ssh://[evil.com]x@gitlab.com/example-org/r",
+            "[evil.com]x@gitlab.com:example-org/r",
+            "[evil.com]@gitlab.com:example-org/r",
+            "https://[evil.com]x@gitlab.com/example-org/r",
+            "ssh://u[x@gitlab.com/example-org/r",
+            "ssh://u]x@gitlab.com/example-org/r",
+            "u]x@gitlab.com:example-org/r",
+            "ssh://@gitlab.com/example-org/r",
+            "@gitlab.com:example-org/r",
+            "ssh://-oProxyCommand=x@gitlab.com/example-org/r",
+            "ssh://a:b@gitlab.com/example-org/r",
+            "ssh://a!b@gitlab.com/example-org/r",
+            "ssh://a;b@gitlab.com/example-org/r",
+            "ssh://a$b@gitlab.com/example-org/r",
+            "ssh://\u{e9}@gitlab.com/example-org/r",
+            "https://a'b@gitlab.com/example-org/r",
+            "https://a+b@gitlab.com/example-org/r",
         ] {
             assert!(!trusted(url), "{url:?} trusted");
         }
         for url in [
-            "ssh://git@gitlab.com/victorkwak/r",
-            "ssh://g.i_t~-1@gitlab.com/victorkwak/r",
-            "git@gitlab.com:victorkwak/r",
-            "https://oauth2:tok@gitlab.com/victorkwak/r",
-            "https://user@gitlab.com/victorkwak/r",
+            "ssh://git@gitlab.com/example-org/r",
+            "ssh://g.i_t~-1@gitlab.com/example-org/r",
+            "git@gitlab.com:example-org/r",
+            "https://oauth2:tok@gitlab.com/example-org/r",
+            "https://user@gitlab.com/example-org/r",
         ] {
             assert!(trusted(url), "{url:?} not trusted");
         }
         for pat in [
-            "*[evil.com]x@gitlab.com:victorkwak/*",
-            "ssh://[evil.com]x@gitlab.com/victorkwak/*",
-            "https://[evil.com]x@gitlab.com/victorkwak/*",
-            "ssh://a:b@gitlab.com/victorkwak/*",
+            "*[evil.com]x@gitlab.com:example-org/*",
+            "ssh://[evil.com]x@gitlab.com/example-org/*",
+            "https://[evil.com]x@gitlab.com/example-org/*",
+            "ssh://a:b@gitlab.com/example-org/*",
         ] {
             assert!(TrustPattern::parse(pat).is_none(), "{pat:?}");
         }
@@ -511,30 +511,30 @@ mod tests {
             .unwrap();
         assert!(init.status.success(), "{init:?}");
         let corpus = [
-            "ssh://git@gitlab.com/victorkwak/r.git",
-            "ssh://gitlab.com/victorkwak/r",
-            "ssh://git@GitLab.com:2222/victorkwak/r",
-            "git+ssh://git@gitlab.com/victorkwak/r",
-            "ssh+git://git@gitlab.com/victorkwak/r",
-            "ssh://git@[::1]:22/victorkwak/r",
-            "ssh://[::1]/victorkwak/r",
-            "ssh://g.i_t~-1@gitlab.com/victorkwak/r",
-            "git@gitlab.com:victorkwak/r.git",
-            "gitlab.com:victorkwak/r",
-            "ssh://[evil.com]x@gitlab.com/victorkwak/r",
-            "ssh://[evil.com]@gitlab.com/victorkwak/r",
-            "[evil.com]x@gitlab.com:victorkwak/r",
-            "[git@evil.com]:victorkwak/r",
-            "git@[evil.com]x@gitlab.com:victorkwak/r",
-            "ssh://u[x@gitlab.com/victorkwak/r",
-            "ssh://u]x@gitlab.com/victorkwak/r",
-            "ssh://[git@evil.com]:22/victorkwak/r",
-            "ssh://git@[gitlab.com]/victorkwak/r",
-            "ssh://git@gitlab.com:x/victorkwak/r",
-            "ssh://a:b@gitlab.com/victorkwak/r",
-            "a:b@gitlab.com:victorkwak/r",
-            "git@[::1]:victorkwak/r",
-            "ssh://-oProxyCommand=x@gitlab.com/victorkwak/r",
+            "ssh://git@gitlab.com/example-org/r.git",
+            "ssh://gitlab.com/example-org/r",
+            "ssh://git@GitLab.com:2222/example-org/r",
+            "git+ssh://git@gitlab.com/example-org/r",
+            "ssh+git://git@gitlab.com/example-org/r",
+            "ssh://git@[::1]:22/example-org/r",
+            "ssh://[::1]/example-org/r",
+            "ssh://g.i_t~-1@gitlab.com/example-org/r",
+            "git@gitlab.com:example-org/r.git",
+            "gitlab.com:example-org/r",
+            "ssh://[evil.com]x@gitlab.com/example-org/r",
+            "ssh://[evil.com]@gitlab.com/example-org/r",
+            "[evil.com]x@gitlab.com:example-org/r",
+            "[git@evil.com]:example-org/r",
+            "git@[evil.com]x@gitlab.com:example-org/r",
+            "ssh://u[x@gitlab.com/example-org/r",
+            "ssh://u]x@gitlab.com/example-org/r",
+            "ssh://[git@evil.com]:22/example-org/r",
+            "ssh://git@[gitlab.com]/example-org/r",
+            "ssh://git@gitlab.com:x/example-org/r",
+            "ssh://a:b@gitlab.com/example-org/r",
+            "a:b@gitlab.com:example-org/r",
+            "git@[::1]:example-org/r",
+            "ssh://-oProxyCommand=x@gitlab.com/example-org/r",
         ];
         let mut accepted = 0;
         for url in corpus {

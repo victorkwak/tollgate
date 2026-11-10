@@ -114,7 +114,7 @@ fn branch_policy_changes_wait_for_the_merge_l2() {
 fn trusted_remote_full_refs_anchor_first_l2() {
     let sb = Sandbox::new();
     // The "remote" URL must match a scope.remotes glob: its path names it.
-    let remote = sb.root().join("gitlab.com/victorkwak/r.git");
+    let remote = sb.root().join("gitlab.com/example-org/r.git");
     std::fs::create_dir_all(&remote).unwrap();
     sb.git(&remote, &["init", "-q", "--bare"]);
     let repo = sb.repo("r");

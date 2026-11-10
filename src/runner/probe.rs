@@ -1027,12 +1027,12 @@ mod tests {
     }
 
     /// Job overhead after each step, not the hook path. A tree the size of
-    /// webapp's (222 dirs, 1958 files on 2026-11-09) costs about 1500
+    /// a 222-dir, 1958-file app (2026-11-09) costs about 1500
     /// `lstat` calls per run: 9 ms wall at load 31 on the dev host, the same
     /// as a Python loop over the same calls (it is all syscalls). The CPU
     /// bound only catches a walk coming back.
     #[test]
-    fn a_probe_run_on_a_webapp_sized_tree_is_cheap() {
+    fn a_probe_run_on_a_mid_size_tree_is_cheap() {
         let t = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(t.path()).unwrap();
         let mut entries = Vec::new();

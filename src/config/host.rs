@@ -837,8 +837,8 @@ mod tests {
             r#"
 [scope]
 roots = ["~/Repos"]
-remotes = ["*gitlab.com:victorkwak/*", "*gitlab.com/victorkwak/*"]
-include = ["baton", "wikiknit"]
+remotes = ["*gitlab.com:example-org/*", "*gitlab.com/example-org/*"]
+include = ["example-repo", "other-repo"]
 exclude = ["agent_v"]
 
 [resources]
@@ -1009,50 +1009,50 @@ SQLX_OFFLINE = "true"
         let dirs = Dirs::from_env(&EnvSnapshot::from_pairs([("HOME", home.as_os_str())])).unwrap();
         let scope = ScopeConfig {
             remotes: vec![
-                "*gitlab.com:victorkwak/*".into(),
-                "*gitlab.com/victorkwak/*".into(),
+                "*gitlab.com:example-org/*".into(),
+                "*gitlab.com/example-org/*".into(),
             ],
             trusted_paths: vec![mirror.to_str().unwrap().to_owned()],
             ..ScopeConfig::default()
         };
         let s = CompiledScope::new(&scope, &dirs).unwrap();
         for url in [
-            "git@gitlab.com:victorkwak/baton.git",
-            "gitlab.com:victorkwak/baton",
-            "ssh://git@gitlab.com/victorkwak/baton.git",
-            "git+ssh://git@gitlab.com/victorkwak/baton.git",
-            "https://gitlab.com/victorkwak/baton.git",
-            "https://oauth2:token@GitLab.COM/victorkwak/baton",
-            "https://gitlab.com/victorkwak/baton.git/",
+            "git@gitlab.com:example-org/example-repo.git",
+            "gitlab.com:example-org/example-repo",
+            "ssh://git@gitlab.com/example-org/example-repo.git",
+            "git+ssh://git@gitlab.com/example-org/example-repo.git",
+            "https://gitlab.com/example-org/example-repo.git",
+            "https://oauth2:token@GitLab.COM/example-org/example-repo",
+            "https://gitlab.com/example-org/example-repo.git/",
         ] {
             assert!(s.remote_trusted(url), "{url} not trusted");
             assert!(s.remote_in_scope(url), "{url} not in scope");
         }
         for url in [
             // Local paths and file URLs that spell the host in a dir name.
-            "/tmp/x/gitlab.com/victorkwak/r.git",
-            "file:///tmp/x/gitlab.com/victorkwak/r.git",
-            "../gitlab.com/victorkwak/r.git",
+            "/tmp/x/gitlab.com/example-org/r.git",
+            "file:///tmp/x/gitlab.com/example-org/r.git",
+            "../gitlab.com/example-org/r.git",
             // Another host with the trusted one in its path or name.
-            "https://evil.example/gitlab.com/victorkwak/r",
-            "https://gitlab.com.evil.example/victorkwak/r",
-            "https://evilgitlab.com/victorkwak/r",
-            "git@evil.example:gitlab.com/victorkwak/r",
+            "https://evil.example/gitlab.com/example-org/r",
+            "https://gitlab.com.evil.example/example-org/r",
+            "https://evilgitlab.com/example-org/r",
+            "git@evil.example:gitlab.com/example-org/r",
             // Schemes without server authentication, a port, deeper paths.
-            "http://gitlab.com/victorkwak/r.git",
-            "git://gitlab.com/victorkwak/r.git",
-            "ssh://git@gitlab.com:2222/victorkwak/r.git",
-            "https://gitlab.com/victorkwak/group/r.git",
-            "https://gitlab.com/victorkwak/../evil/r.git",
-            "https://gitlab.com/victorkwak/%2e%2e",
-            "https://gitlab.com//victorkwak/r.git",
+            "http://gitlab.com/example-org/r.git",
+            "git://gitlab.com/example-org/r.git",
+            "ssh://git@gitlab.com:2222/example-org/r.git",
+            "https://gitlab.com/example-org/group/r.git",
+            "https://gitlab.com/example-org/../evil/r.git",
+            "https://gitlab.com/example-org/%2e%2e",
+            "https://gitlab.com//example-org/r.git",
             "https://gitlab.com/VictorKwak/r.git",
         ] {
             assert!(!s.remote_trusted(url), "{url} trusted");
         }
         // Loose matching still puts the look-alikes in scope.
-        assert!(s.remote_in_scope("/tmp/x/gitlab.com/victorkwak/r.git"));
-        assert!(s.remote_in_scope("https://evil.example/gitlab.com/victorkwak/r"));
+        assert!(s.remote_in_scope("/tmp/x/gitlab.com/example-org/r.git"));
+        assert!(s.remote_in_scope("https://evil.example/gitlab.com/example-org/r"));
         // trusted_paths: the exact canonical path, as a path or file URL.
         assert!(s.remote_trusted(mirror.to_str().unwrap()));
         assert!(s.remote_trusted(&format!("file://{}", mirror.display())));
@@ -1147,44 +1147,44 @@ SQLX_OFFLINE = "true"
     fn scope_l4_depth_one_remotes_include_exclude() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(home.join("Repos/baton/target/fixture")).unwrap();
+        std::fs::create_dir_all(home.join("Repos/example-repo/target/fixture")).unwrap();
         std::fs::create_dir_all(home.join("Repos/agent_v")).unwrap();
         std::fs::create_dir_all(home.join("elsewhere/clone")).unwrap();
         let dirs = Dirs::from_env(&EnvSnapshot::from_pairs([("HOME", home.as_os_str())])).unwrap();
         let scope = ScopeConfig {
             roots: vec!["~/Repos".into(), "~/missing".into()],
-            remotes: vec!["*gitlab.com:victorkwak/*".into()],
+            remotes: vec!["*gitlab.com:example-org/*".into()],
             trusted_paths: Vec::new(),
             include: vec!["*".into()],
             exclude: vec!["agent_v".into()],
         };
         let s = CompiledScope::new(&scope, &dirs).unwrap();
         let none: [String; 0] = [];
-        assert!(s.contains(&home.join("Repos/baton"), &none));
+        assert!(s.contains(&home.join("Repos/example-repo"), &none));
         // Depth exactly 1: a fixture repo nested in a checkout is out.
-        assert!(!s.contains(&home.join("Repos/baton/target/fixture"), &none));
+        assert!(!s.contains(&home.join("Repos/example-repo/target/fixture"), &none));
         assert!(!s.contains(&home.join("Repos/agent_v"), &none));
         assert!(!s.contains(&home.join("elsewhere/clone"), &none));
         // A trusted remote puts a clone anywhere in scope (R5).
-        let remote = ["git@GitLab.com:victorkwak/baton.git".to_owned()];
+        let remote = ["git@GitLab.com:example-org/example-repo.git".to_owned()];
         assert!(s.contains(&home.join("elsewhere/clone"), &remote));
-        assert!(s.remote_in_scope("git@gitlab.com:victorkwak/a/b.git"));
+        assert!(s.remote_in_scope("git@gitlab.com:example-org/a/b.git"));
         assert!(
-            !s.remote_trusted("git@gitlab.com:victorkwak/a/b.git"),
+            !s.remote_trusted("git@gitlab.com:example-org/a/b.git"),
             "item 34"
         );
-        assert!(s.remote_trusted("git@gitlab.com:victorkwak/b.git"));
-        assert!(!s.remote_in_scope("git@github.com:victorkwak/baton.git"));
+        assert!(s.remote_trusted("git@gitlab.com:example-org/b.git"));
+        assert!(!s.remote_in_scope("git@github.com:example-org/example-repo.git"));
         // include/exclude still apply to remote matches: by the local name
         // or the project name; an excluded project in an excluded dir is
         // out, a clone of an allowed project is in whatever its dir name.
         assert!(s.contains(&home.join("elsewhere/agent_v"), &remote));
-        let excluded = ["git@gitlab.com:victorkwak/agent_v.git".to_owned()];
+        let excluded = ["git@gitlab.com:example-org/agent_v.git".to_owned()];
         assert!(!s.contains(&home.join("elsewhere/agent_v"), &excluded));
         // Rollout: a renamed clone of an included project stays in scope by
         // its trusted remote's project name.
         let only = ScopeConfig {
-            include: vec!["baton".into()],
+            include: vec!["example-repo".into()],
             ..scope
         };
         let s = CompiledScope::new(&only, &dirs).unwrap();

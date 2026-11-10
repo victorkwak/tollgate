@@ -1881,7 +1881,7 @@ fn s33_git_exec_path_never_picks_the_git_tollgate_runs() {
 }
 
 /// S30 (item 34, X5): a `scope.remotes` pattern trusts only the server it
-/// names. A local bare repo whose path spells `gitlab.com/victorkwak/...`
+/// names. A local bare repo whose path spells `gitlab.com/example-org/...`
 /// matches the loose glob (the repo stays in scope and its pushes are
 /// gated) but is never trusted: its `main`, which drops the checks, does
 /// not become the policy anchor, so a bad commit is still refused.
@@ -1891,10 +1891,10 @@ fn s30_a_look_alike_remote_path_is_never_trusted() {
     let sb = lab.sb();
     let root = lab.root();
     sb.host_config(
-        "[scope]\nremotes = [\"*gitlab.com:victorkwak/*\", \"*gitlab.com/victorkwak/*\"]\n[verify]\nmin_free = \"1M\"\n",
+        "[scope]\nremotes = [\"*gitlab.com:example-org/*\", \"*gitlab.com/example-org/*\"]\n[verify]\nmin_free = \"1M\"\n",
     );
     // The look-alike "server": its main has a policy with no checks.
-    let evil = root.join("evil/gitlab.com/victorkwak/ws.git");
+    let evil = root.join("evil/gitlab.com/example-org/ws.git");
     std::fs::create_dir_all(&evil).unwrap();
     lab.plain_in(&evil, &["init", "-q", "--bare"]);
     lab.plain(&["checkout", "-q", "-b", "weak"]);
@@ -2213,21 +2213,21 @@ fn s48b_a_deleted_trusted_remote_index_never_reads_as_empty() {
 fn s35_a_query_or_fragment_before_the_at_never_trusts_the_host_after_it() {
     let lab = Lab::new(BAD_FILE_POLICY);
     lab.sb().host_config(
-        "[scope]\nremotes = [\"*gitlab.com:victorkwak/*\", \"*gitlab.com/victorkwak/*\"]\n[verify]\nmin_free = \"1M\"\n",
+        "[scope]\nremotes = [\"*gitlab.com:example-org/*\", \"*gitlab.com/example-org/*\"]\n[verify]\nmin_free = \"1M\"\n",
     );
     for (configured, base, evil) in [
         (
-            "https://gitlab.com/victorkwak/ws.git",
+            "https://gitlab.com/example-org/ws.git",
             "https://gitlab.com/",
             "https://evil.invalid?@gitlab.com/",
         ),
         (
-            "https://gitlab.com/victorkwak/ws.git",
+            "https://gitlab.com/example-org/ws.git",
             "https://gitlab.com/",
             "https://evil.invalid#@gitlab.com/",
         ),
         (
-            "git@gitlab.com:victorkwak/ws.git",
+            "git@gitlab.com:example-org/ws.git",
             "git@gitlab.com:",
             "evil.invalid?@gitlab.com:",
         ),
@@ -2261,21 +2261,21 @@ fn s35_a_query_or_fragment_before_the_at_never_trusts_the_host_after_it() {
 fn s45_a_bracket_in_the_userinfo_never_trusts_the_host_after_it() {
     let lab = Lab::new(BAD_FILE_POLICY);
     lab.sb().host_config(
-        "[scope]\nremotes = [\"*gitlab.com:victorkwak/*\", \"*gitlab.com/victorkwak/*\"]\n[verify]\nmin_free = \"1M\"\n",
+        "[scope]\nremotes = [\"*gitlab.com:example-org/*\", \"*gitlab.com/example-org/*\"]\n[verify]\nmin_free = \"1M\"\n",
     );
     for (configured, base, evil) in [
         (
-            "ssh://git@gitlab.com/victorkwak/ws.git",
+            "ssh://git@gitlab.com/example-org/ws.git",
             "ssh://git@gitlab.com/",
             "ssh://[evil.invalid]x@gitlab.com/",
         ),
         (
-            "ssh://git@gitlab.com/victorkwak/ws.git",
+            "ssh://git@gitlab.com/example-org/ws.git",
             "ssh://git@gitlab.com/",
             "git+ssh://[evil.invalid]@gitlab.com/",
         ),
         (
-            "git@gitlab.com:victorkwak/ws.git",
+            "git@gitlab.com:example-org/ws.git",
             "git@gitlab.com:",
             "[evil.invalid]x@gitlab.com:",
         ),
