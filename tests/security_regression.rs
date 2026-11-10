@@ -1423,6 +1423,19 @@ fn s17_install_and_uninstall_need_an_interactive_terminal() {
         "socat - EXEC:'tollgate install',pty",
         "python3 -c \"import pty; pty.spawn(['tollgate', 'install'])\"",
         "expect -c 'spawn tollgate install; send y\\r; expect eof'",
+        // A launcher or runner in front of the pty wrapper (review note 1,
+        // launcher-plus-script): the guard follows each one, and a pty
+        // made under them would still carry CLAUDECODE, which install,
+        // uninstall and remotes forget refuse.
+        "echo y | ssh-agent script -qc 'tollgate install' /dev/null",
+        "printf 'y\\n' | prlimit script -qec 'tollgate uninstall' /dev/null",
+        "echo y | prlimit script -qec 'tollgate remotes forget' /dev/null",
+        "echo y | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT script -qec 'tollgate remotes forget' /dev/null",
+        "echo y | script -qec 'env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT tollgate install' /dev/null",
+        "echo y | setsid -w script -qec 'tollgate remotes forget' /dev/null",
+        "echo y | prlimit sh -c 'unset CLAUDECODE; script -qec \"tollgate remotes forget\" /dev/null'",
+        "socat - EXEC:'tollgate remotes forget',pty",
+        "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; echo y | script -qec 'tollgate remotes forget' /dev/null",
     ]));
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
