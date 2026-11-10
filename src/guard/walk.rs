@@ -1237,7 +1237,18 @@ impl<'a> Walker<'a> {
             Some(Written::Runtime(t)) => return self.runtime(&t),
             None => match self.read(&path) {
                 Some(r) => r,
-                None => return,
+                None => {
+                    // Case 4: missing at guard time, so the command may
+                    // write it first with a writer the walker does not
+                    // model (`tee`, `cp`, an interpreter).
+                    if has_needle(self.text) && self.has_marker(self.text) {
+                        self.unclassified(
+                            4,
+                            &format!("the missing script file {}", path.display()),
+                        );
+                    }
+                    return;
+                }
             },
         };
         if direct {

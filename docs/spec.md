@@ -309,7 +309,7 @@ The one ask rule for what the walker cannot classify, `unclassified`. A needle i
 1. The command, or literal shell code in it, does not parse as bash and has a needle. With no needle it is allowed.
 2. Shell code made at run time (`eval "$x"`, `sh -c "$cmd"`, `source <(...)`, a pipe that is not literal into a shell, a script the same command wrote with text made at run time) whose words have a needle or a marker.
 3. A command name made at run time (`$X ...`, `"$tool" ...`) whose literal words carry a marker, or whose remaining words are a git or tollgate command that a rule refuses.
-4. A script file that a shell runs and that does not parse, or is over the budget, and that has a needle and a marker.
+4. A script file that a shell runs and that does not parse, or is over the budget, and that has a needle and a marker; or that is missing at guard time (the same command may write it with a writer the walker does not model, such as `tee` or `cp`) while the whole command has a needle and a marker.
 5. A program the guard does not know (not git, tollgate, a shell, a wrapper, a runner, a writer of the table, or a text tool such as `echo`, `grep`, `sed`) whose words, from the first one that is `git`, `tollgate` or a shell name, are a command that a rule refuses (`docker exec app git commit --no-verify`).
 6. A write target of an ordinary tool with a part made at run time, or under a cwd the guard cannot follow, or with a pattern, whose literal text holds the tail of a protected path (`"$d/.claude/settings.json"`). A target whose literal start is inside a tollgate dir denies.
 

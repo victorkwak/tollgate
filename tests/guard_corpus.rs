@@ -206,6 +206,10 @@ const HARMLESS: &[&str] = &[
     "cp -r dist/. ~/.local && git status",
     "rm -rf ~/.cargo/registry/cache ~/.cache/uv && git status",
     "mkdir -p ~/.config/rustfmt && cp rustfmt.toml ~/.config/rustfmt/ && git status",
+    // A script written by a writer the guard does not model, then run:
+    // no bypass marker in the command, so no ask.
+    "tee build.sh <<'EOF' >/dev/null\ncargo build\ngit status\nEOF\nbash build.sh",
+    "cp ci/check.sh /tmp/c.sh && bash /tmp/c.sh && git status",
 ];
 
 /// One command for each deny rule (R25), in a form that every wrapper of
@@ -288,6 +292,9 @@ const ASK: &[&str] = &[
     "$G commit --no-verify -m x",
     // 4: a script file that does not parse.
     "bash scripts/odd.sh",
+    // 4: a script file the same command writes with a writer other than
+    // a redirection, missing at guard time, and the command has a marker.
+    "tee t.sh <<'EOF' >/dev/null\ngit push --no-verify origin main\nEOF\nbash t.sh",
     // 5: an unknown program gets a git command that a rule refuses.
     "docker exec app git commit --no-verify -m x",
     // 6: a write target with a part made at run time.
