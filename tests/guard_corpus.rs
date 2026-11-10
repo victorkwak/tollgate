@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use support::Armed;
-use support::cpu::{CpuMeter, Sample};
+use support::cpu::{CpuMeter, GUARD_BUDGET, Sample};
 
 /// The cap prefix the guard puts in front of waiting commands (L17).
 const CAP: &str = "export TOLLGATE_INLINE_CAP=540; ";
@@ -478,7 +478,8 @@ fn each_rule_denies_or_asks_alone_and_through_each_wrapper() {
 }
 
 /// L19: the guard's p95 over the corpus and the deny and ask lists,
-/// script-file parsing included, is under 10 ms of CPU time (user +
+/// script-file parsing included, is under 10 ms of CPU time in a release
+/// build (`support::cpu::GUARD_BUDGET`: 20 ms in a debug build) (user +
 /// system, as `tests/latency.rs` asserts every L19 budget): wall time
 /// depends on how busy the host is, and the whole parallel suite makes it
 /// several times longer. The guard's work is sequential, so its CPU time
@@ -495,7 +496,7 @@ fn the_guard_p95_over_the_corpus_is_under_10_ms_l19() {
     for i in &inputs {
         a.guard_raw(i, &[]);
     }
-    let budget = Duration::from_millis(10);
+    let budget = GUARD_BUDGET;
     let rank = |v: &mut Vec<Duration>, pct: usize| {
         v.sort();
         v[(v.len() * pct / 100).min(v.len() - 1)]

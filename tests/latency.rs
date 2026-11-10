@@ -12,7 +12,7 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use support::cpu::{CpuMeter, Sample};
+use support::cpu::{CpuMeter, GUARD_BUDGET, Sample};
 use support::{Armed, Sandbox, test_hooks_dir};
 
 const PASS: &str = "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n";
@@ -310,7 +310,7 @@ fn the_guard_answers_in_under_10_ms_l19() {
         let (code, _, err) = a.guard_raw(&input, &[]);
         assert_eq!(code, Some(0), "{err}");
     });
-    within_budget("guard", t, Duration::from_millis(10));
+    within_budget("guard", t, GUARD_BUDGET);
 
     // A deny has more work than an allow: the keyed hash of the command
     // for the metrics log (item 50), which reads `metrics.key`.
@@ -328,7 +328,7 @@ fn the_guard_answers_in_under_10_ms_l19() {
     let key = a.sb.state().join("metrics.key");
     assert!(key.is_file(), "the first deny creates the key");
     let t = p95(&meter, 3, 200, denied);
-    within_budget("guard deny", t, Duration::from_millis(10));
+    within_budget("guard deny", t, GUARD_BUDGET);
 
     // The first deny also creates the key: random bytes from /dev/urandom,
     // a 0600 file and a hard link into place.
@@ -350,7 +350,7 @@ fn the_guard_answers_in_under_10_ms_l19() {
     within_budget(
         "guard deny that creates metrics.key",
         best.unwrap(),
-        Duration::from_millis(10),
+        GUARD_BUDGET,
     );
 }
 
@@ -377,11 +377,7 @@ fn the_guard_reads_push_and_fetch_targets_in_under_10_ms_l19_item22() {
         let (code, _, err) = a.guard_raw(&input, &[]);
         assert_eq!(code, Some(0), "{err}");
     });
-    within_budget(
-        "guard on push and fetch targets",
-        t,
-        Duration::from_millis(10),
-    );
+    within_budget("guard on push and fetch targets", t, GUARD_BUDGET);
 }
 
 /// R26, `unclassified` case 5: the words of a program the guard does not
@@ -414,7 +410,7 @@ fn the_guard_walks_words_of_unknown_programs_in_under_10_ms_l19_item21_20() {
             let (c, _, err) = a.guard_raw(&input, &[]);
             assert_eq!(c, code, "{err}");
         });
-        within_budget(what, t, Duration::from_millis(10));
+        within_budget(what, t, GUARD_BUDGET);
     }
 }
 
@@ -613,7 +609,7 @@ fn large_python_heredocs_cost_little_more_than_reading_them_l19() {
                     python.cpu.as_secs_f64() * 1000.0
                 );
             } else {
-                within_budget(&what, python, Duration::from_millis(10));
+                within_budget(&what, python, GUARD_BUDGET);
             }
             assert!(ratio < 1.6, "{what}: python {python:?}, cat {cat:?}");
         }

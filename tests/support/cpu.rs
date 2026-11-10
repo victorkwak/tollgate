@@ -17,6 +17,20 @@
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+/// The CPU time the guard tests assert, per build. L19 budgets the
+/// release guard: 10 ms. A debug guard costs 2-4x the release one's CPU
+/// time (one host, same hour: release p95 1.4-2.1 ms, debug 3.6-9.4 ms;
+/// most of it starting the larger binary), and on a loaded host debug
+/// measured 10.0-11.9 ms with the release budget never near. A release
+/// guard over 10 ms is a debug guard over 20 ms, so a debug build asserts
+/// 20 ms: it still fails every release breach, and host load no longer
+/// fails it.
+pub const GUARD_BUDGET: Duration = if cfg!(debug_assertions) {
+    Duration::from_millis(20)
+} else {
+    Duration::from_millis(10)
+};
+
 /// One measured run.
 #[derive(Debug, Clone, Copy)]
 pub struct Sample {
