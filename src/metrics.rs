@@ -1149,9 +1149,15 @@ mod tests {
         assert_eq!(keyed_hash(&d, "git status"), None);
     }
 
+    /// One hook run per call: each gets its own `t`, since `stats` takes
+    /// one time sample per (hook, `t`, `ms`, run). Two calls can read the
+    /// same clock value (macOS has microsecond resolution), which would
+    /// make them one run.
     fn hook_event(outcome: HookOutcome, job: Option<&str>) -> Event {
+        static RUN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        let n = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Event::Hook(HookEvent {
-            t: jiff::Timestamp::now(),
+            t: jiff::Timestamp::now() + jiff::SignedDuration::from_millis(n),
             hook: "pre-commit".into(),
             repo: "r".into(),
             tier: Tier::Fast,

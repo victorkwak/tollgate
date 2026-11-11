@@ -282,6 +282,48 @@ pub fn rustup_dirs() -> Vec<(&'static str, OsString)> {
         .collect()
 }
 
+/// `text` (a host config) that lets a sandbox job find rustup's cargo
+/// when [`rustup_dirs`] is not empty: `<CARGO_HOME>/bin` last in
+/// `[job] path_prepend`, and `[job] rustup_home` where `text` does not
+/// set it. Jobs take `CARGO_HOME` and `RUSTUP_HOME` from the host config
+/// or the install's (sandbox) home only, never from the environment
+/// (item 38). `cargo_home` stays the sandbox's `~/.cargo`, as with a
+/// system cargo, so the host tool configs a test writes there still
+/// count (item 35). `text` as it is when there is a system cargo, or
+/// when it is not valid TOML (a test of a bad config).
+pub fn with_rustup_dirs(text: &str) -> String {
+    let dirs = rustup_dirs();
+    if dirs.is_empty() {
+        return text.to_owned();
+    }
+    let Ok(mut config) = text.parse::<toml::Table>() else {
+        return text.to_owned();
+    };
+    let Some(job) = config
+        .entry("job")
+        .or_insert_with(|| toml::Table::new().into())
+        .as_table_mut()
+    else {
+        return text.to_owned();
+    };
+    for (key, path) in dirs {
+        let path = path.to_str().expect("UTF-8 tool home");
+        if key == "CARGO_HOME" {
+            let bin = format!("{path}/bin");
+            if let Some(list) = job
+                .entry("path_prepend")
+                .or_insert_with(|| toml::value::Array::new().into())
+                .as_array_mut()
+            {
+                list.push(bin.into());
+            }
+        } else {
+            job.entry("rustup_home").or_insert_with(|| path.into());
+        }
+    }
+    config.to_string()
+}
+
 /// Sets the modification time of `path` to `secs` seconds ago.
 pub fn backdate(path: &Path, secs: u64) {
     std::fs::File::options()
@@ -303,11 +345,12 @@ pub struct Run {
 }
 
 impl Sandbox {
-    /// Writes the host config (`$XDG_CONFIG_HOME/tollgate/config.toml`).
+    /// Writes the host config (`$XDG_CONFIG_HOME/tollgate/config.toml`),
+    /// with [`with_rustup_dirs`].
     pub fn host_config(&self, text: &str) {
         let p = self.root().join("config/tollgate/config.toml");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, text).unwrap();
+        std::fs::write(p, with_rustup_dirs(text)).unwrap();
     }
 
     /// The sandbox state dir (`$XDG_STATE_HOME/tollgate`).

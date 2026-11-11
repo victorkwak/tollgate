@@ -50,15 +50,23 @@ pub fn apply(cmd: &mut Command) -> &mut Command {
 }
 
 /// [`apply`] with `address_space` bytes.
+///
+/// On macOS every process starts with about 466 GiB of address space
+/// reserved (the shared region and malloc's reservations), and
+/// `setrlimit(RLIMIT_AS)` refuses a limit below the current size with
+/// `EINVAL`. There the limit is `address_space` bytes above the size of
+/// the forked child; the kernel enforces it on each new mapping after
+/// `exec`, as Linux does.
 pub fn apply_with(cmd: &mut Command, address_space: u64) -> &mut Command {
     cmd.stdin(Stdio::null()).process_group(0);
-    // SAFETY: `setrlimit` is async-signal-safe and the closure allocates
-    // nothing.
+    // SAFETY: `setrlimit` and `proc_pidinfo` are system calls and the
+    // closure allocates nothing.
     unsafe {
         cmd.pre_exec(move || {
+            let limit = base_size()?.saturating_add(address_space);
             let lim = libc::rlimit {
-                rlim_cur: address_space as libc::rlim_t,
-                rlim_max: address_space as libc::rlim_t,
+                rlim_cur: limit as libc::rlim_t,
+                rlim_max: limit as libc::rlim_t,
             };
             if libc::setrlimit(libc::RLIMIT_AS, &raw const lim) != 0 {
                 return Err(std::io::Error::last_os_error());
@@ -66,6 +74,36 @@ pub fn apply_with(cmd: &mut Command, address_space: u64) -> &mut Command {
             Ok(())
         })
     }
+}
+
+/// The size the address-space limit counts from: zero on Linux.
+#[cfg(not(target_os = "macos"))]
+#[expect(clippy::unnecessary_wraps, reason = "the macOS form can fail")]
+fn base_size() -> std::io::Result<u64> {
+    Ok(0)
+}
+
+/// The size the address-space limit counts from: on macOS, the current
+/// size of this (forked) process, read with no allocation.
+#[cfg(target_os = "macos")]
+fn base_size() -> std::io::Result<u64> {
+    const SIZE: libc::c_int = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: `info` is a plain C struct of `SIZE` bytes.
+    let (n, info) = unsafe {
+        let mut info: libc::proc_taskinfo = std::mem::zeroed();
+        let n = libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&raw mut info).cast(),
+            SIZE,
+        );
+        (n, info)
+    };
+    if n != SIZE {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(info.pti_virtual_size)
 }
 
 /// Runs `cmd` (already through [`apply`]) to its end or to `wall`, then

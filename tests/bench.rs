@@ -742,10 +742,16 @@ fn bench_kills_step_leftovers_of_a_dead_runner_by_cwd_and_tmpdir_l20() {
         gone1,
         "the leftover in the checkout outlived the bench: {report:#}"
     );
+    // macOS (L13): `KERN_PROCARGS2` shows an unprivileged caller no
+    // environment, so the bench cannot find a process by its `TMPDIR`
+    // there; `gone_or_kill` above ended this leftover.
+    #[cfg(not(target_os = "macos"))]
     assert!(
         gone2,
         "the leftover with the job TMPDIR outlived the bench: {report:#}"
     );
+    #[cfg(target_os = "macos")]
+    let _ = gone2;
     assert_eq!(
         in_scratch,
         Vec::<i32>::new(),

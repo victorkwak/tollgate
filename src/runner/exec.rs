@@ -356,11 +356,12 @@ pub fn run(spec: ExecSpec<'_>) -> ExecOutcome {
         .stderr(log)
         .process_group(0);
     let inherit: Vec<std::os::fd::RawFd> = spec.inherit.to_vec();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let parent = std::process::id();
     // SAFETY: the closure runs in the forked child before exec and calls
-    // only async-signal-safe functions (prctl, getppid, raise, fcntl); it
-    // reads `inherit` and `parent`, which were set up before the fork.
+    // only async-signal-safe functions (prctl, getppid, raise, fcntl; on
+    // macOS fork, waitpid and the watcher's system calls); it reads
+    // `inherit` and `parent`, which were set up before the fork.
     unsafe {
         cmd.pre_exec(move || {
             // R35: the step leader dies with the runner (SIGKILL, OOM), and
@@ -373,6 +374,14 @@ pub fn run(spec: ExecSpec<'_>) -> ExecOutcome {
                     return Err(io::Error::last_os_error());
                 }
                 if libc::getppid().cast_unsigned() != parent {
+                    libc::raise(libc::SIGKILL);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let runner = parent.cast_signed();
+                death_watch::start(runner)?;
+                if libc::getppid() != runner {
                     libc::raise(libc::SIGKILL);
                 }
             }
@@ -453,6 +462,137 @@ pub fn run(spec: ExecSpec<'_>) -> ExecOutcome {
         duration: start.elapsed(),
         killed,
         survivors,
+    }
+}
+
+/// macOS stand-in for the parent-death signal (R35, L13): a watcher
+/// process per step that SIGKILLs the step leader when the runner exits
+/// first, and ends when the leader exits.
+///
+/// The step's child, before exec, forks a helper that forks the watcher
+/// and exits at once; the child reaps the helper, so the watcher is
+/// reparented to launchd before the step execs. The helper first moves
+/// to its own process group and to `/`, so the watcher is never in the
+/// step's group, its descendants or its checkout: the runner's walk and
+/// the bench's working-dir scan do not see it. The watcher closes every
+/// inherited descriptor (no log, pipe or lock stays open through it) and
+/// waits in `kevent` for `NOTE_EXIT` of the runner and of the leader. A
+/// runner that is gone before the watch starts (`ESRCH`) counts as an
+/// exit. Like `PR_SET_PDEATHSIG` on Linux, only the leader is signalled;
+/// what else the step started is reaped from its record (item 49).
+#[cfg(target_os = "macos")]
+mod death_watch {
+    use std::io;
+
+    /// Starts the watcher of the calling process (the step leader) and
+    /// of `runner`. Runs in the forked child before exec: only
+    /// async-signal-safe system calls, no allocation.
+    pub(super) fn start(runner: libc::pid_t) -> io::Result<()> {
+        // SAFETY: system calls only; the forked processes never return
+        // into Rust code that allocates (they end in `_exit`).
+        unsafe {
+            let leader = libc::getpid();
+            let helper = libc::fork();
+            if helper < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if helper == 0 {
+                libc::setpgid(0, 0);
+                libc::chdir(c"/".as_ptr());
+                let watcher = libc::fork();
+                if watcher == 0 {
+                    watch(runner, leader);
+                }
+                libc::_exit(i32::from(watcher < 0));
+            }
+            let mut status = 0;
+            loop {
+                let r = libc::waitpid(helper, &raw mut status, 0);
+                if r == helper {
+                    break;
+                }
+                if r < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+                return Err(io::Error::other("step watcher did not start"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The `NOTE_EXIT` watch of `pid` on `kq`; false when `pid` is gone.
+    unsafe fn add(kq: i32, pid: libc::pid_t) -> bool {
+        // SAFETY: a zeroed kevent is valid; one change, no events out.
+        unsafe {
+            let mut ev: libc::kevent = std::mem::zeroed();
+            ev.ident = pid.cast_unsigned() as libc::uintptr_t;
+            ev.filter = libc::EVFILT_PROC;
+            ev.flags = libc::EV_ADD;
+            ev.fflags = libc::NOTE_EXIT;
+            libc::kevent(
+                kq,
+                &raw const ev,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            ) == 0
+        }
+    }
+
+    /// The watcher: never returns.
+    unsafe fn watch(runner: libc::pid_t, leader: libc::pid_t) -> ! {
+        // SAFETY: system calls only, ending in `_exit`.
+        unsafe {
+            let mut lim: libc::rlimit = std::mem::zeroed();
+            let max = if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) == 0 {
+                lim.rlim_cur.min(1 << 16)
+            } else {
+                1 << 16
+            };
+            for fd in 0..max {
+                libc::close(i32::try_from(fd).unwrap_or(i32::MAX));
+            }
+            let kq = libc::kqueue();
+            if kq < 0 || !add(kq, leader) {
+                libc::_exit(0);
+            }
+            if !add(kq, runner) {
+                libc::kill(leader, libc::SIGKILL);
+                libc::_exit(0);
+            }
+            loop {
+                let mut events: [libc::kevent; 2] = std::mem::zeroed();
+                let n = libc::kevent(
+                    kq,
+                    std::ptr::null(),
+                    0,
+                    events.as_mut_ptr(),
+                    2,
+                    std::ptr::null(),
+                );
+                if n < 0 {
+                    if *libc::__error() == libc::EINTR {
+                        continue;
+                    }
+                    libc::_exit(1);
+                }
+                let seen = &events[..usize::try_from(n).unwrap_or(0)];
+                let gone = |pid: libc::pid_t| {
+                    seen.iter()
+                        .any(|e| e.ident == pid.cast_unsigned() as libc::uintptr_t)
+                };
+                if gone(leader) {
+                    libc::_exit(0);
+                }
+                if gone(runner) {
+                    libc::kill(leader, libc::SIGKILL);
+                    libc::_exit(0);
+                }
+            }
+        }
     }
 }
 

@@ -23,12 +23,41 @@ const PASS: &str = "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nru
 /// during the whole parallel suite). Asserted on CPU time like every
 /// budget here (measured 34 ms at load 14): tighter than L19, so a hook
 /// that does more work fails well before the 200 ms budget.
-const DOCS_ONLY: Duration = Duration::from_millis(90);
+const DOCS_ONLY: Duration = per_os(90, 800);
 
 /// [`DOCS_ONLY`] with detected Bun and Python roots (R65 detection runs on
 /// the hook path; wall p95 before: 151 ms; after: 69 ms alone, 71-77 ms
 /// during the whole suite). CPU measured: 49 ms at load 14.
-const DOCS_ONLY_DETECTED: Duration = Duration::from_millis(120);
+const DOCS_ONLY_DETECTED: Duration = per_os(120, 1000);
+
+/// L19 chained (non-gate) hook: 5 ms.
+const CHAINED: Duration = per_os(5, 20);
+
+/// L19 `pre-commit` on a cache hit: 200 ms.
+const CACHE_HIT: Duration = per_os(200, 800);
+
+/// `linux` ms, else `macos` ms on macOS (L19: budgets are per OS).
+///
+/// Starting a process costs much more CPU time on macOS. Measured
+/// 2026-11-11 on an 8-core Apple Silicon Mac, per call: `/usr/bin/true`
+/// 1.2 ms, the git of the Command Line Tools 4.3 ms (the `/usr/bin/git`
+/// xcrun shim 9.7 ms), the debug tollgate 3 ms. At load 8-10 a debug
+/// chained hook's p95 was 5.4-5.5 ms and a pre-commit that makes 14 git
+/// calls 220-490 ms. Under load (the gate runs the whole suite in
+/// parallel; other sessions run iOS simulators) work moves to the
+/// efficiency cores and the same work costs more CPU time: at load
+/// 80-210, chained 7.8-10.7 ms, docs-only 229 ms, cache hit (full
+/// index) 356-367 ms, cache hit (trusted remote) 393-413 ms, docs-only
+/// with detected roots 467-539 ms; at load 550, docs-only with detected
+/// roots 776 ms. Each macOS budget is about 1.3-3.5x the worst of those,
+/// so a hook that does several times its work still fails.
+const fn per_os(linux: u64, macos: u64) -> Duration {
+    if cfg!(target_os = "macos") {
+        Duration::from_millis(macos)
+    } else {
+        Duration::from_millis(linux)
+    }
+}
 
 fn repo_with(sb: &Sandbox, name: &str, toml: &str) -> PathBuf {
     let repo = sb.repo(name);
@@ -149,7 +178,7 @@ fn hook_latency_budgets_l19() {
     };
     chained();
     let t = p95(&meter, 3, 40, chained);
-    within_budget("chained hook (post-checkout)", t, Duration::from_millis(5));
+    within_budget("chained hook (post-checkout)", t, CHAINED);
     // post-commit after a gate hook of the same git process allowed the
     // commit (item 17): it takes the marker, no subprocess, same budget.
     // The test process stands in for that git process.
@@ -179,7 +208,7 @@ fn hook_latency_budgets_l19() {
     within_budget(
         "chained hook (post-commit, gate marker)",
         best.unwrap(),
-        Duration::from_millis(5),
+        CHAINED,
     );
 
     // pre-commit on a cache hit: under 200 ms.
@@ -196,7 +225,7 @@ fn hook_latency_budgets_l19() {
         let o = sb.run_hook(&repo, "pre-commit", &[]);
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     });
-    within_budget("pre-commit cache hit", t, Duration::from_millis(200));
+    within_budget("pre-commit cache hit", t, CACHE_HIT);
 
     // pre-commit on a docs-only tree: under 200 ms, a new tree each time.
     assert_eq!(sb.hooked(&repo, &["commit", "-m", "b"]).code, Some(0));
@@ -291,7 +320,7 @@ fn post_merge_after_a_trusted_fast_forward_stays_in_budget_l19_item37() {
         within_budget(
             "chained hook (post-merge after a trusted fast-forward)",
             fast,
-            Duration::from_millis(5),
+            CHAINED,
         );
     }
 }
@@ -510,11 +539,7 @@ fn pre_commit_cache_hit_with_a_trusted_remote_l19_item33() {
         let o = sb.run_hook(&repo, "pre-commit", &[]);
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     });
-    within_budget(
-        "pre-commit cache hit (trusted remote)",
-        t,
-        Duration::from_millis(200),
-    );
+    within_budget("pre-commit cache hit (trusted remote)", t, CACHE_HIT);
 }
 
 /// Item 33, secreview note 2: a repo with no recorded trusted remote is
@@ -557,11 +582,7 @@ fn pre_commit_cache_hit_with_a_full_remote_index_l19_item33() {
         "  index of 300 repos adds {:?} p95 cpu",
         t.cpu.saturating_sub(empty.cpu)
     );
-    within_budget(
-        "pre-commit cache hit (no remote, full index)",
-        t,
-        Duration::from_millis(200),
-    );
+    within_budget("pre-commit cache hit (no remote, full index)", t, CACHE_HIT);
 }
 
 /// A 100 KB heredoc costs the guard about what reading the command costs

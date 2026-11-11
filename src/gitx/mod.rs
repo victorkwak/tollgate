@@ -70,7 +70,23 @@ pub use layout::RepoLayout;
 
 /// Dirs searched for git when no install records one (item 39); the same
 /// system dirs as the trusted-server query (X1).
-pub const SYSTEM_GIT_DIRS: [&str; 3] = ["/usr/local/bin", "/usr/bin", "/bin"];
+#[cfg(not(target_os = "macos"))]
+pub const SYSTEM_GIT_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin"];
+
+/// Dirs searched for git when no install records one (item 39). On macOS
+/// `/usr/bin/git` is the `xcrun` shim: each call first runs `xcrun` to
+/// find the developer dir, which doubles its CPU time (measured
+/// 2026-11-11: 9.7 ms per `git rev-parse` against 4.3 ms for the git it
+/// runs). The real binaries of the Command Line Tools and of Xcode come
+/// before it; like `/usr/bin`, both are root-owned system paths.
+#[cfg(target_os = "macos")]
+pub const SYSTEM_GIT_DIRS: &[&str] = &[
+    "/usr/local/bin",
+    "/Library/Developer/CommandLineTools/usr/bin",
+    "/Applications/Xcode.app/Contents/Developer/usr/bin",
+    "/usr/bin",
+    "/bin",
+];
 
 static PROGRAM: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
@@ -588,6 +604,31 @@ fn parse_oid_output<S: AsRef<OsStr>>(args: &[S], stdout: &[u8]) -> Result<Oid, G
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// macOS: a real git of the Command Line Tools or Xcode wins over the
+    /// `/usr/bin/git` shim, and `[job] path_prepend` still comes first.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn find_git_skips_the_xcrun_shim_on_macos() {
+        let real = SYSTEM_GIT_DIRS[1..3]
+            .iter()
+            .map(|d| Path::new(d).join("git"))
+            .find(|p| p.is_file());
+        let found = find_git(&[]).expect("a git");
+        if Path::new("/usr/local/bin/git").is_file() {
+            assert_eq!(found, Path::new("/usr/local/bin/git"));
+        } else if let Some(real) = real {
+            assert_eq!(found, real);
+        } else {
+            assert_eq!(found, Path::new("/usr/bin/git"));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mine = dir.path().join("git");
+        std::fs::write(&mine, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&mine, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        assert_eq!(find_git(&[dir.path().to_owned()]), Some(mine));
+    }
 
     #[test]
     fn oid_validation() {

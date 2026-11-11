@@ -496,7 +496,13 @@ fn the_harness_limits_every_command_a_lab_runs() {
     let (e, took) = bash("dd if=/dev/zero of=/dev/null bs=3G count=1", 60);
     assert_eq!(e.limit, None, "the wall clock, not the memory limit: {e:?}");
     assert_eq!(e.code, Some(1), "{e:?}");
-    assert!(e.out.contains("memory exhausted"), "{e:?}");
+    // GNU dd says "memory exhausted"; BSD dd (macOS) says "input buffer:
+    // Cannot allocate memory" (with no limit it fails the 3G read with
+    // "Invalid argument" instead).
+    assert!(
+        e.out.contains("memory exhausted") || e.out.contains("Cannot allocate memory"),
+        "{e:?}"
+    );
     assert!(took < Duration::from_secs(60), "{took:?}");
     // `script` buffers what its command does not read: the form that an
     // earlier harness ran with no limit.
