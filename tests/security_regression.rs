@@ -1001,9 +1001,11 @@ fn s12_a_branch_cannot_weaken_its_own_policy() {
     }
 }
 
-/// S13: a branch that adds `.cargo/config.toml` with `runner = "true"`
-/// (test binaries then never run), directly, as the legacy `.cargo/config`
-/// or through a symlinked `.cargo` dir: the failing test still fails.
+/// S13, R71, item 3: a branch that adds `.cargo/config.toml` with
+/// `runner = "true"` (test binaries then never run), directly, as the
+/// legacy `.cargo/config` or through a symlinked `.cargo` dir (TOOL_CONFIGS
+/// match git paths, so the link once hid the runner from the overlay): the
+/// failing test still fails, and the deny names the change as policy.
 #[test]
 fn s13_a_branch_cargo_runner_cannot_hide_a_failing_test() {
     let lab = Lab::new(RUST_POLICY);
@@ -1024,6 +1026,7 @@ fn s13_a_branch_cargo_runner_cannot_hide_a_failing_test() {
             std::os::unix::fs::symlink("tools/cargo-cfg", r.join(".cargo")).unwrap();
         },
     ];
+    let changed = [".cargo/config.toml", ".cargo/config", ".cargo"];
     for (i, setup) in setups.iter().enumerate() {
         lab.plain(&["reset", "-q", "--hard", "main"]);
         let _ = std::fs::remove_dir_all(lab.repo.join(".cargo"));
@@ -1042,6 +1045,9 @@ fn s13_a_branch_cargo_runner_cannot_hide_a_failing_test() {
             s.out().contains("FAIL b b tests::fails"),
             "variant {i}: {s:?}"
         );
+        // The deny names the branch's cargo config as a policy change.
+        let notice = format!("POLICY: this branch changes {};", changed[i]);
+        assert!(s.out().contains(&notice), "variant {i}: {s:?}");
     }
 }
 
