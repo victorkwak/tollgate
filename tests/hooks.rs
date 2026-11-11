@@ -844,35 +844,41 @@ fn the_hook_and_a_slow_job_leave_the_agents_index_and_locks_alone_t14_r52() {
     assert_eq!(sb.report(&job)["tree"], index_tree.as_str());
 }
 
+/// T19, R32, L17: a check longer than the inline cap denies with the job
+/// and a retry command, and leaves the job running. The step ends only
+/// when the test releases it after the hook answered, so a deny with
+/// `verdict running` proves the hook did not wait for the job, whatever
+/// the host's speed (runner T19 owns the wall-clock bound). Unreleased,
+/// the step fails after 30 s: a hook that waits for the job then reports
+/// a fail, not a running job.
 #[test]
 fn the_inline_budget_denies_with_the_job_and_a_retry_command_t19_r32_l17() {
     let sb = Sandbox::new();
     sb.scoped_host("");
+    let release = sb.root().join("release");
     let repo = repo_with(
         &sb,
         "r",
-        "version = 1\n[[step]]\nname = \"slow\"\nkind = \"command\"\nrun = \"sleep 3\"\n",
+        &format!(
+            "version = 1\n[[step]]\nname = \"slow\"\nkind = \"command\"\nrun = \"for i in $(seq 600); do [ -e '{}' ] && exit 0; sleep 0.05; done; exit 1\"\n",
+            release.display()
+        ),
     );
     stage(&sb, &repo, "a.txt", "1\n");
     let before = head(&sb, &repo);
-    let start = Instant::now();
     let r = sb.hooked_with(
         &repo,
         &["commit", "-m", "two words"],
         &[("TOLLGATE_INLINE_CAP", "1")],
     );
     assert_eq!(r.code, Some(1), "{}", r.out);
-    assert!(
-        start.elapsed() < Duration::from_secs(3),
-        "{:?}",
-        start.elapsed()
-    );
     let job = job_id(&r.out);
     assert!(r.out.contains("verdict running"), "{}", r.out);
     let retry = format!("tollgate wait {job} && git commit -m 'two words'");
     assert!(r.out.contains(&retry), "no {retry:?} in:\n{}", r.out);
     assert_eq!(head(&sb, &repo), before);
     // The printed command works: wait, then the same commit hits the record.
+    std::fs::write(&release, "").unwrap();
     let w = sb.tollgate(&repo, &["wait", &job, "--timeout", "30s"]);
     assert_eq!(w.code, Some(0), "{}", w.out);
     let r = sb.hooked(&repo, &["commit", "-m", "two words"]);
