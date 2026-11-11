@@ -556,6 +556,9 @@ mod death_watch {
             }
             if helper == 0 {
                 libc::close(answer_r);
+                // Results not checked: a watcher left in the step's
+                // group ends with the group kill, and one left in the
+                // step's dir only keeps that dir busy.
                 libc::setpgid(0, 0);
                 libc::chdir(c"/".as_ptr());
                 let watcher = libc::fork();
@@ -657,6 +660,13 @@ mod death_watch {
                     libc::_exit(1);
                 }
             }
+            // Close what the runner had open (logs, locks, gate pipe
+            // ends), so the watcher holds none of it through the step.
+            // The loop stops at the soft limit, and at 65536 at most: the
+            // limit can be "no limit", and macOS has no call that closes
+            // a range. A descriptor numbered 65536 or more would stay
+            // open here; the runner opens a few tens and numbers are
+            // given lowest first, so it has none.
             let mut lim: libc::rlimit = std::mem::zeroed();
             let max = if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) == 0 {
                 lim.rlim_cur.min(1 << 16)

@@ -140,8 +140,16 @@ fn root_only(meta: &std::fs::Metadata) -> bool {
 /// there: every symlink on the way (each prefix of `path`, read without
 /// following it) sits in a dir that only root can write, and the
 /// canonical path and every dir above it up to `/` are root's and only
-/// root can write them. The caller runs the canonical path, the one
-/// checked, never `path`: a symlink swapped later changes nothing.
+/// root can write them, and the canonical path has the file name of
+/// `path`. The caller runs the canonical path, the one checked, never
+/// `path`: a symlink swapped later changes nothing.
+///
+/// The walk and `canonicalize` are two reads. A user who owns a dir of
+/// `path` can keep a regular file there during the walk and put a symlink
+/// in its place before `canonicalize`. The result is then still a file
+/// that only root can write or replace, with the name asked for (for
+/// `git`: some root-owned `git`, never `/bin/sh`), and never code a user
+/// wrote. The name rule holds whatever the walk saw.
 fn root_controlled(path: &Path) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
@@ -158,6 +166,9 @@ fn root_controlled(path: &Path) -> Option<PathBuf> {
         }
     }
     let real = path.canonicalize().ok()?;
+    if real.file_name() != path.file_name() {
+        return None;
+    }
     real.ancestors()
         .all(|p| std::fs::symlink_metadata(p).is_ok_and(|m| root_only(&m)))
         .then_some(real)
@@ -687,8 +698,8 @@ mod tests {
         let clt = Path::new("/Library/Developer/CommandLineTools/usr/bin/git");
         if local.is_file() && root_controlled(local).is_some() {
             assert_eq!(Some(found), root_controlled(local));
-        } else if clt.is_file() {
-            assert_eq!(found, clt);
+        } else if clt.is_file() && root_controlled(clt).is_some() {
+            assert_eq!(Some(found), root_controlled(clt));
         } else {
             assert_eq!(found, Path::new("/usr/bin/git"));
         }
@@ -716,9 +727,9 @@ mod tests {
         assert_eq!(root_controlled(Path::new("/Applications")), None);
     }
 
-    /// macOS: a symlink in a dir a user can write is never followed to a
-    /// root-owned git, even though the git it points at passes: the user
-    /// could point it elsewhere after the check.
+    /// macOS: a symlink that the walk sees in a dir a user can write is
+    /// not followed to a root-owned git, even though the git it points at
+    /// passes: the user could point it elsewhere after the check.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_symlinked_git_in_a_user_dir_is_rejected_on_macos() {
@@ -741,15 +752,35 @@ mod tests {
     }
 
     /// macOS: the path found is the canonical one that was checked, never
-    /// the spelling of the system dir.
+    /// the spelling of the system dir. (`/usr/local` is not on every Mac;
+    /// `/usr/bin` is.)
     #[cfg(target_os = "macos")]
     #[test]
     fn the_git_found_is_the_canonical_path_on_macos() {
-        let spelled = "/usr/local/../bin";
+        let spelled = "/usr/bin/../bin";
         assert_eq!(
             find_git_in(&[], &[spelled]),
             Some(PathBuf::from("/usr/bin/git"))
         );
+    }
+
+    /// A link in a root-only dir to a program of another name (`/bin/sh`
+    /// to `bash` on many Linux hosts) is not the program asked for: the
+    /// result never depends on what a link pointed at during the walk.
+    #[test]
+    fn root_controlled_never_gives_a_program_of_another_name() {
+        for asked in ["/bin/sh", "/usr/bin/sh", "/usr/bin/awk", "/usr/bin/vi"] {
+            let asked = Path::new(asked);
+            let Ok(real) = asked.canonicalize() else {
+                continue;
+            };
+            let found = root_controlled(asked);
+            if real.file_name() == asked.file_name() {
+                assert!(found.is_none_or(|p| p == real), "{}", asked.display());
+            } else {
+                assert_eq!(found, None, "{} is {}", asked.display(), real.display());
+            }
+        }
     }
 
     /// Linux keeps the first executable git, as before.

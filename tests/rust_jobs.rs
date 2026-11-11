@@ -491,3 +491,44 @@ fn above_max_target_stale_packages_go_first_then_cargo_clean_r44() {
     assert_eq!(r.code, Some(0), "{}", r.out);
     assert!(!checkout.join("target").exists(), "cargo clean");
 }
+
+/// On a host whose only cargo is rustup's, a sandbox home gets the
+/// rustup programs and the toolchains, and nothing else of the real
+/// `CARGO_HOME/bin`: the developer's other programs (an installed
+/// tollgate) stay out of the job `PATH`.
+#[test]
+fn a_sandbox_links_only_the_rustup_programs() {
+    let real = tempfile::tempdir().unwrap();
+    let cargo_home = real.path().join("cargo");
+    let rustup_home = real.path().join("rustup");
+    std::fs::create_dir_all(cargo_home.join("bin")).unwrap();
+    std::fs::create_dir_all(rustup_home.join("toolchains/stable-x")).unwrap();
+    for name in ["cargo", "rustc", "cargo-nextest", "tollgate", "other-tool"] {
+        std::fs::write(cargo_home.join("bin").join(name), "").unwrap();
+    }
+    let home = real.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    support::link_rustup(
+        &home,
+        &[
+            ("CARGO_HOME", cargo_home.clone().into_os_string()),
+            ("RUSTUP_HOME", rustup_home.clone().into_os_string()),
+        ],
+    );
+    let mut linked: Vec<_> = std::fs::read_dir(home.join(".cargo/bin"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    linked.sort();
+    assert_eq!(linked, ["cargo", "cargo-nextest", "rustc"]);
+    assert_eq!(
+        std::fs::read_link(home.join(".cargo/bin/cargo")).unwrap(),
+        cargo_home.join("bin/cargo")
+    );
+    assert!(home.join(".rustup/toolchains/stable-x").is_dir());
+    // A system cargo: nothing is linked.
+    let plain = real.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    support::link_rustup(&plain, &[]);
+    assert!(!plain.join(".cargo").exists() && !plain.join(".rustup").exists());
+}

@@ -30,7 +30,7 @@ tollgate closes these gaps for agent sessions. Your own terminal is not gated.
 **0.1, early.** It is in trial on one Linux machine, on the author's own repos. Read this before you use it:
 
 - **Not a security boundary.** tollgate runs as the same user as the agents. Its guard defends against a careless agent: one that, under pressure to finish, reaches for the direct, documented way round the gate. It does not defend against an agent that sets out to defeat it. The guarantee is not the guard: it is the git hooks, the tree-keyed record check at commit, merge and push, and the trusted anchor that picks the policy. A bypass is made visible. Keep branch protection and CI on your remote as the last line.
-- **Linux first.** On macOS it builds and passes its tests except two: nothing kills a step whose runner was SIGKILLed (see [limits](docs/operations.md)).
+- **Linux first.** On macOS it builds and passes the whole test suite. macOS has no parent-death signal, so a watcher process per step kills the step when its runner dies. Still Linux-only: finding a lost job's processes by their environment (`TMPDIR`), and the subreaper. The latency budgets are per OS, larger on macOS (see [limits](docs/operations.md)).
 - **GitLab CI only.** `tollgate ci-snippet` writes a GitLab CI job. There is no GitHub Actions snippet yet.
 - **Commits without a `fast` check.** Commits made by `cherry-pick`, `revert`, `am`, `rebase` and fast-forward merges get no check when they are made. Push, `tollgate merge` and CI check them.
 - **Nothing is gated until you say so.** The host config that `install` writes has no repos and no trusted remotes. Add them after install (see below).

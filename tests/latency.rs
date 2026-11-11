@@ -21,8 +21,12 @@ const PASS: &str = "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nru
 /// ms; item 41: the hook sees its end near its run time, not at the next
 /// 100 ms poll (wall p95 before: 128 ms; after: 42 ms alone, 47-55 ms
 /// during the whole parallel suite). Asserted on CPU time like every
-/// budget here (measured 34 ms at load 14): tighter than L19, so a hook
-/// that does more work fails well before the 200 ms budget.
+/// budget here (measured 34 ms at load 14). On Linux this is tighter than
+/// L19, so a hook that does more work fails well before the 200 ms
+/// budget. On macOS it is the L19 budget itself (800 ms, the same as
+/// [`CACHE_HIT`]), 3.5 times the worst value measured at load 80-210
+/// (229 ms): there the test only finds a hook that does several times
+/// its work, and Linux is the tight detector.
 const DOCS_ONLY: Duration = per_os(90, 800);
 
 /// [`DOCS_ONLY`] with detected Bun and Python roots (R65 detection runs on
@@ -30,10 +34,10 @@ const DOCS_ONLY: Duration = per_os(90, 800);
 /// during the whole suite). CPU measured: 49 ms at load 14.
 const DOCS_ONLY_DETECTED: Duration = per_os(120, 1000);
 
-/// L19 chained (non-gate) hook: 5 ms.
+/// L19 chained (non-gate) hook: 5 ms (macOS: 20 ms).
 const CHAINED: Duration = per_os(5, 20);
 
-/// L19 `pre-commit` on a cache hit: 200 ms.
+/// L19 `pre-commit` on a cache hit: 200 ms (macOS: 800 ms).
 const CACHE_HIT: Duration = per_os(200, 800);
 
 /// `linux` ms, else `macos` ms on macOS (L19: budgets are per OS).
@@ -50,7 +54,9 @@ const CACHE_HIT: Duration = per_os(200, 800);
 /// index) 356-367 ms, cache hit (trusted remote) 393-413 ms, docs-only
 /// with detected roots 467-539 ms; at load 550, docs-only with detected
 /// roots 776 ms. Each macOS budget is about 1.3-3.5x the worst of those,
-/// so a hook that does several times its work still fails.
+/// so a hook that does several times its work still fails. On macOS the
+/// detached runner is not counted (no subreaper), so the macOS numbers
+/// are the hook's own cost only.
 const fn per_os(linux: u64, macos: u64) -> Duration {
     if cfg!(target_os = "macos") {
         Duration::from_millis(macos)

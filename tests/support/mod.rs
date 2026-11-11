@@ -36,6 +36,7 @@ impl Sandbox {
             "[user]\n\tname = Test\n\temail = test@example.invalid\n[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n",
         )
         .unwrap();
+        link_rustup(&home, &rustup_dirs());
         let sb = Self { tmp, home };
         // As `tollgate install` leaves it (item 33): with no index of
         // trusted-remote records, every gated command denies.
@@ -282,46 +283,53 @@ pub fn rustup_dirs() -> Vec<(&'static str, OsString)> {
         .collect()
 }
 
-/// `text` (a host config) that lets a sandbox job find rustup's cargo
-/// when [`rustup_dirs`] is not empty: `<CARGO_HOME>/bin` last in
-/// `[job] path_prepend`, and `[job] rustup_home` where `text` does not
-/// set it. Jobs take `CARGO_HOME` and `RUSTUP_HOME` from the host config
-/// or the install's (sandbox) home only, never from the environment
-/// (item 38). `cargo_home` stays the sandbox's `~/.cargo`, as with a
-/// system cargo, so the host tool configs a test writes there still
-/// count (item 35). `text` as it is when there is a system cargo, or
-/// when it is not valid TOML (a test of a bad config).
-pub fn with_rustup_dirs(text: &str) -> String {
-    let dirs = rustup_dirs();
-    if dirs.is_empty() {
-        return text.to_owned();
-    }
-    let Ok(mut config) = text.parse::<toml::Table>() else {
-        return text.to_owned();
-    };
-    let Some(job) = config
-        .entry("job")
-        .or_insert_with(|| toml::Table::new().into())
-        .as_table_mut()
-    else {
-        return text.to_owned();
-    };
-    for (key, path) in dirs {
-        let path = path.to_str().expect("UTF-8 tool home");
-        if key == "CARGO_HOME" {
-            let bin = format!("{path}/bin");
-            if let Some(list) = job
-                .entry("path_prepend")
-                .or_insert_with(|| toml::value::Array::new().into())
-                .as_array_mut()
-            {
-                list.push(bin.into());
+/// The programs of a rustup install that sandbox jobs run: the rustup
+/// proxies of the Rust steps, and nextest.
+pub const RUSTUP_PROGRAMS: &[&str] = &[
+    "cargo",
+    "rustc",
+    "rustdoc",
+    "rustfmt",
+    "cargo-fmt",
+    "cargo-clippy",
+    "clippy-driver",
+    "cargo-nextest",
+    "rustup",
+];
+
+/// Lets jobs with the sandbox `home` find rustup's cargo. `dirs` is
+/// [`rustup_dirs`]; nothing is done when it is empty (a system cargo).
+/// Jobs take `CARGO_HOME` and `RUSTUP_HOME` from the host config or the
+/// install's (sandbox) home only, never from the environment (item 38),
+/// and `$CARGO_HOME/bin` is on the job `PATH` (R52). So:
+/// - `<home>/.cargo/bin` gets one symlink per [`RUSTUP_PROGRAMS`] entry
+///   that the real `<CARGO_HOME>/bin` has. Only these: the other programs
+///   of the developer's real dir (an installed tollgate, other tools)
+///   stay out of the sandbox. `cargo_home` stays the sandbox's
+///   `~/.cargo`, as with a system cargo, so the host tool configs a test
+///   writes there still count (item 35).
+/// - `<home>/.rustup` is a symlink to the real `RUSTUP_HOME` (the
+///   toolchains).
+///
+/// No host config changes: each test's config stays as the test wrote
+/// it, on every host.
+pub fn link_rustup(home: &Path, dirs: &[(&'static str, OsString)]) {
+    use std::os::unix::fs::symlink;
+    for (key, real) in dirs {
+        let real = Path::new(real);
+        if *key == "CARGO_HOME" {
+            let bin = home.join(".cargo/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            for name in RUSTUP_PROGRAMS {
+                let program = real.join("bin").join(name);
+                if program.exists() {
+                    symlink(&program, bin.join(name)).unwrap();
+                }
             }
         } else {
-            job.entry("rustup_home").or_insert_with(|| path.into());
+            symlink(real, home.join(".rustup")).unwrap();
         }
     }
-    config.to_string()
 }
 
 /// Sets the modification time of `path` to `secs` seconds ago.
@@ -346,11 +354,11 @@ pub struct Run {
 
 impl Sandbox {
     /// Writes the host config (`$XDG_CONFIG_HOME/tollgate/config.toml`),
-    /// with [`with_rustup_dirs`].
+    /// as `text`.
     pub fn host_config(&self, text: &str) {
         let p = self.root().join("config/tollgate/config.toml");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, with_rustup_dirs(text)).unwrap();
+        std::fs::write(p, text).unwrap();
     }
 
     /// The sandbox state dir (`$XDG_STATE_HOME/tollgate`).

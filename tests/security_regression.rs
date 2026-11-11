@@ -468,11 +468,13 @@ fn the_harness_limits_every_command_a_lab_runs() {
     assert_eq!(e.code, Some(1), "{e:?}");
     // GNU dd says "memory exhausted"; BSD dd (macOS) says "input buffer:
     // Cannot allocate memory" (with no limit it fails the 3G read with
-    // "Invalid argument" instead).
-    assert!(
-        e.out.contains("memory exhausted") || e.out.contains("Cannot allocate memory"),
-        "{e:?}"
-    );
+    // "Invalid argument" instead). Each OS asserts its own dd's text.
+    let refused = if cfg!(target_os = "macos") {
+        "Cannot allocate memory"
+    } else {
+        "memory exhausted"
+    };
+    assert!(e.out.contains(refused), "{e:?}");
     assert!(took < Duration::from_secs(60), "{took:?}");
     // `script` buffers what its command does not read: the form that an
     // earlier harness ran with no limit.
