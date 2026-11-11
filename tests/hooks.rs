@@ -707,59 +707,6 @@ fn remote_urls_with_control_characters_or_two_fetch_urls_deny_r14_l2() {
     assert_eq!(r.code, Some(0), "{}", r.out);
 }
 
-/// L2, X1: a remote-tracking ref is a local file. `git fetch .` and
-/// `git update-ref --stdin` move `origin/main` to the branch's own tip
-/// (with a fetch-like reflog line), which would make the branch its own
-/// policy commit. Only a value the trusted server reported counts.
-#[test]
-fn a_forged_remote_tracking_anchor_does_not_choose_the_policy_l2() {
-    let sb = Sandbox::new();
-    let (repo, _bare) = trusted_repo(
-        &sb,
-        "version = 1\n[[step]]\nname = \"lint\"\nkind = \"command\"\nrun = \"test ! -f bad\"\n",
-    );
-    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
-    sb.commit_file(&repo, "tollgate.toml", PASS, "weaken");
-    let feat = head(&sb, &repo);
-    stage(&sb, &repo, "bad", "x\n");
-    let forge_fetch: &[&[&str]] = &[&["fetch", "-q", ".", "+feat:refs/remotes/origin/main"]];
-    for forge in forge_fetch {
-        sb.git(&repo, forge);
-        assert_eq!(sb.git(&repo, &["rev-parse", "origin/main"]), feat);
-        let r = sb.hooked(&repo, &["commit", "-m", "bad"]);
-        assert_eq!(r.code, Some(1), "{forge:?}: {}", r.out);
-        assert!(r.out.contains("verdict fail"), "{}", r.out);
-        assert_eq!(head(&sb, &repo), feat);
-    }
-    // update-ref --stdin with a fetch-like reflog message.
-    sb.git(&repo, &["fetch", "-q", "origin"]);
-    let mut child = std::process::Command::new("git")
-        .env_clear()
-        .envs(sb.env().iter())
-        .current_dir(&repo)
-        .args(["update-ref", "-m", "fetch: fast-forward", "--stdin"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    use std::io::Write as _;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(format!("update refs/remotes/origin/main {feat}\n").as_bytes())
-        .unwrap();
-    assert!(child.wait().unwrap().success());
-    assert_eq!(sb.git(&repo, &["rev-parse", "origin/main"]), feat);
-    let r = sb.hooked(&repo, &["commit", "-m", "bad"]);
-    assert_eq!(r.code, Some(1), "update-ref --stdin: {}", r.out);
-    assert_eq!(head(&sb, &repo), feat);
-    // Without the bad file the branch passes main's policy.
-    sb.git(&repo, &["rm", "-q", "--cached", "bad"]);
-    stage(&sb, &repo, "ok.txt", "1\n");
-    let r = sb.hooked(&repo, &["commit", "-m", "ok"]);
-    assert_eq!(r.code, Some(0), "{}", r.out);
-}
-
 /// R14(2), item 11: `ls-remote <name>` reads the repo's own config, so
 /// `remote.<name>.uploadpack` (or `core.sshCommand`) could make another
 /// repo answer for the trusted server. tollgate asks the trusted URL from

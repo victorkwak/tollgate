@@ -1045,10 +1045,11 @@ fn s13_a_branch_cargo_runner_cannot_hide_a_failing_test() {
     }
 }
 
-/// S14: a remote-tracking `main` written by `update-ref` or by a fetch
-/// refspec into `refs/remotes` is not trusted: the branch does not become
-/// its own policy commit, and the push gate does not call a forged value
-/// remote-verified.
+/// S14, L2, X1: a remote-tracking `main` written by `update-ref` (also
+/// `--stdin` with a fetch-like reflog line) or by a fetch refspec into
+/// `refs/remotes` is not trusted: the branch does not become its own
+/// policy commit, and the push gate does not call a forged value
+/// remote-verified. Only a value the trusted server reported counts.
 #[test]
 fn s14_forged_remote_tracking_anchors_are_not_trusted() {
     let lab = Lab::new(BAD_FILE_POLICY);
@@ -1088,20 +1089,55 @@ fn s14_forged_remote_tracking_anchors_are_not_trusted() {
             "+main:refs/remotes/origin/main",
         ],
     ];
-    for (i, forge) in forgeries.iter().enumerate() {
-        lab.plain(&["fetch", "-q", "origin"]);
-        lab.plain(forge);
+    // Each forgery points origin/main at feat; the bad commit is then
+    // judged by main's policy and fails (not a deny for another reason).
+    let refused_by_mains_policy = |what: &str, i: usize| {
         assert_eq!(
             lab.plain(&["rev-parse", "origin/main"]),
-            lab.plain(&["rev-parse", "feat"])
+            lab.plain(&["rev-parse", "feat"]),
+            "{what}"
         );
         lab.stage_bad_file(&i.to_string());
         let s = lab.refused("git commit -m bad");
         assert!(
-            s.out().contains("DENIED pre-commit refs/heads/feat"),
-            "{forge:?}: {s:?}"
+            s.out().contains("DENIED pre-commit refs/heads/feat")
+                && s.out().contains("verdict fail"),
+            "{what}: {s:?}"
         );
+    };
+    for (i, forge) in forgeries.iter().enumerate() {
+        lab.plain(&["fetch", "-q", "origin"]);
+        lab.plain(forge);
+        refused_by_mains_policy(&format!("{forge:?}"), i);
     }
+    // update-ref --stdin with a fetch-like reflog message.
+    lab.plain(&["fetch", "-q", "origin"]);
+    let feat = lab.plain(&["rev-parse", "feat"]);
+    let mut child = Command::new("git")
+        .env_clear()
+        .envs(lab.sb().env().iter())
+        .current_dir(&lab.repo)
+        .args(["update-ref", "-m", "fetch: fast-forward", "--stdin"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("update refs/remotes/origin/main {feat}\n").as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    refused_by_mains_policy("update-ref --stdin", forgeries.len());
+    // Without the bad file the branch passes main's policy: the forged
+    // anchor was replaced by the trusted one, not met with a blanket deny.
+    lab.plain(&["rm", "-q", "--cached", "bad"]);
+    std::fs::remove_file(lab.repo.join("bad")).unwrap();
+    lab.stage_code_change("ok");
+    let head = lab.head();
+    let s = lab.session("git commit -m ok");
+    assert!(s.out().contains("pass pre-commit refs/heads/feat"), "{s:?}");
+    assert_ne!(lab.head(), head);
     // R14(2): a forged origin/main equal to a failing main is not
     // remote-verified for a push elsewhere.
     lab.plain(&["checkout", "-q", "-f", "main"]);
