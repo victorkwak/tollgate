@@ -99,9 +99,10 @@ pub fn find_git(prepend: &[PathBuf]) -> Option<PathBuf> {
 }
 
 /// [`find_git`] with `system` as the system dirs. On macOS a git in a
-/// system dir counts only when [`root_controlled`]: `/usr/local/bin` can
-/// belong to a user there (Homebrew on Intel), so a git a session wrote
-/// in it would answer before the system's.
+/// system dir counts only when [`root_controlled`], and the path found is
+/// the canonical one it checked: `/usr/local/bin` can belong to a user
+/// there (Homebrew on Intel), so a git a session wrote in it would answer
+/// before the system's.
 fn find_git_in(prepend: &[PathBuf], system: &[&str]) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt as _;
     let executable = |p: &Path| {
@@ -117,20 +118,49 @@ fn find_git_in(prepend: &[PathBuf], system: &[&str]) -> Option<PathBuf> {
             system
                 .iter()
                 .map(|d| Path::new(d).join("git"))
-                .find(|p| executable(p) && (cfg!(not(target_os = "macos")) || root_controlled(p)))
+                .filter(|p| executable(p))
+                .find_map(|p| {
+                    if cfg!(target_os = "macos") {
+                        root_controlled(&p)
+                    } else {
+                        Some(p)
+                    }
+                })
         })
 }
 
-/// True when `path` (followed through symlinks) and every dir above it
-/// up to `/` belong to root and no group or other can write them: no
-/// user can put another program there.
-fn root_controlled(path: &Path) -> bool {
+/// True when the owner of `meta` is root and no group or other can write
+/// it.
+fn root_only(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt as _;
-    let Ok(real) = path.canonicalize() else {
-        return false;
-    };
+    meta.uid() == 0 && meta.mode() & 0o022 == 0
+}
+
+/// The canonical path of `path` when no user can put another program
+/// there: every symlink on the way (each prefix of `path`, read without
+/// following it) sits in a dir that only root can write, and the
+/// canonical path and every dir above it up to `/` are root's and only
+/// root can write them. The caller runs the canonical path, the one
+/// checked, never `path`: a symlink swapped later changes nothing.
+fn root_controlled(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut prefix = PathBuf::new();
+    for part in path.components() {
+        prefix.push(part);
+        let meta = std::fs::symlink_metadata(&prefix).ok()?;
+        if meta.file_type().is_symlink() {
+            let dir = prefix.parent()?;
+            if !std::fs::metadata(dir).is_ok_and(|m| root_only(&m)) {
+                return None;
+            }
+        }
+    }
+    let real = path.canonicalize().ok()?;
     real.ancestors()
-        .all(|p| std::fs::metadata(p).is_ok_and(|m| m.uid() == 0 && m.mode() & 0o022 == 0))
+        .all(|p| std::fs::symlink_metadata(p).is_ok_and(|m| root_only(&m)))
+        .then_some(real)
 }
 
 /// The git `install.json` records for the install that `exe` belongs to
@@ -655,8 +685,8 @@ mod tests {
         let found = find_git(&[]).expect("a git");
         let local = Path::new("/usr/local/bin/git");
         let clt = Path::new("/Library/Developer/CommandLineTools/usr/bin/git");
-        if local.is_file() && root_controlled(local) {
-            assert_eq!(found, local);
+        if local.is_file() && root_controlled(local).is_some() {
+            assert_eq!(Some(found), root_controlled(local));
         } else if clt.is_file() {
             assert_eq!(found, clt);
         } else {
@@ -673,14 +703,53 @@ mod tests {
     fn a_user_writable_system_git_is_never_picked_on_macos() {
         let (dir, mine) = user_git();
         let user_dir = dir.path().to_str().unwrap();
-        assert!(!root_controlled(&mine));
+        assert_eq!(root_controlled(&mine), None);
         assert_eq!(
             find_git_in(&[], &[user_dir, "/usr/bin"]),
             Some(PathBuf::from("/usr/bin/git"))
         );
-        assert!(root_controlled(Path::new("/usr/bin/git")));
+        assert_eq!(
+            root_controlled(Path::new("/usr/bin/git")),
+            Some(PathBuf::from("/usr/bin/git"))
+        );
         // `/Applications` is group-writable (root:admin 0775).
-        assert!(!root_controlled(Path::new("/Applications")));
+        assert_eq!(root_controlled(Path::new("/Applications")), None);
+    }
+
+    /// macOS: a symlink in a dir a user can write is never followed to a
+    /// root-owned git, even though the git it points at passes: the user
+    /// could point it elsewhere after the check.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_symlinked_git_in_a_user_dir_is_rejected_on_macos() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("bin");
+        std::os::unix::fs::symlink("/usr/bin", &link).unwrap();
+        let candidate = link.join("git");
+        assert!(candidate.is_file(), "the link reaches /usr/bin/git");
+        assert_eq!(root_controlled(&candidate), None);
+        let link_dir = link.to_str().unwrap();
+        assert_eq!(
+            find_git_in(&[], &[link_dir, "/usr/bin"]),
+            Some(PathBuf::from("/usr/bin/git")),
+            "the symlinked dir is skipped"
+        );
+        // A link to the git itself, in a user dir: rejected too.
+        let file_link = dir.path().join("git");
+        std::os::unix::fs::symlink("/usr/bin/git", &file_link).unwrap();
+        assert_eq!(root_controlled(&file_link), None);
+    }
+
+    /// macOS: the path found is the canonical one that was checked, never
+    /// the spelling of the system dir.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_git_found_is_the_canonical_path_on_macos() {
+        let spelled = "/usr/local/../bin";
+        assert_eq!(
+            find_git_in(&[], &[spelled]),
+            Some(PathBuf::from("/usr/bin/git"))
+        );
     }
 
     /// Linux keeps the first executable git, as before.
