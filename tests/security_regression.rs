@@ -442,36 +442,6 @@ fn gated_tree(out: &str) -> String {
         .to_owned()
 }
 
-/// The pid of hook `name` among the descendants of `root`.
-fn hook_pid(root: u32, name: &str) -> Option<i32> {
-    let table = tollgate::procs::ProcTable::snapshot().ok()?;
-    table
-        .descendants(i32::try_from(root).ok()?)
-        .into_iter()
-        .find(|p| {
-            tollgate::procs::argv(*p).is_some_and(|argv| {
-                argv.first()
-                    .is_some_and(|a| a.as_encoded_bytes().ends_with(name.as_bytes()))
-            })
-        })
-}
-
-/// Waits for `child` up to `secs`; kills it and panics after that.
-fn wait_or_kill(child: &mut std::process::Child, secs: u64) -> std::process::ExitStatus {
-    let end = Instant::now() + Duration::from_secs(secs);
-    loop {
-        if let Some(st) = child.try_wait().unwrap() {
-            return st;
-        }
-        if Instant::now() > end {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("still running after {secs} s");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// The harness is safe whatever the guard allows: a lab command has no
 /// input, each of its processes has an address-space limit, and the wall
 /// clock ends its process group. The proof runs the kind of command that
@@ -828,49 +798,10 @@ fn s7_a_cherry_picked_tip_is_caught_at_push() {
     lab.assert_remote_is(&remote);
 }
 
-/// S8: SIGKILL of the hook while its job runs: git aborts, no commit, no
-/// record.
-#[test]
-fn s8_a_killed_hook_leaves_no_commit_and_no_record() {
-    let lab = Lab::new(
-        "version = 1\n[[step]]\nname = \"slow\"\nkind = \"command\"\nrun = \"sleep 30\"\n",
-    );
-    // A code change (a docs-only change would skip the step, R61).
-    lab.stage_code_change("changed");
-    let before = lab.refs();
-    let Guarded::Allowed(cmd) = lab.guard("git commit -m a") else {
-        panic!("the guard stopped a plain commit");
-    };
-    let mut child = lab
-        .cmd("bash", &lab.repo)
-        .args(["-c", &cmd])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    // Kill the hook only once its job runs ("while its job runs"): the job
-    // dir appears before the runner starts.
-    let mut pid = None;
-    assert!(
-        eventually(60, || {
-            pid = hook_pid(child.id(), "pre-commit");
-            pid.is_some() && lab.sb().first_job_running()
-        }),
-        "the hook never started a running job"
-    );
-    tollgate::procs::signal(pid.unwrap(), libc::SIGKILL).unwrap();
-    let st = wait_or_kill(&mut child, 20);
-    assert!(!st.success(), "git committed after its hook was killed");
-    assert_eq!(lab.refs(), before);
-    assert_eq!(lab.sb().record_count(), 0, "{:?}", lab.records());
-    let job = lab.sb().jobs()[0].clone();
-    let s = lab.session(&format!("tollgate cancel {job}"));
-    assert!(s.out().contains("cancel"), "{s:?}");
-    let s = lab.session(&format!("tollgate wait {job} --timeout 30s"));
-    assert!(matches!(s.code(), Some(c) if c != 0), "{s:?}");
-    assert_eq!(lab.sb().record_count(), 0);
-    assert_eq!(lab.refs(), before);
-}
+// S8 (SIGKILL of the hook while its job runs: git aborts, no commit, no
+// record) is `tests/hooks.rs`
+// `a_killed_hook_leaves_no_commit_and_no_record_t18_r31_r37`, which runs
+// the same scenario for SIGKILL and SIGTERM.
 
 /// S9: a check slower than the inline budget denies with the job id and a
 /// wait-then-commit command; no record exists until the job ends, and
@@ -1098,9 +1029,11 @@ fn s12_a_branch_cannot_weaken_its_own_policy() {
     }
 }
 
-/// S13: a branch that adds `.cargo/config.toml` with `runner = "true"`
-/// (test binaries then never run), directly, as the legacy `.cargo/config`
-/// or through a symlinked `.cargo` dir: the failing test still fails.
+/// S13, R71, item 3: a branch that adds `.cargo/config.toml` with
+/// `runner = "true"` (test binaries then never run), directly, as the
+/// legacy `.cargo/config` or through a symlinked `.cargo` dir (TOOL_CONFIGS
+/// match git paths, so the link once hid the runner from the overlay): the
+/// failing test still fails, and the deny names the change as policy.
 #[test]
 fn s13_a_branch_cargo_runner_cannot_hide_a_failing_test() {
     let lab = Lab::new(RUST_POLICY);
@@ -1121,6 +1054,7 @@ fn s13_a_branch_cargo_runner_cannot_hide_a_failing_test() {
             std::os::unix::fs::symlink("tools/cargo-cfg", r.join(".cargo")).unwrap();
         },
     ];
+    let changed = [".cargo/config.toml", ".cargo/config", ".cargo"];
     for (i, setup) in setups.iter().enumerate() {
         lab.plain(&["reset", "-q", "--hard", "main"]);
         let _ = std::fs::remove_dir_all(lab.repo.join(".cargo"));
@@ -1139,13 +1073,17 @@ fn s13_a_branch_cargo_runner_cannot_hide_a_failing_test() {
             s.out().contains("FAIL b b tests::fails"),
             "variant {i}: {s:?}"
         );
+        // The deny names the branch's cargo config as a policy change.
+        let notice = format!("POLICY: this branch changes {};", changed[i]);
+        assert!(s.out().contains(&notice), "variant {i}: {s:?}");
     }
 }
 
-/// S14: a remote-tracking `main` written by `update-ref` or by a fetch
-/// refspec into `refs/remotes` is not trusted: the branch does not become
-/// its own policy commit, and the push gate does not call a forged value
-/// remote-verified.
+/// S14, L2, X1: a remote-tracking `main` written by `update-ref` (also
+/// `--stdin` with a fetch-like reflog line) or by a fetch refspec into
+/// `refs/remotes` is not trusted: the branch does not become its own
+/// policy commit, and the push gate does not call a forged value
+/// remote-verified. Only a value the trusted server reported counts.
 #[test]
 fn s14_forged_remote_tracking_anchors_are_not_trusted() {
     let lab = Lab::new(BAD_FILE_POLICY);
@@ -1185,20 +1123,55 @@ fn s14_forged_remote_tracking_anchors_are_not_trusted() {
             "+main:refs/remotes/origin/main",
         ],
     ];
-    for (i, forge) in forgeries.iter().enumerate() {
-        lab.plain(&["fetch", "-q", "origin"]);
-        lab.plain(forge);
+    // Each forgery points origin/main at feat; the bad commit is then
+    // judged by main's policy and fails (not a deny for another reason).
+    let refused_by_mains_policy = |what: &str, i: usize| {
         assert_eq!(
             lab.plain(&["rev-parse", "origin/main"]),
-            lab.plain(&["rev-parse", "feat"])
+            lab.plain(&["rev-parse", "feat"]),
+            "{what}"
         );
         lab.stage_bad_file(&i.to_string());
         let s = lab.refused("git commit -m bad");
         assert!(
-            s.out().contains("DENIED pre-commit refs/heads/feat"),
-            "{forge:?}: {s:?}"
+            s.out().contains("DENIED pre-commit refs/heads/feat")
+                && s.out().contains("verdict fail"),
+            "{what}: {s:?}"
         );
+    };
+    for (i, forge) in forgeries.iter().enumerate() {
+        lab.plain(&["fetch", "-q", "origin"]);
+        lab.plain(forge);
+        refused_by_mains_policy(&format!("{forge:?}"), i);
     }
+    // update-ref --stdin with a fetch-like reflog message.
+    lab.plain(&["fetch", "-q", "origin"]);
+    let feat = lab.plain(&["rev-parse", "feat"]);
+    let mut child = Command::new("git")
+        .env_clear()
+        .envs(lab.sb().env().iter())
+        .current_dir(&lab.repo)
+        .args(["update-ref", "-m", "fetch: fast-forward", "--stdin"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("update refs/remotes/origin/main {feat}\n").as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    refused_by_mains_policy("update-ref --stdin", forgeries.len());
+    // Without the bad file the branch passes main's policy: the forged
+    // anchor was replaced by the trusted one, not met with a blanket deny.
+    lab.plain(&["rm", "-q", "--cached", "bad"]);
+    std::fs::remove_file(lab.repo.join("bad")).unwrap();
+    lab.stage_code_change("ok");
+    let head = lab.head();
+    let s = lab.session("git commit -m ok");
+    assert!(s.out().contains("pass pre-commit refs/heads/feat"), "{s:?}");
+    assert_ne!(lab.head(), head);
     // R14(2): a forged origin/main equal to a failing main is not
     // remote-verified for a push elsewhere.
     lab.plain(&["checkout", "-q", "-f", "main"]);

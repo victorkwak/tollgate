@@ -1,0 +1,10 @@
+# Fast tier (every commit): leave out the L19 CPU-budget tests and the L20
+# bench end-to-end tests (16 tests). The budget tests measure cost and
+# fail under machine load; the bench tests replay whole commit runs.
+# Together they take most of the suite's time. The full tier (merges into main, pushes
+# to a trusted remote, CI) uses the tollgate-full profile, which has no
+# default filter, so it runs every test before each push.
+#
+# nextest intersects this filter with the fast tier's own -E filterset.
+[profile.tollgate-fast]
+default-filter = "not (binary(=latency) | binary(=bench) | test(=the_guard_p95_over_the_corpus_is_under_10_ms_l19))"

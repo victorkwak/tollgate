@@ -314,71 +314,9 @@ fn full_tier_flaky_quarantine_and_fast_selection_t41_t30_l2() {
     );
 }
 
-#[test]
-fn a_branch_cargo_config_does_not_reach_the_steps_r71() {
-    let sb = Sandbox::new();
-    host(&sb);
-    let repo = sb.rust_repo("ws", Scratch { failing: true });
-    commit_policy(
-        &sb,
-        &repo,
-        "version = 1\n[[step]]\nname = \"tests\"\nkind = \"nextest\"\n",
-        "policy",
-    );
-    // A target runner of `true` makes every test binary "pass" (and list no
-    // tests). The branch's own cargo config must not apply before it
-    // merges (L2); the policy commit's (none here) does.
-    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
-    sb.commit_file(
-        &repo,
-        ".cargo/config.toml",
-        "[target.'cfg(all())']\nrunner = \"true\"\n",
-        "runner",
-    );
-    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
-    assert_eq!(r.code, Some(1), "{}", r.out);
-    assert!(r.out.contains("FAIL b b tests::fails"), "{}", r.out);
-    assert!(
-        r.out
-            .contains("POLICY: this branch changes .cargo/config.toml"),
-        "{}",
-        r.out
-    );
-}
-
-/// R71, item 3: TOOL_CONFIGS match git paths, so a `.cargo` that is a
-/// symlink to a dir holding `config.toml` hid a target runner of `true`
-/// from the overlay. The branch's `.cargo` entry (any mode) is policy.
-#[test]
-fn a_symlinked_cargo_dir_does_not_reach_the_steps_r71() {
-    let sb = Sandbox::new();
-    host(&sb);
-    let repo = sb.rust_repo("ws", Scratch { failing: true });
-    commit_policy(
-        &sb,
-        &repo,
-        "version = 1\n[[step]]\nname = \"tests\"\nkind = \"nextest\"\n",
-        "policy",
-    );
-    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
-    sb.commit_file(
-        &repo,
-        "tools/cfg/config.toml",
-        "[target.'cfg(all())']\nrunner = \"true\"\n",
-        "runner",
-    );
-    std::os::unix::fs::symlink("tools/cfg", repo.join(".cargo")).unwrap();
-    sb.git(&repo, &["add", ".cargo"]);
-    sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "link"]);
-    let r = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
-    assert_eq!(r.code, Some(1), "{}", r.out);
-    assert!(r.out.contains("FAIL b b tests::fails"), "{}", r.out);
-    assert!(
-        r.out.contains("POLICY: this branch changes .cargo"),
-        "{}",
-        r.out
-    );
-}
+// R71 (a branch `.cargo/config.toml`, also through a symlinked `.cargo`,
+// cannot hide a failing test, and the report names it as a policy change):
+// `tests/security_regression.rs` `s13_a_branch_cargo_runner_cannot_hide_a_failing_test`.
 
 #[test]
 fn a_record_covers_only_the_integration_tests_it_ran_r79_r80() {

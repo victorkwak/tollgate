@@ -441,6 +441,9 @@ fn wrong(only: &str) -> (usize, Vec<String>) {
     (n, bad)
 }
 
+/// Every line of the ALLOW lists is allowed, unchanged except for the cap
+/// prefix. An ask fails it too (an `ask, not allow` line), so it also
+/// holds the R26 ask rate of 0 over the corpus.
 #[test]
 fn the_allow_corpus_stays_allowed_and_unchanged() {
     let (n, bad) = wrong("allow");
@@ -449,18 +452,6 @@ fn the_allow_corpus_stays_allowed_and_unchanged() {
         "{} of {n} harmless commands are not allowed:\n{}",
         bad.len(),
         bad.join("\n")
-    );
-}
-
-/// No line of the ALLOW lists asks: the ask rate over the corpus is 0.
-#[test]
-fn the_ask_rate_over_the_corpus_is_zero() {
-    let (n, bad) = wrong("allow");
-    let asks: Vec<&String> = bad.iter().filter(|b| b.starts_with("ask")).collect();
-    assert!(
-        asks.is_empty(),
-        "{} asks over {n} commands: {asks:#?}",
-        asks.len()
     );
 }
 

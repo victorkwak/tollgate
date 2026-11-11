@@ -1013,7 +1013,7 @@ impl Worker<'_> {
 fn cancel_wait(env: &BenchEnv, layout: &Layout, head: &str, trees: &[String]) -> Duration {
     let clone = layout.clone_dir();
     let no_hooks = layout.no_hooks();
-    let grace_at = |rev: &str| -> Duration {
+    let config_at = |rev: &str| -> Option<crate::config::repo::RepoConfig> {
         let text = run_cmd(
             env.git(&no_hooks, &clone).args([
                 "cat-file",
@@ -1024,17 +1024,27 @@ fn cancel_wait(env: &BenchEnv, layout: &Layout, head: &str, trees: &[String]) ->
         );
         text.ok()
             .and_then(|t| crate::config::repo::RepoConfig::from_toml(&t).ok())
-            .map_or(DEFAULT_MAX_GRACE, |c| {
+    };
+    let configs: Vec<_> = std::iter::once(head)
+        .chain(trees.iter().map(String::as_str))
+        .map(config_at)
+        .collect();
+    cancel_wait_for(&configs)
+}
+
+/// [`cancel_wait`] over the configs read (`None`: unreadable).
+fn cancel_wait_for(configs: &[Option<crate::config::repo::RepoConfig>]) -> Duration {
+    configs
+        .iter()
+        .map(|c| {
+            c.as_ref().map_or(DEFAULT_MAX_GRACE, |c| {
                 c.steps
                     .iter()
                     .map(crate::config::repo::Step::grace)
                     .max()
                     .unwrap_or_default()
             })
-    };
-    std::iter::once(head)
-        .chain(trees.iter().map(String::as_str))
-        .map(grace_at)
+        })
         .max()
         .unwrap_or(DEFAULT_MAX_GRACE)
         // Setup steps run with a fixed 10 s grace.
@@ -1113,4 +1123,44 @@ fn collect_jobs(dirs: &Dirs, warm_job: Option<&str>) -> Vec<JobRow> {
             JobRow::new(m, r.as_ref(), warm_job == Some(m.id.as_str()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::repo::RepoConfig;
+
+    fn config(steps: &str) -> Option<RepoConfig> {
+        Some(RepoConfig::from_toml(&format!("version = 1\n{steps}")).unwrap())
+    }
+
+    /// Item 36: cleanup waits out the largest step grace plus the margin,
+    /// never a fixed time shorter than a step's grace.
+    #[test]
+    fn cancel_wait_covers_the_largest_step_grace_item36_l20() {
+        let step = |grace: &str| {
+            format!(
+                "[[step]]\nname = \"s{grace}\"\nkind = \"command\"\nrun = \"true\"\ngrace = \"{grace}\"\n"
+            )
+        };
+        let secs = |configs: &[Option<RepoConfig>]| cancel_wait_for(configs).as_secs();
+        // A grace longer than the old fixed 30 s wait.
+        assert_eq!(secs(&[config(&step("35s"))]), 50);
+        // The largest grace of every config the open jobs can run under.
+        assert_eq!(secs(&[config(&step("2s")), config(&step("35s"))]), 50);
+        assert_eq!(
+            secs(&[config(&format!("{}{}", step("2s"), step("40s")))]),
+            55
+        );
+        // Short graces: the setup steps' fixed 10 s grace.
+        assert_eq!(secs(&[config(&step("2s"))]), 25);
+        assert_eq!(secs(&[config("")]), 25);
+        // nextest's default grace (R35).
+        assert_eq!(
+            secs(&[config("[[step]]\nname = \"t\"\nkind = \"nextest\"\n")]),
+            75
+        );
+        // An unreadable config counts as the largest default grace.
+        assert_eq!(secs(&[config(&step("2s")), None]), 75);
+    }
 }
