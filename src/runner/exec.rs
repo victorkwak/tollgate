@@ -474,56 +474,140 @@ pub fn run(spec: ExecSpec<'_>) -> ExecOutcome {
 /// reparented to launchd before the step execs. The helper first moves
 /// to its own process group and to `/`, so the watcher is never in the
 /// step's group, its descendants or its checkout: the runner's walk and
-/// the bench's working-dir scan do not see it. The watcher closes every
-/// inherited descriptor (no log, pipe or lock stays open through it) and
-/// waits in `kevent` for `NOTE_EXIT` of the runner and of the leader. A
-/// runner that is gone before the watch starts (`ESRCH`) counts as an
-/// exit. Like `PR_SET_PDEATHSIG` on Linux, only the leader is signalled;
-/// what else the step started is reaped from its record (item 49).
+/// the bench's working-dir scan do not see it.
+///
+/// The watcher registers `NOTE_EXIT` of the leader and of the runner
+/// first, then answers on a pipe; the child does not exec until that
+/// answer, so no pid can be reused between the start and the watch. A
+/// runner already gone at registration (`ESRCH`) counts as an exit: the
+/// leader is killed. Any other failure is the child's error, before
+/// exec: no step runs unwatched. After the answer the watcher closes
+/// every inherited descriptor but its kqueue (no log, pipe or lock stays
+/// open through it). Like `PR_SET_PDEATHSIG` on Linux, only the leader
+/// is signalled; what else the step started is reaped from its record
+/// (item 49).
 #[cfg(target_os = "macos")]
 mod death_watch {
     use std::io;
 
+    /// The answer of a watcher that watches.
+    const WATCHING: i32 = 0;
+
+    /// `errno` of the last failed system call.
+    fn errno() -> i32 {
+        io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
+    }
+
+    /// Writes all of `value` to `fd`; EINTR is retried.
+    unsafe fn send(fd: i32, value: i32) {
+        let bytes = value.to_ne_bytes();
+        let mut sent = 0;
+        while sent < bytes.len() {
+            // SAFETY: writes from a live stack buffer.
+            let n = unsafe { libc::write(fd, bytes[sent..].as_ptr().cast(), bytes.len() - sent) };
+            if n > 0 {
+                sent += n.cast_unsigned();
+            } else if n < 0 && errno() == libc::EINTR {
+            } else {
+                return;
+            }
+        }
+    }
+
+    /// Reads one `i32` from `fd`; `None` at EOF or on an error.
+    unsafe fn receive(fd: i32) -> Option<i32> {
+        let mut bytes = [0_u8; 4];
+        let mut got = 0;
+        while got < bytes.len() {
+            // SAFETY: reads into a live stack buffer.
+            let n = unsafe { libc::read(fd, bytes[got..].as_mut_ptr().cast(), bytes.len() - got) };
+            if n > 0 {
+                got += n.cast_unsigned();
+            } else if n < 0 && errno() == libc::EINTR {
+            } else {
+                return None;
+            }
+        }
+        Some(i32::from_ne_bytes(bytes))
+    }
+
     /// Starts the watcher of the calling process (the step leader) and
-    /// of `runner`. Runs in the forked child before exec: only
-    /// async-signal-safe system calls, no allocation.
+    /// of `runner`, and returns once it watches both. Runs in the forked
+    /// child before exec: only async-signal-safe system calls, no
+    /// allocation (errors are raw `errno` values).
     pub(super) fn start(runner: libc::pid_t) -> io::Result<()> {
         // SAFETY: system calls only; the forked processes never return
         // into Rust code that allocates (they end in `_exit`).
         unsafe {
             let leader = libc::getpid();
+            let mut answer = [0; 2];
+            if libc::pipe(answer.as_mut_ptr()) != 0 {
+                return Err(io::Error::from_raw_os_error(errno()));
+            }
+            let [answer_r, answer_w] = answer;
             let helper = libc::fork();
             if helper < 0 {
-                return Err(io::Error::last_os_error());
+                let e = errno();
+                libc::close(answer_r);
+                libc::close(answer_w);
+                return Err(io::Error::from_raw_os_error(e));
             }
             if helper == 0 {
+                libc::close(answer_r);
                 libc::setpgid(0, 0);
                 libc::chdir(c"/".as_ptr());
                 let watcher = libc::fork();
                 if watcher == 0 {
-                    watch(runner, leader);
+                    watch(runner, leader, answer_w);
                 }
-                libc::_exit(i32::from(watcher < 0));
+                if watcher < 0 {
+                    send(answer_w, errno());
+                }
+                libc::_exit(0);
             }
+            libc::close(answer_w);
             let mut status = 0;
-            loop {
-                let r = libc::waitpid(helper, &raw mut status, 0);
-                if r == helper {
+            while libc::waitpid(helper, &raw mut status, 0) < 0 {
+                if errno() != libc::EINTR {
                     break;
                 }
-                if r < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-                    return Err(io::Error::last_os_error());
-                }
             }
-            if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
-                return Err(io::Error::other("step watcher did not start"));
+            // EOF: the watcher died before it answered.
+            let answer = receive(answer_r).unwrap_or(libc::ECHILD);
+            libc::close(answer_r);
+            if answer != WATCHING {
+                return Err(io::Error::from_raw_os_error(answer));
             }
         }
         Ok(())
     }
 
-    /// The `NOTE_EXIT` watch of `pid` on `kq`; false when `pid` is gone.
-    unsafe fn add(kq: i32, pid: libc::pid_t) -> bool {
+    /// What the watcher does after it tried to watch the runner.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum Next {
+        /// Answer "watching" and wait.
+        Watch,
+        /// The runner is gone (`ESRCH`): the leader must not run.
+        KillLeader,
+        /// Any other error: the child's spawn fails with it; nothing is
+        /// killed.
+        Fail(i32),
+    }
+
+    /// [`Next`] for the result of adding the runner's watch.
+    pub(super) fn after_runner_watch(added: Result<(), i32>) -> Next {
+        match added {
+            Ok(()) => Next::Watch,
+            Err(libc::ESRCH) => Next::KillLeader,
+            Err(e) => Next::Fail(e),
+        }
+    }
+
+    /// Adds the `NOTE_EXIT` watch of `pid` to `kq`; the `errno` on failure
+    /// (`ESRCH`: `pid` is gone).
+    unsafe fn add(kq: i32, pid: libc::pid_t) -> Result<(), i32> {
         // SAFETY: a zeroed kevent is valid; one change, no events out.
         unsafe {
             let mut ev: libc::kevent = std::mem::zeroed();
@@ -531,7 +615,7 @@ mod death_watch {
             ev.filter = libc::EVFILT_PROC;
             ev.flags = libc::EV_ADD;
             ev.fflags = libc::NOTE_EXIT;
-            libc::kevent(
+            if libc::kevent(
                 kq,
                 &raw const ev,
                 1,
@@ -539,29 +623,50 @@ mod death_watch {
                 0,
                 std::ptr::null(),
             ) == 0
+            {
+                Ok(())
+            } else {
+                Err(errno())
+            }
         }
     }
 
-    /// The watcher: never returns.
-    unsafe fn watch(runner: libc::pid_t, leader: libc::pid_t) -> ! {
+    /// The watcher: registers, answers on `answer`, then waits. Never
+    /// returns.
+    unsafe fn watch(runner: libc::pid_t, leader: libc::pid_t, answer: i32) -> ! {
         // SAFETY: system calls only, ending in `_exit`.
         unsafe {
+            let kq = libc::kqueue();
+            if kq < 0 {
+                send(answer, errno());
+                libc::_exit(1);
+            }
+            // The leader waits for the answer: it cannot be gone.
+            if let Err(e) = add(kq, leader) {
+                send(answer, e);
+                libc::_exit(1);
+            }
+            match after_runner_watch(add(kq, runner)) {
+                Next::Watch => send(answer, WATCHING),
+                Next::KillLeader => {
+                    libc::kill(leader, libc::SIGKILL);
+                    libc::_exit(0);
+                }
+                Next::Fail(e) => {
+                    send(answer, e);
+                    libc::_exit(1);
+                }
+            }
             let mut lim: libc::rlimit = std::mem::zeroed();
             let max = if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) == 0 {
                 lim.rlim_cur.min(1 << 16)
             } else {
                 1 << 16
             };
-            for fd in 0..max {
-                libc::close(i32::try_from(fd).unwrap_or(i32::MAX));
-            }
-            let kq = libc::kqueue();
-            if kq < 0 || !add(kq, leader) {
-                libc::_exit(0);
-            }
-            if !add(kq, runner) {
-                libc::kill(leader, libc::SIGKILL);
-                libc::_exit(0);
+            for fd in 0..i32::try_from(max).unwrap_or(1 << 16) {
+                if fd != kq {
+                    libc::close(fd);
+                }
             }
             loop {
                 let mut events: [libc::kevent; 2] = std::mem::zeroed();
@@ -574,7 +679,7 @@ mod death_watch {
                     std::ptr::null(),
                 );
                 if n < 0 {
-                    if *libc::__error() == libc::EINTR {
+                    if errno() == libc::EINTR {
                         continue;
                     }
                     libc::_exit(1);
@@ -599,6 +704,140 @@ mod death_watch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `sleep` whose pre-exec starts the death watch of `runner`.
+    #[cfg(target_os = "macos")]
+    fn watched_sleep(runner: libc::pid_t) -> io::Result<Child> {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30").stdin(Stdio::null());
+        // SAFETY: `start` runs only async-signal-safe system calls.
+        unsafe {
+            cmd.pre_exec(move || death_watch::start(runner));
+        }
+        cmd.spawn()
+    }
+
+    /// Waits up to 10 s for `child` to end.
+    #[cfg(target_os = "macos")]
+    fn ended(child: &mut Child) -> Option<ExitStatus> {
+        let end = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < end {
+            if let Ok(Some(s)) = child.try_wait() {
+                return Some(s);
+            }
+            std::thread::sleep(POLL);
+        }
+        None
+    }
+
+    /// R35 on macOS: the leader dies when its runner exits, and lives
+    /// while it runs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_watch_kills_the_leader_when_the_runner_exits() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut runner = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let mut leader = watched_sleep(runner.id().cast_signed()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(matches!(leader.try_wait(), Ok(None)), "leader died early");
+        runner.kill().unwrap();
+        runner.wait().unwrap();
+        let s = ended(&mut leader).expect("leader outlived its runner");
+        assert_eq!(s.signal(), Some(libc::SIGKILL), "{s:?}");
+    }
+
+    /// A runner that is gone when the watch starts (`ESRCH`): the leader
+    /// never runs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_runner_gone_before_the_watch_kills_the_leader() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut gone = Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = gone.id().cast_signed();
+        gone.wait().unwrap();
+        match watched_sleep(pid) {
+            Ok(mut leader) => {
+                let s = ended(&mut leader).expect("leader ran with no runner");
+                assert_eq!(s.signal(), Some(libc::SIGKILL), "{s:?}");
+            }
+            Err(e) => panic!("spawn failed instead of a killed leader: {e}"),
+        }
+    }
+
+    /// Only `ESRCH` from the runner's watch means the runner is gone; any
+    /// other error fails the spawn and kills nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_esrch_kills_the_leader() {
+        use death_watch::{Next, after_runner_watch};
+        assert_eq!(after_runner_watch(Ok(())), Next::Watch);
+        assert_eq!(after_runner_watch(Err(libc::ESRCH)), Next::KillLeader);
+        for e in [libc::EPERM, libc::EINVAL, libc::ENOMEM, libc::EBADF] {
+            assert_eq!(after_runner_watch(Err(e)), Next::Fail(e));
+        }
+    }
+
+    /// A watch that cannot start (here: no descriptor left, `EMFILE`)
+    /// fails the spawn with that errno, with no allocation after the
+    /// fork; the step never runs unwatched.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_watch_that_cannot_start_fails_the_spawn_with_its_errno() {
+        let runner = std::process::id().cast_signed();
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30").stdin(Stdio::null());
+        // SAFETY: system calls only before `start`.
+        unsafe {
+            cmd.pre_exec(move || {
+                // The lowest free descriptor becomes the limit: the next
+                // descriptor `start` asks for fails with EMFILE.
+                let free = libc::dup(0);
+                libc::close(free);
+                let lim = libc::rlimit {
+                    rlim_cur: libc::rlim_t::try_from(free).unwrap_or(0),
+                    rlim_max: libc::RLIM_INFINITY,
+                };
+                libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lim);
+                death_watch::start(runner)
+            });
+        }
+        let e = cmd.spawn().expect_err("a step ran unwatched");
+        assert_eq!(e.raw_os_error(), Some(libc::EMFILE), "{e}");
+    }
+
+    /// The watcher ends with its leader: it leaves no process behind.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_watcher_ends_with_its_leader() {
+        let runner = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let rpid = runner.id().cast_signed();
+        let mut leader = watched_sleep(rpid).unwrap();
+        let lpid = leader.id().cast_signed();
+        // The watcher is a fork of this test process (no exec): an orphan
+        // with this process's arguments.
+        let me: Vec<OsString> = std::env::args_os().collect();
+        let orphans = || {
+            let t = ProcTable::snapshot().unwrap();
+            (1..=99_999)
+                .filter(|p| {
+                    t.get(*p).is_some_and(|i| i.ppid == 1 && !i.zombie)
+                        && procs::argv(*p).as_ref() == Some(&me)
+                })
+                .count()
+        };
+        let during = orphans();
+        assert!(during >= 1, "no watcher seen");
+        leader.kill().unwrap();
+        leader.wait().unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        while orphans() >= during && Instant::now() < end {
+            std::thread::sleep(POLL);
+        }
+        assert!(orphans() < during, "the watcher outlived leader {lpid}");
+        let mut runner = runner;
+        runner.kill().unwrap();
+        runner.wait().unwrap();
+    }
 
     fn env() -> JobEnv {
         JobEnv::from_vars([("PATH", "/usr/bin:/bin")])

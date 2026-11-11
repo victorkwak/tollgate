@@ -69,21 +69,22 @@ pub const CHECKOUT_CONFIG: &[(&str, &str)] = &[
 pub use layout::RepoLayout;
 
 /// Dirs searched for git when no install records one (item 39); the same
-/// system dirs as the trusted-server query (X1).
+/// system dirs as the trusted-server query's `PATH` (X1).
 #[cfg(not(target_os = "macos"))]
 pub const SYSTEM_GIT_DIRS: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin"];
 
-/// Dirs searched for git when no install records one (item 39). On macOS
-/// `/usr/bin/git` is the `xcrun` shim: each call first runs `xcrun` to
-/// find the developer dir, which doubles its CPU time (measured
-/// 2026-11-11: 9.7 ms per `git rev-parse` against 4.3 ms for the git it
-/// runs). The real binaries of the Command Line Tools and of Xcode come
-/// before it; like `/usr/bin`, both are root-owned system paths.
+/// Dirs searched for git when no install records one (item 39): the
+/// trusted-server query's system dirs (X1) with the Command Line Tools
+/// before `/usr/bin`. On macOS `/usr/bin/git` is the `xcrun` shim: each
+/// call first runs `xcrun` to find the developer dir (measured
+/// 2026-11-11, CPU time per `git rev-parse`: shim 9.7-13.1 ms, Command
+/// Line Tools git 7.1 ms, Xcode git 4.4 ms). Xcode's git is not searched: `/Applications`
+/// is writable by the admin group, and a bundle copied in by hand belongs
+/// to its user. A git here counts only when [`root_controlled`].
 #[cfg(target_os = "macos")]
 pub const SYSTEM_GIT_DIRS: &[&str] = &[
     "/usr/local/bin",
     "/Library/Developer/CommandLineTools/usr/bin",
-    "/Applications/Xcode.app/Contents/Developer/usr/bin",
     "/usr/bin",
     "/bin",
 ];
@@ -94,17 +95,42 @@ static PROGRAM: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 /// the caller's `PATH` (item 39).
 #[must_use]
 pub fn find_git(prepend: &[PathBuf]) -> Option<PathBuf> {
+    find_git_in(prepend, SYSTEM_GIT_DIRS)
+}
+
+/// [`find_git`] with `system` as the system dirs. On macOS a git in a
+/// system dir counts only when [`root_controlled`]: `/usr/local/bin` can
+/// belong to a user there (Homebrew on Intel), so a git a session wrote
+/// in it would answer before the system's.
+fn find_git_in(prepend: &[PathBuf], system: &[&str]) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt as _;
+    let executable = |p: &Path| {
+        p.is_absolute()
+            && std::fs::metadata(p)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
     prepend
         .iter()
-        .cloned()
-        .chain(SYSTEM_GIT_DIRS.iter().map(PathBuf::from))
         .map(|d| d.join("git"))
-        .find(|p| {
-            p.is_absolute()
-                && std::fs::metadata(p)
-                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .find(|p| executable(p))
+        .or_else(|| {
+            system
+                .iter()
+                .map(|d| Path::new(d).join("git"))
+                .find(|p| executable(p) && (cfg!(not(target_os = "macos")) || root_controlled(p)))
         })
+}
+
+/// True when `path` (followed through symlinks) and every dir above it
+/// up to `/` belong to root and no group or other can write them: no
+/// user can put another program there.
+fn root_controlled(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(real) = path.canonicalize() else {
+        return false;
+    };
+    real.ancestors()
+        .all(|p| std::fs::metadata(p).is_ok_and(|m| m.uid() == 0 && m.mode() & 0o022 == 0))
 }
 
 /// The git `install.json` records for the install that `exe` belongs to
@@ -605,29 +631,65 @@ fn parse_oid_output<S: AsRef<OsStr>>(args: &[S], stdout: &[u8]) -> Result<Oid, G
 mod tests {
     use super::*;
 
-    /// macOS: a real git of the Command Line Tools or Xcode wins over the
-    /// `/usr/bin/git` shim, and `[job] path_prepend` still comes first.
+    /// An executable `git` in a new dir of this (non-root) user.
+    fn user_git() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join("git");
+        std::fs::write(&git, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&git, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        (dir, git)
+    }
+
+    /// macOS: the Command Line Tools' git wins over the `/usr/bin/git`
+    /// shim; Xcode's is never searched; `[job] path_prepend` still comes
+    /// first, whoever owns it.
     #[cfg(target_os = "macos")]
     #[test]
     fn find_git_skips_the_xcrun_shim_on_macos() {
-        let real = SYSTEM_GIT_DIRS[1..3]
-            .iter()
-            .map(|d| Path::new(d).join("git"))
-            .find(|p| p.is_file());
+        assert!(
+            !SYSTEM_GIT_DIRS
+                .iter()
+                .any(|d| d.starts_with("/Applications"))
+        );
         let found = find_git(&[]).expect("a git");
-        if Path::new("/usr/local/bin/git").is_file() {
-            assert_eq!(found, Path::new("/usr/local/bin/git"));
-        } else if let Some(real) = real {
-            assert_eq!(found, real);
+        let local = Path::new("/usr/local/bin/git");
+        let clt = Path::new("/Library/Developer/CommandLineTools/usr/bin/git");
+        if local.is_file() && root_controlled(local) {
+            assert_eq!(found, local);
+        } else if clt.is_file() {
+            assert_eq!(found, clt);
         } else {
             assert_eq!(found, Path::new("/usr/bin/git"));
         }
-        let dir = tempfile::tempdir().unwrap();
-        let mine = dir.path().join("git");
-        std::fs::write(&mine, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&mine, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        let (dir, mine) = user_git();
         assert_eq!(find_git(&[dir.path().to_owned()]), Some(mine));
+    }
+
+    /// macOS: a git in a system dir that a user owns or can write (a
+    /// user-owned `/usr/local/bin`, an `/Applications` bundle) is skipped.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_user_writable_system_git_is_never_picked_on_macos() {
+        let (dir, mine) = user_git();
+        let user_dir = dir.path().to_str().unwrap();
+        assert!(!root_controlled(&mine));
+        assert_eq!(
+            find_git_in(&[], &[user_dir, "/usr/bin"]),
+            Some(PathBuf::from("/usr/bin/git"))
+        );
+        assert!(root_controlled(Path::new("/usr/bin/git")));
+        // `/Applications` is group-writable (root:admin 0775).
+        assert!(!root_controlled(Path::new("/Applications")));
+    }
+
+    /// Linux keeps the first executable git, as before.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn find_git_takes_the_first_system_git_on_linux() {
+        let (dir, mine) = user_git();
+        let user_dir = dir.path().to_str().unwrap();
+        assert_eq!(find_git_in(&[], &[user_dir, "/usr/bin"]), Some(mine));
     }
 
     #[test]

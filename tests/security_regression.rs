@@ -527,6 +527,28 @@ fn the_harness_limits_every_command_a_lab_runs() {
     assert!(e.out.len() <= 4 << 20, "{}", e.out.len());
 }
 
+/// The address-space limit is the same whatever the test process has
+/// mapped: the budget above a fixed baseline (zero on Linux; on macOS a
+/// small running process), not above the forked child's size. With
+/// 1 GiB reserved here, the command still sees exactly that limit.
+#[test]
+fn the_harness_limit_does_not_depend_on_the_test_process() {
+    let lab = Lab::new(BAD_FILE_POLICY);
+    let want = (limits::baseline() + limits::ADDRESS_SPACE) / 1024;
+    for reserve in [0_usize, 1 << 30] {
+        // Reserved, never touched: address space, not memory.
+        let reserved: Vec<u8> = Vec::with_capacity(reserve);
+        let e = limits::run(
+            lab.cmd("bash", &lab.repo).args(["-c", "ulimit -v"]),
+            None,
+            Duration::from_secs(60),
+        );
+        drop(reserved);
+        assert_eq!(e.code, Some(0), "{e:?}");
+        assert_eq!(e.out.trim(), want.to_string(), "reserved {reserve}: {e:?}");
+    }
+}
+
 /// S1: `--no-verify` in its long, short and grouped spellings (`-n`
 /// alone and in clusters, quoted pieces, inside `bash -c`) never reaches
 /// git through the guard. Option abbreviations are deliberate evasion:

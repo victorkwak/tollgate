@@ -40,8 +40,8 @@ const CACHE_HIT: Duration = per_os(200, 800);
 ///
 /// Starting a process costs much more CPU time on macOS. Measured
 /// 2026-11-11 on an 8-core Apple Silicon Mac, per call: `/usr/bin/true`
-/// 1.2 ms, the git of the Command Line Tools 4.3 ms (the `/usr/bin/git`
-/// xcrun shim 9.7 ms), the debug tollgate 3 ms. At load 8-10 a debug
+/// 1.2 ms, Xcode's git 4.3 ms, the Command Line Tools' git 7.1 ms (the
+/// `/usr/bin/git` xcrun shim 9.7-13.1 ms), the debug tollgate 3 ms. At load 8-10 a debug
 /// chained hook's p95 was 5.4-5.5 ms and a pre-commit that makes 14 git
 /// calls 220-490 ms. Under load (the gate runs the whole suite in
 /// parallel; other sessions run iOS simulators) work moves to the

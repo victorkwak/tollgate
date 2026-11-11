@@ -51,19 +51,23 @@ pub fn apply(cmd: &mut Command) -> &mut Command {
 
 /// [`apply`] with `address_space` bytes.
 ///
-/// On macOS every process starts with about 466 GiB of address space
+/// On macOS every running process has about 466 GiB of address space
 /// reserved (the shared region and malloc's reservations), and
 /// `setrlimit(RLIMIT_AS)` refuses a limit below the current size with
-/// `EINVAL`. There the limit is `address_space` bytes above the size of
-/// the forked child; the kernel enforces it on each new mapping after
-/// `exec`, as Linux does.
+/// `EINVAL`. There the limit is `address_space` bytes above
+/// [`baseline`], the size of a freshly started small process, measured
+/// once; the kernel enforces it on each new mapping after `exec`, as
+/// Linux does. Only when the forked child is already larger than that
+/// (the test process mapped more than `address_space`) is the limit its
+/// own size, the lowest macOS accepts.
 pub fn apply_with(cmd: &mut Command, address_space: u64) -> &mut Command {
+    let budget = baseline().saturating_add(address_space);
     cmd.stdin(Stdio::null()).process_group(0);
     // SAFETY: `setrlimit` and `proc_pidinfo` are system calls and the
     // closure allocates nothing.
     unsafe {
         cmd.pre_exec(move || {
-            let limit = base_size()?.saturating_add(address_space);
+            let limit = budget.max(own_size_floor());
             let lim = libc::rlimit {
                 rlim_cur: limit as libc::rlim_t,
                 rlim_max: limit as libc::rlim_t,
@@ -76,34 +80,68 @@ pub fn apply_with(cmd: &mut Command, address_space: u64) -> &mut Command {
     }
 }
 
-/// The size the address-space limit counts from: zero on Linux.
+/// The lowest limit `setrlimit` accepts in this process: none on Linux.
 #[cfg(not(target_os = "macos"))]
-#[expect(clippy::unnecessary_wraps, reason = "the macOS form can fail")]
-fn base_size() -> std::io::Result<u64> {
-    Ok(0)
+fn own_size_floor() -> u64 {
+    0
 }
 
-/// The size the address-space limit counts from: on macOS, the current
-/// size of this (forked) process, read with no allocation.
+/// The lowest limit `setrlimit` accepts in this process: on macOS its
+/// current size (read with no allocation; 0 when unknown).
 #[cfg(target_os = "macos")]
-fn base_size() -> std::io::Result<u64> {
+fn own_size_floor() -> u64 {
+    // SAFETY: getpid has no preconditions.
+    virtual_size(unsafe { libc::getpid() }).unwrap_or(0)
+}
+
+/// The size the address-space limit counts from: zero on Linux.
+#[cfg(not(target_os = "macos"))]
+pub fn baseline() -> u64 {
+    0
+}
+
+/// The size the address-space limit counts from, on macOS: the address
+/// space of a small process that has started (`/bin/sh` once it printed
+/// a line), measured once per test process. It does not depend on what
+/// the test process has mapped. A process stopped before it runs is no
+/// baseline: measured 2026-11-11, `/usr/bin/true` started suspended had
+/// 442 GiB, any running process 466 GiB (within a few MB: `sleep`,
+/// `sh` and `zsh` alike), so a budget above it would refuse the
+/// process's own start-up.
+#[cfg(target_os = "macos")]
+pub fn baseline() -> u64 {
+    use std::io::BufRead as _;
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BASE.get_or_init(|| {
+        let mut sh = Command::new("/bin/sh")
+            .args(["-c", "echo ready; read x"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn /bin/sh");
+        let mut line = String::new();
+        std::io::BufReader::new(sh.stdout.take().expect("stdout"))
+            .read_line(&mut line)
+            .expect("read /bin/sh");
+        assert_eq!(line, "ready\n");
+        let size = virtual_size(libc::pid_t::try_from(sh.id()).expect("pid"));
+        drop(sh.stdin.take());
+        sh.wait().expect("wait /bin/sh");
+        size.expect("proc_pidinfo of /bin/sh")
+    })
+}
+
+/// The address space of `pid` (`PROC_PIDTASKINFO`).
+#[cfg(target_os = "macos")]
+fn virtual_size(pid: libc::pid_t) -> Option<u64> {
     const SIZE: libc::c_int = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
     // SAFETY: `info` is a plain C struct of `SIZE` bytes.
     let (n, info) = unsafe {
         let mut info: libc::proc_taskinfo = std::mem::zeroed();
-        let n = libc::proc_pidinfo(
-            libc::getpid(),
-            libc::PROC_PIDTASKINFO,
-            0,
-            (&raw mut info).cast(),
-            SIZE,
-        );
+        let n = libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, (&raw mut info).cast(), SIZE);
         (n, info)
     };
-    if n != SIZE {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(info.pti_virtual_size)
+    (n == SIZE).then_some(info.pti_virtual_size)
 }
 
 /// Runs `cmd` (already through [`apply`]) to its end or to `wall`, then
