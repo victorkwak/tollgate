@@ -974,6 +974,9 @@ fn hook_pid(git: u32, name: &str) -> Option<i32> {
         })
 }
 
+/// T18, security regression S8: SIGKILL or SIGTERM of the `pre-commit`
+/// hook while its job runs: git aborts, no commit, no record, and the
+/// cancelled job writes none either (R31, R37).
 #[test]
 fn a_killed_hook_leaves_no_commit_and_no_record_t18_r31_r37() {
     for signal in [libc::SIGKILL, libc::SIGTERM] {

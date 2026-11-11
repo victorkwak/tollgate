@@ -442,36 +442,6 @@ fn gated_tree(out: &str) -> String {
         .to_owned()
 }
 
-/// The pid of hook `name` among the descendants of `root`.
-fn hook_pid(root: u32, name: &str) -> Option<i32> {
-    let table = tollgate::procs::ProcTable::snapshot().ok()?;
-    table
-        .descendants(i32::try_from(root).ok()?)
-        .into_iter()
-        .find(|p| {
-            tollgate::procs::argv(*p).is_some_and(|argv| {
-                argv.first()
-                    .is_some_and(|a| a.as_encoded_bytes().ends_with(name.as_bytes()))
-            })
-        })
-}
-
-/// Waits for `child` up to `secs`; kills it and panics after that.
-fn wait_or_kill(child: &mut std::process::Child, secs: u64) -> std::process::ExitStatus {
-    let end = Instant::now() + Duration::from_secs(secs);
-    loop {
-        if let Some(st) = child.try_wait().unwrap() {
-            return st;
-        }
-        if Instant::now() > end {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("still running after {secs} s");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 /// The harness is safe whatever the guard allows: a lab command has no
 /// input, each of its processes has an address-space limit, and the wall
 /// clock ends its process group. The proof runs the kind of command that
@@ -800,49 +770,10 @@ fn s7_a_cherry_picked_tip_is_caught_at_push() {
     lab.assert_remote_is(&remote);
 }
 
-/// S8: SIGKILL of the hook while its job runs: git aborts, no commit, no
-/// record.
-#[test]
-fn s8_a_killed_hook_leaves_no_commit_and_no_record() {
-    let lab = Lab::new(
-        "version = 1\n[[step]]\nname = \"slow\"\nkind = \"command\"\nrun = \"sleep 30\"\n",
-    );
-    // A code change (a docs-only change would skip the step, R61).
-    lab.stage_code_change("changed");
-    let before = lab.refs();
-    let Guarded::Allowed(cmd) = lab.guard("git commit -m a") else {
-        panic!("the guard stopped a plain commit");
-    };
-    let mut child = lab
-        .cmd("bash", &lab.repo)
-        .args(["-c", &cmd])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    // Kill the hook only once its job runs ("while its job runs"): the job
-    // dir appears before the runner starts.
-    let mut pid = None;
-    assert!(
-        eventually(60, || {
-            pid = hook_pid(child.id(), "pre-commit");
-            pid.is_some() && lab.sb().first_job_running()
-        }),
-        "the hook never started a running job"
-    );
-    tollgate::procs::signal(pid.unwrap(), libc::SIGKILL).unwrap();
-    let st = wait_or_kill(&mut child, 20);
-    assert!(!st.success(), "git committed after its hook was killed");
-    assert_eq!(lab.refs(), before);
-    assert_eq!(lab.sb().record_count(), 0, "{:?}", lab.records());
-    let job = lab.sb().jobs()[0].clone();
-    let s = lab.session(&format!("tollgate cancel {job}"));
-    assert!(s.out().contains("cancel"), "{s:?}");
-    let s = lab.session(&format!("tollgate wait {job} --timeout 30s"));
-    assert!(matches!(s.code(), Some(c) if c != 0), "{s:?}");
-    assert_eq!(lab.sb().record_count(), 0);
-    assert_eq!(lab.refs(), before);
-}
+// S8 (SIGKILL of the hook while its job runs: git aborts, no commit, no
+// record) is `tests/hooks.rs`
+// `a_killed_hook_leaves_no_commit_and_no_record_t18_r31_r37`, which runs
+// the same scenario for SIGKILL and SIGTERM.
 
 /// S9: a check slower than the inline budget denies with the job id and a
 /// wait-then-commit command; no record exists until the job ends, and
