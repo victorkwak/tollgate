@@ -95,6 +95,54 @@ fn p95(meter: &CpuMeter, rounds: usize, runs: usize, mut f: impl FnMut()) -> P95
     best.unwrap()
 }
 
+/// Two measures taken in the same rounds, run by run in turn (`a`, `b`,
+/// `a`, `b`, ...), so a change of host load moves both alike.
+#[derive(Debug, Clone, Copy)]
+struct Paired {
+    /// The best p95 of `a` over the rounds (as [`p95`]).
+    a: P95,
+    /// The best p95 of `b` over the rounds.
+    b: P95,
+    /// The lowest per-round ratio of the CPU p95s, `b / a`.
+    ratio: f64,
+}
+
+/// [`Paired`] over `rounds` rounds of `runs` runs of each of `a` and `b`.
+/// A ratio from separate bursts compares two host loads; a ratio inside
+/// one round of runs in turn compares the two programs.
+fn paired(
+    meter: &CpuMeter,
+    rounds: usize,
+    runs: usize,
+    mut a: impl FnMut(),
+    mut b: impl FnMut(),
+) -> Paired {
+    let mut best: Option<Paired> = None;
+    for _ in 0..rounds {
+        let mut sa = Vec::with_capacity(runs);
+        let mut sb = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            sa.push(meter.measure(&mut a));
+            sb.push(meter.measure(&mut b));
+        }
+        let (pa, pb) = (P95::of(&sa), P95::of(&sb));
+        let ratio = pb.cpu.as_secs_f64() / pa.cpu.as_secs_f64();
+        best = Some(match best {
+            None => Paired {
+                a: pa,
+                b: pb,
+                ratio,
+            },
+            Some(p) => Paired {
+                a: if pa.cpu < p.a.cpu { pa } else { p.a },
+                b: if pb.cpu < p.b.cpu { pb } else { p.b },
+                ratio: ratio.min(p.ratio),
+            },
+        });
+    }
+    best.unwrap()
+}
+
 /// The env of a hook as on a real machine: the sandbox env and the
 /// injection, with git's system config path from the tool cache.
 fn hook_env(sb: &Sandbox) -> Vec<(String, String)> {
@@ -244,40 +292,61 @@ fn post_merge_after_a_trusted_fast_forward_stays_in_budget_l19_item37() {
     sb.git(&repo, &["checkout", "-q", "main"]);
     sb.git(&repo, &["branch", "-q", "-D", "up"]);
     sb.git(&repo, &["merge", "-q", "--ff-only", "origin/up"]);
+    // The full check in a clone of the same remote: a fast-forward to a
+    // local branch at a commit no gate checked (Gate::open, which records
+    // the commit). Both states exist at once, so their runs alternate.
+    let local = sb.root().join("local");
+    sb.git(
+        &sb.root(),
+        &[
+            "clone",
+            "-q",
+            bare.to_str().unwrap(),
+            local.to_str().unwrap(),
+        ],
+    );
+    sb.git(&local, &["checkout", "-q", "-b", "side"]);
+    let side = sb.commit_file(&local, "s.txt", "1\n", "side");
+    sb.git(&local, &["checkout", "-q", "main"]);
+    sb.git(&local, &["merge", "-q", "--ff-only", "side"]);
     let env = hook_env(&sb);
-    let fast = p95(&meter, 3, 40, || {
-        let out = run_hook(&env, &repo, "post-merge");
-        assert!(
-            out.stderr.is_empty(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    });
-    // The full check: Gate::open, which records the commit.
-    sb.git(&repo, &["checkout", "-q", "-b", "side"]);
-    let side = sb.commit_file(&repo, "s.txt", "1\n", "side");
-    sb.git(&repo, &["checkout", "-q", "main"]);
-    sb.git(&repo, &["merge", "-q", "--ff-only", "side"]);
-    let full = p95(&meter, 1, 20, || {
-        let out = run_hook(&env, &repo, "post-merge");
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains(&side[..12]),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    });
+    let Paired {
+        a: full,
+        b: fast,
+        ratio,
+    } = paired(
+        &meter,
+        3,
+        20,
+        || {
+            let out = run_hook(&env, &local, "post-merge");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains(&side[..12]),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        },
+        || {
+            let out = run_hook(&env, &repo, "post-merge");
+            assert!(
+                out.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        },
+    );
     {
         use std::io::Write as _;
         let _ = writeln!(
             std::io::stderr().lock(),
-            "L19 post-merge full check (local fast-forward, records): p95 cpu {:.2} ms, wall {:.2} ms (no budget)",
+            "L19 post-merge full check (local fast-forward, records): p95 cpu {:.2} ms, wall {:.2} ms (no budget); trusted fast-forward / full: {ratio:.2}",
             full.cpu.as_secs_f64() * 1000.0,
             full.wall.as_secs_f64() * 1000.0
         );
     }
     assert!(
-        fast.cpu * 2 < full.cpu,
-        "the trusted fast-forward ({fast:?}) does not skip the full check ({full:?})"
+        ratio < 0.5,
+        "the trusted fast-forward ({fast:?}) does not skip the full check ({full:?}): best round ratio {ratio:.2}"
     );
     if cfg!(debug_assertions) {
         use std::io::Write as _;
@@ -570,23 +639,24 @@ fn pre_commit_cache_hit_with_a_full_remote_index_l19_item33() {
 /// the guard does not scan its text, so both stay within 1.6x of `cat`,
 /// and a release build answers in the guard's 10 ms budget. A debug
 /// build reads any 100 KB command, `cat`'s too, in tens of ms, so there
-/// only the ratio holds.
+/// only the ratio holds. `cat` and python run in turn in each round, so
+/// host load moves both alike, and the best round's ratio counts.
 #[test]
 fn large_python_heredocs_cost_little_more_than_reading_them_l19() {
     let meter = CpuMeter::new();
     let a = Armed::new();
-    let guard = |head: &str, body: &str, tail: &str, code: i32| {
-        let command = format!("{head} <<'EOF'\n{body}EOF{tail}");
-        let input = serde_json::json!({
+    let input = |head: &str, body: &str, tail: &str| {
+        serde_json::json!({
             "cwd": a.sb.root(),
             "tool_name": "Bash",
-            "tool_input": {"command": command},
+            "tool_input": {"command": format!("{head} <<'EOF'\n{body}EOF{tail}")},
         })
-        .to_string();
-        p95(&meter, 3, 30, || {
-            let (got, out, err) = a.guard_raw(&input, &[]);
-            assert_eq!(got, Some(code), "{head}: {out}{err}");
-        })
+        .to_string()
+    };
+    // Every case is allowed.
+    let run = |input: &str| {
+        let (got, out, err) = a.guard_raw(input, &[]);
+        assert_eq!(got, Some(0), "{out}{err}");
     };
     for (what, line) in [
         (
@@ -596,22 +666,29 @@ fn large_python_heredocs_cost_little_more_than_reading_them_l19() {
         ("dotted words", "a.\n"),
     ] {
         let body = line.repeat(100 * 1024 / line.len());
-        let cat = guard("cat", &body, "\ngit status", 0);
-        for (case, tail, code) in [("next to git", "\ngit status", 0), ("no git", "", 0)] {
-            let python = guard("python3 -", &body, tail, code);
-            let ratio = python.cpu.as_secs_f64() / cat.cpu.as_secs_f64();
+        let cat = input("cat", &body, "\ngit status");
+        for (case, tail) in [("next to git", "\ngit status"), ("no git", "")] {
+            let python = input("python3 -", &body, tail);
+            let Paired {
+                a: cat_p95,
+                b: python_p95,
+                ratio,
+            } = paired(&meter, 3, 30, || run(&cat), || run(&python));
             let what = format!("guard, 100 KB python heredoc of {what}, {case} ({ratio:.2}x cat)");
             if cfg!(debug_assertions) {
                 use std::io::Write as _;
                 let _ = writeln!(
                     std::io::stderr().lock(),
                     "L19 {what}: p95 cpu {:.2} ms (debug build: ratio asserted)",
-                    python.cpu.as_secs_f64() * 1000.0
+                    python_p95.cpu.as_secs_f64() * 1000.0
                 );
             } else {
-                within_budget(&what, python, GUARD_BUDGET);
+                within_budget(&what, python_p95, GUARD_BUDGET);
             }
-            assert!(ratio < 1.6, "{what}: python {python:?}, cat {cat:?}");
+            assert!(
+                ratio < 1.6,
+                "{what}: python {python_p95:?}, cat {cat_p95:?}"
+            );
         }
     }
 }
