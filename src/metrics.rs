@@ -1300,20 +1300,50 @@ mod tests {
         assert_eq!(repo_name(Path::new("/srv/plain")), "plain");
     }
 
+    /// CPU time per guard event that [`logging_cost_is_small_against_the_guard`]
+    /// allows. Asserted on the CPU time of the test thread, not wall-clock
+    /// time: a fast-tier test must not deny a commit because the host is
+    /// busy (L19). On a busy Mac the wall time measured 4.377 ms per event
+    /// against the old 2 ms wall limit. Linux, debug build, 2026-11-11 on
+    /// 16 threads: 20 µs CPU idle; 26.5-28.5 µs CPU (wall 50-89 µs) in 20
+    /// runs at load 18-21 (32 busy loops). The limit is 5x the idle cost,
+    /// 3.5x the worst loaded one: `append` done 10 times per event
+    /// measured 115 µs and failed. macOS keeps 2 ms until a Mac measures
+    /// its CPU time.
+    const LOG_EVENT_CPU: std::time::Duration = if cfg!(target_os = "macos") {
+        std::time::Duration::from_millis(2)
+    } else {
+        std::time::Duration::from_micros(100)
+    };
+
     #[test]
     fn logging_cost_is_small_against_the_guard() {
         // Item 50: measured, not assumed. 500 appends with the key read
         // and the hash, as the guard does them.
         let tmp = tempfile::tempdir().unwrap();
         let d = dirs(tmp.path());
-        let start = std::time::Instant::now();
+        let (start, cpu) = (std::time::Instant::now(), thread_cpu());
         for _ in 0..500 {
             let _ = keyed_hash(&d, "cargo test --workspace");
             record(&d, &[guard_event("r")]);
         }
-        let per = start.elapsed() / 500;
-        eprintln!("metrics: {per:?} per guard event");
-        assert!(per < std::time::Duration::from_millis(2), "{per:?}");
+        let (wall, per) = (start.elapsed() / 500, (thread_cpu() - cpu) / 500);
+        eprintln!("metrics: {per:?} CPU, {wall:?} wall per guard event");
+        assert!(per < LOG_EVENT_CPU, "{per:?} CPU (limit {LOG_EVENT_CPU:?})");
+    }
+
+    /// CPU time (user + system) of the calling thread.
+    fn thread_cpu() -> std::time::Duration {
+        let mut ts = std::mem::MaybeUninit::<libc::timespec>::zeroed();
+        // SAFETY: clock_gettime fills the struct it is given.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, ts.as_mut_ptr()) };
+        assert_eq!(rc, 0, "clock_gettime: {}", io::Error::last_os_error());
+        // SAFETY: clock_gettime returned 0, so the struct is filled.
+        let ts = unsafe { ts.assume_init() };
+        std::time::Duration::new(
+            u64::try_from(ts.tv_sec).unwrap_or(0),
+            u32::try_from(ts.tv_nsec).unwrap_or(0),
+        )
     }
 
     fn job_end(job: &str, t: jiff::Timestamp, verdict: &str) -> Event {

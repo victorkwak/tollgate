@@ -23,15 +23,18 @@ const PASS: &str = "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nru
 /// during the whole parallel suite). Asserted on CPU time like every
 /// budget here (measured 34 ms at load 14). On Linux this is tighter than
 /// L19, so a hook that does more work fails well before the 200 ms
-/// budget. On macOS it is the L19 budget itself (800 ms, the same as
-/// [`CACHE_HIT`]), 3.5 times the worst value measured at load 80-210
-/// (229 ms): there the test only finds a hook that does several times
-/// its work, and Linux is the tight detector.
-const DOCS_ONLY: Duration = per_os(90, 800);
+/// budget. On macOS it is 550 ms, about 2 times the worst CPU p95 measured
+/// in 10 full-tier runs at load 18-72 (267.5 ms; earlier, 229 ms at load
+/// 80-210): a hook that does twice its work fails, and Linux is still the
+/// tight detector. `tollgate bench --enforce-budgets` checks docs-only on
+/// macOS against 2000 ms of wall time with 6 commits at once, which
+/// measures another thing (spec L19).
+const DOCS_ONLY: Duration = per_os(90, 550);
 
 /// [`DOCS_ONLY`] with detected Bun and Python roots (R65 detection runs on
 /// the hook path; wall p95 before: 151 ms; after: 69 ms alone, 71-77 ms
-/// during the whole suite). CPU measured: 49 ms at load 14.
+/// during the whole suite). CPU measured: 49 ms at load 14. On macOS it
+/// stays 1000 ms: worst CPU p95 in the same 10 full-tier runs, 408 ms.
 const DOCS_ONLY_DETECTED: Duration = per_os(120, 1000);
 
 /// L19 chained (non-gate) hook: 5 ms (macOS: 20 ms).
