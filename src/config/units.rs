@@ -33,6 +33,26 @@ impl DurationSpec {
         })
     }
 
+    /// Parses a duration given on the command line (R113): a bare whole
+    /// number is seconds; anything else follows [`Self::parse`]. Files
+    /// (policy, host config) keep the unit rule and never call this.
+    pub fn parse_cli(raw: &str) -> Result<Self, String> {
+        let text = raw.trim();
+        let bad =
+            || format!("invalid duration {raw:?}: write seconds (300) or a unit (300s, 5m, 1h30m)");
+        if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+            let secs: u64 = text.parse().map_err(|_| bad())?;
+            if secs == 0 {
+                return Err(bad());
+            }
+            return Ok(Self {
+                raw: text.to_owned(),
+                value: Duration::from_secs(secs),
+            });
+        }
+        Self::parse(text).map_err(|_| bad())
+    }
+
     /// The duration.
     #[must_use]
     pub fn get(&self) -> Duration {
@@ -171,6 +191,41 @@ mod tests {
         for bad in ["0s", "-5m", "", "soon", "5"] {
             assert!(DurationSpec::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn command_line_durations_take_bare_seconds_r113() {
+        for (raw, secs) in [
+            ("3000", 3000),
+            (" 300 ", 300),
+            ("300s", 300),
+            ("1h30m", 5400),
+        ] {
+            assert_eq!(
+                DurationSpec::parse_cli(raw).unwrap().get().as_secs(),
+                secs,
+                "{raw}"
+            );
+        }
+        for bad in [
+            "5x",
+            "0",
+            "0s",
+            "-5",
+            "1.5",
+            "",
+            "soon",
+            "99999999999999999999",
+        ] {
+            assert_eq!(
+                DurationSpec::parse_cli(bad).unwrap_err(),
+                format!(
+                    "invalid duration {bad:?}: write seconds (300) or a unit (300s, 5m, 1h30m)"
+                ),
+            );
+        }
+        // Files keep the unit rule (R63).
+        assert!(DurationSpec::parse("3000").is_err());
     }
 
     #[test]

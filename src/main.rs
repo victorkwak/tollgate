@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tollgate::config::Tier;
+use tollgate::config::units::DurationSpec;
 use tollgate::{cli, exit};
 
 fn main() -> ExitCode {
@@ -76,7 +77,9 @@ fn run() -> u8 {
                 all,
             },
         ),
-        Command::Wait { job, timeout } => cli::wait(&ctx, &job, timeout.as_deref()),
+        Command::Wait { job, timeout } => {
+            cli::wait(&ctx, &job, timeout.as_ref().map(DurationSpec::get))
+        }
         Command::Cancel { job } => cli::cancel(&ctx, &job),
         Command::Status { rev, json } => cli::status(&ctx, rev.as_deref(), json),
         Command::Report { target, json } => cli::report_cmd(&ctx, &target, json),
@@ -323,8 +326,9 @@ enum Command {
     /// Wait for a job (exit 0 pass, 1 fail, 3 running) (R99).
     Wait {
         job: String,
-        #[arg(long)]
-        timeout: Option<String>,
+        /// Seconds (`300`) or a duration with a unit (`5m`, `1h30m`).
+        #[arg(long, value_parser = DurationSpec::parse_cli)]
+        timeout: Option<DurationSpec>,
     },
     /// Cancel a queued or running job (R89).
     Cancel { job: String },

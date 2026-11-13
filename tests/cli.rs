@@ -218,3 +218,41 @@ fn config_check_validates_repo_and_host_config_r64() {
     assert_eq!(code, Some(1), "{text}");
     assert!(text.contains("not in a git repository"), "{text}");
 }
+
+/// R113: a duration on the command line may be bare seconds; a bad one is
+/// refused with the forms named, exit 2, before the job id is even read.
+#[test]
+fn wait_timeout_takes_bare_seconds_r113() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().canonicalize().unwrap();
+    // 3000 is seconds: the job (unknown here) is looked up and is not
+    // there, so the answer comes at once and names the job.
+    for t in ["3000", "3000s", "50m"] {
+        let out = run(
+            Path::new(BIN),
+            &["wait", "20260101-000000-deadbeef", "--timeout", t],
+            &home,
+        );
+        assert_eq!(out.status.code(), Some(1), "{t}: {}", stderr(&out));
+        assert!(
+            !stderr(&out).contains("invalid duration"),
+            "{}",
+            stderr(&out)
+        );
+        assert!(
+            stderr(&out).contains("20260101-000000-deadbeef"),
+            "{}",
+            stderr(&out)
+        );
+    }
+    for t in ["5x", "0", "-5", "1.5", ""] {
+        // A job id that is not valid either: the duration is checked first.
+        let arg = format!("--timeout={t}");
+        let out = run(Path::new(BIN), &["wait", "nope", &arg], &home);
+        assert_eq!(out.status.code(), Some(2), "{t:?}: {}", stderr(&out));
+        let want =
+            format!("invalid duration {t:?}: write seconds (300) or a unit (300s, 5m, 1h30m)");
+        assert!(stderr(&out).contains(&want), "{t:?}: {}", stderr(&out));
+        assert!(!stderr(&out).contains("job id"), "{}", stderr(&out));
+    }
+}

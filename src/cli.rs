@@ -677,22 +677,18 @@ fn print_lookup(dirs: &Dirs, found: &Lookup) -> u8 {
 /// `tollgate wait <job> [--timeout D]` (R99, L17): 0 pass, 1 fail, 3
 /// still running. The default timeout is `TOLLGATE_INLINE_CAP` when set,
 /// else 100 s (under the Bash default timeout).
-pub fn wait(ctx: &Ctx, job: &str, timeout: Option<&str>) -> u8 {
-    let dirs = match ctx.dirs() {
-        Ok(d) => d,
-        Err(e) => return fail(e),
-    };
+/// `timeout` is parsed with the arguments (R113: bare seconds allowed).
+pub fn wait(ctx: &Ctx, job: &str, timeout: Option<Duration>) -> u8 {
     let id = match JobId::parse(job) {
         Ok(i) => i,
         Err(e) => return fail(e),
     };
-    let limit = match timeout {
-        Some(t) => match DurationSpec::parse(t) {
-            Ok(d) => d.get(),
-            Err(e) => return fail(e),
-        },
-        None => inline_cap(&ctx.env).unwrap_or(crate::config::host::DEFAULT_INLINE_CAP),
+    let dirs = match ctx.dirs() {
+        Ok(d) => d,
+        Err(e) => return fail(e),
     };
+    let limit = timeout
+        .unwrap_or_else(|| inline_cap(&ctx.env).unwrap_or(crate::config::host::DEFAULT_INLINE_CAP));
     wait_and_print(&dirs, &id, Some(Instant::now() + limit))
 }
 
