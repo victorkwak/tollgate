@@ -1360,7 +1360,7 @@ fn expensive_declared_runner_called_narrow_is_its_own_business_r103() {
     std::fs::write(
         app.join("tollgate.toml"),
         format!(
-            "{EXPENSIVE_TOML}\n[[expensive]]\nname = \"web runner\"\nprogram = \"bun\"\nwith = [\"run\", \"e2e:web\"]\nnarrow = [\"*.spec.ts\"]\nhint = \"bun run e2e:web <file>.spec.ts\"\n"
+            "{EXPENSIVE_TOML}\n[[expensive]]\nname = \"web runner\"\nprogram = \"bun\"\nwith = [\"run\", \"e2e:web\"]\ncwd = \"web\"\nnarrow = [\"*.spec.ts\"]\nhint = \"bun run e2e:web <file>.spec.ts\"\n"
         ),
     )
     .unwrap();
@@ -1382,6 +1382,12 @@ fn expensive_declared_runner_called_narrow_is_its_own_business_r103() {
     std::fs::write(
         app.join("web/package.json"),
         r#"{"scripts":{"e2e:web":"playwright test --list && playwright test","e2e":"playwright test","all":"playwright test; true"}}"#,
+    )
+    .unwrap();
+    // A script of the same name at the repo root, outside the rule's cwd.
+    std::fs::write(
+        app.join("package.json"),
+        r#"{"scripts":{"e2e:web":"./scripts/e2e.sh main; true"}}"#,
     )
     .unwrap();
     // A file whose name is a declared bare program, with a wide call in it.
@@ -1421,6 +1427,9 @@ fn expensive_declared_runner_called_narrow_is_its_own_business_r103() {
             "bash scripts/run-all.sh a.spec.ts",
             // R103 is off only for the file the narrow call starts.
             "./scripts/e2e.sh main a.spec.ts && ./scripts/run-all.sh",
+            // The "web runner" rule holds under web/ only: at the repo
+            // root its words declare no script.
+            "bun run e2e:web a.spec.ts",
             // The sourced script's `cd` in its branches leaves the cwd
             // unknown: an absolute `cd` names it again.
             "source scripts/e2e.sh main a.spec.ts; cd {APP}/web && bunx playwright test",

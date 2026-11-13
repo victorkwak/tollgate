@@ -110,8 +110,9 @@ impl Rules {
             let with = r.with_holds(args);
             // A declared runner: a rule on a repo path (never a bare
             // program name) that applies to this call in full.
-            out.program |= r.path && with && r.cwd_holds(cwd);
-            if with {
+            let applies = with && r.cwd_holds(cwd);
+            out.program |= r.path && applies;
+            if applies {
                 out.with_words.extend(r.with.iter().cloned());
             }
             if with && r.wide(args, cwd) {
