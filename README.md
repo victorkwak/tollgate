@@ -59,7 +59,7 @@ tollgate doctor
 
 To check that the hooks reach a session, run `tollgate doctor --injection` from a Bash call in a Claude session, in the main session and in a subagent. If the settings `env` does not reach one, the guard denies every Bash call there, so the gap fails closed.
 
-To remove it, run `tollgate uninstall`. It removes exactly what `install` added. `tollgate gc --all` removes the stored results, logs and verify checkouts.
+To remove it, run `tollgate uninstall`. It removes exactly what `install` added. `tollgate gc` removes old results and logs and the verify checkouts of worktrees and repos that are gone; `tollgate gc --all` removes every stored result, log and verify checkout.
 
 ## Quick start
 

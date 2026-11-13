@@ -2403,12 +2403,7 @@ fn a_candidate_whose_runner_died_does_not_hold_the_ref_r111() {
         .parse()
         .unwrap();
     tollgate::procs::signal(pid, libc::SIGKILL).unwrap();
-    assert!(eventually(10, || !std::path::Path::new(&format!(
-        "/proc/{pid}/cmdline"
-    ))
-    .exists()
-        || std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .is_ok_and(|s| s.contains(") Z "))));
+    assert!(eventually(10, || gone(pid)));
     named_commit(&sb, &repo, "b", "main", "b");
     let r = push_main(&sb, &repo, "b", &[]);
     assert!(!r.out.contains("(R111)"), "{}", r.out);
@@ -2427,9 +2422,13 @@ fn watch_pid(sb: &Sandbox, job: &str) -> Option<i32> {
         .ok()
 }
 
-/// True when process `pid` is gone (or a zombie nobody reaped yet).
+/// True when process `pid` is gone (or a zombie nobody reaped yet). The
+/// process table, not `/proc`: macOS has none, and every pid read as gone
+/// there.
 fn gone(pid: i32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |s| s.contains(") Z "))
+    !tollgate::procs::ProcTable::snapshot()
+        .expect("process table")
+        .alive(pid)
 }
 
 /// R112: the remote check is its own process (`tollgate __watch-push`),
