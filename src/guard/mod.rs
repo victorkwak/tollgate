@@ -36,6 +36,7 @@
 //! `updatedInput` without one; if not, the 100 s default cap stands, R28).
 
 mod cmds;
+pub mod expensive;
 mod git;
 pub mod paths;
 pub mod rules;
@@ -364,8 +365,16 @@ fn context(
         protected.push(d);
     }
     let mut full: Vec<String> = DEFAULT_FULL_REFS.iter().map(|s| (*s).to_owned()).collect();
-    if let Some(root) = repo_root(&cwd.join("x")) {
-        full.extend(repo_config(&root).tiers.full_refs);
+    // One read and parse of the repo config serves `full_refs` and the
+    // R103 rules of the call's cwd.
+    let root = repo_root(&cwd.join("x"));
+    let mut rules = None;
+    if let Some(root) = &root {
+        let config = repo_config(root);
+        if !config.expensive.is_empty() {
+            rules = expensive::Rules::compile(root, &config.expensive);
+        }
+        full.extend(config.tiers.full_refs);
     }
     let full_refs = glob::compile(
         &full,
@@ -397,6 +406,7 @@ fn context(
         full_refs,
         tollgate_names: names,
         inline_cap,
+        expensive: Some(expensive::Seed { root, rules }),
     }
 }
 

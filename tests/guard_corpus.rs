@@ -309,6 +309,63 @@ const ASK: &[&str] = &[
     "rm .git/index.lock",
 ];
 
+/// R103: the commands agents run in a repo whose `tollgate.toml` declares
+/// expensive commands ([`EXPENSIVE_TOML`]): narrow forms and commands
+/// that only name the program. They run in that repo's root.
+const EXPENSIVE_ALLOW: &[&str] = &[
+    "./scripts/e2e.sh main web/login.spec.ts",
+    "bash scripts/e2e.sh main web/a.spec.ts web/b.spec.ts",
+    "./scripts/e2e.sh main -g login 2>&1 | tail -30",
+    "timeout 900 ./scripts/e2e.sh main --grep=@smoke",
+    "./scripts/e2e.sh main \"$spec\"",
+    "ls web/*.spec.ts | xargs ./scripts/e2e.sh main",
+    "cd web && bunx playwright test login.spec.ts",
+    "cd web && bunx playwright test -g login --workers=1",
+    "cd web && bun run e2e tests/a.spec.ts",
+    "cd web && npm run e2e -- tests/a.spec.ts",
+    "cd web && bunx playwright show-report",
+    "cd web && bun run build && bunx tsc --noEmit",
+    "bunx playwright test",
+    "cargo test -p myapp-core && cargo clippy --all-targets -- -D warnings",
+    "bash -n scripts/e2e.sh && chmod +x scripts/e2e.sh",
+    "cat scripts/e2e.sh ; grep -n playwright scripts/e2e.sh web/package.json",
+    "echo 'run ./scripts/e2e.sh main' >> notes.md",
+    "git add scripts/e2e.sh && git commit -m \"test: run scripts/e2e.sh and bunx playwright test in CI\"",
+    "cat >> notes.md <<'EOF'\n./scripts/e2e.sh\ncd web && bunx playwright test\nEOF",
+    "ssh host 'cd app && ./scripts/e2e.sh' ; docker exec app bash scripts/e2e.sh",
+];
+
+/// R103: wide forms in that repo.
+const EXPENSIVE_DENY: &[&str] = &[
+    "./scripts/e2e.sh",
+    "./scripts/e2e.sh main 2>&1 | tail -30",
+    "bash scripts/e2e.sh main",
+    "timeout 900 ./scripts/e2e.sh main",
+    "sh -c './scripts/e2e.sh main'",
+    "cd web && bunx playwright test",
+    "cd web && npx playwright test --workers=4",
+    "cd web && bun run e2e",
+];
+
+/// The `tollgate.toml` of the R103 repo.
+const EXPENSIVE_TOML: &str = r#"version = 1
+
+[[expensive]]
+name = "browser suite"
+program = "scripts/e2e*.sh"
+narrow = ["*.spec.ts", "-g", "--grep*"]
+hint = "scripts/e2e.sh <suite> <file>.spec.ts"
+step = "e2e main"
+
+[[expensive]]
+name = "web tests"
+program = "playwright"
+with = ["test"]
+narrow = ["*.spec.ts", "-g", "--grep*"]
+cwd = "web"
+hint = "bunx playwright test <file>.spec.ts"
+"#;
+
 /// A realistic check script for the script-file path.
 fn check_script() -> String {
     let mut s =
@@ -338,9 +395,9 @@ fn input(cwd: &Path, cmd: &str) -> String {
     .to_string()
 }
 
-/// The sandbox, the repo `r` under its root, and a second repo whose
-/// path has the word `tollgate` in it.
-fn setup() -> (Armed, PathBuf, PathBuf) {
+/// The sandbox, the repo `r` under its root, a second repo whose path has
+/// the word `tollgate` in it, and the R103 repo `myapp`.
+fn setup() -> (Armed, PathBuf, PathBuf, PathBuf) {
     let a = Armed::new();
     let repo = a.sb.repo("r");
     // As in the session transcripts: the repo has its server remote.
@@ -369,11 +426,23 @@ fn setup() -> (Armed, PathBuf, PathBuf) {
         r#"{"version": "1.0.0", "scripts": {"build": "tsc --noEmit && echo built"}}"#,
     )
     .unwrap();
-    (a, repo, demo)
+    let app = a.sb.repo("myapp");
+    std::fs::write(app.join("tollgate.toml"), EXPENSIVE_TOML).unwrap();
+    support::write_exe(
+        &app.join("scripts/e2e.sh"),
+        "#!/bin/bash\nset -euo pipefail\ncd web\nbunx playwright test \"$@\"\n",
+    );
+    std::fs::create_dir_all(app.join("web")).unwrap();
+    std::fs::write(
+        app.join("web/package.json"),
+        r#"{"scripts": {"e2e": "playwright test", "build": "tsc --noEmit"}}"#,
+    )
+    .unwrap();
+    (a, repo, demo, app)
 }
 
 /// Every line of the lists as (cwd, command, the decision it must get).
-fn cases(a: &Armed, repo: &Path, demo: &Path) -> Vec<(PathBuf, String, &'static str)> {
+fn cases(a: &Armed, repo: &Path, demo: &Path, app: &Path) -> Vec<(PathBuf, String, &'static str)> {
     let root = a.sb.root().to_owned();
     let mut out = Vec::new();
     for raw in CORPUS {
@@ -394,6 +463,11 @@ fn cases(a: &Armed, repo: &Path, demo: &Path) -> Vec<(PathBuf, String, &'static 
     }
     for raw in ASK {
         out.push((root.clone(), fill(raw, repo), "ask"));
+    }
+    for (list, want) in [(EXPENSIVE_ALLOW, "allow"), (EXPENSIVE_DENY, "deny")] {
+        for raw in list {
+            out.push((app.to_owned(), (*raw).to_owned(), want));
+        }
     }
     out
 }
@@ -425,10 +499,10 @@ fn decision(a: &Armed, cwd: &Path, cmd: &str) -> &'static str {
 
 /// The lines whose decision is not the one the lists give.
 fn wrong(only: &str) -> (usize, Vec<String>) {
-    let (a, repo, demo) = setup();
+    let (a, repo, demo, app) = setup();
     let mut bad = Vec::new();
     let mut n = 0;
-    for (cwd, cmd, want) in cases(&a, &repo, &demo) {
+    for (cwd, cmd, want) in cases(&a, &repo, &demo, &app) {
         if only != want {
             continue;
         }
@@ -478,8 +552,8 @@ fn each_rule_denies_or_asks_alone_and_through_each_wrapper() {
 #[test]
 fn the_guard_p95_over_the_corpus_is_under_10_ms_l19() {
     let meter = CpuMeter::new();
-    let (a, repo, demo) = setup();
-    let inputs: Vec<String> = cases(&a, &repo, &demo)
+    let (a, repo, demo, app) = setup();
+    let inputs: Vec<String> = cases(&a, &repo, &demo, &app)
         .iter()
         .map(|(cwd, cmd, _)| input(cwd, cmd))
         .collect();

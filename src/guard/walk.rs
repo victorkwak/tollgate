@@ -29,8 +29,11 @@
 use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
 
 use super::cmds::{self, Arg, DYNAMIC, Wrapper, operands_at};
+use super::expensive;
 use super::git;
 use super::paths;
 use super::rules::{self, Assessment, Context, Ruling};
@@ -74,6 +77,8 @@ pub fn assess(ctx: &Context, command: &str) -> Assessment {
         taint: None,
         depth: 0,
         nest: 0,
+        typed: None,
+        runtime_args: false,
     };
     w.script(&script, &mut st);
     Assessment {
@@ -128,6 +133,12 @@ struct State {
     depth: usize,
     /// Code strings above this code.
     nest: usize,
+    /// The command the agent typed, when this code is the text of a
+    /// script file or a package script it runs (for the R103 refusal).
+    typed: Option<Rc<str>>,
+    /// The command gets more arguments at run time (`xargs`, `find -exec
+    /// ... {}`): for R103 it is narrow.
+    runtime_args: bool,
 }
 
 /// The stdin and the source text of the simple command that runs.
@@ -165,6 +176,12 @@ struct Walker<'a> {
     bytes: usize,
     /// The last two components of each tollgate dir, lowercase.
     tails: Vec<String>,
+    /// R103 rules by command cwd and by repo root; `None`: no rules.
+    expensive_by_cwd: HashMap<PathBuf, Option<Arc<expensive::Rules>>>,
+    expensive_by_root: HashMap<PathBuf, Option<Arc<expensive::Rules>>>,
+    /// Inside case 5: the words are a guess at a command that may run
+    /// elsewhere (`ssh host ...`, `docker exec ...`); R103 does not apply.
+    probing: bool,
 }
 
 fn config_var(name: &str) -> bool {
@@ -237,6 +254,14 @@ impl<'a> Walker<'a> {
                 )
             })
             .collect();
+        let mut expensive_by_cwd = HashMap::new();
+        let mut expensive_by_root = HashMap::new();
+        if let Some(seed) = &ctx.expensive {
+            expensive_by_cwd.insert(ctx.cwd.clone(), seed.rules.clone());
+            if let Some(root) = &seed.root {
+                expensive_by_root.insert(root.clone(), seed.rules.clone());
+            }
+        }
         Self {
             ctx,
             text,
@@ -247,6 +272,9 @@ impl<'a> Walker<'a> {
             files: 0,
             bytes: 0,
             tails,
+            expensive_by_cwd,
+            expensive_by_root,
+            probing: false,
         }
     }
 
@@ -665,6 +693,7 @@ impl<'a> Walker<'a> {
             return;
         };
         let base = rules::basename(name);
+        self.expensive(name, false, rest, st, io);
         if base == "git" {
             return self.git(rest, st);
         }
@@ -686,6 +715,9 @@ impl<'a> Walker<'a> {
             }
             "source" | "." => {
                 if let Some(f) = rest.first() {
+                    if let Some(name) = f.lit() {
+                        self.expensive(name, true, &rest[1..], st, io);
+                    }
                     self.run_file(f, st, false, true, io);
                 }
                 return;
@@ -849,7 +881,12 @@ impl<'a> Walker<'a> {
             stdin |= letters.contains('s');
         }
         match rest.get(i) {
-            Some(f) if !stdin => self.run_file(f, &mut st.clone(), false, false, io),
+            Some(f) if !stdin => {
+                if let Some(name) = f.lit() {
+                    self.expensive(name, true, &rest[i + 1..], st, io);
+                }
+                self.run_file(f, &mut st.clone(), false, false, io);
+            }
             _ => self.stdin_code(st, io),
         }
     }
@@ -915,6 +952,9 @@ impl<'a> Walker<'a> {
         }
         match shell::parse(text) {
             Ok(script) => {
+                // Arguments a runner adds go to the shell, not to the
+                // commands of its code.
+                st.runtime_args = false;
                 st.nest += 1;
                 self.script(&script, st);
                 st.nest -= 1;
@@ -1017,6 +1057,7 @@ impl<'a> Walker<'a> {
             Wrapper::Plain(valued) => self.run(from(operands_at(rest, valued)), &mut sub, io),
             Wrapper::Xargs => {
                 let i = operands_at(rest, cmds::XARGS_VALUED);
+                sub.runtime_args = true;
                 self.run(from(i), &mut sub, io.detached());
             }
             Wrapper::Find => self.find(rest, &sub, io),
@@ -1135,6 +1176,7 @@ impl<'a> Walker<'a> {
                     if op.ends_with("dir") {
                         sub.cwd = None;
                     }
+                    sub.runtime_args = inner.iter().any(|a| a.dynamic || a.s.contains("{}"));
                     self.run(&inner, &mut sub, io.detached());
                     i = end;
                 }
@@ -1152,7 +1194,7 @@ impl<'a> Walker<'a> {
     fn runner(&mut self, r: Runner, rest: &[Arg], st: &State, io: Io<'_>) {
         match r {
             Runner::Argv(i) => self.run(rest.get(i..).unwrap_or(&[]), &mut st.clone(), io),
-            Runner::Script(name) => {
+            Runner::Script(name, at) => {
                 let Some(cwd) = &st.cwd else {
                     return;
                 };
@@ -1164,8 +1206,21 @@ impl<'a> Walker<'a> {
                     .and_then(|v| v["scripts"][name.as_str()].as_str().map(str::to_owned));
                 // A script that names nothing can still run a script file
                 // that does, as in `run_file`.
-                if let Some(code) = script {
-                    self.code(&code, &mut st.clone());
+                if let Some(mut code) = script {
+                    // The runner puts the words after the script name at
+                    // the end of the script text (R103: they can make
+                    // the call narrow).
+                    let mut extra = rest.get(at..).unwrap_or(&[]);
+                    if extra.first().and_then(Arg::lit) == Some("--") {
+                        extra = &extra[1..];
+                    }
+                    for a in extra {
+                        code.push(' ');
+                        code.push_str(&shell_quote(a));
+                    }
+                    let mut sub = st.clone();
+                    sub.typed.get_or_insert_with(|| io.raw.into());
+                    self.code(&code, &mut sub);
                 }
             }
             Runner::Data => {}
@@ -1185,7 +1240,9 @@ impl<'a> Walker<'a> {
             return;
         };
         let outer = std::mem::replace(&mut self.ruling, Ruling::Allow);
+        let probing = std::mem::replace(&mut self.probing, true);
         self.run(&rest[k..], &mut st.clone(), io.detached());
+        self.probing = probing;
         let inner = std::mem::replace(&mut self.ruling, outer);
         if let Some(r) = inner.reason() {
             self.add(Ruling::ask(
@@ -1300,11 +1357,50 @@ impl<'a> Walker<'a> {
         };
         let mut sub = st.clone();
         sub.depth += 1;
+        sub.runtime_args = false;
+        sub.typed.get_or_insert_with(|| io.raw.into());
         self.script(&script, &mut sub);
         if keep {
             sub.depth -= 1;
+            sub.typed = st.typed.take();
             *st = sub;
         }
+    }
+
+    /// R103: the `[[expensive]]` rule for `word args...` in the repo of
+    /// the command's cwd. `file`: a shell reads `word` as a script file.
+    fn expensive(&mut self, word: &str, file: bool, args: &[Arg], st: &State, io: Io<'_>) {
+        if self.probing || st.runtime_args {
+            return;
+        }
+        // A cwd the walker cannot follow: the repo is not known.
+        let Some(cwd) = st.cwd.as_deref() else {
+            return;
+        };
+        let Some(rules) = self.expensive_rules(cwd) else {
+            return;
+        };
+        let typed = st.typed.as_deref().unwrap_or(io.raw);
+        self.add(rules.check(word, file, args, cwd, typed));
+    }
+
+    /// The R103 rules of the repo that holds `cwd`: the nearest dir with a
+    /// `.git` entry, its working-tree `tollgate.toml`, read once per repo.
+    fn expensive_rules(&mut self, cwd: &Path) -> Option<Arc<expensive::Rules>> {
+        if let Some(r) = self.expensive_by_cwd.get(cwd) {
+            return r.clone();
+        }
+        let rules = super::repo_root(&cwd.join("x")).and_then(|root| {
+            if let Some(r) = self.expensive_by_root.get(&root) {
+                return r.clone();
+            }
+            let config = super::repo_config(&root);
+            let r = expensive::Rules::compile(&root, &config.expensive);
+            self.expensive_by_root.insert(root, r.clone());
+            r
+        });
+        self.expensive_by_cwd.insert(cwd.to_owned(), rules.clone());
+        rules
     }
 
     /// M3: a file that a redirection or an ordinary tool writes.
@@ -1384,5 +1480,14 @@ impl<'a> Walker<'a> {
             }
         }
         out
+    }
+}
+
+/// `a` as one shell word: single-quoted, or a parameter the walker does
+/// not know when a part of it is made at run time.
+fn shell_quote(a: &Arg) -> String {
+    match a.lit() {
+        Some(s) => format!("'{}'", s.replace('\'', "'\\''")),
+        None => "\"$__runtime_arg\"".to_owned(),
     }
 }

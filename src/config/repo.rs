@@ -55,6 +55,10 @@ pub struct RepoConfig {
     /// Quarantined flaky tests (R93).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quarantine: Vec<Quarantine>,
+    /// Commands whose wide form only the gate runs (R103). Not part of
+    /// [`RepoConfig::effective_hash`]: the guard reads them, no job does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expensive: Vec<Expensive>,
 }
 
 impl Default for RepoConfig {
@@ -69,8 +73,52 @@ impl Default for RepoConfig {
             setup: Vec::new(),
             steps: Vec::new(),
             quarantine: Vec::new(),
+            expensive: Vec::new(),
         }
     }
+}
+
+/// `[[expensive]]` (R103): a command whose wide form runs a whole suite.
+/// The guard refuses the wide form in a session and prints `hint`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Expensive {
+    /// Label in the refusal and in stats.
+    pub name: String,
+    /// Without `/`: a glob on the basename of the command name. With `/`:
+    /// a glob on the repo-relative path of the command word made absolute
+    /// against the command's cwd (`*` stops at `/`).
+    pub program: String,
+    /// Words that must all be among the literal argument words.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub with: Vec<String>,
+    /// Globs on whole argument words; one match makes the call narrow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub narrow: Vec<String>,
+    /// The rule applies only in this repo dir or below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The narrow form, printed with the refusal.
+    pub hint: String,
+    /// The gate step that runs the wide form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+}
+
+impl Expensive {
+    /// Glob options of `program` with a `/`: case-sensitive, `*` stops at
+    /// `/`.
+    pub const PATH_GLOB: GlobOpts = GlobOpts {
+        case_insensitive: false,
+        literal_separator: true,
+    };
+    /// Glob options of `narrow` and of a basename `program`:
+    /// case-sensitive, `*` crosses `/` (`*.spec.ts` matches
+    /// `web/a.spec.ts`).
+    pub const WORD_GLOB: GlobOpts = GlobOpts {
+        case_insensitive: false,
+        literal_separator: false,
+    };
 }
 
 /// `[tiers]`.
@@ -536,10 +584,20 @@ impl RepoConfig {
     }
 
     /// blake3 of the canonical JSON of the effective config: part of the
-    /// fingerprint (R65, R74).
+    /// fingerprint (R65, R74). `[[expensive]]` is left out (R103): it
+    /// changes what the guard refuses, not what a job checks, and a
+    /// config without it hashes as before R103.
     #[must_use]
     pub fn effective_hash(&self) -> String {
-        let json = serde_json::to_vec(self).expect("RepoConfig serializes to JSON");
+        let json = if self.expensive.is_empty() {
+            serde_json::to_vec(self)
+        } else {
+            serde_json::to_vec(&Self {
+                expensive: Vec::new(),
+                ..self.clone()
+            })
+        }
+        .expect("RepoConfig serializes to JSON");
         blake3::hash(&json).to_hex().to_string()
     }
 
@@ -687,6 +745,37 @@ impl RepoConfig {
             }
             if q.issue.trim().is_empty() {
                 v.error(&at, "empty issue");
+            }
+        }
+
+        for (i, e) in self.expensive.iter().enumerate() {
+            let at = format!("expensive[{i}] {:?}", e.name);
+            for (field, value) in [
+                ("name", &e.name),
+                ("program", &e.program),
+                ("hint", &e.hint),
+            ] {
+                if value.trim().is_empty() {
+                    v.error(&at, format!("empty {field}"));
+                }
+            }
+            let opts = if e.program.contains('/') {
+                Expensive::PATH_GLOB
+            } else {
+                Expensive::WORD_GLOB
+            };
+            if let Err(err) = glob::compile(std::slice::from_ref(&e.program), opts) {
+                v.error(&at, format!("program: {err}"));
+            }
+            if let Err(err) = glob::compile(&e.narrow, Expensive::WORD_GLOB) {
+                v.error(&at, format!("narrow: {err}"));
+            }
+            if e.with.iter().any(|w| w.trim().is_empty()) {
+                v.error(&at, "empty word in with");
+            }
+            rel_path(&mut v, &at, "cwd", e.cwd.as_deref());
+            if e.step.as_ref().is_some_and(|s| s.trim().is_empty()) {
+                v.error(&at, "empty step");
             }
         }
         v
@@ -1192,6 +1281,99 @@ issue = ""
         assert_eq!(a.effective_hash(), b.effective_hash());
         b.push.fast_refs.push("wip/*".into());
         assert_ne!(a.effective_hash(), b.effective_hash());
+    }
+
+    const EXPENSIVE: &str = r#"
+[[expensive]]
+name = "browser suite"
+program = "scripts/e2e*.sh"
+narrow = ["*.spec.ts", "-g", "--grep*"]
+hint = "scripts/e2e.sh <suite> <file>.spec.ts"
+step = "e2e main"
+
+[[expensive]]
+name = "web tests"
+program = "playwright"
+with = ["test"]
+cwd = "web"
+hint = "bunx playwright test <file>.spec.ts"
+"#;
+
+    #[test]
+    fn expensive_entries_parse_and_validate_r103() {
+        let c = parse(&format!("version = 1\n{EXPENSIVE}"));
+        assert!(c.validate().is_ok(), "{:?}", c.validate());
+        assert_eq!(c.expensive.len(), 2);
+        assert_eq!(c.expensive[0].narrow, ["*.spec.ts", "-g", "--grep*"]);
+        assert_eq!(c.expensive[0].step.as_deref(), Some("e2e main"));
+        assert_eq!(c.expensive[1].with, ["test"]);
+        assert_eq!(c.expensive[1].cwd.as_deref(), Some("web"));
+        // `config --effective` prints them.
+        let toml = c.to_toml().unwrap();
+        assert!(toml.contains("[[expensive]]"), "{toml}");
+        assert_eq!(RepoConfig::from_toml(&toml).unwrap(), c);
+        // Unknown keys and missing required keys are parse errors.
+        for bad in [
+            "[[expensive]]\nname = \"x\"\nprogram = \"y\"\nhint = \"z\"\nnarow = []\n",
+            "[[expensive]]\nname = \"x\"\nprogram = \"y\"\n",
+            "[[expensive]]\nprogram = \"y\"\nhint = \"z\"\n",
+        ] {
+            assert!(
+                RepoConfig::from_toml(&format!("version = 1\n{bad}")).is_err(),
+                "{bad}"
+            );
+        }
+        let c = parse(
+            r#"version = 1
+[[expensive]]
+name = " "
+program = ""
+hint = ""
+narrow = ["a["]
+with = [""]
+cwd = "../up"
+step = ""
+[[expensive]]
+name = "bad program"
+program = "scripts/[x"
+hint = "h"
+"#,
+        );
+        let errs = errors(&c).join("\n");
+        for needle in [
+            "expensive[0] \" \": empty name",
+            "empty program",
+            "empty hint",
+            "narrow: invalid glob \"a[\"",
+            "empty word in with",
+            "cwd \"../up\"",
+            "empty step",
+            "expensive[1] \"bad program\": program: invalid glob \"scripts/[x\"",
+        ] {
+            assert!(errs.contains(needle), "missing {needle:?} in:\n{errs}");
+        }
+    }
+
+    /// The table only feeds the guard: no job checks differently, so it
+    /// must not change the fingerprint of any record (R65, R74, R103).
+    #[test]
+    fn expensive_entries_do_not_change_the_effective_hash_r103() {
+        let base = parse(SPEC_EXAMPLE);
+        // A config without the table hashes as the serialization without
+        // the field (as before R103).
+        let json = serde_json::to_string(&base).unwrap();
+        assert!(!json.contains("expensive"), "{json}");
+        assert_eq!(
+            base.effective_hash(),
+            blake3::hash(json.as_bytes()).to_hex().to_string()
+        );
+        let with = parse(&format!("{SPEC_EXAMPLE}\n{EXPENSIVE}"));
+        assert_eq!(with.expensive.len(), 2);
+        assert_eq!(base.effective_hash(), with.effective_hash());
+        let mut changed = with.clone();
+        changed.expensive[0].narrow.push("--project*".into());
+        changed.expensive.pop();
+        assert_eq!(base.effective_hash(), changed.effective_hash());
     }
 
     #[test]

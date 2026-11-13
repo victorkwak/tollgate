@@ -277,6 +277,7 @@ R25. Bash rules (deny, exit 2, one-line reason). The guard stops a careless agen
 | `full-ref-move` | `git update-ref refs/heads/<full>`; `git push .`, `git fetch .` and `git pull .` with a destination that is a full ref (`main` or `refs/heads/main`) or under `refs/remotes/` |
 | `git-update-ref-remote`, `git-symbolic-ref` | `git update-ref refs/remotes/...`; a `git symbolic-ref` write or delete of `refs/remotes/...` or `refs/heads/<full>` |
 | `git-pack-direct`, `git-replace` | `git send-pack`, `git receive-pack`, `git replace` |
+| `expensive-wide` | The wide form of a command that the repo of the command's cwd declares in `[[expensive]]` (R103), as typed and through the wrappers and runners the walker follows |
 
 Ordinary tools (one table, `src/guard/cmds.rs`): output redirections (`>`, `>>`, `>|`, `&>`), `cp`, `mv`, `rm`, `rmdir`, `unlink`, `ln`, `tee`, `sed -i`, `perl -i`, `truncate`, `chmod`, `chown`, `touch`, `dd of=`, `install`, `rsync` (last word), `find -delete`, `git rm`, `git mv`, `git clean`, `git config --file`. `-t` and `--target-directory` in their exact spellings. There is no rule for a writer that is not in the table. A path is made absolute against the cwd after `~`, `$HOME`, the `XDG_*` variables, `$PWD` and `$(pwd)` (the walker's cwd) are expanded and a literal `cd` or `pushd` is applied, then resolved once through symlinks, so a link into a protected dir does not hide it. A pattern in the component at or above a tollgate dir (`rm -rf ~/.local/state/toll*`) is matched against that dir.
 
@@ -499,6 +500,15 @@ cache_dirs = ["ios/.build"]
 test = "gatehouse-api::sessions test_concurrent_cancel"   # <package>::<binary> <test>, exact
 until = "2026-12-01"
 issue = "Issues/open/myapp-cancel-flake"
+
+[[expensive]]                               # R103: the guard refuses the wide form in a session
+name = "browser suite"                      # label in the refusal and in stats
+program = "scripts/e2e*.sh"                 # no "/": glob on the command name's basename; with "/": repo-relative path
+with = ["test"]                             # optional: words that must all be among the arguments
+narrow = ["*.spec.ts", "-g", "--grep*"]     # optional: one matching argument makes the call narrow
+cwd = "web"                                 # optional: only when the command runs in this dir or below
+hint = "scripts/e2e.sh <suite> <file>.spec.ts"   # the narrow form, printed with the refusal
+step = "e2e main"                           # optional: the gate step that runs the wide form
 ```
 
 Common step fields: `name`, `kind`, `cwd`, `tiers`, `when`, `resources`, `timeout`, `grace`, `only_on`, `env`, `env_file` (outside the tree, hashed into the key), `cache_dirs`.
@@ -663,6 +673,11 @@ tollgate guard                                                        # PreToolU
 tollgate hook <name> [args]                                           # explicit dispatch
 tollgate waive --tree T --tier t --reason S                           # TTY only (Q6)
 ```
+
+### 4.14 Wasted runs (R101-R109)
+
+R103. A repo declares its expensive commands in `tollgate.toml` (`[[expensive]]`, R63). The guard refuses the wide form of such a command in a session (R25, `expensive-wide`) and prints the narrow form. A call is wide when `program` matches, every `with` word is among its literal argument words, its cwd is under `cwd` (when set), and no argument matches a `narrow` glob. With no `narrow` list, every call of the matching command is wide. `program` without `/` is a glob on the basename of the command name. `program` with `/` is a glob on a repo-relative path (`*` stops at `/`): it matches when the command word, made absolute against the command's cwd, is that file under the repo root. A shell that runs a script file (`bash F args`, `source F`) has `F` as the program and the rest as arguments. The runners give the command in their arguments (`bunx tool args`: program `tool`). For `bun|npm|pnpm|yarn run <script> [args]`, a rule on the runner matches the call as typed, and the words after the script name go to the end of the script text from `package.json`, as the runner passes them. An argument made at run time counts as narrow (`"$spec"`, `$(...)`, the words `xargs` and `find -exec ... {}` add). The rules are those of the repo that holds the command's cwd (the nearest dir with a `.git` entry, its working-tree `tollgate.toml`); the walker follows a literal `cd`, and a cwd it cannot follow gets no rule. A repo with no `[[expensive]]` gets no rule. Words of a program that may run on another host (ASK case 5: `ssh host ...`, `docker exec ...`) get no rule. The refusal is one line: `` `<command as typed, at most 80 characters>` runs all of "<name>" (tollgate.toml [[expensive]], R103). Narrow form: <hint>. The whole run belongs to the gate: a push or a merge to a full ref starts it.``, and with `step`: `` To run or read it now: tollgate run "<step>" (a pass of the same inputs is reused).`` The table is not part of the effective config hash (R65): it changes what the guard refuses, not what a job checks. `tollgate config --effective` prints it, and `tollgate config --check` refuses an entry with an empty `name`, `program` or `hint`, or a glob that does not compile.
+Reason: agents ran whole browser suites and workspace-wide test runs by hand, several times for one change. A rule in prose did not stop it. Gate jobs and CI are not tool calls, so the guard never sees them and they still run the wide form.
 
 ---
 
