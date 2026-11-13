@@ -40,6 +40,7 @@ fn ctx_at(cwd: &Path, home: &Path) -> Context {
                 .to_string(),
         ],
         inline_cap: 540,
+        expensive: None,
     }
 }
 
@@ -1055,4 +1056,296 @@ fn a_literal_cd_moves_relative_paths() {
         "(cd /h/.local/state/tollgate); rm install.json",
         "cd \"$d\" && rm -rf results",
     ]);
+}
+
+// ---- R103: expensive commands ----
+
+/// A repo `myapp` whose `tollgate.toml` declares the expensive commands,
+/// and a sibling repo `other` with the same files and no table.
+const EXPENSIVE_TOML: &str = r#"version = 1
+
+[[expensive]]
+name = "browser suite"
+program = "scripts/e2e*.sh"
+narrow = ["*.spec.ts", "-g", "--grep*"]
+hint = "scripts/e2e.sh <suite> <file>.spec.ts"
+step = "e2e main"
+
+[[expensive]]
+name = "web tests"
+program = "playwright"
+with = ["test"]
+narrow = ["*.spec.ts", "-g", "--grep*"]
+cwd = "web"
+hint = "bunx playwright test <file>.spec.ts"
+
+[[expensive]]
+name = "all browsers"
+program = "bun"
+with = ["run", "e2e:all"]
+hint = "bun run e2e <file>.spec.ts"
+"#;
+
+fn expensive_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let (app, other) = (base.join("myapp"), base.join("other"));
+    for r in [&app, &other] {
+        for d in [".git", "scripts", "web"] {
+            std::fs::create_dir_all(r.join(d)).unwrap();
+        }
+        std::fs::write(
+            r.join("scripts/e2e.sh"),
+            "#!/bin/bash\nset -e\nbunx playwright test \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::write(r.join("scripts/check.sh"), "#!/bin/bash\ncargo test\n").unwrap();
+        std::fs::write(
+            r.join("web/package.json"),
+            r#"{"scripts":{"e2e":"playwright test","e2e:all":"node run-all.js","build":"tsc --noEmit"}}"#,
+        )
+        .unwrap();
+    }
+    std::fs::write(app.join("tollgate.toml"), EXPENSIVE_TOML).unwrap();
+    (tmp, app, other)
+}
+
+#[track_caller]
+fn all_filled(c: &Context, want: (&str, &str), app: &Path, other: &Path, cmds: &[&str]) {
+    let filled: Vec<String> = cmds
+        .iter()
+        .map(|c| {
+            c.replace("{APP}", &app.display().to_string())
+                .replace("{OTHER}", &other.display().to_string())
+        })
+        .collect();
+    let refs: Vec<&str> = filled.iter().map(String::as_str).collect();
+    all(c, want, &refs);
+}
+
+const WIDE: (&str, &str) = ("deny", "expensive-wide");
+const ALLOWED: (&str, &str) = ("allow", "");
+
+/// A rule on a script path: the wide form is denied as typed and through
+/// each wrapper the walker follows; narrow forms, words made at run time,
+/// another repo and data are allowed.
+#[test]
+fn expensive_script_path_wide_denied_narrow_allowed_r103() {
+    let (_tmp, app, other) = expensive_fixture();
+    let c = ctx_at(&app, Path::new("/h"));
+    all_filled(
+        &c,
+        WIDE,
+        &app,
+        &other,
+        &[
+            "scripts/e2e.sh",
+            "./scripts/e2e.sh",
+            "./scripts/e2e.sh main",
+            "./scripts/e2e-full.sh",
+            "bash scripts/e2e.sh",
+            "sh ./scripts/e2e.sh main",
+            "source scripts/e2e.sh",
+            "{APP}/scripts/e2e.sh",
+            "\"$PWD\"/scripts/e2e.sh",
+            "cd web && ../scripts/e2e.sh",
+            "cd web && bash ../scripts/e2e.sh main",
+            "cd {OTHER} && cd {APP} && ./scripts/e2e.sh",
+            "true && ./scripts/e2e.sh",
+            "cargo build && ./scripts/e2e.sh; echo done",
+            "(./scripts/e2e.sh)",
+            "{ ./scripts/e2e.sh; }",
+            "env CI=1 ./scripts/e2e.sh",
+            "CI=1 ./scripts/e2e.sh",
+            "timeout 900 ./scripts/e2e.sh",
+            "timeout -k 5 900 bash scripts/e2e.sh",
+            "nice -n 5 ./scripts/e2e.sh",
+            "nohup ./scripts/e2e.sh &",
+            "time ./scripts/e2e.sh",
+            "sh -c './scripts/e2e.sh'",
+            "bash -c 'bash scripts/e2e.sh main'",
+            "./scripts/e2e.sh 2>&1 | tail -20",
+            "for s in main; do ./scripts/e2e.sh \"$s\" --workers=2 x; done",
+        ],
+    );
+    all_filled(
+        &c,
+        ALLOWED,
+        &app,
+        &other,
+        &[
+            // Narrow forms.
+            "./scripts/e2e.sh main web/login.spec.ts",
+            "bash scripts/e2e.sh main web/a.spec.ts",
+            "./scripts/e2e.sh -g login",
+            "./scripts/e2e.sh main --grep=login",
+            "timeout 900 ./scripts/e2e.sh main web/a.spec.ts",
+            // Arguments made at run time.
+            "./scripts/e2e.sh \"$spec\"",
+            "./scripts/e2e.sh main $(ls web/*.spec.ts)",
+            "ls web/*.spec.ts | xargs ./scripts/e2e.sh main",
+            // Another repo without the table; a cwd the walker cannot
+            // follow; a script outside the repo.
+            "cd {OTHER} && ./scripts/e2e.sh",
+            "bash {OTHER}/scripts/e2e.sh",
+            "cd \"$d\" && ./scripts/e2e.sh",
+            // Another program; runs on another host.
+            "./scripts/check.sh",
+            "bash scripts/check.sh",
+            "ssh host ./scripts/e2e.sh",
+            "ssh host bash scripts/e2e.sh",
+            "docker exec app bash scripts/e2e.sh",
+            // Data: the program's name in text, patterns and messages.
+            "echo ./scripts/e2e.sh",
+            "echo 'run scripts/e2e.sh' >> notes.md",
+            "printf '%s\\n' 'bash scripts/e2e.sh' > notes.md",
+            "grep -n playwright scripts/e2e.sh",
+            "rg 'scripts/e2e.sh' docs",
+            "cat scripts/e2e.sh",
+            "chmod +x scripts/e2e.sh",
+            "bash -n scripts/e2e.sh",
+            "git add scripts/e2e.sh && git commit -m 'run scripts/e2e.sh and bunx playwright test'",
+            "cat > notes.md <<'EOF'\n./scripts/e2e.sh\nbash scripts/e2e.sh\nbunx playwright test\nEOF",
+            "python3 - <<'PY'\nimport subprocess\nsubprocess.run(['./scripts/e2e.sh'])\nPY",
+        ],
+    );
+}
+
+/// A rule on a bare program with `with` and `cwd`, through the runners
+/// and `package.json` scripts, and a rule on `bun run <script>` as typed.
+#[test]
+fn expensive_program_with_cwd_and_runners_r103() {
+    let (_tmp, app, other) = expensive_fixture();
+    let web = ctx_at(&app.join("web"), Path::new("/h"));
+    let root = ctx_at(&app, Path::new("/h"));
+    all_filled(
+        &web,
+        WIDE,
+        &app,
+        &other,
+        &[
+            "bunx playwright test",
+            "bunx playwright test --workers=4",
+            "npx playwright test --project=chromium",
+            "bun x playwright test",
+            "npm exec playwright test",
+            "./node_modules/.bin/playwright test",
+            "env CI=1 bunx playwright test",
+            "timeout 900 npx playwright test",
+            "nohup bunx playwright test &",
+            "sh -c 'bunx playwright test'",
+            // The script text from package.json.
+            "bun run e2e",
+            "npm run e2e",
+            "bun e2e",
+            "npm run e2e -- --workers=2",
+            // `bun run <script>` as typed.
+            "bun run e2e:all",
+            "timeout 600 bun run e2e:all",
+        ],
+    );
+    all_filled(
+        &root,
+        WIDE,
+        &app,
+        &other,
+        &[
+            "cd web && bunx playwright test",
+            "cd web && bun run e2e",
+            "(cd web && npx playwright test)",
+            "bun run e2e:all",
+        ],
+    );
+    all_filled(
+        &web,
+        ALLOWED,
+        &app,
+        &other,
+        &[
+            "bunx playwright test login.spec.ts",
+            "bunx playwright test -g login",
+            "bunx playwright test --grep @smoke",
+            "bun run e2e tests/a.spec.ts",
+            "npm run e2e -- tests/a.spec.ts",
+            "bun run e2e -g login",
+            "bunx playwright test \"$f\"",
+            "bunx playwright show-report",
+            "bunx playwright install",
+            "bun run build",
+            "bunx tsc --noEmit",
+            "bun run e2e:all-fast",
+            "echo bunx playwright test",
+            "grep -rn 'playwright test' .",
+            "git commit -m 'bun run e2e:all and bunx playwright test'",
+            "cd {OTHER}/web && bunx playwright test",
+            "cd {OTHER}/web && bun run e2e:all",
+        ],
+    );
+    // Outside the rule's cwd.
+    all_filled(
+        &root,
+        ALLOWED,
+        &app,
+        &other,
+        &["bunx playwright test", "npx playwright test"],
+    );
+}
+
+/// The refusal names the command as typed, the rule, the narrow form and
+/// the gate step.
+#[test]
+fn expensive_refusal_text_r103() {
+    let (_tmp, app, _other) = expensive_fixture();
+    let c = ctx_at(&app, Path::new("/h"));
+    let why = |cmd: &str| match bash_ruling(&c, cmd) {
+        Ruling::Deny(r) => {
+            assert_eq!(r.rule, "expensive-wide");
+            r.why
+        }
+        other => panic!("{cmd}: {other:?}"),
+    };
+    assert_eq!(
+        why("timeout 900 ./scripts/e2e.sh main"),
+        "`timeout 900 ./scripts/e2e.sh main` runs all of \"browser suite\" (tollgate.toml [[expensive]], R103). Narrow form: scripts/e2e.sh <suite> <file>.spec.ts. The whole run belongs to the gate: a push or a merge to a full ref starts it. To run or read it now: tollgate run \"e2e main\" (a pass of the same inputs is reused)."
+    );
+    // No step: no `tollgate run` text. A package script names the
+    // command the agent typed.
+    assert_eq!(
+        why("cd web && bun run e2e"),
+        "`bun run e2e` runs all of \"web tests\" (tollgate.toml [[expensive]], R103). Narrow form: bunx playwright test <file>.spec.ts. The whole run belongs to the gate: a push or a merge to a full ref starts it."
+    );
+    // Long commands are cut.
+    let long = format!("./scripts/e2e.sh main {}", "--workers=2 ".repeat(20));
+    let w = why(&long);
+    assert!(w.starts_with("`./scripts/e2e.sh main --workers=2"), "{w}");
+    assert!(w.contains("...` runs all of"), "{w}");
+}
+
+/// A repo whose `tollgate.toml` has no table, and a dir with no repo, get
+/// no rule; a malformed table is no rule either (`config --check` reports
+/// it).
+#[test]
+fn expensive_no_table_no_rule_r103() {
+    let (_tmp, app, other) = expensive_fixture();
+    std::fs::write(other.join("tollgate.toml"), "version = 1\n").unwrap();
+    let c = ctx_at(&other, Path::new("/h"));
+    all_filled(
+        &c,
+        ALLOWED,
+        &app,
+        &other,
+        &["./scripts/e2e.sh", "cd web && bunx playwright test"],
+    );
+    std::fs::write(
+        app.join("tollgate.toml"),
+        "version = 1\n[[expensive]]\nname = \"x\"\nprogram = \"scripts/e2e.sh\"\n",
+    )
+    .unwrap();
+    all_filled(
+        &ctx_at(&app, Path::new("/h")),
+        ALLOWED,
+        &app,
+        &other,
+        &["./scripts/e2e.sh"],
+    );
 }

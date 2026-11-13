@@ -251,3 +251,36 @@ fn an_unarmed_gate_denies_every_bash_call_and_repairs_links_t5_r24_l8_l18() {
     std::fs::remove_file(a.data().join("install.json")).unwrap();
     assert_eq!(a.bash("ls").0, Some(2));
 }
+
+/// R103: the wide form of a command the repo declares expensive is denied
+/// with the narrow form and the gate step; the narrow form runs.
+#[test]
+fn an_expensive_command_is_denied_wide_and_allowed_narrow_r103() {
+    let a = Armed::new();
+    let repo = a.sb.repo("myapp");
+    std::fs::write(
+        repo.join("tollgate.toml"),
+        r#"version = 1
+[[expensive]]
+name = "browser suite"
+program = "scripts/e2e*.sh"
+narrow = ["*.spec.ts", "-g", "--grep*"]
+hint = "scripts/e2e.sh <suite> <file>.spec.ts"
+step = "e2e main"
+"#,
+    )
+    .unwrap();
+    // Never run: the guard only reads it.
+    write_exe(&repo.join("scripts/e2e.sh"), "#!/bin/sh\nexit 1\n");
+    let (code, out, err) = a.bash(&format!("cd {} && ./scripts/e2e.sh main", repo.display()));
+    assert_eq!((code, out.as_str()), (Some(2), ""), "{err}");
+    assert_eq!(
+        err.trim_end(),
+        "tollgate guard: denied: `./scripts/e2e.sh main` runs all of \"browser suite\" (tollgate.toml [[expensive]], R103). Narrow form: scripts/e2e.sh <suite> <file>.spec.ts. The whole run belongs to the gate: a push or a merge to a full ref starts it. To run or read it now: tollgate run \"e2e main\" (a pass of the same inputs is reused)."
+    );
+    let (code, out, err) = a.bash(&format!(
+        "cd {} && ./scripts/e2e.sh main web/login.spec.ts",
+        repo.display()
+    ));
+    assert_eq!((code, out.as_str(), err.as_str()), (Some(0), "", ""));
+}

@@ -111,6 +111,9 @@ pub struct Context {
     /// The `TOLLGATE_INLINE_CAP` the guard exports for this call: a
     /// client value may only lower it.
     pub inline_cap: u64,
+    /// R103: the repo of `cwd` and its `[[expensive]]` rules, when the
+    /// caller read them; `None`: the walker reads them itself.
+    pub expensive: Option<super::expensive::Seed>,
 }
 
 impl Context {

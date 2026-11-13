@@ -9,8 +9,9 @@ use super::cmds::{Arg, operands_at};
 pub enum Runner {
     /// The command that starts at this index of the arguments.
     Argv(usize),
-    /// The script with this name in `package.json` of the cwd.
-    Script(String),
+    /// The script with this name in `package.json` of the cwd, and the
+    /// index of the first argument the runner adds to its text.
+    Script(String, usize),
     /// Nothing the walker reads (`uv sync`, `bun test`).
     Data,
 }
@@ -91,13 +92,13 @@ pub fn runner(name: &str, args: &[Arg]) -> Option<Runner> {
         ("bun" | "npm" | "pnpm" | "yarn", Some("run" | "run-script")) => {
             let k = 1 + operands_at(&args[1..], &[]);
             match args.get(k).and_then(Arg::lit) {
-                Some(script) => Runner::Script(script.to_owned()),
+                Some(script) => Runner::Script(script.to_owned(), k + 1),
                 None => Runner::Data,
             }
         }
-        ("npm" | "pnpm" | "yarn", Some(s @ ("test" | "start"))) => Runner::Script(s.to_owned()),
+        ("npm" | "pnpm" | "yarn", Some(s @ ("test" | "start"))) => Runner::Script(s.to_owned(), 1),
         ("bun", Some(s)) if !s.starts_with('-') && !BUN_BUILTINS.contains(&s) => {
-            Runner::Script(s.to_owned())
+            Runner::Script(s.to_owned(), 1)
         }
         ("uv" | "bun" | "npm" | "pnpm" | "yarn", _) => Runner::Data,
         _ => return None,
@@ -122,11 +123,17 @@ mod tests {
         assert_eq!(run("bunx tsc --noEmit"), Some(Runner::Argv(0)));
         assert_eq!(run("npx -y -p pkg tool"), Some(Runner::Argv(3)));
         assert_eq!(run("bun x tsc"), Some(Runner::Argv(1)));
-        assert_eq!(run("bun run build"), Some(Runner::Script("build".into())));
-        assert_eq!(run("npm run -s lint"), Some(Runner::Script("lint".into())));
-        assert_eq!(run("npm test"), Some(Runner::Script("test".into())));
+        assert_eq!(
+            run("bun run build"),
+            Some(Runner::Script("build".into(), 2))
+        );
+        assert_eq!(
+            run("npm run -s lint"),
+            Some(Runner::Script("lint".into(), 3))
+        );
+        assert_eq!(run("npm test"), Some(Runner::Script("test".into(), 1)));
         assert_eq!(run("bun test"), Some(Runner::Data));
-        assert_eq!(run("bun ship"), Some(Runner::Script("ship".into())));
+        assert_eq!(run("bun ship"), Some(Runner::Script("ship".into(), 1)));
         assert_eq!(run("bun build"), Some(Runner::Data));
         assert_eq!(run("bun --version"), Some(Runner::Data));
         assert_eq!(run("uv sync"), Some(Runner::Data));
