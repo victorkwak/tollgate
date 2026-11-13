@@ -627,7 +627,7 @@ pub fn run_step(ctx: &Ctx, a: &StepArgs) -> u8 {
 fn refuse_full_in_session(rev: Option<&str>) -> u8 {
     eprintln!(
         "tollgate: check --tier full is not started by hand in an agent session (R104).\n\
-         tollgate: a push, or a merge into a full ref, starts the full tier and reuses its result: run git push. Results so far: tollgate status.\n\
+         tollgate: a push of, or a merge into, a full ref (main) starts the full tier and reuses its result; a branch push needs only fast (R107). Results so far: tollgate status.\n\
          tollgate: after a stored fail: tollgate check --tier full --rev {} --rerun (runs only the steps that did not pass).",
         rev.unwrap_or("<rev>")
     );
@@ -1515,6 +1515,48 @@ pub fn stats(ctx: &Ctx, since_arg: Option<&str>, json: bool) -> u8 {
         }
     } else {
         for l in crate::metrics::render(&s) {
+            println!("{l}");
+        }
+    }
+    exit::OK
+}
+
+/// `tollgate cost [--since D] [--repo R] [--json]` (R109): gate time per
+/// repo and local day from the `job` lines of the metrics log. Writes
+/// nothing.
+pub fn cost(ctx: &Ctx, since_arg: &str, repo: Option<&str>, json: bool) -> u8 {
+    let dirs = match ctx.dirs() {
+        Ok(d) => d,
+        Err(e) => return fail(e),
+    };
+    let from = match since(since_arg) {
+        Ok(f) => f,
+        Err(e) => return fail(e),
+    };
+    let events = match crate::metrics::read(&dirs, Some(from)) {
+        Ok(log) => {
+            for m in &log.skipped {
+                eprintln!("tollgate: metrics log: {m}");
+            }
+            log.events
+        }
+        Err(e) => return fail(format!("metrics log: {e}")),
+    };
+    let lookup = crate::metrics::cost::from_reports(&dirs);
+    let c = crate::metrics::cost::cost(
+        &events,
+        Some(from),
+        &jiff::tz::TimeZone::system(),
+        repo,
+        &lookup,
+    );
+    if json {
+        match serde_json::to_string_pretty(&c) {
+            Ok(t) => println!("{t}"),
+            Err(e) => return fail(e),
+        }
+    } else {
+        for l in crate::metrics::cost::render(&c) {
             println!("{l}");
         }
     }

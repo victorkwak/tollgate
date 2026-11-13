@@ -132,10 +132,20 @@ impl<'a> Gate<'a> {
         tip: Option<&Oid>,
         own_ref: &str,
     ) -> Result<RefRules, String> {
+        self.policy(tree, tip, own_ref)?.config.ref_rules()
+    }
+
+    /// The policy that applies to new commit `tip` on `own_ref` (L2), with
+    /// its policy commit. `tree` is the tree under test.
+    pub fn policy(
+        &self,
+        tree: &Oid,
+        tip: Option<&Oid>,
+        own_ref: &str,
+    ) -> Result<policy::Policy, String> {
         let entries = self.git.ls_tree(tree).map_err(|e| e.to_string())?;
-        let p = policy::resolve(&self.git, &entries, tip, &self.remote_refs, Some(own_ref))
-            .map_err(|e| e.to_string())?;
-        p.config.ref_rules()
+        policy::resolve(&self.git, &entries, tip, &self.remote_refs, Some(own_ref))
+            .map_err(|e| e.to_string())
     }
 
     /// The current branch (`refs/heads/x`), or `HEAD` when detached.
@@ -413,23 +423,35 @@ fn run_id(t: jiff::Timestamp) -> String {
 /// share `t`, `ms` and a run id, so `stats` takes one hook time per run.
 /// `ms` runs from the hook process's start ([`HookClock`]).
 fn record_metrics(gate: &Gate<'_>, checks: &[Check], outcomes: &[Outcome]) {
+    let lines: Vec<(Option<Tier>, HookOutcome, Option<&JobId>)> = outcomes
+        .iter()
+        .zip(checks)
+        .map(|(o, c)| {
+            let (outcome, job) = o.metric();
+            (Some(c.tier), outcome, job)
+        })
+        .collect();
+    record_hook_lines(gate, &lines);
+}
+
+/// Metrics lines of one hook run: (tier, outcome, job) per check or
+/// refused ref (item 50, R102); never fails the hook.
+pub fn record_hook_lines(gate: &Gate<'_>, lines: &[(Option<Tier>, HookOutcome, Option<&JobId>)]) {
     let ms_of = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     let ms = ms_of(gate.clock.started.elapsed());
     let repo_hook_ms = gate.clock.repo_hook.map(ms_of);
     let t = jiff::Timestamp::now();
     let repo = metrics::repo_name(&gate.layout.common_dir);
     let run = run_id(t);
-    let events: Vec<metrics::Event> = outcomes
+    let events: Vec<metrics::Event> = lines
         .iter()
-        .zip(checks)
-        .map(|(o, c)| {
-            let (outcome, job) = o.metric();
+        .map(|(tier, outcome, job)| {
             metrics::Event::Hook(metrics::HookEvent {
                 t,
                 hook: gate.hook.to_owned(),
                 repo: repo.clone(),
-                tier: c.tier,
-                outcome,
+                tier: *tier,
+                outcome: *outcome,
                 job: job.cloned(),
                 ms,
                 repo_hook_ms,

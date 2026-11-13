@@ -16,7 +16,7 @@ tollgate closes these gaps for agent sessions. Your own terminal is not gated.
 ## What it does
 
 - **Hooks for every git process of a session.** `tollgate install` adds the hook path to the `env` of `~/.claude/settings.json`. Each git process that a Claude session starts (Bash calls, scripts, `bash -c`) then runs tollgate's hooks. When a hook fails or is killed, git stops, so the gate fails closed.
-- **Two tiers.** `fast` runs on every commit and checks what the change affects: the Rust crates that depend on the changed ones, the changed files for linters, the TypeScript and Python roots that changed. `full` checks everything. It runs on merges into `main`, `master` or `integration/*`, on pushes to a trusted remote, and in CI.
+- **Two tiers.** `fast` runs on every commit and on branch pushes, and checks what the change affects: the Rust crates that depend on the changed ones, the changed files for linters, the TypeScript and Python roots that changed. `full` checks everything. It runs on merges into `main`, `master` or `integration/*`, on pushes of those branches to a trusted remote, and in CI.
 - **The exact tree.** Checks run on the tree from the git index, in a separate verify checkout with a clean environment. Untracked and dirty files never take part. Each agent worktree gets its own checkout, so its incremental build stays warm.
 - **Results by tree.** A result is stored by tree hash, tier and a fingerprint of the toolchain and config. An identical tree is never checked twice. In `fast` jobs, a step whose inputs did not change reuses its last pass. Merges and pushes to `main` (and the other full refs) and CI run every step again, except a step that already ran and passed on that same tree. `tollgate check --rerun` runs only the steps that did not pass on the tree; `--rerun --all` runs every step.
 - **Policy from the protected branch.** `tollgate.toml` and the tool configs come from the merge-base with the trusted `main`. A branch cannot weaken the checks that judge it. Its policy changes apply after it merges.
@@ -67,7 +67,7 @@ To remove it, run `tollgate uninstall`. It removes exactly what `install` added.
    ```toml
    [scope]
    roots = ["~/Repos"]                                   # repos directly under these dirs are gated
-   remotes = ["*github.com:you/*", "*github.com/you/*"]  # trusted remotes: full check on push
+   remotes = ["*github.com:you/*", "*github.com/you/*"]  # trusted remotes: full check on push of main
    include = ["myapp"]                                    # start with one repo; ["*"] for all
    exclude = []
 
@@ -101,7 +101,7 @@ To remove it, run `tollgate uninstall`. It removes exactly what `install` added.
    full_refs = ["main", "integration/*"]   # merges into these run the full tier
 
    [push]
-   fast_refs = ["wip/*"]                   # pushes of these branches run only fast
+   full_refs = ["release/*"]               # pushes of these branches also run the full tier
 
    [select]
    docs_only = ["docs/**"]                 # commits that touch only these run no steps
@@ -139,13 +139,14 @@ To remove it, run `tollgate uninstall`. It removes exactly what `install` added.
    | `tollgate wait <job>` | Wait for a job: exit 0 pass, 1 fail, 3 still running. |
    | `tollgate status` | Results and running jobs for `HEAD` and the index, and commits on the branch that have no result. |
    | `tollgate report <job>`, `tollgate log <job> <step>` | The full report and a step log. |
+   | `tollgate cost [--since D] [--repo R]` | Gate time per day, repo and tier, and the branches that cost most. |
    | `tollgate merge <branch>` | Merge into a full ref with a `full` check before the commit. |
 
    When a check takes longer than the hook can wait, the hook denies and leaves the job running. The deny message gives one command that waits and then commits again.
 
 ## How it works
 
-**Tiers and gates.** There are four gates. `pre-commit` runs `fast` on every commit. `pre-merge-commit` runs the tier of the target branch: `full` for a full ref. `pre-push` runs `full` for pushes to a trusted remote, unless `push.fast_refs` matches the branch. CI runs `tollgate run --tier full --here`, which you add with `tollgate ci-snippet --gitlab`.
+**Tiers and gates.** There are four gates. `pre-commit` runs `fast` on every commit. `pre-merge-commit` runs the tier of the target branch: `full` for a full ref. `pre-push` to a trusted remote runs `full` for a full ref or a branch that matches `push.full_refs`, and `fast` for other branches. A push that git would reject because the remote branch has commits the push does not contain is refused at once, with no check (R102). CI runs `tollgate run --tier full --here`, which you add with `tollgate ci-snippet --gitlab`.
 
 **Results by tree.** A hook computes the tree of the index and looks for a stored result with the same tree, tier and fingerprint. On a hit, the hook answers at once. On a miss, it starts a job in the verify checkout for that worktree and waits for it up to its inline budget. Results are written only by the job runner. `tollgate audit` lists them for review.
 

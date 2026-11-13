@@ -734,8 +734,11 @@ fn s5_amend_is_gated() {
 }
 
 /// The S6/S7 policy: `deep` refuses `bad` only in tier `full`, so a
-/// branch can hold a tree that passes `fast` and fails `full`.
-const DEEP_POLICY: &str = "version = 1\n[[step]]\nname = \"quick\"\nkind = \"command\"\nrun = \"true\"\n[[step]]\nname = \"deep\"\nkind = \"command\"\nrun = \"test ! -f bad\"\ntiers = [\"full\"]\n";
+/// branch can hold a tree that passes `fast` and fails `full`. Since R107
+/// (2026-11-12) a branch push needs only `fast` by default;
+/// `push.full_refs = ["**"]` keeps every branch push at `full`, so these
+/// tests still prove that the push gate catches such a tree.
+const DEEP_POLICY: &str = "version = 1\n[push]\nfull_refs = [\"**\"]\n[[step]]\nname = \"quick\"\nkind = \"command\"\nrun = \"true\"\n[[step]]\nname = \"deep\"\nkind = \"command\"\nrun = \"test ! -f bad\"\ntiers = [\"full\"]\n";
 
 /// S6: `merge --no-ff` into `main` needs `full`; a fast-forward merge runs
 /// no gate hook (the L1 gap), so the push of `main` needs `full`.
@@ -897,7 +900,9 @@ fn s10_missing_hooks_are_repaired_or_the_guard_denies() {
 /// to this tree's key.
 #[test]
 fn s11_forged_records_do_not_pass() {
-    let lab = Lab::new(BAD_FILE_POLICY);
+    // Branch pushes need `full` here (R107: `push.full_refs`), so the
+    // forged records are `full` records, as before R107.
+    let lab = Lab::new(&format!("{BAD_FILE_POLICY}[push]\nfull_refs = [\"**\"]\n"));
     let results = lab.sb().state().join("results");
     for cmd in [
         format!("echo '{{}}' > {}/ab/x.json", results.display()),
@@ -1918,11 +1923,15 @@ fn s30_a_look_alike_remote_path_is_never_trusted() {
         s.out().contains("DENIED pre-commit") && s.out().contains("step lint: fail"),
         "{s:?}"
     );
-    // Still in scope by the loose match: its push is gated at full.
+    // Still in scope by the loose match: its push is gated (R5), and the
+    // bad commit is refused. A branch push needs `fast` since R107
+    // (2026-11-12; `full` before), and `lint` runs in `fast` too.
     lab.plain(&["commit", "-q", "--no-verify", "-m", "bad"]);
     let s = lab.session("git push origin feat");
     assert!(
-        s.out().contains("DENIED pre-push") && s.out().contains("tier full"),
+        s.out().contains("DENIED pre-push refs/heads/feat")
+            && s.out().contains("tier fast")
+            && s.out().contains("verdict fail"),
         "{s:?}"
     );
     assert!(lab.refs_in(&evil).contains("refs/heads/main"));

@@ -306,7 +306,8 @@ fn scope_by_path_depth_and_by_push_url_t4_r4_r5_l4() {
     let r = sb.hooked(&clone, &["commit", "-m", "f"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
     assert!(sb.jobs().is_empty(), "out-of-scope commit gated: {}", r.out);
-    // ...but its push to a trusted URL is gated, at full (R5, R20).
+    // ...but its push to a trusted URL is gated (R5), at fast for a
+    // branch that is not a full ref (R107, 2026-11-12; full before).
     let bare = sb.root().join("remotes/trusted.git");
     std::fs::create_dir_all(&bare).unwrap();
     sb.git(&bare, &["init", "-q", "--bare"]);
@@ -317,7 +318,7 @@ fn scope_by_path_depth_and_by_push_url_t4_r4_r5_l4() {
         "{}",
         r.out
     );
-    assert_eq!(tiers_of_jobs(&sb), ["full"]);
+    assert_eq!(tiers_of_jobs(&sb), ["fast"]);
     // A push to an untrusted URL from an out-of-scope repo is not gated.
     let other = sb.root().join("elsewhere/other.git");
     sb.git(
@@ -355,30 +356,34 @@ fn push_tiers_tags_and_deletions_t13_r20_r22() {
     let sb = Sandbox::new();
     let (repo, _bare) = trusted_repo(
         &sb,
-        "version = 1\n[push]\nfast_refs = [\"wip/*\"]\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n",
+        "version = 1\n[push]\nfull_refs = [\"release/*\"]\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n",
     );
-    sb.hooked(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.hooked(&repo, &["checkout", "-q", "-b", "release/1"]);
     stage(&sb, &repo, "f.txt", "1\n");
     let r = sb.hooked(&repo, &["commit", "-m", "f"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
     assert_eq!(tiers_of_jobs(&sb), ["fast"]);
-    // A feature branch to a trusted remote needs full (R20, L7).
-    let r = sb.hooked(&repo, &["push", "-q", "origin", "feat"]);
+    // A branch that matches push.full_refs needs full (R107).
+    let r = sb.hooked(&repo, &["push", "-q", "origin", "release/1"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
     assert_eq!(tiers_of_jobs(&sb), ["fast", "full"]);
-    // wip/* needs only fast. A new branch has no remote tree, so its base
-    // is the empty tree and the fast job checks everything (R55, R56).
+    // Another branch needs only fast (R107). A new branch has no remote
+    // tree; its base is its policy commit, the trusted main (R55, R108).
+    // The commit's own fast record (base release/1) runs every step, so it
+    // covers the selection from main too (R79): no job.
     sb.hooked(&repo, &["checkout", "-q", "-b", "wip/x"]);
     stage(&sb, &repo, "w.txt", "1\n");
     assert_eq!(sb.hooked(&repo, &["commit", "-m", "w"]).code, Some(0));
     let r = sb.hooked(&repo, &["push", "-q", "origin", "wip/x"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
     assert!(
-        r.out.contains("pre-push refs/heads/wip/x") && r.out.contains("tier fast"),
+        r.out.contains("pass pre-push refs/heads/wip/x")
+            && r.out.contains("tier fast")
+            && r.out.contains("record of job"),
         "{}",
         r.out
     );
-    assert_eq!(tiers_of_jobs(&sb), ["fast", "full", "fast", "fast"]);
+    assert_eq!(tiers_of_jobs(&sb), ["fast", "full", "fast"]);
     // The next push has the remote tip as its base: the commit's own fast
     // record (same base) allows it, no job.
     stage(&sb, &repo, "w2.txt", "1\n");
@@ -392,7 +397,7 @@ fn push_tiers_tags_and_deletions_t13_r20_r22() {
     sb.git(&repo, &["tag", "v1"]);
     let r = sb.hooked(&repo, &["push", "-q", "origin", "v1"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
-    let r = sb.hooked(&repo, &["push", "-q", "--delete", "origin", "feat"]);
+    let r = sb.hooked(&repo, &["push", "-q", "--delete", "origin", "release/1"]);
     assert_eq!(r.code, Some(0), "{}", r.out);
     assert_eq!(sb.jobs().len(), jobs);
     // wip/x pushed onto main needs full: a new full job.
@@ -410,7 +415,7 @@ fn push_tiers_tags_and_deletions_t13_r20_r22() {
 fn a_push_to_main_runs_only_the_steps_not_fresh_on_the_tree_r101_l16() {
     let sb = Sandbox::new();
     let counter = sb.root().join("count");
-    let toml = "version = 1\n[[step]]\nname = \"narrow\"\nkind = \"command\"\nrun = \"echo narrow >> \\\"$COUNT\\\"\"\ninputs = [\"a/**\"]\n[[step]]\nname = \"wide\"\nkind = \"command\"\nrun = \"echo wide >> \\\"$COUNT\\\"\"\n";
+    let toml = "version = 1\n[push]\nfull_refs = [\"feat\"]\n[[step]]\nname = \"narrow\"\nkind = \"command\"\nrun = \"echo narrow >> \\\"$COUNT\\\"\"\ninputs = [\"a/**\"]\n[[step]]\nname = \"wide\"\nkind = \"command\"\nrun = \"echo wide >> \\\"$COUNT\\\"\"\n";
     let (repo, _bare) = trusted_repo(&sb, toml);
     sb.scoped_host(&format!(
         "trusted_paths = [\"{}\"]\n[job.env]\nCOUNT = \"{}\"",
@@ -450,6 +455,210 @@ fn a_push_to_main_runs_only_the_steps_not_fresh_on_the_tree_r101_l16() {
     assert!(rep["steps"][0].get("reused_from").is_none(), "{rep}");
     assert!(rep["steps"][0].get("fresh_from").is_none(), "{rep}");
     assert_eq!(rep["steps"][1]["fresh_from"], branch_job.as_str(), "{rep}");
+}
+
+/// A step that takes seconds, so a job the hook started would show. The
+/// tests that use it change `.cfg` files: a docs-only change (`*.txt`)
+/// would pass with no step (R61).
+const SLOW: &str =
+    "version = 1\n[[step]]\nname = \"slow\"\nkind = \"command\"\nrun = \"sleep 3\"\n";
+
+/// Another clone of `bare` adds a commit to `branch` and pushes it, as
+/// another machine would (no hooks); it starts from the bare's current
+/// branch. Returns the new remote commit.
+fn advance_remote(sb: &Sandbox, bare: &Path, branch: &str, file: &str) -> String {
+    let other = sb.root().join(format!("other-{file}"));
+    sb.git(
+        &sb.root(),
+        &[
+            "clone",
+            "-q",
+            "-b",
+            branch,
+            bare.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    let c = sb.commit_file(&other, file, "1\n", "elsewhere");
+    sb.git(&other, &["push", "-q", "origin", branch]);
+    c
+}
+
+/// R102: git gives `pre-push` the remote's current value of each ref (from
+/// the push's ref advertisement, no fetch). When the remote branch has
+/// commits that the push does not contain, git rejects the push after the
+/// hook, so the hook refuses at once and starts no check. Forced pushes,
+/// new branches and fast-forwards are untouched.
+#[test]
+fn a_push_behind_the_remote_branch_starts_no_check_r102() {
+    let sb = Sandbox::new();
+    let (repo, bare) = trusted_repo(&sb, SLOW);
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(&repo, "f.cfg", "1\n", "f");
+    sb.git(&repo, &["push", "-q", "origin", "feat"]);
+    // The remote branch moves on elsewhere; a local commit on the old tip.
+    let theirs = advance_remote(&sb, &bare, "feat", "o.cfg");
+    sb.commit_file(&repo, "l.cfg", "1\n", "local");
+    // The remote commit is not in the local repo: the hook gets the line
+    // with the remote's current value and refuses before any job.
+    let started = Instant::now();
+    let r = sb.hooked(&repo, &["push", "origin", "feat"]);
+    assert_ne!(r.code, Some(0), "{}", r.out);
+    let want = format!(
+        "tollgate: DENIED pre-push refs/heads/feat: origin has commits that this push does not contain (remote at {}). No check was started (R102).",
+        &theirs[..12]
+    );
+    assert!(r.out.contains(&want), "{}", r.out);
+    assert!(
+        r.out.contains(
+            "tollgate: run: git fetch origin feat && git merge FETCH_HEAD   (or rebase), then push again."
+        ),
+        "{}",
+        r.out
+    );
+    assert!(sb.jobs().is_empty(), "{}", r.out);
+    assert!(started.elapsed() < Duration::from_secs(3), "{}", r.out);
+    // The refusal is a `behind` line in the metrics log.
+    let stats = sb.tollgate(&repo, &["stats", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stats.out).unwrap();
+    let behind: u64 = v["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["behind"].as_u64().unwrap())
+        .sum();
+    assert_eq!(behind, 1, "{v:#}");
+    // Fetched but not merged: git itself leaves the ref out of the hook's
+    // input (non-fast-forward) and rejects it; still no job.
+    sb.git(&repo, &["fetch", "-q", "origin"]);
+    let r = sb.hooked(&repo, &["push", "origin", "feat"]);
+    assert_ne!(r.code, Some(0), "{}", r.out);
+    assert!(r.out.contains("rejected"), "{}", r.out);
+    assert!(sb.jobs().is_empty(), "{}", r.out);
+    // After a merge the push goes on as before: a fast job (R107).
+    sb.git(&repo, &["merge", "-q", "--no-edit", "origin/feat"]);
+    let r = sb.hooked(&repo, &["push", "-q", "origin", "feat"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(!r.out.contains("R102"), "{}", r.out);
+    assert_eq!(tiers_of_jobs(&sb), ["fast"]);
+    // A fast-forward push: untouched.
+    sb.commit_file(&repo, "l2.cfg", "1\n", "local 2");
+    let r = sb.hooked(&repo, &["push", "-q", "origin", "feat"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(!r.out.contains("R102"), "{}", r.out);
+    assert_eq!(sb.jobs().len(), 2, "{}", r.out);
+    // A new branch (zero remote oid): untouched.
+    sb.git(&repo, &["checkout", "-q", "-b", "new"]);
+    sb.commit_file(&repo, "n.cfg", "1\n", "new");
+    let r = sb.hooked(&repo, &["push", "-q", "origin", "new"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(!r.out.contains("R102"), "{}", r.out);
+    assert_eq!(sb.jobs().len(), 3, "{}", r.out);
+    // Forced pushes are not this rule's business: `--force`, a `+`
+    // refspec and a `+` push refspec in the remote's config go on to the
+    // check, with the remote commit not fetched.
+    sb.git(&repo, &["checkout", "-q", "feat"]);
+    let forced: [&[&str]; 3] = [
+        &["push", "-q", "--force", "origin", "feat"],
+        &["push", "-q", "origin", "+feat"],
+        &["push", "-q", "origin"],
+    ];
+    for (n, args) in forced.into_iter().enumerate() {
+        if n == 2 {
+            sb.git(
+                &repo,
+                &[
+                    "config",
+                    "remote.origin.push",
+                    "+refs/heads/feat:refs/heads/feat",
+                ],
+            );
+        }
+        advance_remote(&sb, &bare, "feat", &format!("x{n}.cfg"));
+        sb.commit_file(&repo, &format!("y{n}.cfg"), "1\n", "mine");
+        let jobs = sb.jobs().len();
+        let r = sb.hooked(&repo, args);
+        assert_eq!(r.code, Some(0), "{args:?}: {}", r.out);
+        assert!(!r.out.contains("R102"), "{args:?}: {}", r.out);
+        assert_eq!(sb.jobs().len(), jobs + 1, "{args:?}: {}", r.out);
+        assert_eq!(
+            sb.git(&bare, &["rev-parse", "refs/heads/feat"]),
+            head(&sb, &repo),
+            "{args:?}"
+        );
+    }
+}
+
+/// R107, R108 (owner decision 2026-11-12: "Only relevant tests should be
+/// conducted, and then a full test for main"): a branch push to a trusted
+/// remote needs `fast`, with selection against the branch's policy commit
+/// when the remote has no value for it; `full` stays for full refs and
+/// `push.full_refs`.
+#[test]
+fn a_branch_push_runs_the_relevant_tests_and_full_is_for_full_refs_r107_r108() {
+    let sb = Sandbox::new();
+    let (repo, _bare) = trusted_repo(
+        &sb,
+        "version = 1\n[push]\nfull_refs = [\"release/*\"]\n[[step]]\nname = \"a\"\nkind = \"command\"\nrun = \"true\"\nwhen = [\"a/**\"]\n[[step]]\nname = \"b\"\nkind = \"command\"\nrun = \"true\"\nwhen = [\"b/**\"]\n",
+    );
+    let main = head(&sb, &repo);
+    let main_tree = sb.git(&repo, &["rev-parse", "HEAD^{tree}"]);
+    // A new branch cut from the trusted main, one file under b/, committed
+    // with no hook: the push runs a fast job only, selected against main,
+    // so step `a` does not run.
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(&repo, "b/x.cfg", "1\n", "b");
+    let r = sb.hooked(&repo, &["push", "-q", "origin", "feat"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(tiers_of_jobs(&sb), ["fast"], "{}", r.out);
+    let job = job_id(&r.out);
+    let spec: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(sb.state().join("jobs").join(&job).join("spec.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(spec["base_tree"], main_tree.as_str(), "{spec:#}");
+    assert_eq!(spec["select"], true, "{spec:#}");
+    let rep = sb.report(&job);
+    assert_eq!(
+        rep["selection"]["subset"]["steps"],
+        serde_json::json!(["b"]),
+        "{rep:#}"
+    );
+    // A commit made through the hook has its own fast record with main as
+    // its base: that record answers the push of a new branch, no job.
+    sb.git(&repo, &["checkout", "-q", "-b", "feat2", &main]);
+    stage(&sb, &repo, "a/y.cfg", "1\n");
+    let r = sb.hooked(&repo, &["commit", "-m", "a"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let jobs = sb.jobs().len();
+    let r = sb.hooked(&repo, &["push", "-q", "origin", "feat2"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        r.out.contains("pass pre-push refs/heads/feat2") && r.out.contains("record of job"),
+        "{}",
+        r.out
+    );
+    assert_eq!(sb.jobs().len(), jobs, "{}", r.out);
+    // push.full_refs: release/x needs full.
+    sb.git(&repo, &["checkout", "-q", "-b", "release/x", &main]);
+    sb.commit_file(&repo, "b/r.cfg", "1\n", "r");
+    let r = sb.hooked(&repo, &["push", "-q", "origin", "release/x"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(
+        tiers_of_jobs(&sb).last().map(String::as_str),
+        Some("full"),
+        "{}",
+        r.out
+    );
+    // A full ref still needs full.
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    sb.commit_file(&repo, "b/m.cfg", "1\n", "m");
+    let jobs = sb.jobs().len();
+    let r = sb.hooked(&repo, &["push", "-q", "origin", "main"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(r.out.contains("tier full"), "{}", r.out);
+    assert_eq!(sb.jobs().len(), jobs + 1, "{}", r.out);
+    assert_eq!(tiers_of_jobs(&sb).last().map(String::as_str), Some("full"));
 }
 
 /// Item 33 (R4): once a repo had a trusted remote, losing it (removed, or
@@ -618,13 +827,15 @@ fn a_full_miss_is_allowed_for_the_trusted_remote_tip_r14() {
 /// `url.<x>.insteadOf` that sends the trusted origin to a repo the agent
 /// controls must not make `ls-remote` vouch for a failing main, and a
 /// `pushInsteadOf` must not turn a push to the trusted origin into a push
-/// that needs only `fast`.
+/// that needs only `fast`. The policy sets `push.full_refs = ["**"]`, so
+/// every branch push to a trusted remote needs `full` and a push that lost
+/// its trust would need `fast` (R107; before R107 the default did that).
 #[test]
 fn url_rewrites_do_not_move_remote_trust_r14_r5_r20() {
     let sb = Sandbox::new();
     let (repo, bare) = trusted_repo(
         &sb,
-        "version = 1\n[push]\nfast_refs = []\n[[step]]\nname = \"lint\"\nkind = \"command\"\nrun = \"test ! -f bad\"\n",
+        "version = 1\n[push]\nfull_refs = [\"**\"]\n[[step]]\nname = \"lint\"\nkind = \"command\"\nrun = \"test ! -f bad\"\n",
     );
     let bare_s = bare.to_str().unwrap();
     // A failing main made without hooks (as Victor's terminal could).
@@ -681,7 +892,7 @@ fn url_rewrites_do_not_move_remote_trust_r14_r5_r20() {
     );
     sb.git(&repo, &["reset", "-q", "--hard", "origin/main"]);
     // pushInsteadOf: the push to origin goes to another URL, but it is
-    // still a push to the trusted remote: full, not fast (R5, R20).
+    // still a push to the trusted remote: full, not fast (R5, R20, R107).
     let elsewhere = sb.root().join("elsewhere.git");
     sb.git(
         &sb.root(),

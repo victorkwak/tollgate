@@ -121,6 +121,7 @@ fn run() -> u8 {
         Command::Audit { since } => cli::audit(&ctx, since.as_deref()),
         Command::Flaky { days } => cli::flaky(&ctx, days),
         Command::Stats { since, json } => cli::stats(&ctx, since.as_deref(), json),
+        Command::Cost { since, repo, json } => cli::cost(&ctx, &since, repo.as_deref(), json),
         Command::RunJob { job, lock_fd } => cli::run_job(&ctx, &job, lock_fd),
         Command::Merge { branch } => tollgate::merge::merge(&ctx, &branch),
         Command::Remotes {
@@ -404,6 +405,20 @@ enum Command {
         #[arg(long)]
         since: Option<String>,
         /// JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Gate time per repo and local day, and the branches that cost most
+    /// (R109). Read-only.
+    Cost {
+        /// Only jobs after this: a date `YYYY-MM-DD`, `<n>d` or a duration
+        /// (`12h`). Default `7d`.
+        #[arg(long, default_value = "7d")]
+        since: String,
+        /// Only this repo (its name in the metrics log).
+        #[arg(long)]
+        repo: Option<String>,
+        /// JSON instead of the tables.
         #[arg(long)]
         json: bool,
     },

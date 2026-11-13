@@ -1872,7 +1872,7 @@ fn reports_record_queue_wait_per_resource_and_for_the_checkout_r85_r87_l20() {
 /// The R104 refusal, line by line.
 const R104_LINES: [&str; 3] = [
     "tollgate: check --tier full is not started by hand in an agent session (R104).",
-    "tollgate: a push, or a merge into a full ref, starts the full tier and reuses its result: run git push. Results so far: tollgate status.",
+    "tollgate: a push of, or a merge into, a full ref (main) starts the full tier and reuses its result; a branch push needs only fast (R107). Results so far: tollgate status.",
     "tollgate: after a stored fail: tollgate check --tier full --rev HEAD --rerun (runs only the steps that did not pass).",
 ];
 

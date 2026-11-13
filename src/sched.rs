@@ -208,6 +208,8 @@ fn lost_metrics(dirs: &Dirs, meta: &JobMeta) {
         steps_fresh: 0,
         flaky: 0,
         quarantined: 0,
+        step_ms: None,
+        branch: None,
     };
     crate::metrics::record(dirs, &[crate::metrics::Event::Job(event)]);
 }

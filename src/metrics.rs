@@ -23,7 +23,8 @@
 //!   `fast_forward`, `tree_passed`) or the full check after `Gate::open`
 //!   (`full`, `recorded`).
 //! - `job`: a finished job's wall time, its queue time before the first
-//!   step and in step slots, steps reused, flaky and quarantined tests.
+//!   step and in step slots, steps reused, flaky and quarantined tests,
+//!   the time of the steps that ran and the branch (R109, [`cost`]).
 //!   The reap of a job whose runner died writes its line, verdict
 //!   [`LOST`], without run times; a cap refusal of it gets no wait sample.
 //!
@@ -48,6 +49,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::Tier;
 use crate::dirs::Dirs;
 use crate::ids::JobId;
+
+pub mod cost;
 
 /// Size at which the log rotates.
 pub const MAX_BYTES: u64 = 8 << 20;
@@ -89,6 +92,9 @@ pub enum HookOutcome {
     Failed,
     /// Plan, store or job error.
     Error,
+    /// R102: the remote branch has commits that the push does not
+    /// contain, so git would reject it; refused before any plan or job.
+    Behind,
 }
 
 /// One line of the log.
@@ -149,8 +155,10 @@ pub struct HookEvent {
     pub hook: String,
     /// Repo name (see [`repo_name`]).
     pub repo: String,
-    /// Tier.
-    pub tier: Tier,
+    /// Tier; absent on an R102 `behind` refusal, which resolves no
+    /// policy and so no tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<Tier>,
     /// How it ended.
     pub outcome: HookOutcome,
     /// The job, when one ran or runs.
@@ -268,6 +276,39 @@ pub struct JobEvent {
     pub flaky: u32,
     /// Quarantined failures.
     pub quarantined: u32,
+    /// Sum of `duration_ms` of the steps that ran in this job: not
+    /// skipped, not reused (R109). Absent on lines from before it and on a
+    /// [`LOST`] line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_ms: Option<u64>,
+    /// The job's origin ref without `refs/heads/` (R109). Absent as
+    /// `step_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// R109: the summed time of the steps of `steps` that ran (not skipped,
+/// not reused from a stored pass).
+#[must_use]
+pub fn ran_step_ms(steps: &[crate::report::StepReport]) -> u64 {
+    steps
+        .iter()
+        .filter(|s| {
+            s.status != crate::cache::record::StepStatus::Skipped
+                && s.reused_from.is_none()
+                && s.fresh_from.is_none()
+        })
+        .map(|s| s.duration_ms)
+        .sum()
+}
+
+/// R109: a job's origin ref as a branch name (`refs/heads/` removed).
+#[must_use]
+pub fn branch_of(refname: &str) -> String {
+    refname
+        .strip_prefix("refs/heads/")
+        .unwrap_or(refname)
+        .to_owned()
 }
 
 /// The display name of the repo whose common dir is `common_dir`: the
@@ -558,6 +599,9 @@ pub struct RepoTier {
     pub remote_verified: u32,
     /// Refused at the inline cap.
     pub cap_refusals: u32,
+    /// Push refs refused because the remote branch has commits that the
+    /// push does not contain (R102). No job ran; not in [`Self::checks`].
+    pub behind: u32,
     /// Refusals whose job has no `job` line yet: it still runs, or its
     /// line was rotated out. A job lost to a dead runner gets its line
     /// from the reap ([`LOST`]).
@@ -689,12 +733,21 @@ struct Acc {
     queue: Vec<u64>,
 }
 
-/// The row of `repo` and `tier`.
-fn acc<'a>(by: &'a mut BTreeMap<(String, String), Acc>, repo: &str, tier: Tier) -> &'a mut Acc {
-    let tier = serde_json::to_value(tier)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_default();
+/// The row of `repo` and `tier` (`-` for none).
+fn acc<'a>(
+    by: &'a mut BTreeMap<(String, String), Acc>,
+    repo: &str,
+    tier: Option<Tier>,
+) -> &'a mut Acc {
+    let tier = tier.map_or_else(
+        || "-".to_owned(),
+        |t| {
+            serde_json::to_value(t)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default()
+        },
+    );
     let a = by.entry((repo.to_owned(), tier.clone())).or_default();
     a.row.repo = repo.to_owned();
     a.row.tier = tier;
@@ -754,6 +807,11 @@ pub fn stats(events: &[Event], since: Option<jiff::Timestamp>) -> Stats {
                     }
                 }
             }
+            // R102: a refusal before any check; not a check, no hook time
+            // sample.
+            Event::Hook(h) if h.outcome == HookOutcome::Behind => {
+                acc(&mut by, &h.repo, h.tier).row.behind += 1;
+            }
             Event::Hook(h) => {
                 let a = acc(&mut by, &h.repo, h.tier);
                 // One time sample per hook run (and row): a push of five
@@ -777,6 +835,8 @@ pub fn stats(events: &[Event], since: Option<jiff::Timestamp>) -> Stats {
                     HookOutcome::RemoteVerified => a.row.remote_verified += 1,
                     HookOutcome::Failed => a.row.failed += 1,
                     HookOutcome::Error => a.row.errors += 1,
+                    // Counted above, outside `checks`.
+                    HookOutcome::Behind => {}
                     HookOutcome::RefusedCap => {
                         a.row.cap_refusals += 1;
                         if let Some(j) = &h.job {
@@ -796,7 +856,7 @@ pub fn stats(events: &[Event], since: Option<jiff::Timestamp>) -> Stats {
                 if !counted.insert(&j.job) {
                     continue;
                 }
-                let a = acc(&mut by, &j.repo, j.tier);
+                let a = acc(&mut by, &j.repo, Some(j.tier));
                 a.row.jobs += 1;
                 match j.by.as_str() {
                     "hook" => a.row.jobs_by_hook += 1,
@@ -921,6 +981,7 @@ pub fn render(s: &Stats) -> Vec<String> {
                 "remote",
                 "cap",
                 "cap->end",
+                "behind",
                 "retry",
                 "failed",
                 "hook p50/p90",
@@ -943,6 +1004,7 @@ pub fn render(s: &Stats) -> Vec<String> {
                 r.remote_verified.to_string(),
                 cap_cell(r),
                 pair(r.refusal_wait_ms, fmt_ms),
+                r.behind.to_string(),
                 r.cap_retries.to_string(),
                 (r.failed + r.errors).to_string(),
                 pair(r.hook_ms, fmt_ms),
@@ -1171,7 +1233,7 @@ mod tests {
             t: jiff::Timestamp::now() + jiff::SignedDuration::from_millis(n),
             hook: "pre-commit".into(),
             repo: "r".into(),
-            tier: Tier::Fast,
+            tier: Some(Tier::Fast),
             outcome,
             job: job.map(|j| JobId::parse(j).unwrap()),
             ms: 5,
@@ -1235,7 +1297,7 @@ mod tests {
     fn hook_run(run: Option<&str>, t: jiff::Timestamp, tier: Tier, ms: u64) -> Event {
         Event::Hook(HookEvent {
             t,
-            tier,
+            tier: Some(tier),
             ms,
             run: run.map(str::to_owned),
             ..match hook_event(HookOutcome::CacheHit, None) {
@@ -1243,6 +1305,34 @@ mod tests {
                 _ => unreachable!(),
             }
         })
+    }
+
+    /// R102: a push refused because the remote branch moved is counted as
+    /// `behind`, not as a check, and has no tier. Lines written before R102
+    /// (with a tier, no `behind`) still read.
+    #[test]
+    fn behind_refusals_count_apart_from_checks_r102() {
+        let old = r#"{"kind":"hook","t":"2026-11-09T12:00:00Z","hook":"pre-push","repo":"r","tier":"full","outcome":"cache_hit","job":null,"ms":5}"#;
+        let new = r#"{"kind":"hook","t":"2026-11-09T12:00:01Z","hook":"pre-push","repo":"r","outcome":"behind","ms":3,"run":"aaaaaaaa"}"#;
+        let events: Vec<Event> = [old, new, new]
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let Event::Hook(h) = &events[1] else {
+            panic!("{events:?}")
+        };
+        assert_eq!((h.tier, h.outcome), (None, HookOutcome::Behind));
+        // It writes back with no tier key.
+        let text = serde_json::to_string(&events[1]).unwrap();
+        assert!(!text.contains("tier"), "{text}");
+        let s = stats(&events, None);
+        let full = s.repos.iter().find(|r| r.tier == "full").unwrap();
+        assert_eq!((full.checks, full.cache_hits, full.behind), (1, 1, 0));
+        let none = s.repos.iter().find(|r| r.tier == "-").unwrap();
+        assert_eq!((none.checks, none.behind), (0, 2), "{none:#?}");
+        assert_eq!(none.hook_ms, None, "{none:#?}");
+        let out = render(&s).join("\n");
+        assert!(out.contains("behind"), "{out}");
     }
 
     #[test]
@@ -1344,6 +1434,8 @@ mod tests {
             steps_fresh: 0,
             flaky: 0,
             quarantined: 0,
+            step_ms: None,
+            branch: None,
         })
     }
 
