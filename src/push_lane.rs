@@ -148,16 +148,18 @@ pub fn liveness(
         JobState::Finished {
             verdict: Verdict::Pass,
         } => {
-            let passed = match c.passed {
-                Some(t) => t,
-                None => {
-                    let t = mtime(&dirs.job_dir(&c.job).join("job.json")).unwrap_or(now);
-                    c.passed = Some(t);
-                    t
-                }
-            };
+            // A time in the future (a clock that was ahead) is kept as
+            // now, so it holds the ref for at most `hold`.
+            let passed = c
+                .passed
+                .unwrap_or_else(|| mtime(&dirs.job_dir(&c.job).join("job.json")).unwrap_or(now))
+                .min(now);
+            c.passed = Some(passed);
+            if let Some(a) = c.allowed {
+                c.allowed = Some(a.min(now));
+            }
             let last = c.allowed.map_or(passed, |a| a.max(passed));
-            let held = now.duration_since(last).unsigned_abs() < hold || last > now;
+            let held = now.duration_since(last).unsigned_abs() < hold;
             held.then_some(Live::Passed(passed))
         }
         _ => None,
@@ -585,6 +587,36 @@ mod tests {
         assert_eq!(age_text(Duration::from_secs(45)), "45s");
         assert_eq!(age_text(Duration::from_secs(192)), "3m12s");
         assert_eq!(age_text(Duration::from_secs(7500)), "2h05m");
+    }
+
+    /// R111: a pass or allow time in the future (a clock that was ahead)
+    /// counts as now, and is kept as now: it holds the ref for at most
+    /// `candidate_hold` from the first read.
+    #[test]
+    fn a_time_in_the_future_holds_for_at_most_the_hold_r111() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = dirs(tmp.path());
+        let hold = Duration::from_secs(600);
+        let now = jiff::Timestamp::now();
+        let passed = job(
+            &d,
+            3,
+            JobState::Finished {
+                verdict: Verdict::Pass,
+            },
+        );
+        let id = identity_of("/srv/r.git");
+        let mut lane = Lane::open(&d, &id, "refs/heads/main").unwrap();
+        let mut c = cand('c', &passed);
+        let day = jiff::SignedDuration::from_hours(24);
+        c.passed = Some(now + day);
+        c.allowed = Some(now + day);
+        lane.upsert(c);
+        assert_eq!(lane.prune(&d, hold, now, &|_| false).len(), 1);
+        assert_eq!(lane.file.entries[0].passed, Some(now));
+        assert_eq!(lane.file.entries[0].allowed, Some(now));
+        let after = now + jiff::SignedDuration::from_secs(601);
+        assert!(lane.prune(&d, hold, after, &|_| false).is_empty());
     }
 
     /// R111: two processes that update one ref at the same moment both
