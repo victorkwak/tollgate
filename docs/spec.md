@@ -662,6 +662,7 @@ tollgate baseline record pyright|pytest [--force]                     # TTY only
 tollgate remotes forget [repo]                                        # TTY only (item 33)
 tollgate flaky [--days N] | audit [--since D] | gc [--all]
 tollgate stats [--since D] [--json]                                   # item 50: metrics log summary
+tollgate cost [--since D] [--repo R] [--json]                         # R109: gate time per day, repo, tier, branch
 tollgate guard                                                        # PreToolUse entry (stdin JSON)
 tollgate hook <name> [args]                                           # explicit dispatch
 tollgate waive --tree T --tier t --reason S                           # TTY only (Q6)
@@ -677,6 +678,9 @@ Reason: a `full` job on every branch push ran every test for a change that touch
 
 R108. Selection base of a push (R55): when the remote has no value for the branch (zero remote oid) or its value is not in the local repo, the base is the policy commit of the pushed commit (L2: its merge-base with the trusted anchor) when that commit is not the pushed commit itself; else the empty tree as before. The hook takes the policy commit from the same policy resolution that gives the tier. R56 still decides whether the base is trusted: a policy commit is trusted when its tree has a record, or when it is reachable from a trusted remote's tracking ref whose current value the trusted server reported. With no trusted remote (local anchors only) and no record of its tree, or with a tracking ref the server never reported, selection stays off.
 Reason: with the empty tree as the base, the `fast` job of a new branch checked the whole workspace. The policy commit is the commit the branch was cut from on the trusted `main`, which CI covers, so selection against it is sound, and the branch commit's own `fast` record (based on its parent) often answers the push with no job.
+
+R109. `tollgate cost [--since D] [--repo R] [--json]` reports gate time per local day (system time zone), repo and tier, from the `job` lines of the metrics log (rotated files included; `--since` as `tollgate stats`, default `7d`): jobs, passed, step time, wall time, steps run and steps not run (reused), times as `h:mm`, a total row per day, newest day first; and per repo the 10 branches with the most step time. It is read-only and keeps no state. A `job` line holds `step_ms`, the sum of `duration_ms` of the steps that ran (not skipped, not reused), and `branch`, the job's origin ref without `refs/heads/`. A line without them (an older binary) takes both from `jobs/<id>/report.json` while it exists; else the step time is `wall_ms - job_queue_ms - slot_queue_ms`, the branch is `?`, and the cell is marked `~` (`"estimated": true` in JSON). A lost-job line with no report counts 0, estimated: its wall time runs to the reap. A job counts once (its first line), whatever its `by` value. `--repo` filters both tables by the repo name in the log.
+Reason: nothing showed what the gate costs. On one day one machine ran 110 `full` jobs with 9 hours of step time, and nobody saw it until someone summed job reports by hand.
 
 ---
 

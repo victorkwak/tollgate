@@ -1235,6 +1235,48 @@ pub fn stats(ctx: &Ctx, since_arg: Option<&str>, json: bool) -> u8 {
     exit::OK
 }
 
+/// `tollgate cost [--since D] [--repo R] [--json]` (R109): gate time per
+/// repo and local day from the `job` lines of the metrics log. Writes
+/// nothing.
+pub fn cost(ctx: &Ctx, since_arg: &str, repo: Option<&str>, json: bool) -> u8 {
+    let dirs = match ctx.dirs() {
+        Ok(d) => d,
+        Err(e) => return fail(e),
+    };
+    let from = match since(since_arg) {
+        Ok(f) => f,
+        Err(e) => return fail(e),
+    };
+    let events = match crate::metrics::read(&dirs, Some(from)) {
+        Ok(log) => {
+            for m in &log.skipped {
+                eprintln!("tollgate: metrics log: {m}");
+            }
+            log.events
+        }
+        Err(e) => return fail(format!("metrics log: {e}")),
+    };
+    let lookup = crate::metrics::cost::from_reports(&dirs);
+    let c = crate::metrics::cost::cost(
+        &events,
+        Some(from),
+        &jiff::tz::TimeZone::system(),
+        repo,
+        &lookup,
+    );
+    if json {
+        match serde_json::to_string_pretty(&c) {
+            Ok(t) => println!("{t}"),
+            Err(e) => return fail(e),
+        }
+    } else {
+        for l in crate::metrics::cost::render(&c) {
+            println!("{l}");
+        }
+    }
+    exit::OK
+}
+
 /// The hidden runner entry (`tollgate __run-job <id> --lock-fd 3`).
 pub fn run_job(ctx: &Ctx, job: &str, lock_fd: Option<i32>) -> u8 {
     let _lock = match lock_fd.map(crate::runner::spawn::adopt_lock).transpose() {

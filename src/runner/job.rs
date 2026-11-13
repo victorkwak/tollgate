@@ -1739,6 +1739,8 @@ impl Runner<'_> {
             steps_reused: count(r.steps.iter().filter(|s| s.reused_from.is_some()).count()),
             flaky: count(r.flaky.len()),
             quarantined: count(r.quarantined.len()),
+            step_ms: Some(crate::metrics::ran_step_ms(&r.steps)),
+            branch: Some(crate::metrics::branch_of(&self.spec.origin.refname)),
         };
         crate::metrics::record(self.dirs, &[crate::metrics::Event::Job(event)]);
     }

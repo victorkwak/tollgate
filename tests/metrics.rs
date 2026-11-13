@@ -657,3 +657,188 @@ fn an_out_of_scope_post_commit_logs_the_full_check_item37() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(chained_exits(&sb.state(), "post-commit"), ["full"]);
 }
+
+/// One `job` line of the metrics log; `extra` is appended JSON fields
+/// (`,"step_ms":1`), empty for a line of an older binary.
+fn job_line(id: &str, t: jiff::Timestamp, repo: &str, by: &str, extra: &str) -> String {
+    format!(
+        "{{\"kind\":\"job\",\"t\":\"{t}\",\"job\":\"{id}\",\"repo\":\"{repo}\",\"tier\":\"fast\",\"by\":\"{by}\",\"verdict\":\"pass\",\"wall_ms\":600000,\"job_queue_ms\":60000,\"slot_queue_ms\":0,\"checkout_wait_ms\":0,\"steps\":2,\"steps_reused\":1,\"flaky\":0,\"quarantined\":0{extra}}}\n"
+    )
+}
+
+fn cost_json(sb: &Sandbox, args: &[&str], env: &[(&str, &str)]) -> Value {
+    let mut all = vec!["cost", "--json"];
+    all.extend_from_slice(args);
+    let r = sb.tollgate_with(&sb.root(), &all, env);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    serde_json::from_str(&r.out).unwrap_or_else(|e| panic!("{e}: {}", r.out))
+}
+
+/// R109: `tollgate cost` buckets jobs by local day (`TZ` of the process),
+/// filters by repo, counts a `by` it does not know, and has one JSON
+/// shape.
+#[test]
+fn cost_buckets_by_local_day_and_filters_by_repo_r109() {
+    let sb = Sandbox::new();
+    let state = sb.state();
+    std::fs::create_dir_all(&state).unwrap();
+    let tz = "America/Chicago";
+    let midnight = jiff::Timestamp::now()
+        .in_tz(tz)
+        .unwrap()
+        .start_of_day()
+        .unwrap()
+        .timestamp();
+    let five = jiff::SignedDuration::from_mins(5);
+    let text = [
+        job_line(
+            "20261109-120000-00000001",
+            midnight - five,
+            "a",
+            "hook",
+            ",\"step_ms\":60000,\"branch\":\"x\"",
+        ),
+        job_line(
+            "20261109-120000-00000002",
+            midnight + five,
+            "a",
+            "step",
+            ",\"step_ms\":120000,\"branch\":\"y\"",
+        ),
+        job_line(
+            "20261109-120000-00000003",
+            midnight + five,
+            "b",
+            "prewarm",
+            ",\"step_ms\":3600000,\"branch\":\"main\"",
+        ),
+    ]
+    .concat();
+    std::fs::write(state.join("metrics.jsonl"), text).unwrap();
+    let v = cost_json(&sb, &[], &[("TZ", tz)]);
+    assert_eq!(v["jobs"], 3, "{v:#}");
+    assert_eq!(v["time_zone"], tz, "{v:#}");
+    let days = v["days"].as_array().unwrap();
+    assert_eq!(days.len(), 2, "{v:#}");
+    let today = midnight
+        .to_zoned(jiff::tz::TimeZone::get(tz).unwrap())
+        .date();
+    assert_eq!(days[0]["day"], today.to_string(), "{v:#}");
+    assert_eq!(days[1]["day"], today.yesterday().unwrap().to_string());
+    assert_eq!(days[0]["total"]["jobs"], 2, "{v:#}");
+    assert_eq!(days[0]["total"]["step_ms"], 3_720_000, "{v:#}");
+    assert_eq!(days[1]["total"]["step_ms"], 60_000, "{v:#}");
+    let row = &days[0]["rows"][0];
+    for key in [
+        "day",
+        "repo",
+        "tier",
+        "jobs",
+        "passed",
+        "step_ms",
+        "wall_ms",
+        "steps_run",
+        "steps_reused",
+        "estimated",
+    ] {
+        assert!(row.get(key).is_some(), "no {key}: {v:#}");
+    }
+    assert_eq!(v["top_branches"][0]["repo"], "a", "{v:#}");
+    assert_eq!(v["top_branches"][0]["branches"][0]["branch"], "y", "{v:#}");
+    // In UTC, 5 minutes either side of Chicago midnight is one day.
+    let v = cost_json(&sb, &[], &[("TZ", "UTC")]);
+    assert_eq!(v["days"].as_array().unwrap().len(), 1, "{v:#}");
+    // --repo
+    let v = cost_json(&sb, &["--repo", "b"], &[("TZ", tz)]);
+    assert_eq!(v["jobs"], 1, "{v:#}");
+    assert_eq!(v["top_branches"].as_array().unwrap().len(), 1, "{v:#}");
+    assert_eq!(v["top_branches"][0]["branches"][0]["branch"], "main");
+    // The table: h:mm cells and a total row.
+    let r = sb.tollgate_with(&sb.root(), &["cost"], &[("TZ", tz)]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        r.out.contains("1:02") && r.out.contains("total"),
+        "{}",
+        r.out
+    );
+    assert!(r.out.contains("top branches"), "{}", r.out);
+    // --since: a job older than the default 7 days is left out.
+    std::fs::write(
+        state.join("metrics.jsonl"),
+        job_line(
+            "20261109-120000-00000009",
+            jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 8),
+            "a",
+            "hook",
+            "",
+        ),
+    )
+    .unwrap();
+    assert_eq!(cost_json(&sb, &[], &[])["jobs"], 0);
+    assert_eq!(cost_json(&sb, &["--since", "30d"], &[])["jobs"], 1);
+}
+
+/// R109: a real job's log line carries `step_ms` (the steps that ran) and
+/// `branch`, and shows in `tollgate cost`. The same line without the new
+/// fields (an older binary) takes them from `report.json`; with the report
+/// gone, the step time is estimated and marked.
+#[test]
+fn a_real_job_shows_in_cost_and_old_lines_fall_back_r109() {
+    let sb = Sandbox::new();
+    sb.scoped_host("");
+    let repo = sb.repo("r");
+    sb.commit_file(
+        &repo,
+        "tollgate.toml",
+        "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"sleep 1\"\n",
+        "policy",
+    );
+    let r = sb.tollgate(&repo, &["check", "--rev", "HEAD", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let job = job_id(&r.out);
+    let jobs = of_kind(&events(&sb.state()), "job");
+    assert_eq!(jobs.len(), 1, "{jobs:#?}");
+    let line = &jobs[0];
+    let report = sb.report(&job);
+    let sum: u64 = report["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["duration_ms"].as_u64().unwrap())
+        .sum();
+    assert!(sum >= 1000, "{report:#}");
+    assert_eq!(line["step_ms"], sum, "{line:#}");
+    assert_eq!(line["branch"], "main", "{line:#}");
+    let v = cost_json(&sb, &[], &[]);
+    assert_eq!(v["jobs"], 1, "{v:#}");
+    let row = &v["days"][0]["rows"][0];
+    assert_eq!(
+        (row["repo"].as_str(), row["step_ms"].as_u64()),
+        (Some("r"), Some(sum))
+    );
+    assert_eq!(row["estimated"], false, "{v:#}");
+    assert_eq!(v["top_branches"][0]["branches"][0]["branch"], "main");
+    // The same line as an older binary wrote it.
+    let mut old = line.clone();
+    old.as_object_mut().unwrap().remove("step_ms");
+    old.as_object_mut().unwrap().remove("branch");
+    let log = sb.state().join("metrics.jsonl");
+    std::fs::write(&log, format!("{old}\n")).unwrap();
+    let v = cost_json(&sb, &[], &[]);
+    let row = &v["days"][0]["rows"][0];
+    assert_eq!(row["step_ms"], sum, "{v:#}");
+    assert_eq!(row["estimated"], false, "{v:#}");
+    assert_eq!(v["top_branches"][0]["branches"][0]["branch"], "main");
+    // Its report gone: estimated from wall and queue times, branch `?`.
+    std::fs::remove_file(sb.state().join("jobs").join(&job).join("report.json")).unwrap();
+    let v = cost_json(&sb, &[], &[]);
+    let row = &v["days"][0]["rows"][0];
+    let want = line["wall_ms"].as_u64().unwrap()
+        - line["job_queue_ms"].as_u64().unwrap()
+        - line["slot_queue_ms"].as_u64().unwrap();
+    assert_eq!(row["step_ms"], want, "{v:#}");
+    assert_eq!(row["estimated"], true, "{v:#}");
+    assert_eq!(v["top_branches"][0]["branches"][0]["branch"], "?");
+    let r = sb.tollgate(&sb.root(), &["cost"]);
+    assert!(r.out.contains("~0:0"), "{}", r.out);
+}

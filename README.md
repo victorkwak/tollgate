@@ -138,6 +138,7 @@ To remove it, run `tollgate uninstall`. It removes exactly what `install` added.
    | `tollgate wait <job>` | Wait for a job: exit 0 pass, 1 fail, 3 still running. |
    | `tollgate status` | Results and running jobs for `HEAD` and the index, and commits on the branch that have no result. |
    | `tollgate report <job>`, `tollgate log <job> <step>` | The full report and a step log. |
+   | `tollgate cost [--since D] [--repo R]` | Gate time per day, repo and tier, and the branches that cost most. |
    | `tollgate merge <branch>` | Merge into a full ref with a `full` check before the commit. |
 
    When a check takes longer than the hook can wait, the hook denies and leaves the job running. The deny message gives one command that waits and then commits again.

@@ -23,7 +23,8 @@
 //!   `fast_forward`, `tree_passed`) or the full check after `Gate::open`
 //!   (`full`, `recorded`).
 //! - `job`: a finished job's wall time, its queue time before the first
-//!   step and in step slots, steps reused, flaky and quarantined tests.
+//!   step and in step slots, steps reused, flaky and quarantined tests,
+//!   the time of the steps that ran and the branch (R109, [`cost`]).
 //!   The reap of a job whose runner died writes its line, verdict
 //!   [`LOST`], without run times; a cap refusal of it gets no wait sample.
 //!
@@ -48,6 +49,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::Tier;
 use crate::dirs::Dirs;
 use crate::ids::JobId;
+
+pub mod cost;
 
 /// Size at which the log rotates.
 pub const MAX_BYTES: u64 = 8 << 20;
@@ -269,6 +272,37 @@ pub struct JobEvent {
     pub flaky: u32,
     /// Quarantined failures.
     pub quarantined: u32,
+    /// Sum of `duration_ms` of the steps that ran in this job: not
+    /// skipped, not reused (R109). Absent on lines from before it and on a
+    /// [`LOST`] line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_ms: Option<u64>,
+    /// The job's origin ref without `refs/heads/` (R109). Absent as
+    /// `step_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// R109: the summed time of the steps of `steps` that ran (not skipped,
+/// not reused from a stored pass).
+#[must_use]
+pub fn ran_step_ms(steps: &[crate::report::StepReport]) -> u64 {
+    steps
+        .iter()
+        .filter(|s| {
+            s.status != crate::cache::record::StepStatus::Skipped && s.reused_from.is_none()
+        })
+        .map(|s| s.duration_ms)
+        .sum()
+}
+
+/// R109: a job's origin ref as a branch name (`refs/heads/` removed).
+#[must_use]
+pub fn branch_of(refname: &str) -> String {
+    refname
+        .strip_prefix("refs/heads/")
+        .unwrap_or(refname)
+        .to_owned()
 }
 
 /// The display name of the repo whose common dir is `common_dir`: the
@@ -1386,6 +1420,8 @@ mod tests {
             steps_reused: 0,
             flaky: 0,
             quarantined: 0,
+            step_ms: None,
+            branch: None,
         })
     }
 
