@@ -28,7 +28,7 @@ tollgate closes these gaps for agent sessions. Your own terminal is not gated.
 
 ## Status
 
-**0.1, early.** It is in trial on one Linux machine, on the author's own repos. Read this before you use it:
+**0.2, early.** It is in trial on one Linux machine, on the author's own repos. Read this before you use it:
 
 - **Not a security boundary.** tollgate runs as the same user as the agents. Its guard defends against a careless agent: one that, under pressure to finish, reaches for the direct, documented way round the gate. It does not defend against an agent that sets out to defeat it. The guarantee is not the guard: it is the git hooks, the tree-keyed record check at commit, merge and push, and the trusted anchor that picks the policy. A bypass is made visible. Keep branch protection and CI on your remote as the last line.
 - **Linux first.** On macOS it builds and passes the whole test suite. macOS has no parent-death signal, so a watcher process per step kills the step when its runner dies. Still Linux-only: finding a lost job's processes by their environment (`TMPDIR`), and the subreaper. The latency budgets are per OS, larger on macOS (see [limits](docs/operations.md)).
@@ -55,7 +55,7 @@ tollgate install
 tollgate doctor
 ```
 
-`install` copies the binary to `$XDG_DATA_HOME/tollgate/bin/`, links the hooks next to it, writes the host config when it is absent, and shows a diff of `~/.claude/settings.json`. It asks before it changes the settings. Run it again after each `cargo install`.
+`install` copies the binary to `$XDG_DATA_HOME/tollgate/bin/`, links the hooks next to it, writes the host config when it is absent, and shows a diff of `~/.claude/settings.json`. It asks before it changes the settings. Run it again after each `cargo install`. `tollgate --version` and `tollgate doctor` print the version and the commit of the build, for example `tollgate 0.2.0 (a1b2c3d4e5f6)`, so you can see which build is installed. [CHANGELOG.md](CHANGELOG.md) lists what each version changed.
 
 To check that the hooks reach a session, run `tollgate doctor --injection` from a Bash call in a Claude session, in the main session and in a subagent. If the settings `env` does not reach one, the guard denies every Bash call there, so the gap fails closed.
 

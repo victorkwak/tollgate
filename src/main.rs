@@ -221,7 +221,7 @@ fn config_main(ctx: &cli::Ctx, args: &ConfigArgs) -> u8 {
 #[derive(Debug, Parser)]
 #[command(
     name = "tollgate",
-    version,
+    version = tollgate::BUILD,
     about = "Gate git ref updates on checks of the exact tree"
 )]
 struct Cli {

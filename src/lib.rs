@@ -41,3 +41,17 @@ pub mod steps;
 
 /// The version recorded in records and fingerprints (R74, R76).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The git commit this binary was built from: 12 hex digits, with `-dirty`
+/// when the checkout had changes; `None` when the build did not know it
+/// (`build.rs`). It names a build for people and for `doctor` (R97). It is
+/// never part of a record or a fingerprint: a commit there would void every
+/// stored result on each build.
+pub const GIT_COMMIT: Option<&str> = option_env!("TOLLGATE_GIT_COMMIT");
+
+/// What `tollgate --version` prints after the name: the version, and the
+/// commit in parentheses when it is known.
+pub const BUILD: &str = match option_env!("TOLLGATE_BUILD") {
+    Some(build) => build,
+    None => VERSION,
+};

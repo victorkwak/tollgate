@@ -114,6 +114,39 @@ fn version_and_help_exit_zero() {
     }
 }
 
+/// `--version` names the build: the package version and, when the build
+/// knew it, the git commit it was made from (12 hex digits, `-dirty` when
+/// the checkout had changes). Two builds of one version can then be told
+/// apart, which `doctor` needs (R97). The version in records and
+/// fingerprints (R74, R76) stays the package version alone: a commit there
+/// would void every stored result on each build.
+#[test]
+fn version_names_the_package_version_and_the_commit_r97() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run(Path::new(BIN), &["--version"], tmp.path());
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    assert_eq!(tollgate::VERSION, env!("CARGO_PKG_VERSION"));
+    assert!(!tollgate::VERSION.contains('('), "{}", tollgate::VERSION);
+    match tollgate::GIT_COMMIT {
+        Some(commit) => {
+            let hex = commit.strip_suffix("-dirty").unwrap_or(commit);
+            assert_eq!(hex.len(), 12, "{commit}");
+            assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()), "{commit}");
+            assert_eq!(text, format!("tollgate {} ({commit})", tollgate::VERSION));
+        }
+        None => assert_eq!(text, format!("tollgate {}", tollgate::VERSION)),
+    }
+    assert_eq!(text, format!("tollgate {}", tollgate::BUILD));
+    // A build in a git checkout knows its commit.
+    if Path::new(env!("CARGO_MANIFEST_DIR")).join(".git").exists() {
+        assert!(
+            tollgate::GIT_COMMIT.is_some(),
+            "the build found no git commit"
+        );
+    }
+}
+
 /// Runs the binary in `cwd` with the sandbox environment only.
 fn run_in(sb: &Sandbox, cwd: &Path, args: &[&str]) -> (Option<i32>, String) {
     let mut cmd = Command::new(BIN);
