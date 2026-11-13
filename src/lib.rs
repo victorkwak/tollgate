@@ -39,7 +39,8 @@ pub mod sched;
 pub mod select;
 pub mod steps;
 
-/// The version recorded in records and fingerprints (R74, R76).
+/// The package version, recorded in records (R76). Not in the fingerprint:
+/// that holds [`cache::RECORD_EPOCH`] (R110).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The git commit this binary was built from: 12 hex digits, with `-dirty`

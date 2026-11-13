@@ -122,6 +122,10 @@ fn run() -> u8 {
         Command::Flaky { days } => cli::flaky(&ctx, days),
         Command::Stats { since, json } => cli::stats(&ctx, since.as_deref(), json),
         Command::Cost { since, repo, json } => cli::cost(&ctx, &since, repo.as_deref(), json),
+        Command::RecordId => {
+            println!("{}", tollgate::cache::record_id());
+            exit::OK
+        }
         Command::RunJob { job, lock_fd } => cli::run_job(&ctx, &job, lock_fd),
         Command::Merge { branch } => tollgate::merge::merge(&ctx, &branch),
         Command::Remotes {
@@ -443,6 +447,10 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+    /// Internal: the record id of this build (R110), for install and
+    /// doctor to compare builds.
+    #[command(name = "__record-id", hide = true)]
+    RecordId,
     /// Internal: the detached job runner (R38).
     #[command(name = "__run-job", hide = true)]
     RunJob {

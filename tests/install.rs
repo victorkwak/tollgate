@@ -541,3 +541,240 @@ fn a_symlinked_settings_file_is_edited_at_its_target_item29() {
     );
     assert!(!e.data().exists());
 }
+
+/// A queued job in the sandbox state dir, as a hook leaves it while it
+/// waits for a slot (R110 lists it before an install that voids it).
+fn queue_job(e: &Env) -> String {
+    use tollgate::locks::Priority;
+    use tollgate::sched::{JobMeta, JobState, JobStore, Origin};
+    let dirs = tollgate::dirs::Dirs::from_env(&e.sb.env()).unwrap();
+    let id = tollgate::ids::JobId::generate(jiff::Timestamp::now());
+    let meta = JobMeta {
+        id: id.clone(),
+        key: tollgate::ids::RecordKey::from_hash(&blake3::hash(b"r110")),
+        tree: tollgate::gitx::Oid::parse(&"ab".repeat(20)).unwrap(),
+        tier: tollgate::config::Tier::Full,
+        origin: Origin {
+            worktree: e.sb.root().join("wt"),
+            refname: "refs/heads/main".into(),
+        },
+        priority: Priority::Hook,
+        created: jiff::Timestamp::now(),
+        state: JobState::Queued,
+    };
+    JobStore::new(&dirs).create(&meta).unwrap();
+    id.to_string()
+}
+
+fn install_json(e: &Env) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(e.data().join("install.json")).unwrap()).unwrap()
+}
+
+fn set_install_json(e: &Env, v: &serde_json::Value) {
+    std::fs::write(
+        e.data().join("install.json"),
+        serde_json::to_vec_pretty(v).unwrap(),
+    )
+    .unwrap();
+}
+
+/// R110: install records the record id; a reinstall of a build with the
+/// same id keeps the stored results and asks nothing, also while a job
+/// runs.
+#[test]
+fn reinstall_with_the_same_record_id_keeps_results_r110() {
+    let e = Env::new("2.1.317");
+    let r = e.tty(Path::new(BIN), &["install"], &["y"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    // First install: nothing to compare.
+    assert!(!r.out.contains("stored results"), "{}", r.out);
+    let id = tollgate::cache::record_id();
+    assert_eq!(install_json(&e)["record_id"], id.as_str());
+    let job = queue_job(&e);
+    let r = e.tty(Path::new(BIN), &["install"], &[]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        r.out
+            .contains(&format!("stored results: kept (record id {id})")),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("[y/N]"), "{}", r.out);
+    assert!(!r.out.contains(&job), "{}", r.out);
+}
+
+/// R110: a build with another record id lists the queued and running jobs
+/// and asks; a no changes nothing (copy and install.json) and exits 1; a
+/// yes installs.
+#[test]
+fn reinstall_with_another_record_id_asks_while_jobs_wait_r110() {
+    let e = Env::new("2.1.317");
+    let r = e.tty(Path::new(BIN), &["install"], &["y"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    // The installed copy is "another build": other bytes, and its
+    // install.json names another record id.
+    let bin = e.data().join("bin/tollgate");
+    let other = e.sb.root().join("other-tollgate");
+    let status = std::process::Command::new("sh")
+        .args(["-c", "cp \"$1\" \"$2\" && printf x >> \"$2\"", "sh", BIN])
+        .arg(&other)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    std::fs::rename(&other, &bin).unwrap();
+    let mut rec = install_json(&e);
+    rec["record_id"] = serde_json::json!("4/0.1.9");
+    set_install_json(&e, &rec);
+    let before_bin = std::fs::read(&bin).unwrap();
+    let before_rec = std::fs::read(e.data().join("install.json")).unwrap();
+    let job = queue_job(&e);
+    let new = tollgate::cache::record_id();
+
+    for answer in ["n", ""] {
+        let r = e.tty(Path::new(BIN), &["install"], &[answer]);
+        assert_eq!(r.code, Some(1), "{answer:?}: {}", r.out);
+        assert!(
+            r.out.contains(&format!(
+                "stored results: not used by this build (record id 4/0.1.9 -> {new}); each tree runs one time again"
+            )),
+            "{}",
+            r.out
+        );
+        let line = r
+            .out
+            .lines()
+            .find(|l| l.contains(&job))
+            .unwrap_or_else(|| panic!("job {job} not listed:\n{}", r.out));
+        assert!(
+            line.contains("full") && line.contains("refs/heads/main") && line.contains("queued"),
+            "{line}"
+        );
+        assert!(
+            r.out
+                .contains("Install now? The results of these jobs will not count. [y/N]"),
+            "{}",
+            r.out
+        );
+        assert_eq!(r.out.matches("[y/N]").count(), 1, "{}", r.out);
+        assert_eq!(std::fs::read(&bin).unwrap(), before_bin);
+        assert_eq!(
+            std::fs::read(e.data().join("install.json")).unwrap(),
+            before_rec
+        );
+    }
+    // A yes installs this build and records its id.
+    let r = e.tty(Path::new(BIN), &["install"], &["y"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(std::fs::read(&bin).unwrap(), std::fs::read(BIN).unwrap());
+    assert_eq!(install_json(&e)["record_id"], new.as_str());
+
+    // Without jobs, a different id prints the line and asks nothing.
+    let mut rec = install_json(&e);
+    rec["record_id"] = serde_json::json!("4/0.1.9");
+    set_install_json(&e, &rec);
+    let dirs = tollgate::dirs::Dirs::from_env(&e.sb.env()).unwrap();
+    std::fs::remove_dir_all(dirs.jobs_dir()).unwrap();
+    let r = e.tty(Path::new(BIN), &["install"], &[]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        r.out.contains("stored results: not used by this build"),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("[y/N]"), "{}", r.out);
+}
+
+/// R110: an install.json of 0.2.0 or older has no `record_id`; the id of
+/// the installed copy is then `<checks_schema of 0.2.0>/<its version>`,
+/// read from `--version`. A copy that does not run has an unknown id.
+#[test]
+fn an_old_install_json_without_record_id_is_read_r110() {
+    let e = Env::new("2.1.317");
+    let r = e.tty(Path::new(BIN), &["install"], &["y"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let bin = e.data().join("bin/tollgate");
+    let mut rec = install_json(&e);
+    rec.as_object_mut().unwrap().remove("record_id");
+    set_install_json(&e, &rec);
+    let new = tollgate::cache::record_id();
+
+    // An installed 0.2.0: its fingerprint held "0.2.0", the epoch.
+    write_exe(&bin, "#!/bin/sh\necho 'tollgate 0.2.0 (0123456789ab)'\n");
+    let r = e.tty(Path::new(BIN), &["install"], &[]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    if new == "5/0.2.0" {
+        assert!(
+            r.out.contains("stored results: kept (record id 5/0.2.0)"),
+            "{}",
+            r.out
+        );
+    } else {
+        assert!(
+            r.out.contains(&format!(
+                "stored results: not used by this build (record id 5/0.2.0 -> {new})"
+            )),
+            "{}",
+            r.out
+        );
+    }
+    assert_eq!(install_json(&e)["record_id"], new.as_str());
+
+    // An installed 0.1.9.
+    rec.as_object_mut().unwrap().remove("record_id");
+    set_install_json(&e, &rec);
+    write_exe(&bin, "#!/bin/sh\necho 'tollgate 0.1.9'\n");
+    let r = e.tty(Path::new(BIN), &["install"], &[]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        r.out.contains(&format!(
+            "stored results: not used by this build (record id 5/0.1.9 -> {new})"
+        )),
+        "{}",
+        r.out
+    );
+
+    // A copy that does not run.
+    set_install_json(&e, &rec);
+    write_exe(&bin, "#!/bin/sh\nexit 1\n");
+    let r = e.tty(Path::new(BIN), &["install"], &[]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        r.out.contains(&format!(
+            "stored results: not used by this build (record id unknown -> {new})"
+        )),
+        "{}",
+        r.out
+    );
+}
+
+/// R110: doctor names the record id on the binary lines only when the
+/// PATH binary and the installed copy differ in it.
+#[test]
+fn doctor_names_record_ids_only_when_they_differ_r110() {
+    let e = Env::new("2.1.317");
+    let r = e.tty(Path::new(BIN), &["install"], &["y"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let bin = e.data().join("bin/tollgate");
+    // The same build on PATH.
+    let path_bin = e.bin_dir.join("tollgate");
+    std::fs::copy(BIN, &path_bin).unwrap();
+    let r = e.run(&bin, &["doctor"], &[]);
+    let lines: Vec<&str> = r.out.lines().filter(|l| l.contains(" binary: ")).collect();
+    assert_eq!(lines.len(), 2, "{}", r.out);
+    assert!(lines.iter().all(|l| !l.contains("record id")), "{lines:?}");
+    // An old build on PATH (0.1.9: record id 5/0.1.9).
+    write_exe(&path_bin, "#!/bin/sh\necho 'tollgate 0.1.9'\n");
+    let r = e.run(&bin, &["doctor"], &[]);
+    let lines: Vec<&str> = r.out.lines().filter(|l| l.contains(" binary: ")).collect();
+    assert_eq!(lines.len(), 2, "{}", r.out);
+    let new = tollgate::cache::record_id();
+    assert!(
+        lines[0].contains("installed copy") && lines[0].contains(&format!("record id {new}")),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].contains("PATH") && lines[1].contains("record id 5/0.1.9"),
+        "{lines:?}"
+    );
+}

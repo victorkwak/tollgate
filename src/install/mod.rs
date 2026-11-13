@@ -41,6 +41,14 @@ use settings_file::SettingsFile;
 /// Version of `install.json`.
 pub const RECORD_VERSION: u32 = 1;
 
+/// R110: `checks_schema` of 0.2.0 and older. Their fingerprint held the
+/// package version, so the record id of such a build is
+/// `<this>/<its package version>`.
+pub const LEGACY_CHECKS_SCHEMA: u32 = 5;
+
+/// How long install and doctor wait for an installed copy to answer.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Oldest Claude Code with `onFailure: "block"` for hooks (R23, R95b).
 pub const MIN_CLAUDE: (u32, u32, u32) = (2, 1, 295);
 
@@ -82,6 +90,10 @@ pub struct InstallRecord {
     /// it, which only `tollgate remotes forget` accepts.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trust_index: bool,
+    /// The record id of the installed build (R110). `None` in records of
+    /// 0.2.0 and older: [`record_id_of`] the installed copy then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<String>,
 }
 
 impl InstallRecord {
@@ -235,6 +247,150 @@ fn copy_binary(exe: &Path, dest: &Path) -> Result<bool, String> {
         format!("{}: {e}", dest.display())
     })?;
     Ok(true)
+}
+
+/// Runs `program args` with stdin closed, for at most [`PROBE_TIMEOUT`];
+/// its stdout when it exits 0.
+fn probe(program: &Path, args: &[&str], env: &EnvSnapshot) -> Option<String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for (k, v) in env.iter() {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().ok()?;
+    let until = std::time::Instant::now() + PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut text).ok()?;
+    status.success().then_some(text)
+}
+
+/// True for `<digits>/<epoch>`: what [`crate::cache::record_id`] prints.
+fn is_record_id(text: &str) -> bool {
+    text.split_once('/').is_some_and(|(schema, epoch)| {
+        !schema.is_empty()
+            && schema.bytes().all(|b| b.is_ascii_digit())
+            && !epoch.is_empty()
+            && !epoch.contains(char::is_whitespace)
+    })
+}
+
+/// The package version in `tollgate --version` output: the first word that
+/// starts with a digit and holds a dot (`tollgate 0.2.0 (0123456789ab)`).
+fn version_word(text: &str) -> Option<&str> {
+    text.lines()
+        .next()?
+        .split_whitespace()
+        .find(|w| w.starts_with(|c: char| c.is_ascii_digit()) && w.contains('.'))
+}
+
+/// The record id of the tollgate binary `program` (R110): what it prints
+/// for `__record-id`; for a build of 0.2.0 or older, which has no such
+/// command, `<checks_schema of 0.2.0>/<package version>` from its
+/// `--version`. `None` (unknown) when it does not run or prints neither.
+#[must_use]
+pub fn record_id_of(program: &Path, env: &EnvSnapshot) -> Option<String> {
+    if let Some(out) = probe(program, &["__record-id"], env) {
+        let id = out.trim();
+        if is_record_id(id) {
+            return Some(id.to_owned());
+        }
+    }
+    let out = probe(program, &["--version"], env)?;
+    version_word(&out).map(|v| format!("{LEGACY_CHECKS_SCHEMA}/{v}"))
+}
+
+/// The age of a job, short: `45s`, `12m`, `2h05m`.
+fn age(since: jiff::Timestamp, now: jiff::Timestamp) -> String {
+    let secs = (now.as_second() - since.as_second()).max(0);
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+    }
+}
+
+/// R110: compares the record id of the installed copy with this build's
+/// before the copy is replaced. A different id voids the stored results;
+/// while jobs are queued or running, the person decides (L10). `Err` when
+/// the person said no: nothing was changed.
+fn check_record_id(ctx: &Ctx, dirs: &Dirs, previous: Option<&InstallRecord>) -> Result<(), ()> {
+    let binary = dirs.installed_binary();
+    if binary.symlink_metadata().is_err() {
+        // A first install: nothing stored by another build to compare.
+        return Ok(());
+    }
+    let new = crate::cache::record_id();
+    let old = previous
+        .and_then(|p| p.record_id.clone())
+        .or_else(|| record_id_of(&binary, &ctx.env));
+    if old.as_deref() == Some(new.as_str()) {
+        println!("stored results: kept (record id {new})");
+        return Ok(());
+    }
+    println!(
+        "stored results: not used by this build (record id {} -> {new}); each tree runs one time again",
+        old.as_deref().unwrap_or("unknown")
+    );
+    use crate::sched::{JobState, JobStore};
+    let active: Vec<_> = match JobStore::new(dirs).list() {
+        Ok(jobs) => jobs
+            .into_iter()
+            .filter(|j| matches!(j.state, JobState::Queued | JobState::Running { .. }))
+            .collect(),
+        Err(e) => {
+            // Jobs that cannot be listed may still run: ask.
+            println!("jobs: cannot list the jobs ({e})");
+            return if confirm("Install now? The results of these jobs will not count.") {
+                Ok(())
+            } else {
+                Err(())
+            };
+        }
+    };
+    if active.is_empty() {
+        return Ok(());
+    }
+    let now = jiff::Timestamp::now();
+    println!("jobs queued or running:");
+    for j in &active {
+        let repo = crate::runner::job::JobSpec::read(dirs, &j.id).map_or_else(
+            |_| "?".to_owned(),
+            |s| crate::metrics::repo_name(&s.common_dir),
+        );
+        let state = match j.state {
+            JobState::Queued => "queued",
+            _ => "running",
+        };
+        println!(
+            "  {}  {}  {repo}  {}  {state}  {}",
+            j.id,
+            j.tier,
+            j.origin.refname,
+            age(j.created, now)
+        );
+    }
+    if confirm("Install now? The results of these jobs will not count.") {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 /// Parses the first `x.y.z` in `text`.
@@ -395,6 +551,11 @@ pub fn install(ctx: &Ctx) -> u8 {
         }
         Err(e) => return fail(format!("cannot check the Claude Code version (R95b): {e}")),
     }
+    let previous = InstallRecord::read(&dirs).ok();
+    // R110: before the copy, what the new build does to stored results.
+    if check_record_id(ctx, &dirs, previous.as_ref()).is_err() {
+        return fail("not installed: not confirmed; nothing changed");
+    }
     // (a) the private copy and the links.
     let binary = dirs.installed_binary();
     match copy_binary(&ctx.exe, &binary) {
@@ -419,7 +580,6 @@ pub fn install(ctx: &Ctx) -> u8 {
         ),
         Err(e) => return fail(e),
     }
-    let previous = InstallRecord::read(&dirs).ok();
     let mut status = exit::OK;
     // The index of repos with trusted-remote records (item 33): made by
     // the first install only.
@@ -473,6 +633,7 @@ pub fn install(ctx: &Ctx) -> u8 {
         dirs: Some(dirs.clone()),
         git: Some(git),
         trust_index,
+        record_id: Some(crate::cache::record_id()),
     };
     // (c) the settings edit, on the file resolved once (item 29).
     let path = settings_path(&ctx.env, &dirs);
@@ -698,6 +859,33 @@ mod tests {
         assert_eq!(parse_version("claude v2.1.295"), Some((2, 1, 295)));
         assert_eq!(parse_version("none"), None);
         assert!((2, 1, 317) >= MIN_CLAUDE && (2, 0, 999) < MIN_CLAUDE);
+    }
+
+    #[test]
+    fn record_ids_and_versions_r110() {
+        assert!(is_record_id(&crate::cache::record_id()));
+        assert!(is_record_id("5/0.1.9"));
+        for bad in [
+            "",
+            "5",
+            "/0.2.0",
+            "5/",
+            "x/0.2.0",
+            "tollgate 0.2.0",
+            "5/0 2",
+        ] {
+            assert!(!is_record_id(bad), "{bad}");
+        }
+        assert_eq!(
+            version_word("tollgate 0.2.0 (0123456789ab)\n"),
+            Some("0.2.0")
+        );
+        assert_eq!(version_word("tollgate 0.3.0-rc.1"), Some("0.3.0-rc.1"));
+        assert_eq!(version_word("tollgate"), None);
+        let t = |s| jiff::Timestamp::from_second(s).unwrap();
+        assert_eq!(age(t(100), t(145)), "45s");
+        assert_eq!(age(t(0), t(720)), "12m");
+        assert_eq!(age(t(0), t(7500)), "2h05m");
     }
 
     #[test]

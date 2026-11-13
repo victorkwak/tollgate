@@ -109,13 +109,35 @@ fn check_install(out: &mut Out, ctx: &Ctx, dirs: &Dirs) -> Option<InstallRecord>
     }
     // Binaries (R97): the PATH binary against the installed copy.
     let installed = super::inode(&rec.binary);
+    let on_path = which("tollgate", ctx.env.get("PATH"));
+    let same = on_path
+        .as_ref()
+        .is_some_and(|p| std::fs::read(p).ok() == std::fs::read(&rec.binary).ok());
+    // R110: the record ids, named only when the two builds differ in it.
+    let ids = match &on_path {
+        Some(p) if !same && installed.is_some() => {
+            let a = super::record_id_of(&rec.binary, &ctx.env);
+            let b = super::record_id_of(p, &ctx.env);
+            (a != b).then(|| {
+                let show = |id: Option<String>| {
+                    format!(", record id {}", id.as_deref().unwrap_or("unknown"))
+                };
+                (show(a), show(b))
+            })
+        }
+        _ => None,
+    };
+    let (installed_id, path_id) = ids.unwrap_or_default();
     match &installed {
         Some(_) => {
             let v = version_of(&rec.binary, &["--version"], &ctx.env).unwrap_or_else(|| "?".into());
             out.line(
                 Level::Ok,
                 "binary",
-                format!("installed copy {} ({v})", rec.binary.display()),
+                format!(
+                    "installed copy {} ({v}){installed_id}",
+                    rec.binary.display()
+                ),
             );
         }
         None => out.line(
@@ -124,10 +146,9 @@ fn check_install(out: &mut Out, ctx: &Ctx, dirs: &Dirs) -> Option<InstallRecord>
             format!("{} is missing; run: tollgate install", rec.binary.display()),
         ),
     }
-    match which("tollgate", ctx.env.get("PATH")) {
+    match on_path {
         Some(p) => {
             let v = version_of(&p, &["--version"], &ctx.env).unwrap_or_else(|| "?".into());
-            let same = std::fs::read(&p).ok() == std::fs::read(&rec.binary).ok();
             if same {
                 out.line(
                     Level::Ok,
@@ -138,7 +159,7 @@ fn check_install(out: &mut Out, ctx: &Ctx, dirs: &Dirs) -> Option<InstallRecord>
                 out.line(
                     Level::Warn,
                     "binary",
-                    format!("PATH {} ({v}) differs from the installed copy; run tollgate install to refresh it", p.display()),
+                    format!("PATH {} ({v}){path_id} differs from the installed copy; run tollgate install to refresh it", p.display()),
                 );
             }
         }

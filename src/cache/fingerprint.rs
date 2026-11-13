@@ -188,7 +188,7 @@ pub fn compute(
     tools: &mut ToolCache,
 ) -> Result<Fingerprint, FingerprintError> {
     let mut fp = Fingerprint::new();
-    fp.insert("tollgate", crate::VERSION);
+    fp.insert("tollgate", super::RECORD_EPOCH);
     let mut probes = vec![GIT];
     if inputs.roots.typescript {
         probes.push(BUN);

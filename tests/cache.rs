@@ -13,7 +13,9 @@ use tollgate::cache::record::{
 };
 use tollgate::cache::store::{Lookup, LookupRequest, RecordStore, StoreError, WriteOutcome};
 use tollgate::cache::toolcache::ToolCache;
-use tollgate::cache::{Fingerprint, RECORD_SCHEMA, record_key};
+use tollgate::cache::{
+    CHECKS_SCHEMA, Fingerprint, RECORD_EPOCH, RECORD_SCHEMA, record_id, record_key,
+};
 use tollgate::config::Tier;
 use tollgate::dirs::Dirs;
 use tollgate::gitx::Oid;
@@ -97,7 +99,7 @@ fn fingerprint_inputs_and_toolcache_hits_r74_r75_t36() {
     assert_eq!(fp.get("cargo-nextest"), Some("cargo-nextest 0.9.150"));
     assert_eq!(fp.get("bun"), Some("absent"));
     assert_eq!(fp.get("uv"), None, "no Python root, no uv probe");
-    assert_eq!(fp.get("tollgate"), Some(tollgate::VERSION));
+    assert_eq!(fp.get("tollgate"), Some(RECORD_EPOCH));
     assert!(fp.get("uname").is_some() && fp.get("job-env").is_some());
     assert_eq!(cache.stats().runs, 4);
     cache.save().unwrap();
@@ -136,6 +138,30 @@ fn fingerprint_inputs_and_toolcache_hits_r74_r75_t36() {
     ]);
     let other = compute_with(&env2, &sb.root(), &mut cache, &[], &BTreeMap::new()).unwrap();
     assert_ne!(other.get("job-env"), same.get("job-env"));
+}
+
+/// R110: the fingerprint names the record epoch, not the package version,
+/// and the epoch is the value 0.2.0 wrote, so its records keep their keys.
+#[test]
+fn fingerprint_holds_the_record_epoch_r110() {
+    let sb = Sandbox::new();
+    let t = tools(&sb);
+    let mut cache = ToolCache::load(&sb.root().join("state/toolcache.json"));
+    let fp = compute(&t, &sb.root(), &mut cache);
+    assert_eq!(fp.get("tollgate"), Some("0.2.0"));
+    assert_eq!(fp.get("tollgate"), Some(RECORD_EPOCH));
+    assert_eq!(record_id(), format!("{CHECKS_SCHEMA}/0.2.0"));
+
+    // A record key of 0.2.0 (fixed tree, tier and fingerprint, computed
+    // with the 0.2.0 build) is the key this build computes.
+    let mut fixed = Fingerprint::new();
+    fixed.insert("tollgate", RECORD_EPOCH);
+    fixed.insert("git", "git version 2.56.0");
+    fixed.insert("rustc", "rustc 1.96.1");
+    assert_eq!(
+        record_key(&tree(1), Tier::Full, &fixed).as_str(),
+        "8ca7aff7a9b8bd7dedb9c24b89ebb7a4da6e360106cfc3b9c7769f472ee3e70a"
+    );
 }
 
 #[test]

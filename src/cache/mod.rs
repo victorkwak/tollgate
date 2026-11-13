@@ -27,6 +27,21 @@ pub const RECORD_SCHEMA: u32 = 1;
 /// logic, so records made by older logic stop matching.
 pub const CHECKS_SCHEMA: u32 = 5;
 
+/// R110: the fingerprint entry `tollgate`. It holds the value that 0.2.0
+/// wrote there (its package version), so records and step passes of 0.2.0
+/// stay valid. It never changes again: a release that changes what a
+/// stored pass means bumps [`CHECKS_SCHEMA`], and the entry goes away at
+/// the next bump.
+pub const RECORD_EPOCH: &str = "0.2.0";
+
+/// R110: the record id of this build, `<checks_schema>/<record epoch>`.
+/// Two builds with the same id read each other's records and step passes
+/// (when tools, host config and policy are the same).
+#[must_use]
+pub fn record_id() -> String {
+    format!("{CHECKS_SCHEMA}/{RECORD_EPOCH}")
+}
+
 /// The sorted map of outside inputs (R74).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
