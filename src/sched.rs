@@ -11,7 +11,9 @@
 //!   `jobs/<id>/state.lock` by [`JobStore::transition`].
 //! - `jobs/queue/<origin hash>/<nanos>-<id>`: one marker per queued job, for
 //!   supersession by origin.
-//! - `jobs/<id>/cancel`: cancel request for a running job.
+//! - `jobs/<id>/cancel`: cancel request for a running job (with a note,
+//!   R112).
+//! - `jobs/<id>/keep`: a job the remote check of R112 never ends.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -177,6 +179,39 @@ pub fn reap_if_lost(dirs: &Dirs, id: &JobId) -> Result<bool, SchedError> {
     };
     lost_metrics(dirs, &meta);
     Ok(true)
+}
+
+/// How long a queued or running job whose runner does not hold its key
+/// lock is given before it counts as lost: the creator writes its files
+/// one after the other (as `plan::wait` allows).
+pub const RUNNER_GRACE: Duration = Duration::from_millis(200);
+
+/// True when `meta` (queued or running) has a runner that holds its key
+/// lock (R88). A job whose runner is gone after [`RUNNER_GRACE`] is
+/// reaped ([`reap_if_lost`]: marked lost, its leftovers killed) and is not
+/// alive; a job that ended meanwhile is not alive either.
+#[must_use]
+pub fn runner_alive(dirs: &Dirs, meta: &JobMeta) -> bool {
+    let holds = || running_job(dirs, &meta.key).ok().flatten().as_ref() == Some(&meta.id);
+    let end = std::time::Instant::now() + RUNNER_GRACE;
+    loop {
+        if holds() {
+            return true;
+        }
+        if std::time::Instant::now() >= end {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    match reap_if_lost(dirs, &meta.id) {
+        Ok(true) => false,
+        _ => {
+            JobStore::new(dirs)
+                .read(&meta.id)
+                .is_ok_and(|m| !m.state.is_terminal())
+                && holds()
+        }
+    }
 }
 
 /// The lost job's line in the metrics log (item 50). Its runner died
@@ -635,7 +670,8 @@ impl JobStore {
         match self.transition(id, &[StateKind::Queued], state)? {
             Transition::Done(_) => Ok(CancelOutcome::Cancelled),
             Transition::Refused(meta) if meta.state.kind() == StateKind::Running => {
-                if note.is_none() {
+                // A plain cancel keeps a note that is there (R112).
+                if note.is_none() && !path.exists() {
                     fsx::write_atomic(&path, &bytes).map_err(io_at(&path))?;
                 }
                 Ok(CancelOutcome::Requested)
@@ -648,6 +684,35 @@ impl JobStore {
     #[must_use]
     pub fn cancel_requested(&self, id: &JobId) -> bool {
         self.dirs.job_dir(id).join("cancel").exists()
+    }
+
+    /// R112: something that is not a candidate push attached to the job
+    /// (a check, a merge, a commit hook, a forced push): `jobs/<id>/keep`,
+    /// and the remote check never ends the job.
+    /// The job dir appears whole, by one rename (R82): while it does not
+    /// exist yet this waits for it (up to a second), and never makes it.
+    pub fn mark_keep(&self, id: &JobId) -> Result<(), SchedError> {
+        let dir = self.dirs.job_dir(id);
+        let path = dir.join("keep");
+        for _ in 0..50 {
+            if dir.join("job.json").exists() {
+                if path.exists() {
+                    return Ok(());
+                }
+                return fsx::write_atomic(&path, b"").map_err(io_at(&path));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Err(SchedError::Io {
+            path: dir,
+            source: io::Error::new(io::ErrorKind::NotFound, "the job dir did not appear"),
+        })
+    }
+
+    /// True when the job has the `keep` marker ([`JobStore::mark_keep`]).
+    #[must_use]
+    pub fn keep_requested(&self, id: &JobId) -> bool {
+        self.dirs.job_dir(id).join("keep").exists()
     }
 
     /// The note of a cancel request with a reason (R112); `None` for a

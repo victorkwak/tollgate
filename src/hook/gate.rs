@@ -541,42 +541,22 @@ pub fn decide(gate: &Gate<'_>, checks: &[Check], retry: &str, ask_remotes: &[Str
         }
         // R111: the candidates of the ref, locked until this check's job
         // is in the list.
-        let mut lane = None;
-        if let Some((pf, url)) = check
-            .push
-            .as_ref()
-            .and_then(|pf| pf.candidate.as_ref().map(|u| (pf, u)))
-        {
-            match candidacy(gate, pf, url) {
-                Candidacy::Busy(refusal) => {
-                    for l in refusal {
-                        eprintln!("{l}");
-                    }
-                    outcomes.push(Outcome::Denied(HookOutcome::RefBusy, None));
-                    continue;
+        let go = match candidacy_of(gate, check) {
+            Ok(go) => go,
+            Err(refusal) => {
+                for l in refusal {
+                    eprintln!("{l}");
                 }
-                Candidacy::Go(l) => lane = l,
+                outcomes.push(Outcome::Denied(HookOutcome::RefBusy, None));
+                continue;
             }
-        }
+        };
         let mut p = p;
-        // R112: only a job `pre-push` created asks the remote.
-        p.spec.for_push = check.push.is_some();
+        // R112: only a candidate's job asks the remote.
+        p.spec.for_push = check.push.as_ref().is_some_and(|pf| pf.candidate.is_some());
         let started = plan::start(&gate.dirs, &p, gate.exe, gate.env);
-        if let Some(mut l) = lane {
-            match &started {
-                Ok(Started::Created(id) | Started::Attached(id)) => {
-                    l.upsert(candidate_entry(gate, check, id));
-                }
-                Ok(Started::Hit(found)) if matches!(**found, Lookup::Pass(_)) => {
-                    if let Some(pf) = &check.push {
-                        l.mark_allowed(&pf.commit, jiff::Timestamp::now());
-                    }
-                }
-                _ => {}
-            }
-            if let Err(e) = l.save() {
-                eprintln!("tollgate: push candidates (R111): {e}");
-            }
+        if let Some(go) = go {
+            enter(gate, check, go, started.as_ref().ok());
         }
         match started {
             Ok(Started::Hit(found)) => outcomes.push(lookup_outcome(gate, check, &found, false)),
@@ -605,17 +585,20 @@ pub fn decide(gate: &Gate<'_>, checks: &[Check], retry: &str, ask_remotes: &[Str
     let deadline = Instant::now() + budget;
     for (i, p, s) in pending {
         let check = &checks[i];
+        // R111 (item 7): a job started after an attached one ended takes
+        // the same look at the ref as the first start, and enters it.
+        let entering: std::cell::RefCell<Option<Go>> = std::cell::RefCell::new(None);
+        let mut before = || match candidacy_of(gate, check) {
+            Ok(go) => {
+                *entering.borrow_mut() = go;
+                Ok(())
+            }
+            Err(lines) => Err(plan::PlanError::Declined(lines)),
+        };
         let mut say = |s: &Started| {
             announce(gate, check, s);
-            // R111: a job started after an attached one ended is the
-            // candidate's job now.
-            if let (Started::Created(id) | Started::Attached(id), Some(pf)) = (s, &check.push)
-                && let Some(url) = &pf.candidate
-                && let Ok(mut l) =
-                    push_lane::Lane::open(&gate.dirs, &push_lane::identity_of(url), &pf.remote_ref)
-            {
-                l.upsert(candidate_entry(gate, check, id));
-                let _ = l.save();
+            if let Some(go) = entering.borrow_mut().take() {
+                enter(gate, check, go, Some(s));
             }
         };
         outcomes[i] = match plan::settle(
@@ -625,9 +608,18 @@ pub fn decide(gate: &Gate<'_>, checks: &[Check], retry: &str, ask_remotes: &[Str
             gate.env,
             s,
             Some(deadline),
-            &mut say,
+            plan::SettleHooks {
+                before_restart: &mut before,
+                on_start: &mut say,
+            },
         ) {
             Ok(settled) => settled_outcome(gate, check, settled),
+            Err(plan::PlanError::Declined(lines)) => {
+                for l in lines {
+                    eprintln!("{l}");
+                }
+                Outcome::Denied(HookOutcome::RefBusy, None)
+            }
             Err(e) => {
                 eprintln!("{}", header(gate, check, "error", None));
                 eprintln!("tollgate: {e}");
@@ -675,64 +667,212 @@ pub fn decide(gate: &Gate<'_>, checks: &[Check], retry: &str, ask_remotes: &[Str
     }
 }
 
-/// R111: whether a candidate line may start or attach to its job.
-enum Candidacy {
-    /// Another commit is in the gate for the ref: the refusal's lines.
-    Busy(Vec<String>),
-    /// Go on; the lane stays locked until the job is in it (`None` when
-    /// the lane cannot be opened: the rule only saves time, so it never
-    /// blocks on its own fault).
-    Go(Option<push_lane::Lane>),
+/// R111: a candidate line that may start or attach to its job.
+struct Go {
+    /// The lane, locked until the job is in it (`None` when it cannot be
+    /// opened: the rule only saves time, so it never blocks on its own
+    /// fault).
+    lane: Option<push_lane::Lane>,
+    /// Earlier candidates of the same worktree and local ref that the
+    /// pushed commit does not contain: this push replaces them.
+    replaced: Vec<push_lane::Candidate>,
 }
 
-/// True when `ancestor` is in the repo and is `commit` or an ancestor of
-/// it. A git error counts as false.
-fn contains(gate: &Gate<'_>, commit: &Oid, ancestor: &Oid) -> bool {
+/// R111: the look at the ref of a candidate line: `Ok(None)` for a line
+/// that is not a candidate, `Err` with the refusal's lines when the ref
+/// is busy.
+fn candidacy_of(gate: &Gate<'_>, check: &Check) -> Result<Option<Go>, Vec<String>> {
+    let Some((pf, url)) = check
+        .push
+        .as_ref()
+        .and_then(|pf| pf.candidate.as_ref().map(|u| (pf, u)))
+    else {
+        return Ok(None);
+    };
+    candidacy(gate, pf, url).map(Some)
+}
+
+/// The worktree a candidate of this hook comes from.
+fn worktree_of(gate: &Gate<'_>) -> std::path::PathBuf {
+    gate.layout
+        .worktree
+        .clone()
+        .unwrap_or_else(|| gate.layout.common_dir.clone())
+}
+
+/// Whether `commit` contains `ancestor`: `Some(false)` when `ancestor` is
+/// not in the repo or not an ancestor, `Some(true)` when it is `commit` or
+/// an ancestor of it, `None` on a doubt (a git error).
+fn contains(gate: &Gate<'_>, commit: &Oid, ancestor: &Oid) -> Option<bool> {
     if commit == ancestor {
-        return true;
+        return Some(true);
     }
-    gate.git
+    if gate
+        .git
+        .rev_parse_verify(&format!("{ancestor}^{{commit}}"))
+        .ok()?
+        .is_none()
+    {
+        return Some(false);
+    }
+    let out = gate
+        .git
         .output([
             "merge-base",
             "--is-ancestor",
             ancestor.as_str(),
             commit.as_str(),
         ])
-        .is_ok_and(|o| o.status.code() == Some(0))
+        .ok()?;
+    match out.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
 }
 
 /// R111: reads the live candidates of the line's ref (entries whose
 /// commit the remote's value on stdin contains have landed and go) and
 /// decides. A candidate whose commit the pushed commit contains is stacked
-/// under it; any other live candidate makes the ref busy. When several are
-/// not contained, the oldest of those is named.
-fn candidacy(gate: &Gate<'_>, pf: &PushFacts, url: &str) -> Candidacy {
+/// under it, and so is one on a doubt. One from the same worktree and
+/// local ref that the pushed commit does not contain is replaced (a
+/// rewrite: amend, reset). Any other live candidate makes the ref busy;
+/// the oldest of those is named.
+fn candidacy(gate: &Gate<'_>, pf: &PushFacts, url: &str) -> Result<Go, Vec<String>> {
     let mut lane =
         match push_lane::Lane::open(&gate.dirs, &push_lane::identity_of(url), &pf.remote_ref) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("tollgate: push candidates (R111): {e}");
-                return Candidacy::Go(None);
+                return Ok(Go {
+                    lane: None,
+                    replaced: Vec::new(),
+                });
             }
         };
     let now = jiff::Timestamp::now();
     let hold = gate.host.config.push.candidate_hold.get();
-    let landed = |c: &Oid| !pf.remote_oid.is_zero() && contains(gate, &pf.remote_oid, c);
+    let landed =
+        |c: &Oid| !pf.remote_oid.is_zero() && contains(gate, &pf.remote_oid, c) == Some(true);
     let live = lane.prune(&gate.dirs, hold, now, &landed);
-    let busy = live
-        .iter()
-        .find(|(c, _)| c.commit != pf.commit && !contains(gate, &pf.commit, &c.commit));
+    let mine = worktree_of(gate);
+    let mut replaced = Vec::new();
+    let mut busy = None;
+    for (c, state) in &live {
+        if c.commit == pf.commit || contains(gate, &pf.commit, &c.commit) != Some(false) {
+            continue;
+        }
+        if c.worktree == mine && c.local_ref == pf.local_ref {
+            replaced.push(c.clone());
+        } else if busy.is_none() {
+            busy = Some((c, *state));
+        }
+    }
     let refuse = gate.host.config.push.second_candidate == SecondCandidate::Refuse;
     match busy {
         Some((k, state)) if refuse => {
             if let Err(e) = lane.save() {
                 eprintln!("tollgate: push candidates (R111): {e}");
             }
-            Candidacy::Busy(busy_lines(gate, pf, k, *state, now))
+            Err(busy_lines(gate, pf, k, state, now))
         }
-        _ => Candidacy::Go(Some(lane)),
+        _ => Ok(Go {
+            lane: Some(lane),
+            replaced,
+        }),
     }
 }
+
+/// R111: after the start of a candidate line's job (`started` is `None`
+/// when it failed): the replaced entries go, the line's entry goes in (or
+/// a stored pass marks it allowed), the lane is saved and unlocked; then
+/// replaced jobs are cancelled, and a created job gets its remote check
+/// (R112).
+fn enter(gate: &Gate<'_>, check: &Check, go: Go, started: Option<&Started>) {
+    let Some(pf) = &check.push else {
+        return;
+    };
+    let job = match started {
+        Some(Started::Created(id) | Started::Attached(id)) => Some(id),
+        _ => None,
+    };
+    if let Some(mut l) = go.lane {
+        if started.is_some() {
+            for r in &go.replaced {
+                l.file.entries.retain(|e| e.commit != r.commit);
+            }
+        }
+        match started {
+            Some(Started::Created(id) | Started::Attached(id)) => {
+                l.upsert(candidate_entry(gate, check, id));
+            }
+            Some(Started::Hit(found)) if matches!(**found, Lookup::Pass(_)) => {
+                l.mark_allowed(&pf.commit, jiff::Timestamp::now());
+            }
+            _ => {}
+        }
+        if let Err(e) = l.save() {
+            eprintln!("tollgate: push candidates (R111): {e}");
+        }
+    }
+    if started.is_none() {
+        return;
+    }
+    for r in &go.replaced {
+        let what = replace_old(gate, r, job, &pf.local_ref);
+        eprintln!(
+            "tollgate: {} {}: replaces commit {} of this worktree in the gate (job {} {what})",
+            gate.hook,
+            pf.remote_ref,
+            r.commit.short(12),
+            r.job
+        );
+    }
+    if let Some(Started::Created(id)) = started
+        && gate.host.config.push.remote_check.interval().is_some()
+        && let Err(e) = crate::runner::spawn::spawn_watch(gate.exe, &gate.dirs, id, gate.env)
+    {
+        eprintln!("tollgate: job {id}: cannot start its remote check (R112): {e}");
+    }
+}
+
+/// R111: ends the job of a replaced candidate when nothing else needs it;
+/// returns `cancelled` or `kept: <why>`.
+fn replace_old(
+    gate: &Gate<'_>,
+    old: &push_lane::Candidate,
+    new_job: Option<&JobId>,
+    local_ref: &str,
+) -> String {
+    let store = crate::sched::JobStore::new(&gate.dirs);
+    let why = if new_job == Some(&old.job) {
+        "the new commit has the same tree"
+    } else if !push_lane::of_job(&gate.dirs, &old.job).is_empty() {
+        "another candidate needs it"
+    } else if !crate::runner::job::JobSpec::read(&gate.dirs, &old.job).is_ok_and(|s| s.for_push) {
+        "not started by a candidate push"
+    } else if store.keep_requested(&old.job) {
+        "another check waits for it"
+    } else {
+        let note = crate::sched::CancelNote {
+            reason: format!(
+                "replaced by a newer push of {local_ref} from the same worktree (R111)"
+            ),
+            cause: Some(CAUSE_REPLACED.to_owned()),
+        };
+        return match store.request_cancel_with(&old.job, Some(&note)) {
+            Ok(crate::sched::CancelOutcome::Cancelled | crate::sched::CancelOutcome::Requested) => {
+                "cancelled".to_owned()
+            }
+            Ok(crate::sched::CancelOutcome::AlreadyEnded(_)) => "kept: it already ended".to_owned(),
+            Err(e) => format!("kept: {e}"),
+        };
+    };
+    format!("kept: {why}")
+}
+
+/// The `cause` of the metrics line of a job a newer push replaced (R111).
+pub const CAUSE_REPLACED: &str = "replaced";
 
 /// R111: the refusal of a second candidate.
 fn busy_lines(
@@ -765,6 +905,10 @@ fn busy_lines(
             super::argv::shell_quote(&k.worktree.to_string_lossy()),
             super::argv::shell_quote(&k.local_ref)
         ),
+        format!(
+            "tollgate: or, when that commit is no longer wanted: tollgate cancel {}, then push again.",
+            k.job
+        ),
     ]
 }
 
@@ -775,11 +919,7 @@ fn candidate_entry(gate: &Gate<'_>, check: &Check, job: &JobId) -> push_lane::Ca
         commit: pf.commit.clone(),
         tree: check.tree.clone(),
         job: job.clone(),
-        worktree: gate
-            .layout
-            .worktree
-            .clone()
-            .unwrap_or_else(|| gate.layout.common_dir.clone()),
+        worktree: worktree_of(gate),
         local_ref: pf.local_ref.clone(),
         remote: pf.remote.clone(),
         url: pf.candidate.clone().unwrap_or_default(),

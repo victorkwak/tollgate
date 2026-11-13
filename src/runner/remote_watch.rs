@@ -1,48 +1,50 @@
-//! R112: a job that `pre-push` started for push candidates (R111) asks
-//! the trusted server during its run whether its candidates can still be
-//! pushed.
+//! R112: the remote check of a job that `pre-push` created for a push
+//! candidate (R111).
 //!
-//! Every `[push] remote_check` a thread of the runner reads the candidates
-//! whose job is this job ([`push_lane::of_job`]) and asks the server of
-//! each for the current value of its ref (`git ls-remote --heads` through
+//! `pre-push` starts `tollgate __watch-push <job>` next to the runner
+//! ([`crate::runner::spawn::spawn_watch`]): its own session, never a
+//! descendant of the runner, whose step ends treat every descendant as
+//! part of the step (R35). The watcher looks at the job every half second
+//! and exits when it ended, its dir is gone, its runner is gone
+//! ([`sched::runner_alive`]), or after [`MAX_LIFETIME`]. Every `[push]
+//! remote_check` it reads the candidates whose job is this job
+//! ([`push_lane::of_job`]) and asks the server of each for the current
+//! value of its ref (`git ls-remote --heads` through
 //! [`RemoteRefs::server_heads`]: the clean environment of R14 and X1, the
 //! answer kept in `remote-refs.json`). A candidate is lost when the value
 //! is not zero and the candidate commit does not contain it: the value is
 //! not in the repo, or it is not an ancestor of the commit. A failed query
 //! or a doubt about the repo keeps the candidate. When every candidate is
-//! lost, the thread removes the entries and cancels the job with the
-//! reason ([`JobStore::request_cancel_with`]); the runner ends it as
-//! cancelled at its next look at the cancel request, and writes no record.
+//! lost, and the job has no `keep` marker (something that is not a
+//! candidate push also waits for its result), the watcher cancels the job
+//! with the reason ([`JobStore::request_cancel_with`]) and then removes the
+//! entries, only when the cancel took (a job that just passed keeps its
+//! entries and its hold). The runner ends the job as cancelled at its next
+//! look at the cancel request and writes no record.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::repo::branch_name;
 use crate::dirs::Dirs;
 use crate::env::EnvSnapshot;
+use crate::exit;
 use crate::gitx::{Git, Oid};
 use crate::ids::JobId;
 use crate::push_lane::{self, Candidate};
 use crate::remote_refs::{RemoteRefs, TrustedRemote};
-use crate::sched::{CancelNote, JobStore};
+use crate::runner::job::JobSpec;
+use crate::sched::{self, CancelNote, CancelOutcome, JobStore};
 
 /// The `cause` of the metrics line of a job R112 ended.
 pub const CAUSE_BEHIND: &str = "behind";
 
-/// Stops the watch thread when dropped.
-#[derive(Debug)]
-pub struct Watch {
-    stop: Arc<AtomicBool>,
-}
+/// A watcher never lives longer than this.
+pub const MAX_LIFETIME: Duration = Duration::from_secs(24 * 3600);
 
-impl Drop for Watch {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
-}
+/// How often the watcher looks at the job's state.
+const LOOK: Duration = Duration::from_millis(500);
 
-/// What the thread needs.
+/// What one remote check needs.
 #[derive(Debug, Clone)]
 pub struct WatchInput {
     /// Dirs.
@@ -51,54 +53,74 @@ pub struct WatchInput {
     pub job: JobId,
     /// The repo's common dir (the candidate commits are in it).
     pub common_dir: std::path::PathBuf,
-    /// The runner's environment (credentials for the query, X1).
+    /// The watcher's environment (credentials for the query, X1).
     pub env: EnvSnapshot,
     /// `job.path_prepend` of the host config (X1).
     pub path_prepend: Vec<String>,
-    /// `[push] remote_check`.
-    pub every: Duration,
 }
 
-/// Starts the watch thread; it ends when the returned [`Watch`] is dropped
-/// or when it cancelled the job.
-#[must_use]
-pub fn start(input: WatchInput) -> Watch {
-    let stop = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&stop);
-    let _ = std::thread::Builder::new()
-        .name("remote-check".into())
-        .spawn(move || watch(&input, &flag));
-    Watch { stop }
-}
-
-/// Sleeps `d` in short slices; false when `stop` was set meanwhile.
-fn pause(d: Duration, stop: &AtomicBool) -> bool {
-    let end = Instant::now() + d;
-    while Instant::now() < end {
-        if stop.load(Ordering::Relaxed) {
-            return false;
+/// `tollgate __watch-push <job>`: watches until the job ends. Exit 0.
+pub fn run(dirs: &Dirs, id: &JobId, env: &EnvSnapshot) -> u8 {
+    let spec = match JobSpec::read(dirs, id) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("tollgate watch: {e}");
+            return exit::OK;
         }
-        std::thread::sleep(Duration::from_millis(50).min(end - Instant::now()));
-    }
-    !stop.load(Ordering::Relaxed)
-}
-
-fn watch(input: &WatchInput, stop: &AtomicBool) {
-    while pause(input.every, stop) {
-        let cands = push_lane::of_job(&input.dirs, &input.job);
-        if cands.is_empty() {
-            continue;
-        }
-        let Some(note) = all_lost(input, &cands) else {
-            continue;
+    };
+    let Some(every) = spec.host.push.remote_check.interval() else {
+        return exit::OK;
+    };
+    let input = WatchInput {
+        dirs: dirs.clone(),
+        job: id.clone(),
+        common_dir: spec.common_dir.clone(),
+        env: env.clone(),
+        path_prepend: spec.host.job.path_prepend.clone(),
+    };
+    let store = JobStore::new(dirs);
+    let started = Instant::now();
+    let mut next = started + every;
+    while started.elapsed() < MAX_LIFETIME {
+        let Ok(meta) = store.read(id) else {
+            return exit::OK;
         };
-        if stop.load(Ordering::Relaxed) {
-            return;
+        if meta.state.is_terminal() || !sched::runner_alive(dirs, &meta) {
+            return exit::OK;
         }
-        push_lane::remove_job(&input.dirs, &input.job);
-        let _ = JobStore::new(&input.dirs).request_cancel_with(&input.job, Some(&note));
-        return;
+        if Instant::now() >= next {
+            next = Instant::now() + every;
+            if store.keep_requested(id) {
+                // Never ended now; nothing more to watch for.
+                return exit::OK;
+            }
+            if let Some(note) = check(&input) {
+                if let Ok(CancelOutcome::Cancelled | CancelOutcome::Requested) =
+                    store.request_cancel_with(id, Some(&note))
+                {
+                    push_lane::remove_job(dirs, id);
+                    eprintln!("tollgate watch: {}", note.reason);
+                }
+                return exit::OK;
+            }
+        }
+        std::thread::sleep(
+            LOOK.min(next.saturating_duration_since(Instant::now()))
+                .max(Duration::from_millis(10)),
+        );
     }
+    exit::OK
+}
+
+/// One remote check: the cancel note when every candidate of the job is
+/// lost; `None` when one is not, when there are none, or on any doubt.
+#[must_use]
+pub fn check(input: &WatchInput) -> Option<CancelNote> {
+    let cands = push_lane::of_job(&input.dirs, &input.job);
+    if cands.is_empty() {
+        return None;
+    }
+    all_lost(input, &cands)
 }
 
 /// The value of `remote_ref` on the trusted server of `c`, asked now;

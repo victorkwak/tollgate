@@ -30,7 +30,7 @@ use crate::fsx;
 use crate::gitx::Oid;
 use crate::ids::JobId;
 use crate::locks::LockFile;
-use crate::sched::{JobState, JobStore};
+use crate::sched::{self, JobState, JobStore};
 
 const VERSION: u32 = 1;
 
@@ -143,21 +143,25 @@ pub fn liveness(
 ) -> Option<Live> {
     let meta = JobStore::new(dirs).read(&c.job).ok()?;
     match meta.state {
+        // A job whose runner died holds no ref; it is reaped here.
+        JobState::Queued | JobState::Running { .. } if !sched::runner_alive(dirs, &meta) => None,
         JobState::Queued => Some(Live::Queued(meta.created)),
         JobState::Running { started, .. } => Some(Live::Running(started)),
         JobState::Finished {
             verdict: Verdict::Pass,
         } => {
-            let passed = match c.passed {
-                Some(t) => t,
-                None => {
-                    let t = mtime(&dirs.job_dir(&c.job).join("job.json")).unwrap_or(now);
-                    c.passed = Some(t);
-                    t
-                }
-            };
+            // A time in the future (a clock that was ahead) is kept as
+            // now, so it holds the ref for at most `hold`.
+            let passed = c
+                .passed
+                .unwrap_or_else(|| mtime(&dirs.job_dir(&c.job).join("job.json")).unwrap_or(now))
+                .min(now);
+            c.passed = Some(passed);
+            if let Some(a) = c.allowed {
+                c.allowed = Some(a.min(now));
+            }
             let last = c.allowed.map_or(passed, |a| a.max(passed));
-            let held = now.duration_since(last).unsigned_abs() < hold || last > now;
+            let held = now.duration_since(last).unsigned_abs() < hold;
             held.then_some(Live::Passed(passed))
         }
         _ => None,
@@ -457,6 +461,13 @@ mod tests {
             state: JobState::Queued,
         };
         let store = JobStore::new(dirs);
+        // A live job's runner holds its key lock (R88): kept for the test.
+        if !state.is_terminal()
+            && let crate::sched::Claim::Owner(claim) =
+                crate::sched::claim_job(dirs, &meta.key, &id).unwrap()
+        {
+            std::mem::forget(claim);
+        }
         store.create(&meta).unwrap();
         if state != JobState::Queued {
             store.transition(&id, &[StateKind::Queued], state).unwrap();
@@ -585,6 +596,36 @@ mod tests {
         assert_eq!(age_text(Duration::from_secs(45)), "45s");
         assert_eq!(age_text(Duration::from_secs(192)), "3m12s");
         assert_eq!(age_text(Duration::from_secs(7500)), "2h05m");
+    }
+
+    /// R111: a pass or allow time in the future (a clock that was ahead)
+    /// counts as now, and is kept as now: it holds the ref for at most
+    /// `candidate_hold` from the first read.
+    #[test]
+    fn a_time_in_the_future_holds_for_at_most_the_hold_r111() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = dirs(tmp.path());
+        let hold = Duration::from_secs(600);
+        let now = jiff::Timestamp::now();
+        let passed = job(
+            &d,
+            3,
+            JobState::Finished {
+                verdict: Verdict::Pass,
+            },
+        );
+        let id = identity_of("/srv/r.git");
+        let mut lane = Lane::open(&d, &id, "refs/heads/main").unwrap();
+        let mut c = cand('c', &passed);
+        let day = jiff::SignedDuration::from_hours(24);
+        c.passed = Some(now + day);
+        c.allowed = Some(now + day);
+        lane.upsert(c);
+        assert_eq!(lane.prune(&d, hold, now, &|_| false).len(), 1);
+        assert_eq!(lane.file.entries[0].passed, Some(now));
+        assert_eq!(lane.file.entries[0].allowed, Some(now));
+        let after = now + jiff::SignedDuration::from_secs(601);
+        assert!(lane.prune(&d, hold, after, &|_| false).is_empty());
     }
 
     /// R111: two processes that update one ref at the same moment both

@@ -364,7 +364,16 @@ pub fn check(ctx: &Ctx, a: &CheckArgs) -> u8 {
         )
     };
     match plan::settle(
-        &repo.dirs, &plan, &ctx.exe, &ctx.env, started, deadline, &mut say,
+        &repo.dirs,
+        &plan,
+        &ctx.exe,
+        &ctx.env,
+        started,
+        deadline,
+        plan::SettleHooks {
+            before_restart: &mut || Ok(()),
+            on_start: &mut say,
+        },
     ) {
         Ok(Settled::Record(found)) => print_lookup(&repo.dirs, &found),
         Ok(Settled::Report(r)) => {
@@ -1701,6 +1710,20 @@ pub fn run_job(ctx: &Ctx, job: &str, lock_fd: Option<i32>) -> u8 {
         Err(e) => return fail(e),
     };
     job::run_job(&dirs, &id, &ctx.env)
+}
+
+/// `tollgate __watch-push <job>` (R112): the remote check of a push job,
+/// started by `pre-push` next to the runner.
+pub fn watch_push(ctx: &Ctx, job: &str) -> u8 {
+    let dirs = match ctx.dirs() {
+        Ok(d) => d,
+        Err(e) => return fail(e),
+    };
+    let id = match JobId::parse(job) {
+        Ok(i) => i,
+        Err(e) => return fail(e),
+    };
+    crate::runner::remote_watch::run(&dirs, &id, &ctx.env)
 }
 
 /// `tollgate remotes forget [repo]` (item 33): empties the record of the

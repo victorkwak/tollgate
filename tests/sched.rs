@@ -434,6 +434,17 @@ fn a_cancel_keeps_its_reason_and_old_job_files_read_r112() {
     );
     assert!(store.cancel_requested(&running.id));
     assert_eq!(store.cancel_note(&running.id), Some(note.clone()));
+    // A plain `tollgate cancel` afterwards keeps the note.
+    assert_eq!(
+        store.request_cancel(&running.id).unwrap(),
+        CancelOutcome::Requested
+    );
+    assert_eq!(store.cancel_note(&running.id), Some(note.clone()));
+    // The keep marker (R112).
+    assert!(!store.keep_requested(&running.id));
+    store.mark_keep(&running.id).unwrap();
+    store.mark_keep(&running.id).unwrap();
+    assert!(store.keep_requested(&running.id));
     // A plain cancel has no note.
     let plain = meta(job_id(3), key(3), 3, Tier::Full, &origin, 2);
     store.create(&plain).unwrap();

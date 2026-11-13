@@ -58,6 +58,10 @@ pub enum PlanError {
     /// Job store or files.
     #[error("{0}")]
     Io(String),
+    /// The caller declined to start a job (R111: the ref is busy); the
+    /// lines say why.
+    #[error("{}", .0.join("\n"))]
+    Declined(Vec<String>),
     /// [`Plan::may_create`] is off and no job runs for the key (R104).
     #[error("no job runs for key {0}, and this check may not start one (R104)")]
     NoNewJob(RecordKey),
@@ -990,13 +994,35 @@ pub fn start(
                 }
                 return Ok(Started::Created(spec.id.clone()));
             }
-            Claim::Running(Some(id)) => return Ok(Started::Attached(id)),
+            Claim::Running(Some(id)) => {
+                // R112: a plan that is not a candidate push wants this
+                // job's result too: the remote check never ends it.
+                if !spec.for_push {
+                    let _ = JobStore::new(dirs).mark_keep(&id);
+                }
+                return Ok(Started::Attached(id));
+            }
             Claim::Running(None) => std::thread::sleep(Duration::from_millis(20)),
         }
     }
     Err(PlanError::Io(
         "another job holds the key but its id cannot be read".into(),
     ))
+}
+
+/// The callers' hooks of [`settle`].
+pub struct SettleHooks<'a> {
+    /// Runs before the plan starts its own job after an attached one
+    /// ended; an error declines that start (R111).
+    pub before_restart: &'a mut dyn FnMut() -> Result<(), PlanError>,
+    /// Sees every job started or attached on the way (for messages).
+    pub on_start: &'a mut dyn FnMut(&Started),
+}
+
+impl std::fmt::Debug for SettleHooks<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SettleHooks")
+    }
 }
 
 /// How a check ended ([`settle`]).
@@ -1039,9 +1065,8 @@ fn same_check(dirs: &Dirs, id: &JobId, plan: &Plan) -> bool {
 /// (another check of the same key) may have checked another selection or
 /// reused steps, so its report answers only when [`same_check`] holds;
 /// otherwise, once it ends, this plan's own lookup decides, and on a miss
-/// this plan starts its own job. `on_start` sees every job started or
-/// attached on the way (for messages). The hooks use this, never the
-/// attached job's verdict alone.
+/// this plan starts its own job ([`SettleHooks`]). The hooks use this,
+/// never the attached job's verdict alone.
 pub fn settle(
     dirs: &Dirs,
     plan: &Plan,
@@ -1049,8 +1074,12 @@ pub fn settle(
     env: &EnvSnapshot,
     started: Started,
     deadline: Option<Instant>,
-    on_start: &mut dyn FnMut(&Started),
+    hooks: SettleHooks<'_>,
 ) -> Result<Settled, PlanError> {
+    let SettleHooks {
+        before_restart,
+        on_start,
+    } = hooks;
     let mut current = started;
     for _ in 0..8 {
         match current {
@@ -1082,6 +1111,7 @@ pub fn settle(
                 // this plan attached.
                 let mut own = plan.clone();
                 own.spec.created = jiff::Timestamp::now();
+                before_restart()?;
                 current = start(dirs, &own, exe, env)?;
                 on_start(&current);
             }

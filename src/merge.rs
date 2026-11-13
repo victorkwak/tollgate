@@ -174,7 +174,18 @@ pub fn merge(ctx: &Ctx, branch: &str) -> u8 {
                     Started::Hit(_) => {}
                 };
                 say(&started);
-                plan::settle(&dirs, &p, &ctx.exe, &ctx.env, started, deadline, &mut say)
+                plan::settle(
+                    &dirs,
+                    &p,
+                    &ctx.exe,
+                    &ctx.env,
+                    started,
+                    deadline,
+                    plan::SettleHooks {
+                        before_restart: &mut || Ok(()),
+                        on_start: &mut say,
+                    },
+                )
             }
             Err(e) => Err(e),
         },
