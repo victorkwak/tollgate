@@ -374,6 +374,7 @@ mod tests {
             quarantined: 0,
             step_ms,
             branch: branch.map(str::to_owned),
+            cause: None,
         })
     }
 

@@ -329,7 +329,10 @@ fn cancel_ends_queued_jobs_and_flags_running_ones_r89_t39() {
         store.request_cancel(&queued.id).unwrap(),
         CancelOutcome::Cancelled
     );
-    assert_eq!(store.read(&queued.id).unwrap().state, JobState::Cancelled);
+    assert_eq!(
+        store.read(&queued.id).unwrap().state,
+        JobState::Cancelled { reason: None }
+    );
     assert!(!store.cancel_requested(&running.id));
     assert_eq!(
         store.request_cancel(&running.id).unwrap(),
@@ -338,7 +341,7 @@ fn cancel_ends_queued_jobs_and_flags_running_ones_r89_t39() {
     assert!(store.cancel_requested(&running.id));
     assert_eq!(
         store.request_cancel(&queued.id).unwrap(),
-        CancelOutcome::AlreadyEnded(JobState::Cancelled)
+        CancelOutcome::AlreadyEnded(JobState::Cancelled { reason: None })
     );
     // A cancelled job leaves the origin queue.
     let qdir = dirs.job_queue_dir().join(origin.hash());
@@ -382,4 +385,80 @@ fn a_held_key_of_an_ended_job_is_not_a_running_job_r88() {
         Claim::Owner(c) => assert_eq!(c.job(), &job_id(31)),
         other => panic!("attached to an ended job: {other:?}"),
     }
+}
+
+/// R112: a cancel with a reason keeps it in the `cancel` file and, for a
+/// queued job, in the state; a `job.json` written before the reason
+/// existed (`"state": "cancelled"` alone) still reads.
+#[test]
+fn a_cancel_keeps_its_reason_and_old_job_files_read_r112() {
+    let sb = Sandbox::new();
+    let dirs = dirs_at(&sb.root().join("state"));
+    let store = JobStore::new(&dirs);
+    let origin = Origin {
+        worktree: "/r".into(),
+        refname: "refs/heads/main".into(),
+    };
+    let queued = meta(job_id(1), key(1), 1, Tier::Full, &origin, 0);
+    let running = meta(job_id(2), key(2), 2, Tier::Full, &origin, 1);
+    store.create(&queued).unwrap();
+    store.create(&running).unwrap();
+    store
+        .transition(
+            &running.id,
+            &[StateKind::Queued],
+            JobState::Running {
+                started: jiff::Timestamp::now(),
+                pid: 1,
+            },
+        )
+        .unwrap();
+    let note = sched::CancelNote {
+        reason: "refs/heads/main on origin moved (R112)".into(),
+        cause: Some("behind".into()),
+    };
+    assert_eq!(
+        store.request_cancel_with(&queued.id, Some(&note)).unwrap(),
+        CancelOutcome::Cancelled
+    );
+    assert_eq!(
+        store.read(&queued.id).unwrap().state,
+        JobState::Cancelled {
+            reason: Some(note.reason.clone())
+        }
+    );
+    assert_eq!(store.cancel_note(&queued.id), Some(note.clone()));
+    assert_eq!(
+        store.request_cancel_with(&running.id, Some(&note)).unwrap(),
+        CancelOutcome::Requested
+    );
+    assert!(store.cancel_requested(&running.id));
+    assert_eq!(store.cancel_note(&running.id), Some(note.clone()));
+    // A plain cancel has no note.
+    let plain = meta(job_id(3), key(3), 3, Tier::Full, &origin, 2);
+    store.create(&plain).unwrap();
+    store.request_cancel(&plain.id).unwrap();
+    assert_eq!(store.cancel_note(&plain.id), None);
+    let json = std::fs::read_to_string(dirs.job_dir(&plain.id).join("job.json")).unwrap();
+    assert!(!json.contains("reason"), "{json}");
+    // The job.json of an older version.
+    let old = format!(
+        r#"{{"id":"{}","key":"{}","tree":"{}","tier":"full","origin":{{"worktree":"/r","refname":"HEAD"}},"priority":"hook","created":"2026-11-01T00:00:00Z","state":"cancelled"}}"#,
+        job_id(4),
+        key(4),
+        "04".repeat(20)
+    );
+    let m: JobMeta = serde_json::from_str(&old).unwrap();
+    assert_eq!(m.state, JobState::Cancelled { reason: None });
+    let with = old.replace(
+        r#""state":"cancelled""#,
+        r#""state":"cancelled","reason":"why""#,
+    );
+    let m: JobMeta = serde_json::from_str(&with).unwrap();
+    assert_eq!(
+        m.state,
+        JobState::Cancelled {
+            reason: Some("why".into())
+        }
+    );
 }

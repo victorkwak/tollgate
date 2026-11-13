@@ -293,7 +293,7 @@ impl JobRow {
             JobState::Running { .. } => "running",
             JobState::Finished { .. } => "finished",
             JobState::Superseded => "superseded",
-            JobState::Cancelled => "cancelled",
+            JobState::Cancelled { .. } => "cancelled",
             JobState::Deferred { .. } => "deferred",
             JobState::Lost { .. } => "lost",
         };

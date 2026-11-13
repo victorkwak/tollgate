@@ -95,6 +95,10 @@ pub enum HookOutcome {
     /// R102: the remote branch has commits that the push does not
     /// contain, so git would reject it; refused before any plan or job.
     Behind,
+    /// R111: another commit is already in the gate for the ref; refused
+    /// before any job.
+    #[serde(rename = "ref-busy")]
+    RefBusy,
 }
 
 /// One line of the log.
@@ -290,6 +294,11 @@ pub struct JobEvent {
     /// `step_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Why a job ended without a verdict, when it has a reason: `behind`
+    /// for a job that R112 ended because the remote ref moved past its
+    /// candidates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
 }
 
 /// R109: the summed time of the steps of `steps` that ran (not skipped,
@@ -607,6 +616,9 @@ pub struct RepoTier {
     /// Push refs refused because the remote branch has commits that the
     /// push does not contain (R102). No job ran; not in [`Self::checks`].
     pub behind: u32,
+    /// Push refs refused because another commit was in the gate for the
+    /// ref (R111). No job ran; not in [`Self::checks`].
+    pub ref_busy: u32,
     /// Refusals whose job has no `job` line yet: it still runs, or its
     /// line was rotated out. A job lost to a dead runner gets its line
     /// from the reap ([`LOST`]).
@@ -817,6 +829,10 @@ pub fn stats(events: &[Event], since: Option<jiff::Timestamp>) -> Stats {
             Event::Hook(h) if h.outcome == HookOutcome::Behind => {
                 acc(&mut by, &h.repo, h.tier).row.behind += 1;
             }
+            // R111: the same, for a ref with another commit in the gate.
+            Event::Hook(h) if h.outcome == HookOutcome::RefBusy => {
+                acc(&mut by, &h.repo, h.tier).row.ref_busy += 1;
+            }
             Event::Hook(h) => {
                 let a = acc(&mut by, &h.repo, h.tier);
                 // One time sample per hook run (and row): a push of five
@@ -841,7 +857,7 @@ pub fn stats(events: &[Event], since: Option<jiff::Timestamp>) -> Stats {
                     HookOutcome::Failed => a.row.failed += 1,
                     HookOutcome::Error => a.row.errors += 1,
                     // Counted above, outside `checks`.
-                    HookOutcome::Behind => {}
+                    HookOutcome::Behind | HookOutcome::RefBusy => {}
                     HookOutcome::RefusedCap => {
                         a.row.cap_refusals += 1;
                         if let Some(j) = &h.job {
@@ -1340,6 +1356,48 @@ mod tests {
         assert!(out.contains("behind"), "{out}");
     }
 
+    /// R111: a `ref-busy` refusal is counted as `ref_busy`, not as a
+    /// check, and has no hook time sample. R112: a job line with `cause`
+    /// reads and writes it; older lines without it read.
+    #[test]
+    fn ref_busy_refusals_and_behind_job_ends_r111_r112() {
+        let hit = r#"{"kind":"hook","t":"2026-11-09T12:00:00Z","hook":"pre-push","repo":"r","tier":"full","outcome":"cache_hit","job":null,"ms":5}"#;
+        let busy = r#"{"kind":"hook","t":"2026-11-09T12:00:01Z","hook":"pre-push","repo":"r","tier":"full","outcome":"ref-busy","ms":3,"run":"aaaaaaaa"}"#;
+        let events: Vec<Event> = [hit, busy]
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let Event::Hook(h) = &events[1] else {
+            panic!("{events:?}")
+        };
+        assert_eq!(h.outcome, HookOutcome::RefBusy);
+        let text = serde_json::to_string(&events[1]).unwrap();
+        assert!(text.contains("\"outcome\":\"ref-busy\""), "{text}");
+        let s = stats(&events, None);
+        let full = s.repos.iter().find(|r| r.tier == "full").unwrap();
+        assert_eq!((full.checks, full.cache_hits, full.ref_busy), (1, 1, 1));
+        assert_eq!(full.hook_ms.map(|p| p.p50), Some(5), "{full:#?}");
+        let mut job = job_end(
+            "20261109-120000-0000000a",
+            jiff::Timestamp::now(),
+            "cancelled",
+        );
+        let Event::Job(j) = &mut job else {
+            panic!("{job:?}")
+        };
+        assert_eq!(j.cause, None);
+        let text = serde_json::to_string(&job).unwrap();
+        assert!(!text.contains("cause"), "{text}");
+        let Event::Job(j) = &mut job else {
+            panic!("{job:?}")
+        };
+        j.cause = Some("behind".into());
+        let text = serde_json::to_string(&job).unwrap();
+        assert!(text.contains("\"cause\":\"behind\""), "{text}");
+        let back: Event = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, job);
+    }
+
     #[test]
     fn hook_time_is_one_sample_per_hook_run_not_per_check() {
         // A pre-push of 5 refs that waited 30 s is one 30 s wait, as long
@@ -1442,6 +1500,7 @@ mod tests {
             quarantined: 0,
             step_ms: None,
             branch: None,
+            cause: None,
         })
     }
 

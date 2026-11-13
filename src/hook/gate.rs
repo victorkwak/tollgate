@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use crate::cache::record::Verdict;
 use crate::cache::store::Lookup;
+use crate::config::host::SecondCandidate;
+use crate::config::repo::branch_name;
 use crate::config::{CompiledScope, HostConfig, LoadedHost, RefRules, Tier};
 use crate::dirs::Dirs;
 use crate::env::EnvSnapshot;
@@ -24,6 +26,7 @@ use crate::locks::Priority;
 use crate::metrics::{self, HookOutcome};
 use crate::plan::{self, Base, Plan, PlanRequest, Settled, Started};
 use crate::policy;
+use crate::push_lane;
 use crate::remote_refs::RemoteRefs;
 use crate::report::{self, JobReport};
 
@@ -223,6 +226,26 @@ pub struct Check {
     pub remote_verify: Option<RemoteVerify>,
     /// The command that runs this check again after a stored fail.
     pub rerun_hint: String,
+    /// `pre-push`: the pushed branch line (R111, R112).
+    pub push: Option<PushFacts>,
+}
+
+/// What `pre-push` knows of one pushed branch (R111, R112).
+#[derive(Debug, Clone)]
+pub struct PushFacts {
+    /// The remote name.
+    pub remote: String,
+    /// The remote ref.
+    pub remote_ref: String,
+    /// The local ref.
+    pub local_ref: String,
+    /// The pushed commit.
+    pub commit: Oid,
+    /// The remote's current value (zero when the ref is new).
+    pub remote_oid: Oid,
+    /// The trusted fetch URL of the remote, when the line is a push
+    /// candidate (R111): tier `full`, a trusted remote, not forced.
+    pub candidate: Option<String>,
 }
 
 /// R14 outcome 2: the current `refs/heads/<branch>` of each of `remotes`
@@ -496,6 +519,9 @@ pub fn decide(gate: &Gate<'_>, checks: &[Check], retry: &str, ask_remotes: &[Str
         match plan::lookup(&gate.dirs, &p) {
             Ok(Lookup::Miss) => {}
             Ok(found) => {
+                if matches!(found, Lookup::Pass(_)) {
+                    mark_allowed(gate, check);
+                }
                 outcomes.push(lookup_outcome(gate, check, &found, false));
                 continue;
             }
@@ -513,7 +539,46 @@ pub fn decide(gate: &Gate<'_>, checks: &[Check], retry: &str, ask_remotes: &[Str
             outcomes.push(Outcome::Allowed(HookOutcome::RemoteVerified, None));
             continue;
         }
-        match plan::start(&gate.dirs, &p, gate.exe, gate.env) {
+        // R111: the candidates of the ref, locked until this check's job
+        // is in the list.
+        let mut lane = None;
+        if let Some((pf, url)) = check
+            .push
+            .as_ref()
+            .and_then(|pf| pf.candidate.as_ref().map(|u| (pf, u)))
+        {
+            match candidacy(gate, pf, url) {
+                Candidacy::Busy(refusal) => {
+                    for l in refusal {
+                        eprintln!("{l}");
+                    }
+                    outcomes.push(Outcome::Denied(HookOutcome::RefBusy, None));
+                    continue;
+                }
+                Candidacy::Go(l) => lane = l,
+            }
+        }
+        let mut p = p;
+        // R112: only a job `pre-push` created asks the remote.
+        p.spec.for_push = check.push.is_some();
+        let started = plan::start(&gate.dirs, &p, gate.exe, gate.env);
+        if let Some(mut l) = lane {
+            match &started {
+                Ok(Started::Created(id) | Started::Attached(id)) => {
+                    l.upsert(candidate_entry(gate, check, id));
+                }
+                Ok(Started::Hit(found)) if matches!(**found, Lookup::Pass(_)) => {
+                    if let Some(pf) = &check.push {
+                        l.mark_allowed(&pf.commit, jiff::Timestamp::now());
+                    }
+                }
+                _ => {}
+            }
+            if let Err(e) = l.save() {
+                eprintln!("tollgate: push candidates (R111): {e}");
+            }
+        }
+        match started {
             Ok(Started::Hit(found)) => outcomes.push(lookup_outcome(gate, check, &found, false)),
             Ok(s) => {
                 announce(gate, check, &s);
@@ -540,7 +605,19 @@ pub fn decide(gate: &Gate<'_>, checks: &[Check], retry: &str, ask_remotes: &[Str
     let deadline = Instant::now() + budget;
     for (i, p, s) in pending {
         let check = &checks[i];
-        let mut say = |s: &Started| announce(gate, check, s);
+        let mut say = |s: &Started| {
+            announce(gate, check, s);
+            // R111: a job started after an attached one ended is the
+            // candidate's job now.
+            if let (Started::Created(id) | Started::Attached(id), Some(pf)) = (s, &check.push)
+                && let Some(url) = &pf.candidate
+                && let Ok(mut l) =
+                    push_lane::Lane::open(&gate.dirs, &push_lane::identity_of(url), &pf.remote_ref)
+            {
+                l.upsert(candidate_entry(gate, check, id));
+                let _ = l.save();
+            }
+        };
         outcomes[i] = match plan::settle(
             &gate.dirs,
             &p,
@@ -595,6 +672,138 @@ pub fn decide(gate: &Gate<'_>, checks: &[Check], retry: &str, ask_remotes: &[Str
             eprintln!("{l}");
         }
         crate::exit::FAIL
+    }
+}
+
+/// R111: whether a candidate line may start or attach to its job.
+enum Candidacy {
+    /// Another commit is in the gate for the ref: the refusal's lines.
+    Busy(Vec<String>),
+    /// Go on; the lane stays locked until the job is in it (`None` when
+    /// the lane cannot be opened: the rule only saves time, so it never
+    /// blocks on its own fault).
+    Go(Option<push_lane::Lane>),
+}
+
+/// True when `ancestor` is in the repo and is `commit` or an ancestor of
+/// it. A git error counts as false.
+fn contains(gate: &Gate<'_>, commit: &Oid, ancestor: &Oid) -> bool {
+    if commit == ancestor {
+        return true;
+    }
+    gate.git
+        .output([
+            "merge-base",
+            "--is-ancestor",
+            ancestor.as_str(),
+            commit.as_str(),
+        ])
+        .is_ok_and(|o| o.status.code() == Some(0))
+}
+
+/// R111: reads the live candidates of the line's ref (entries whose
+/// commit the remote's value on stdin contains have landed and go) and
+/// decides. A candidate whose commit the pushed commit contains is stacked
+/// under it; any other live candidate makes the ref busy. When several are
+/// not contained, the oldest of those is named.
+fn candidacy(gate: &Gate<'_>, pf: &PushFacts, url: &str) -> Candidacy {
+    let mut lane =
+        match push_lane::Lane::open(&gate.dirs, &push_lane::identity_of(url), &pf.remote_ref) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("tollgate: push candidates (R111): {e}");
+                return Candidacy::Go(None);
+            }
+        };
+    let now = jiff::Timestamp::now();
+    let hold = gate.host.config.push.candidate_hold.get();
+    let landed = |c: &Oid| !pf.remote_oid.is_zero() && contains(gate, &pf.remote_oid, c);
+    let live = lane.prune(&gate.dirs, hold, now, &landed);
+    let busy = live
+        .iter()
+        .find(|(c, _)| c.commit != pf.commit && !contains(gate, &pf.commit, &c.commit));
+    let refuse = gate.host.config.push.second_candidate == SecondCandidate::Refuse;
+    match busy {
+        Some((k, state)) if refuse => {
+            if let Err(e) = lane.save() {
+                eprintln!("tollgate: push candidates (R111): {e}");
+            }
+            Candidacy::Busy(busy_lines(gate, pf, k, *state, now))
+        }
+        _ => Candidacy::Go(Some(lane)),
+    }
+}
+
+/// R111: the refusal of a second candidate.
+fn busy_lines(
+    gate: &Gate<'_>,
+    pf: &PushFacts,
+    k: &push_lane::Candidate,
+    state: push_lane::Live,
+    now: jiff::Timestamp,
+) -> Vec<String> {
+    let age = push_lane::age_text(now.duration_since(state.since()).unsigned_abs());
+    let remote = super::argv::shell_quote(&pf.remote);
+    let branch = super::argv::shell_quote(branch_name(&pf.remote_ref));
+    let k12 = k.commit.short(12);
+    vec![
+        format!(
+            "tollgate: DENIED {} {}: commit {k12} is already in the gate for this ref (job {}, {} for {age}, from {} {}). Only one of two commits can land first; no check was started (R111).",
+            gate.hook,
+            pf.remote_ref,
+            k.job,
+            state.name(),
+            k.worktree.display(),
+            k.local_ref
+        ),
+        format!(
+            "tollgate: wait: tollgate wait {}; when that push has landed, git fetch {remote} {branch} && git merge FETCH_HEAD, then push again.",
+            k.job
+        ),
+        format!(
+            "tollgate: or now: git merge {k12} (git fetch {} {} first when the commit is not in this repo), then push: the check of the merged commit starts at once and lands after it.",
+            super::argv::shell_quote(&k.worktree.to_string_lossy()),
+            super::argv::shell_quote(&k.local_ref)
+        ),
+    ]
+}
+
+/// R111: the entry of a candidate line whose job is `job`.
+fn candidate_entry(gate: &Gate<'_>, check: &Check, job: &JobId) -> push_lane::Candidate {
+    let pf = check.push.as_ref().expect("a push check");
+    push_lane::Candidate {
+        commit: pf.commit.clone(),
+        tree: check.tree.clone(),
+        job: job.clone(),
+        worktree: gate
+            .layout
+            .worktree
+            .clone()
+            .unwrap_or_else(|| gate.layout.common_dir.clone()),
+        local_ref: pf.local_ref.clone(),
+        remote: pf.remote.clone(),
+        url: pf.candidate.clone().unwrap_or_default(),
+        time: jiff::Timestamp::now(),
+        passed: None,
+        allowed: None,
+    }
+}
+
+/// R111: a stored pass allowed a candidate line: its entry, when there is
+/// one, holds the ref for `candidate_hold` from now.
+fn mark_allowed(gate: &Gate<'_>, check: &Check) {
+    let Some((pf, url)) = check
+        .push
+        .as_ref()
+        .and_then(|pf| pf.candidate.as_ref().map(|u| (pf, u)))
+    else {
+        return;
+    };
+    if let Ok(mut l) =
+        push_lane::Lane::open(&gate.dirs, &push_lane::identity_of(url), &pf.remote_ref)
+        && l.mark_allowed(&pf.commit, jiff::Timestamp::now())
+    {
+        let _ = l.save();
     }
 }
 

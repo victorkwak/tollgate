@@ -7,5 +7,6 @@ pub mod env;
 pub mod exec;
 pub mod job;
 pub mod probe;
+pub mod remote_watch;
 pub mod setup;
 pub mod spawn;

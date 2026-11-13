@@ -31,6 +31,7 @@ pub mod metrics;
 pub mod plan;
 pub mod policy;
 pub mod procs;
+pub mod push_lane;
 pub mod remote_record;
 pub mod remote_refs;
 pub mod report;

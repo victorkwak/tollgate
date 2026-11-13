@@ -735,7 +735,10 @@ fn state_text(s: &JobState) -> String {
         JobState::Running { started, pid } => format!("running since {started} (pid {pid})"),
         JobState::Finished { verdict } => format!("finished: {verdict:?}").to_lowercase(),
         JobState::Superseded => "superseded".into(),
-        JobState::Cancelled => "cancelled".into(),
+        JobState::Cancelled { reason: None } => "cancelled".into(),
+        JobState::Cancelled {
+            reason: Some(reason),
+        } => format!("cancelled: {reason}"),
         JobState::Deferred { reason } => format!("deferred: {reason}"),
         JobState::Lost { reason } => format!("lost: {reason}"),
     }
@@ -784,6 +787,10 @@ struct StatusJson {
     policy_line: Option<String>,
     /// Item 17: commits on the branch made without the gate.
     unverified: Vec<crate::hook::unverified::UnverifiedCommit>,
+    /// R111: live push candidates of the repo's remotes.
+    candidates: Vec<CandidateLine>,
+    /// R112: jobs ended in the last hour because the remote moved.
+    ended_behind: Vec<JobLine>,
 }
 
 const UNCHECKED_SCAN: usize = 200;
@@ -918,6 +925,8 @@ pub fn status(ctx: &Ctx, rev: Option<&str>, json: bool) -> u8 {
             })
             .collect();
     let jobs = active_jobs(&repo.dirs, &repo.layout.common_dir);
+    let candidates = push_candidates(&repo);
+    let behind = ended_behind(&repo.dirs, &repo.layout.common_dir);
     if json {
         let s = StatusJson {
             repo: repo.layout.repo_dir(),
@@ -927,6 +936,8 @@ pub fn status(ctx: &Ctx, rev: Option<&str>, json: bool) -> u8 {
             unchecked,
             policy_line,
             unverified,
+            candidates,
+            ended_behind: behind,
         };
         println!(
             "{}",
@@ -1004,7 +1015,103 @@ pub fn status(ctx: &Ctx, rev: Option<&str>, json: bool) -> u8 {
             j.state
         );
     }
+    for c in &candidates {
+        println!(
+            "push candidate {} {}: commit {} job {} {} for {}, from {} {}",
+            c.remote,
+            c.remote_ref,
+            c.commit.short(12),
+            c.job,
+            c.state,
+            c.age,
+            c.worktree.display(),
+            c.local_ref
+        );
+    }
+    for j in &behind {
+        println!("job {} {}: {}", j.id, j.refname, j.state);
+    }
     exit::OK
+}
+
+/// A live push candidate (R111) in `tollgate status`.
+#[derive(Debug, Serialize)]
+struct CandidateLine {
+    remote: String,
+    remote_ref: String,
+    commit: Oid,
+    job: JobId,
+    state: String,
+    age: String,
+    worktree: PathBuf,
+    local_ref: String,
+}
+
+/// R111: the live push candidates of the refs of the repo's remotes (by
+/// URL identity, so another clone's candidates show too).
+fn push_candidates(repo: &Repo) -> Vec<CandidateLine> {
+    let Ok(remotes) = plan::remote_urls(&repo.git) else {
+        return Vec::new();
+    };
+    let ids: Vec<String> = remotes
+        .iter()
+        .filter_map(|r| r.fetch.first())
+        .map(|u| crate::push_lane::identity_of(u))
+        .collect();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let now = jiff::Timestamp::now();
+    crate::push_lane::live_candidates(&repo.dirs, &ids, repo.host.config.push.candidate_hold.get())
+        .into_iter()
+        .map(|l| CandidateLine {
+            remote: remotes
+                .iter()
+                .find(|r| {
+                    r.fetch
+                        .first()
+                        .is_some_and(|u| crate::push_lane::identity_of(u) == l.identity)
+                })
+                .map_or_else(|| l.candidate.remote.clone(), |r| r.name.clone()),
+            remote_ref: l.remote_ref,
+            commit: l.candidate.commit,
+            job: l.candidate.job,
+            state: l.live.name().to_owned(),
+            age: crate::push_lane::age_text(now.duration_since(l.live.since()).unsigned_abs()),
+            worktree: l.candidate.worktree,
+            local_ref: l.candidate.local_ref,
+        })
+        .collect()
+}
+
+/// How long `tollgate status` shows a job that R112 ended.
+const BEHIND_SHOWN: Duration = Duration::from_secs(3600);
+
+/// R112: the jobs of the repo that ended in the last hour because the
+/// remote ref moved during the run, with the reason.
+fn ended_behind(dirs: &Dirs, common_dir: &Path) -> Vec<JobLine> {
+    let now = jiff::Timestamp::now();
+    let store = JobStore::new(dirs);
+    store
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| matches!(m.state, JobState::Cancelled { reason: Some(_) }))
+        .filter(|m| {
+            JobReport::read(dirs, &m.id)
+                .ok()
+                .flatten()
+                .is_some_and(|r| now.duration_since(r.finished).unsigned_abs() < BEHIND_SHOWN)
+        })
+        .filter(|m| JobSpec::read(dirs, &m.id).is_ok_and(|s| s.common_dir == common_dir))
+        .map(|m| JobLine {
+            state: state_text(&m.state),
+            id: m.id,
+            tier: m.tier,
+            tree: m.tree,
+            refname: m.origin.refname,
+        })
+        .collect()
 }
 
 fn active_jobs(dirs: &Dirs, common_dir: &Path) -> Vec<JobLine> {
@@ -1227,6 +1334,7 @@ pub fn run_here(ctx: &Ctx, a: HereArgs) -> u8 {
         priority: Priority::Hook,
         created: now,
         step_run: None,
+        for_push: false,
     };
     // The repo's own nextest config applies in CI (no policy base).
     let mut spec = spec;
