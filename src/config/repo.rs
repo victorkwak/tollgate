@@ -99,10 +99,18 @@ impl Default for TiersConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PushConfig {
-    /// Branch globs that push to trusted remotes with `fast` only (R20); L7
-    /// default empty.
+    /// No effect since R107 (2026-11-12): a branch push to a trusted
+    /// remote needs `fast` unless it is a full ref or matches
+    /// [`Self::full_refs`]. Still parsed, because existing policy files
+    /// set it and the table denies unknown fields.
     #[serde(default)]
     pub fast_refs: Vec<String>,
+    /// Branch globs whose pushes to trusted remotes need `full`, besides
+    /// the full refs (R107). Exact case; `*` stops at `/`, `**` crosses.
+    /// Left out of the serialized config when empty, so a config without
+    /// it keeps its effective hash (R74).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub full_refs: Vec<String>,
 }
 
 /// `[budget]` in the repo: each value overrides the host value (R33).
@@ -472,11 +480,11 @@ pub struct ContextReport {
     pub unknown_owner_packages: BTreeSet<String>,
 }
 
-/// Compiled ref rules (R20, R27).
+/// Compiled ref rules (R20, R27, R107).
 #[derive(Debug, Clone)]
 pub struct RefRules {
     full: GlobSet,
-    push_fast: GlobSet,
+    push_full: GlobSet,
 }
 
 /// The branch name of a ref: strips `refs/heads/` or `refs/remotes/<remote>/`
@@ -506,20 +514,20 @@ impl RefRules {
         }
     }
 
-    /// The tier a push needs (R20, L7). To a trusted remote: `full`, or `fast`
-    /// when the branch matches `push.fast_refs`, but never `fast` for a full
-    /// ref. To other remotes: `tier_for_ref`. `fast_refs` match exactly in
-    /// case and `*` stops at `/`, so the exemption stays narrow.
+    /// The tier a push needs (R20, R107). To a trusted remote: `full` for a
+    /// full ref or a branch that matches `push.full_refs`, else `fast`. To
+    /// other remotes: `tier_for_ref`. `push.full_refs` match exactly in
+    /// case and `*` stops at `/` (`**` crosses), as `fast_refs` did.
     #[must_use]
     pub fn push_tier(&self, remote_ref: &str, trusted_remote: bool) -> Tier {
         let tier = self.tier_for_ref(remote_ref);
         if !trusted_remote || tier == Tier::Full {
             return tier;
         }
-        if self.push_fast.is_match(branch_name(remote_ref)) {
-            Tier::Fast
-        } else {
+        if self.push_full.is_match(branch_name(remote_ref)) {
             Tier::Full
+        } else {
+            Tier::Fast
         }
     }
 }
@@ -543,8 +551,14 @@ impl RepoConfig {
         blake3::hash(&json).to_hex().to_string()
     }
 
-    /// Compiles the ref rules (R20, R27).
+    /// Compiles the ref rules (R20, R27, R107). `push.fast_refs` is still
+    /// compiled, so a bad pattern there stays a config error.
     pub fn ref_rules(&self) -> Result<RefRules, String> {
+        let strict = GlobOpts {
+            case_insensitive: false,
+            literal_separator: true,
+        };
+        glob::compile(&self.push.fast_refs, strict)?;
         Ok(RefRules {
             full: glob::compile(
                 &self.tiers.full_refs,
@@ -553,13 +567,7 @@ impl RepoConfig {
                     literal_separator: false,
                 },
             )?,
-            push_fast: glob::compile(
-                &self.push.fast_refs,
-                GlobOpts {
-                    case_insensitive: false,
-                    literal_separator: true,
-                },
-            )?,
+            push_full: glob::compile(&self.push.full_refs, strict)?,
         })
     }
 
@@ -1165,24 +1173,62 @@ issue = ""
         }
     }
 
+    /// R107 (replaces the L7 rule "full for every branch" of R20): a push
+    /// to a trusted remote needs `full` for a full ref (`tiers.full_refs`)
+    /// or a `push.full_refs` match, else `fast`. Other remotes:
+    /// `tier_for_ref`.
     #[test]
-    fn push_tier_r20_l7() {
-        let c = parse("version = 1\n[push]\nfast_refs = [\"wip/*\", \"*\"]\n");
-        let rules = c.ref_rules().unwrap();
-        // Trusted remote: fast only through fast_refs, never for a full ref.
-        assert_eq!(rules.push_tier("refs/heads/wip/x", true), Tier::Fast);
-        assert_eq!(rules.push_tier("refs/heads/main", true), Tier::Full);
+    fn push_tier_r107() {
         let default = RepoConfig::default().ref_rules().unwrap();
-        assert_eq!(default.push_tier("refs/heads/feat", true), Tier::Full);
-        // `*` in fast_refs does not cross `/` and case must match.
-        let narrow = parse("version = 1\n[push]\nfast_refs = [\"wip/*\"]\n")
+        for (r, want) in [
+            ("refs/heads/feat", Tier::Fast),
+            ("refs/heads/wip/x", Tier::Fast),
+            ("refs/heads/release/x", Tier::Fast),
+            ("refs/heads/main", Tier::Full),
+            ("refs/heads/MAIN", Tier::Full),
+            ("refs/heads/master", Tier::Full),
+            ("refs/heads/integration/a/b", Tier::Full),
+        ] {
+            assert_eq!(default.push_tier(r, true), want, "trusted {r}");
+            // Other remotes: tier_for_ref, the same table by default.
+            assert_eq!(default.push_tier(r, false), want, "other {r}");
+        }
+        // push.full_refs: exact case, `*` stops at `/`, `**` crosses.
+        let rel = parse("version = 1\n[push]\nfull_refs = [\"release/*\", \"hot/**\"]\n")
             .ref_rules()
             .unwrap();
-        assert_eq!(narrow.push_tier("refs/heads/wip/a/b", true), Tier::Full);
-        assert_eq!(narrow.push_tier("refs/heads/WIP/a", true), Tier::Full);
-        // Other remotes: tier_for_ref.
-        assert_eq!(default.push_tier("refs/heads/feat", false), Tier::Fast);
-        assert_eq!(default.push_tier("refs/heads/main", false), Tier::Full);
+        for (r, want) in [
+            ("refs/heads/release/x", Tier::Full),
+            ("refs/heads/release/a/b", Tier::Fast),
+            ("refs/heads/Release/x", Tier::Fast),
+            ("refs/heads/hot/a/b", Tier::Full),
+            ("refs/heads/feat", Tier::Fast),
+            ("refs/heads/main", Tier::Full),
+        ] {
+            assert_eq!(rel.push_tier(r, true), want, "trusted {r}");
+        }
+        // push.full_refs counts for trusted remotes only.
+        assert_eq!(rel.push_tier("refs/heads/release/x", false), Tier::Fast);
+        // `**` makes every branch push need full.
+        let all = parse("version = 1\n[push]\nfull_refs = [\"**\"]\n")
+            .ref_rules()
+            .unwrap();
+        assert_eq!(all.push_tier("refs/heads/a/b/c", true), Tier::Full);
+        // push.fast_refs still parses and has no effect: never below the
+        // table above, and a full ref stays full.
+        let fast =
+            parse("version = 1\n[push]\nfast_refs = [\"*\", \"**\"]\nfull_refs = [\"wip/*\"]\n")
+                .ref_rules()
+                .unwrap();
+        assert_eq!(fast.push_tier("refs/heads/wip/x", true), Tier::Full);
+        assert_eq!(fast.push_tier("refs/heads/main", true), Tier::Full);
+        assert_eq!(fast.push_tier("refs/heads/feat", true), Tier::Fast);
+        // A bad glob is a config error.
+        assert!(
+            parse("version = 1\n[push]\nfull_refs = [\"a[\"]\n")
+                .ref_rules()
+                .is_err()
+        );
     }
 
     #[test]
@@ -1192,6 +1238,34 @@ issue = ""
         assert_eq!(a.effective_hash(), b.effective_hash());
         b.push.fast_refs.push("wip/*".into());
         assert_ne!(a.effective_hash(), b.effective_hash());
+    }
+
+    /// R107: `push.full_refs` is new, and the effective hash is in every
+    /// record's fingerprint (R74). A config that does not set it hashes as
+    /// before (values from the code before R107), so no record goes stale.
+    #[test]
+    fn effective_hash_is_unchanged_without_push_full_refs_r107_r74() {
+        assert_eq!(
+            RepoConfig::default().effective_hash(),
+            "abf725995f5f90284baa2aa6f5f405e49d954759b38802c3b9095901255a272b"
+        );
+        assert_eq!(
+            parse(SPEC_EXAMPLE).effective_hash(),
+            "210f87fca7b7887299e1d296ea76a15f8aebafa0c2bfcf6a53956ab856ae7d34"
+        );
+        assert_eq!(
+            parse("version = 1\n[push]\nfast_refs = [\"wip/*\"]\n").effective_hash(),
+            "3ba812900a88932873de579af9b887e96f23a2461bb8920d03771ca6603200c0"
+        );
+        // An empty list is the same as none; a set list changes the hash.
+        assert_eq!(
+            parse("version = 1\n[push]\nfull_refs = []\n").effective_hash(),
+            RepoConfig::default().effective_hash()
+        );
+        assert_ne!(
+            parse("version = 1\n[push]\nfull_refs = [\"release/*\"]\n").effective_hash(),
+            RepoConfig::default().effective_hash()
+        );
     }
 
     #[test]

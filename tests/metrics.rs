@@ -284,14 +284,15 @@ fn hook_outcomes_and_job_times_reach_stats() {
 #[test]
 fn hook_time_is_sampled_once_per_hook_run() {
     // A pre-push of three refs is one wait for Victor: three checks in
-    // the outcome counts, one sample in `hook_ms`.
+    // the outcome counts, one sample in `hook_ms`. The branch pushes need
+    // `fast` (R107; this test set `push.fast_refs = ["*"]` before).
     let sb = Sandbox::new();
     sb.scoped_host("remotes = [\"*/remotes/trusted*\"]");
     let repo = sb.repo("r");
     sb.commit_file(
         &repo,
         "tollgate.toml",
-        "version = 1\n[push]\nfast_refs = [\"*\"]\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n",
+        "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n",
         "policy",
     );
     let bare = sb.root().join("remotes/trusted.git");
