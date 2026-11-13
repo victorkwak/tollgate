@@ -2295,3 +2295,47 @@ fn a_push_job_runs_on_when_the_remote_moves_inside_it_or_cannot_be_asked_r112() 
     release(&gate, "b");
     assert_eq!(wait_job(&sb, &repo, &jc).code, Some(0));
 }
+
+/// R111 never refuses on a doubt: a live candidate whose commit is in the
+/// repo but whose history git cannot read (`merge-base` fails) does not
+/// make the ref busy. A candidate whose commit is not in the repo at all
+/// still does (another clone's commit).
+#[test]
+fn a_candidate_git_cannot_compare_does_not_make_the_ref_busy_r111() {
+    let sb = Sandbox::new();
+    let (repo, bare, gate) = lane_repo(&sb, "", "");
+    let other = sb.root().join("other");
+    sb.git(
+        &sb.root(),
+        &[
+            "clone",
+            "-q",
+            bare.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    sb.git(&other, &["checkout", "-q", "-b", "k"]);
+    sb.commit_file(&other, "p.cfg", "1\n", "parent");
+    let k = sb.commit_file(&other, "id.cfg", "k\n", "k");
+    let jk = job_id(&push_main(&sb, &other, "k", &[]).out);
+    assert!(running(&sb, &jk));
+    // Not in this repo: busy.
+    named_commit(&sb, &repo, "b", "main", "b");
+    let r = push_main(&sb, &repo, "b", &[]);
+    assert!(r.out.contains("(R111)"), "{}", r.out);
+    // The commit object alone, without its parent: git cannot tell.
+    let obj = format!("objects/{}/{}", &k[..2], &k[2..]);
+    let src = other.join(".git").join(&obj);
+    let dst = repo.join(".git").join(&obj);
+    std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+    std::fs::copy(&src, &dst).unwrap();
+    let mb = sb.git_output(&repo, &["merge-base", "--is-ancestor", &k, "b"], &[]);
+    assert!(
+        !matches!(mb.status.code(), Some(0 | 1)),
+        "merge-base must fail: {mb:?}"
+    );
+    let r = push_main(&sb, &repo, "b", &[]);
+    assert!(!r.out.contains("(R111)"), "{}", r.out);
+    release(&gate, "k");
+    release(&gate, "b");
+}

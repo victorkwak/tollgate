@@ -685,20 +685,35 @@ enum Candidacy {
     Go(Option<push_lane::Lane>),
 }
 
-/// True when `ancestor` is in the repo and is `commit` or an ancestor of
-/// it. A git error counts as false.
-fn contains(gate: &Gate<'_>, commit: &Oid, ancestor: &Oid) -> bool {
+/// Whether `commit` contains `ancestor`: `Some(false)` when `ancestor` is
+/// not in the repo or not an ancestor, `Some(true)` when it is `commit` or
+/// an ancestor of it, `None` on a doubt (a git error).
+fn contains(gate: &Gate<'_>, commit: &Oid, ancestor: &Oid) -> Option<bool> {
     if commit == ancestor {
-        return true;
+        return Some(true);
     }
-    gate.git
+    if gate
+        .git
+        .rev_parse_verify(&format!("{ancestor}^{{commit}}"))
+        .ok()?
+        .is_none()
+    {
+        return Some(false);
+    }
+    let out = gate
+        .git
         .output([
             "merge-base",
             "--is-ancestor",
             ancestor.as_str(),
             commit.as_str(),
         ])
-        .is_ok_and(|o| o.status.code() == Some(0))
+        .ok()?;
+    match out.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
 }
 
 /// R111: reads the live candidates of the line's ref (entries whose
@@ -717,11 +732,12 @@ fn candidacy(gate: &Gate<'_>, pf: &PushFacts, url: &str) -> Candidacy {
         };
     let now = jiff::Timestamp::now();
     let hold = gate.host.config.push.candidate_hold.get();
-    let landed = |c: &Oid| !pf.remote_oid.is_zero() && contains(gate, &pf.remote_oid, c);
+    let landed =
+        |c: &Oid| !pf.remote_oid.is_zero() && contains(gate, &pf.remote_oid, c) == Some(true);
     let live = lane.prune(&gate.dirs, hold, now, &landed);
-    let busy = live
-        .iter()
-        .find(|(c, _)| c.commit != pf.commit && !contains(gate, &pf.commit, &c.commit));
+    let busy = live.iter().find(|(c, _)| {
+        c.commit != pf.commit && contains(gate, &pf.commit, &c.commit) == Some(false)
+    });
     let refuse = gate.host.config.push.second_candidate == SecondCandidate::Refuse;
     match busy {
         Some((k, state)) if refuse => {
