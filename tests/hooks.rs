@@ -1886,3 +1886,412 @@ fn hook_dirs_come_from_the_install_not_from_git_env_r8_l4() {
     let r = installed_git(&a, &repo, &["commit", "-m", "x"], &[]);
     assert!(r.out.contains("stored fail"), "{}", r.out);
 }
+
+/// R111, R112: a policy whose one step waits until its commit is released
+/// (the commit names itself in `id.cfg`; `release` writes `<gate>/<name>`)
+/// and then fails when the tree holds `fail.cfg`. Unreleased, a step goes
+/// on alone after 15 s. `extra` goes into the policy before the step.
+fn lane_policy(gate: &Path, extra: &str) -> String {
+    format!(
+        "version = 1\n{extra}[[step]]\nname = \"gated\"\nkind = \"command\"\nrun = \"id=$(cat id.cfg 2>/dev/null || echo none); for i in $(seq 300); do [ -e '{}'/$id ] && break; sleep 0.05; done; test ! -e fail.cfg\"\n",
+        gate.display()
+    )
+}
+
+/// A trusted repo (see [`trusted_repo`]) with [`lane_policy`] and `push`
+/// lines in the host config's `[push]` table. Returns the repo, the bare
+/// remote and the release dir.
+fn lane_repo(sb: &Sandbox, policy_extra: &str, push: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let gate = sb.root().join("gate");
+    std::fs::create_dir_all(&gate).unwrap();
+    let (repo, bare) = trusted_repo(sb, &lane_policy(&gate, policy_extra));
+    lane_host(sb, &bare, push);
+    (repo, bare, gate)
+}
+
+fn lane_host(sb: &Sandbox, bare: &Path, push: &str) {
+    sb.scoped_host(&format!(
+        "trusted_paths = [\"{}\"]\n[push]\n{push}\n",
+        bare.display()
+    ));
+}
+
+/// A branch `branch` from `from` with a commit that names itself `name`;
+/// returns the commit.
+fn named_commit(sb: &Sandbox, repo: &Path, branch: &str, from: &str, name: &str) -> String {
+    sb.git(repo, &["checkout", "-q", "-b", branch, from]);
+    sb.commit_file(repo, "id.cfg", &format!("{name}\n"), name)
+}
+
+fn release(gate: &Path, name: &str) {
+    std::fs::write(gate.join(name), "").unwrap();
+}
+
+/// `git push origin <branch>:main` through the hook, with a 1 s inline
+/// budget: a job that waits is left running and the push is denied.
+fn push_main(sb: &Sandbox, repo: &Path, branch: &str, extra: &[&str]) -> support::Run {
+    let spec = format!("{branch}:main");
+    let mut args = vec!["push"];
+    args.extend_from_slice(extra);
+    args.extend(["origin", spec.as_str()]);
+    sb.hooked_with(repo, &args, &[("TOLLGATE_INLINE_CAP", "1")])
+}
+
+fn running(sb: &Sandbox, job: &str) -> bool {
+    eventually(15, || sb.job_state(job).as_deref() == Some("running"))
+}
+
+fn wait_job(sb: &Sandbox, repo: &Path, job: &str) -> support::Run {
+    sb.tollgate(repo, &["wait", job, "--timeout", "40s"])
+}
+
+fn ref_busy_count(sb: &Sandbox, repo: &Path) -> u64 {
+    let stats = sb.tollgate(repo, &["stats", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stats.out).unwrap();
+    v["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["ref_busy"].as_u64().unwrap())
+        .sum()
+}
+
+/// R111: while one commit's `full` job for a ref is queued or running, a
+/// push of a commit that does not contain it is refused before any job,
+/// with both ways on; a commit that contains it is a stacked candidate and
+/// gets its own job.
+#[test]
+fn a_second_commit_for_a_ref_in_the_gate_is_refused_before_any_job_r111() {
+    let sb = Sandbox::new();
+    let (repo, _bare, gate) = lane_repo(&sb, "", "");
+    let a = named_commit(&sb, &repo, "a", "main", "a");
+    let r = push_main(&sb, &repo, "a", &[]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    let ja = job_id(&r.out);
+    assert!(running(&sb, &ja), "{}", r.out);
+    // An unrelated commit for the same ref.
+    named_commit(&sb, &repo, "b", "main", "b");
+    let r = push_main(&sb, &repo, "b", &[]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    let want = format!(
+        "tollgate: DENIED pre-push refs/heads/main: commit {} is already in the gate for this ref (job {ja}, running for ",
+        &a[..12]
+    );
+    assert!(r.out.contains(&want), "{}", r.out);
+    let from = format!(
+        "s, from {} refs/heads/a). Only one of two commits can land first; no check was started (R111).",
+        repo.display()
+    );
+    assert!(r.out.contains(&from), "{}", r.out);
+    let wait = format!(
+        "tollgate: wait: tollgate wait {ja}; when that push has landed, git fetch origin main && git merge FETCH_HEAD, then push again."
+    );
+    assert!(r.out.contains(&wait), "{}", r.out);
+    let now = format!(
+        "tollgate: or now: git merge {} (git fetch {} refs/heads/a first when the commit is not in this repo), then push: the check of the merged commit starts at once and lands after it.",
+        &a[..12],
+        repo.display()
+    );
+    assert!(r.out.contains(&now), "{}", r.out);
+    assert_eq!(
+        sb.jobs(),
+        std::slice::from_ref(&ja),
+        "no job dir for the refused push"
+    );
+    let log = std::fs::read_to_string(sb.state().join("metrics.jsonl")).unwrap();
+    assert!(
+        log.lines()
+            .any(|l| l.contains("\"outcome\":\"ref-busy\"") && l.contains("\"tier\":\"full\"")),
+        "{log}"
+    );
+    assert_eq!(ref_busy_count(&sb, &repo), 1);
+    // `status` lists the live candidate.
+    let st = sb.tollgate(&repo, &["status"]);
+    assert!(
+        st.out.contains(&format!(
+            "push candidate origin refs/heads/main: commit {} job {ja} running for",
+            &a[..12]
+        )),
+        "{}",
+        st.out
+    );
+    // A commit that contains the first one is stacked on it: its own job.
+    named_commit(&sb, &repo, "c", "a", "c");
+    let r = push_main(&sb, &repo, "c", &[]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(!r.out.contains("R111"), "{}", r.out);
+    let jc = job_id(&r.out);
+    assert_ne!(jc, ja);
+    assert_eq!(sb.jobs().len(), 2);
+    release(&gate, "a");
+    release(&gate, "c");
+    assert_eq!(wait_job(&sb, &repo, &ja).code, Some(0));
+    assert_eq!(wait_job(&sb, &repo, &jc).code, Some(0));
+}
+
+/// R111: a candidate whose job failed or was cancelled frees the ref; one
+/// whose job passed holds it for `candidate_hold`, then frees it. A line
+/// with a stored pass is allowed while another commit is a live candidate.
+#[test]
+fn the_ref_frees_after_a_fail_a_cancel_and_the_hold_of_a_pass_r111() {
+    let sb = Sandbox::new();
+    let (repo, bare, gate) = lane_repo(&sb, "", "candidate_hold = \"3s\"");
+    named_commit(&sb, &repo, "a", "main", "a");
+    let ja = job_id(&push_main(&sb, &repo, "a", &[]).out);
+    assert!(running(&sb, &ja));
+    // `tollgate cancel` frees the ref.
+    let c = sb.tollgate(&repo, &["cancel", &ja]);
+    assert_eq!(c.code, Some(0), "{}", c.out);
+    assert!(eventually(15, || sb.job_state(&ja).as_deref() == Some("cancelled")));
+    sb.git(&repo, &["checkout", "-q", "-b", "b", "main"]);
+    sb.commit_file(&repo, "fail.cfg", "1\n", "fails");
+    sb.commit_file(&repo, "id.cfg", "b\n", "b");
+    let r = push_main(&sb, &repo, "b", &[]);
+    assert!(!r.out.contains("R111"), "{}", r.out);
+    let jb = job_id(&r.out);
+    assert_ne!(jb, ja);
+    release(&gate, "b");
+    assert_eq!(wait_job(&sb, &repo, &jb).code, Some(1));
+    // A failed candidate frees the ref too.
+    let d = named_commit(&sb, &repo, "d", "main", "d");
+    let r = push_main(&sb, &repo, "d", &[]);
+    assert!(!r.out.contains("R111"), "{}", r.out);
+    let jd = job_id(&r.out);
+    release(&gate, "d");
+    assert_eq!(wait_job(&sb, &repo, &jd).code, Some(0));
+    // A passed candidate holds the ref for the hold.
+    named_commit(&sb, &repo, "e", "main", "e");
+    let jobs = sb.jobs().len();
+    let r = push_main(&sb, &repo, "e", &[]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains(&format!(
+            "commit {} is already in the gate for this ref (job {jd}, passed for ",
+            &d[..12]
+        )),
+        "{}",
+        r.out
+    );
+    assert_eq!(sb.jobs().len(), jobs);
+    std::thread::sleep(Duration::from_millis(3500));
+    let r = push_main(&sb, &repo, "e", &[]);
+    assert!(!r.out.contains("R111"), "{}", r.out);
+    let je = job_id(&r.out);
+    assert!(running(&sb, &je));
+    // `d` has a stored pass: its push is allowed while `e` is a live
+    // candidate, and it lands.
+    let r = push_main(&sb, &repo, "d", &[]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(r.out.contains(&format!("record of job {jd}")), "{}", r.out);
+    assert!(!r.out.contains("R111"), "{}", r.out);
+    assert_eq!(sb.git(&bare, &["rev-parse", "refs/heads/main"]), d);
+    release(&gate, "e");
+    let _ = wait_job(&sb, &repo, &je);
+}
+
+/// R111: forced pushes and other refs are not refused; worktrees of one
+/// repo and clones of one remote share the candidates of a ref;
+/// `second_candidate = "allow"` turns the refusal off.
+#[test]
+fn candidates_are_shared_by_worktrees_and_clones_and_the_refusal_can_be_off_r111() {
+    let sb = Sandbox::new();
+    let (repo, bare, gate) = lane_repo(&sb, "[push]\nfull_refs = [\"release\"]\n", "");
+    named_commit(&sb, &repo, "a", "main", "a");
+    let ja = job_id(&push_main(&sb, &repo, "a", &[]).out);
+    assert!(running(&sb, &ja));
+    // Another ref of the same remote.
+    named_commit(&sb, &repo, "b", "main", "b");
+    let jobs = sb.jobs().len();
+    let r = sb.hooked_with(
+        &repo,
+        &["push", "origin", "b:release"],
+        &[("TOLLGATE_INLINE_CAP", "1")],
+    );
+    assert!(!r.out.contains("R111"), "{}", r.out);
+    assert!(r.out.contains("tier full"), "{}", r.out);
+    assert_eq!(sb.jobs().len(), jobs + 1);
+    // A forced push is not a candidate.
+    named_commit(&sb, &repo, "f", "main", "f");
+    let jobs = sb.jobs().len();
+    let r = push_main(&sb, &repo, "f", &["--force"]);
+    assert!(!r.out.contains("R111"), "{}", r.out);
+    assert_eq!(sb.jobs().len(), jobs + 1);
+    // A linked worktree of the repo.
+    let wt = sb.root().join("wt");
+    sb.git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "w",
+            wt.to_str().unwrap(),
+            "main",
+        ],
+    );
+    sb.commit_file(&wt, "id.cfg", "w\n", "w");
+    let jobs = sb.jobs().len();
+    let r = push_main(&sb, &wt, "w", &[]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains(&format!("(job {ja}, running for ")) && r.out.contains("(R111)"),
+        "{}",
+        r.out
+    );
+    assert_eq!(sb.jobs().len(), jobs);
+    // Another clone of the remote.
+    let clone = sb.root().join("clone");
+    sb.git(
+        &sb.root(),
+        &[
+            "clone",
+            "-q",
+            bare.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    );
+    sb.git(&clone, &["checkout", "-q", "-b", "o"]);
+    sb.commit_file(&clone, "id.cfg", "o\n", "o");
+    let r = push_main(&sb, &clone, "o", &[]);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(
+        r.out.contains(&format!("(job {ja}, running for ")) && r.out.contains("(R111)"),
+        "{}",
+        r.out
+    );
+    assert_eq!(sb.jobs().len(), jobs);
+    // The refusal off: the second candidate gets its job.
+    lane_host(&sb, &bare, "second_candidate = \"allow\"");
+    let r = push_main(&sb, &clone, "o", &[]);
+    assert!(!r.out.contains("R111"), "{}", r.out);
+    assert_eq!(sb.jobs().len(), jobs + 1);
+    for n in ["a", "b", "f", "w", "o"] {
+        release(&gate, n);
+    }
+}
+
+/// R112: a push job whose ref moves on the remote to a commit the
+/// candidate does not contain ends as cancelled with the reason, which
+/// `wait`, `report` and `status` print; no record is written and its
+/// metrics line has `cause: "behind"`.
+#[test]
+fn a_push_job_ends_when_the_remote_moves_past_its_commit_r112() {
+    let sb = Sandbox::new();
+    let (repo, bare, _gate) = lane_repo(&sb, "", "remote_check = \"1s\"");
+    named_commit(&sb, &repo, "a", "main", "a");
+    let ja = job_id(&push_main(&sb, &repo, "a", &[]).out);
+    assert!(running(&sb, &ja));
+    let spec: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(sb.state().join("jobs").join(&ja).join("spec.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(spec["for_push"], true, "{spec}");
+    // Another machine pushes to main.
+    let x = advance_remote(&sb, &bare, "main", "x.cfg");
+    let started = Instant::now();
+    assert!(eventually(20, || {
+        sb.job_state(&ja).as_deref() == Some("cancelled")
+    }));
+    assert!(started.elapsed() < Duration::from_secs(15));
+    let reason = format!(
+        "refs/heads/main on origin moved to {} during the run; this commit can no longer be pushed there (R112). Run: git fetch origin main && git merge FETCH_HEAD, then push again.",
+        &x[..12]
+    );
+    let w = wait_job(&sb, &repo, &ja);
+    assert_eq!(w.code, Some(1), "{}", w.out);
+    assert!(w.out.contains(&format!("cancelled: {reason}")), "{}", w.out);
+    let rep = sb.report(&ja);
+    assert_eq!(rep["outcome"], "cancelled", "{rep}");
+    assert_eq!(rep["message"], reason.as_str(), "{rep}");
+    assert_eq!(rep["record_written"], false, "{rep}");
+    assert_eq!(sb.record_count(), 0);
+    let r = sb.tollgate(&repo, &["report", &ja]);
+    assert!(r.out.contains(&format!("cancelled: {reason}")), "{}", r.out);
+    let meta: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(sb.state().join("jobs").join(&ja).join("job.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta["reason"], reason.as_str(), "{meta}");
+    let cancel = std::fs::read_to_string(sb.state().join("jobs").join(&ja).join("cancel")).unwrap();
+    assert!(cancel.contains("R112"), "{cancel}");
+    let st = sb.tollgate(&repo, &["status"]);
+    assert!(st.out.contains(&reason), "{}", st.out);
+    assert!(!st.out.contains("push candidate"), "{}", st.out);
+    let log = std::fs::read_to_string(sb.state().join("metrics.jsonl")).unwrap();
+    let line = log
+        .lines()
+        .find(|l| l.contains("\"kind\":\"job\"") && l.contains(&ja))
+        .unwrap_or_else(|| panic!("{log}"));
+    assert!(line.contains("\"cause\":\"behind\""), "{line}");
+    assert!(line.contains("\"verdict\":\"cancelled\""), "{line}");
+}
+
+/// R112 never ends a job on a doubt: a remote value the candidate contains
+/// (the commit under it landed), a remote that cannot be asked, and a job
+/// that `tollgate check` created leave the job running. A spec without
+/// `for_push` reads as false.
+#[test]
+fn a_push_job_runs_on_when_the_remote_moves_inside_it_or_cannot_be_asked_r112() {
+    let sb = Sandbox::new();
+    let (repo, bare, gate) = lane_repo(&sb, "", "remote_check = \"1s\"");
+    sb.git(&repo, &["checkout", "-q", "-b", "a", "main"]);
+    let p = sb.commit_file(&repo, "p.cfg", "1\n", "under");
+    sb.commit_file(&repo, "id.cfg", "a\n", "a");
+    let ja = job_id(&push_main(&sb, &repo, "a", &[]).out);
+    assert!(running(&sb, &ja));
+    // The commit under the candidate lands (no hook): contained.
+    sb.git(
+        &repo,
+        &["push", "-q", "origin", &format!("{p}:refs/heads/main")],
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(sb.job_state(&ja).as_deref(), Some("running"));
+    // The runner asked the server, and kept its answer (X1).
+    let answers = std::fs::read_to_string(sb.state().join("remote-refs.json")).unwrap();
+    assert!(answers.contains(&p), "{answers}");
+    // The remote cannot be asked.
+    let away = sb.root().join("remotes/away.git");
+    std::fs::rename(&bare, &away).unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    let state = sb.job_state(&ja);
+    std::fs::rename(&away, &bare).unwrap();
+    assert_eq!(state.as_deref(), Some("running"));
+    release(&gate, "a");
+    assert_eq!(wait_job(&sb, &repo, &ja).code, Some(0));
+    // A job that `tollgate check` created, which a push (stacked on `a`,
+    // which passed) attached to.
+    named_commit(&sb, &repo, "b", "a", "b");
+    let c = sb.tollgate(
+        &repo,
+        &["check", "--tier", "full", "--rev", "b", "--detach"],
+    );
+    assert_eq!(c.code, Some(0), "{}", c.out);
+    let jc = job_id(&c.out);
+    assert!(running(&sb, &jc));
+    let r = push_main(&sb, &repo, "b", &[]);
+    assert!(
+        r.out.contains(&format!("attached to running job {jc}")),
+        "{}",
+        r.out
+    );
+    advance_remote(&sb, &bare, "main", "y.cfg");
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(sb.job_state(&jc).as_deref(), Some("running"));
+    let dirs = tollgate::dirs::Dirs::from_env(&sb.env()).unwrap();
+    let id = tollgate::ids::JobId::parse(&jc).unwrap();
+    let spec_path = dirs.job_dir(&id).join("spec.json");
+    let mut spec: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&spec_path).unwrap()).unwrap();
+    assert!(spec.get("for_push").is_none(), "{spec}");
+    assert!(
+        !tollgate::runner::job::JobSpec::read(&dirs, &id)
+            .unwrap()
+            .for_push
+    );
+    spec["for_push"] = true.into();
+    let parsed: tollgate::runner::job::JobSpec = serde_json::from_value(spec).unwrap();
+    assert!(parsed.for_push);
+    release(&gate, "b");
+    assert_eq!(wait_job(&sb, &repo, &jc).code, Some(0));
+}

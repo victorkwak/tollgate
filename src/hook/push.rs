@@ -19,7 +19,7 @@
 
 use std::ffi::OsString;
 
-use super::gate::{self, Check, Gate, RemoteVerify};
+use super::gate::{self, Check, Gate, PushFacts, RemoteVerify};
 use crate::config::Tier;
 use crate::config::repo::branch_name;
 use crate::exit;
@@ -354,6 +354,8 @@ pub fn run(gate: &Gate<'_>, args: &[OsString], stdin: &[u8]) -> u8 {
         return code;
     }
     let mut checks = Vec::new();
+    // R111: only a push that is not forced has candidates; asked once.
+    let mut forced: Option<bool> = None;
     for line in &lines {
         // R22: tags and other non-branch refs; deletions.
         if !line.remote_ref.starts_with("refs/heads/") || line.local_oid.is_zero() {
@@ -391,6 +393,15 @@ pub fn run(gate: &Gate<'_>, args: &[OsString], stdin: &[u8]) -> u8 {
             "tollgate check --tier {tier} --rev {} --rerun",
             line.local_oid
         );
+        // R111: a candidate is a `full` line to a trusted remote (one whose
+        // server R112 can ask) in a push that is not forced.
+        let candidate = match gate.remote_refs.get(&remote) {
+            Some(trusted) if tier == Tier::Full => {
+                let f = *forced.get_or_insert_with(|| push_forced(gate, &remote));
+                (!f).then(|| trusted.url.clone())
+            }
+            _ => None,
+        };
         checks.push(Check {
             tree,
             tier,
@@ -399,6 +410,14 @@ pub fn run(gate: &Gate<'_>, args: &[OsString], stdin: &[u8]) -> u8 {
             refname: line.remote_ref.clone(),
             remote_verify,
             rerun_hint,
+            push: Some(PushFacts {
+                remote: remote.clone(),
+                remote_ref: line.remote_ref.clone(),
+                local_ref: line.local_ref.clone(),
+                commit: line.local_oid.clone(),
+                remote_oid: line.remote_oid.clone(),
+                candidate,
+            }),
         });
     }
     if checks.is_empty() {

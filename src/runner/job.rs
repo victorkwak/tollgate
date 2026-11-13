@@ -159,6 +159,11 @@ pub struct JobSpec {
     /// and makes no record lookup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_run: Option<StepRun>,
+    /// R112: `pre-push` created the job. Only such a job is ended when the
+    /// remote moves past every candidate it checks; specs written before
+    /// the field read as false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub for_push: bool,
 }
 
 /// What a `tollgate run <step>` job runs (R105).
@@ -337,8 +342,23 @@ pub fn run_job(dirs: &Dirs, id: &JobId, runner_env: &EnvSnapshot) -> u8 {
         eprintln!("tollgate runner: cannot become subreaper: {e}");
     }
     let job_dir = dirs.job_dir(id);
+    // R112: a push job asks the remote during its run.
+    let watch = match spec.host.push.remote_check.interval() {
+        Some(every) if spec.for_push => Some(super::remote_watch::start(
+            super::remote_watch::WatchInput {
+                dirs: dirs.clone(),
+                job: id.clone(),
+                common_dir: spec.common_dir.clone(),
+                env: runner_env.clone(),
+                path_prepend: spec.host.job.path_prepend.clone(),
+                every,
+            },
+        )),
+        _ => None,
+    };
     let mut r = Runner::new(dirs, spec, job_dir, runner_env, false, true);
     let end = r.run();
+    drop(watch);
     r.finish(end);
     0
 }
@@ -1800,7 +1820,18 @@ impl Runner<'_> {
             }
             End::Cancelled => {
                 self.report.outcome = Outcome::Cancelled;
-                JobState::Cancelled
+                // R112: the reason of a cancel that gave one (the cancel
+                // file, or the state of a job cancelled while queued).
+                let reason = self
+                    .store
+                    .cancel_note(&self.spec.id)
+                    .map(|n| n.reason)
+                    .or_else(|| match self.store.read(&self.spec.id).map(|m| m.state) {
+                        Ok(JobState::Cancelled { reason }) => reason,
+                        _ => None,
+                    });
+                self.report.message.clone_from(&reason);
+                JobState::Cancelled { reason }
             }
             End::Superseded => {
                 self.report.outcome = Outcome::Superseded;
@@ -1938,6 +1969,10 @@ impl Runner<'_> {
             quarantined: count(r.quarantined.len()),
             step_ms: Some(crate::metrics::ran_step_ms(&r.steps)),
             branch: Some(crate::metrics::branch_of(&self.spec.origin.refname)),
+            // R112: `behind` for a job ended because the remote moved.
+            cause: (r.outcome == Outcome::Cancelled && !self.here)
+                .then(|| self.store.cancel_note(&self.spec.id).and_then(|n| n.cause))
+                .flatten(),
         };
         crate::metrics::record(self.dirs, &[crate::metrics::Event::Job(event)]);
     }
@@ -1993,7 +2028,7 @@ fn millis(d: Duration) -> u64 {
 /// While queued: cancelled (state) or superseded (R89).
 fn queued_abort(store: &JobStore, id: &JobId) -> Option<String> {
     match store.read(id).map(|m| m.state) {
-        Ok(JobState::Cancelled) => return Some("cancelled".into()),
+        Ok(JobState::Cancelled { .. }) => return Some("cancelled".into()),
         Ok(JobState::Superseded) => return Some("superseded".into()),
         _ => {}
     }

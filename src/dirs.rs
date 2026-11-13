@@ -182,6 +182,13 @@ impl Dirs {
         self.state_dir().join("unverified")
     }
 
+    /// Push candidates, one file per (remote URL identity, remote ref)
+    /// (R111).
+    #[must_use]
+    pub fn push_candidates_dir(&self) -> PathBuf {
+        self.state_dir().join("push-candidates")
+    }
+
     /// What trusted servers reported for their branches (L2, R56).
     #[must_use]
     pub fn remote_refs_file(&self) -> PathBuf {

@@ -70,6 +70,7 @@ pub fn run(gate: &Gate<'_>, kind: Kind, cwd: &std::path::Path) -> u8 {
         refname,
         remote_verify,
         rerun_hint,
+        push: None,
     };
     // After a denied pre-merge-commit git keeps the merge in progress:
     // `git commit` concludes it (and runs pre-commit, which finds the

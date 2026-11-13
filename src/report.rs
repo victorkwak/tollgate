@@ -329,7 +329,14 @@ pub fn render(r: &JobReport, header: &str) -> Vec<String> {
             q.test, q.until, q.issue
         ));
     }
-    if let Some(m) = &r.message {
+    if let Some(m) = r
+        .message
+        .as_ref()
+        .filter(|_| r.outcome == Outcome::Cancelled)
+    {
+        // R112: why the job was cancelled.
+        head.push(format!("cancelled: {m}"));
+    } else if let Some(m) = &r.message {
         let cause = r
             .cause
             .and_then(|c| serde_json::to_value(c).ok())

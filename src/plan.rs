@@ -904,6 +904,7 @@ fn plan_with(
         priority: req.priority,
         created: now,
         step_run: None,
+        for_push: false,
     };
     Ok(Plan {
         spec,

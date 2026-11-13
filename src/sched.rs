@@ -211,6 +211,7 @@ fn lost_metrics(dirs: &Dirs, meta: &JobMeta) {
         quarantined: 0,
         step_ms: None,
         branch: None,
+        cause: None,
     };
     crate::metrics::record(dirs, &[crate::metrics::Event::Job(event)]);
 }
@@ -335,7 +336,12 @@ pub enum JobState {
     /// Replaced by a newer job from the same origin (R89). No record.
     Superseded,
     /// Cancelled (R89). No record.
-    Cancelled,
+    Cancelled {
+        /// Why, when the cancel gave a reason (R112: the remote ref moved
+        /// during the run). `job.json` files from before it have none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Queue budget or disk (R33, R44). No record.
     Deferred {
         /// Why.
@@ -376,7 +382,7 @@ impl JobState {
             Self::Running { .. } => StateKind::Running,
             Self::Finished { .. } => StateKind::Finished,
             Self::Superseded => StateKind::Superseded,
-            Self::Cancelled => StateKind::Cancelled,
+            Self::Cancelled { .. } => StateKind::Cancelled,
             Self::Deferred { .. } => StateKind::Deferred,
             Self::Lost { .. } => StateKind::Lost,
         }
@@ -429,6 +435,16 @@ pub enum CancelOutcome {
     Requested,
     /// The job had already ended in this state.
     AlreadyEnded(JobState),
+}
+
+/// Why a job is cancelled, kept in `jobs/<id>/cancel` (R112).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelNote {
+    /// The reason, for `wait`, `status` and `report`.
+    pub reason: String,
+    /// The `cause` of the job's metrics line (`behind`, R112).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
 }
 
 /// The job dirs under the state dir.
@@ -586,11 +602,42 @@ impl JobStore {
     /// `tollgate cancel <job>` (R89): a queued job ends now; a running job
     /// gets a request its runner acts on.
     pub fn request_cancel(&self, id: &JobId) -> Result<CancelOutcome, SchedError> {
-        match self.transition(id, &[StateKind::Queued], JobState::Cancelled)? {
+        self.request_cancel_with(id, None)
+    }
+
+    /// [`JobStore::request_cancel`] with a reason (R112). The `cancel` file
+    /// holds the note as JSON (empty for a plain cancel); a queued job also
+    /// keeps the reason in its state. The file is written first, so the
+    /// runner of a queued job finds the note when it ends.
+    pub fn request_cancel_with(
+        &self,
+        id: &JobId,
+        note: Option<&CancelNote>,
+    ) -> Result<CancelOutcome, SchedError> {
+        let path = self.dirs.job_dir(id).join("cancel");
+        let bytes = match note {
+            Some(n) => serde_json::to_vec(n).map_err(|e| SchedError::Corrupt {
+                path: path.clone(),
+                message: e.to_string(),
+            })?,
+            None => Vec::new(),
+        };
+        let current = self.read(id)?;
+        if current.state.is_terminal() {
+            return Ok(CancelOutcome::AlreadyEnded(current.state));
+        }
+        if note.is_some() {
+            fsx::write_atomic(&path, &bytes).map_err(io_at(&path))?;
+        }
+        let state = JobState::Cancelled {
+            reason: note.map(|n| n.reason.clone()),
+        };
+        match self.transition(id, &[StateKind::Queued], state)? {
             Transition::Done(_) => Ok(CancelOutcome::Cancelled),
             Transition::Refused(meta) if meta.state.kind() == StateKind::Running => {
-                let path = self.dirs.job_dir(id).join("cancel");
-                fsx::write_atomic(&path, b"").map_err(io_at(&path))?;
+                if note.is_none() {
+                    fsx::write_atomic(&path, &bytes).map_err(io_at(&path))?;
+                }
                 Ok(CancelOutcome::Requested)
             }
             Transition::Refused(meta) => Ok(CancelOutcome::AlreadyEnded(meta.state)),
@@ -601,6 +648,16 @@ impl JobStore {
     #[must_use]
     pub fn cancel_requested(&self, id: &JobId) -> bool {
         self.dirs.job_dir(id).join("cancel").exists()
+    }
+
+    /// The note of a cancel request with a reason (R112); `None` for a
+    /// plain cancel or none.
+    #[must_use]
+    pub fn cancel_note(&self, id: &JobId) -> Option<CancelNote> {
+        let bytes = fsx::read_optional(&self.dirs.job_dir(id).join("cancel"))
+            .ok()
+            .flatten()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     /// Every readable job, oldest first.

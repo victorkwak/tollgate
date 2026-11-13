@@ -42,6 +42,107 @@ pub struct HostConfig {
     /// default, so specs and the effective config stay as before.
     #[serde(default, skip_serializing_if = "SessionConfig::is_default")]
     pub session: SessionConfig,
+    /// Push candidates (R111, R112). Left out of `spec.json` when it is
+    /// the default, as `[session]`.
+    #[serde(default, skip_serializing_if = "PushHost::is_default")]
+    pub push: PushHost,
+}
+
+/// `[push]` (R111, R112): one push candidate per full-tier ref, and the
+/// remote check of a push job during its run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushHost {
+    /// What `pre-push` does with a second candidate for a ref (R111).
+    #[serde(default)]
+    pub second_candidate: SecondCandidate,
+    /// How long a passed candidate holds its ref (R111).
+    #[serde(default = "default_candidate_hold")]
+    pub candidate_hold: DurationSpec,
+    /// How often a push job asks the remote during its run (R112).
+    #[serde(default)]
+    pub remote_check: RemoteCheck,
+}
+
+fn default_candidate_hold() -> DurationSpec {
+    dur("10m")
+}
+
+impl Default for PushHost {
+    fn default() -> Self {
+        Self {
+            second_candidate: SecondCandidate::default(),
+            candidate_hold: default_candidate_hold(),
+            remote_check: RemoteCheck::default(),
+        }
+    }
+}
+
+impl PushHost {
+    /// True for the defaults.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `[push] second_candidate` (R111).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecondCandidate {
+    /// A push of a commit that does not contain the live candidate of the
+    /// ref is refused before any job (default).
+    #[default]
+    Refuse,
+    /// No refusal; the candidates are still written (R112).
+    Allow,
+}
+
+/// `[push] remote_check` (R112): a duration, or `"off"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteCheck {
+    /// No remote check during a run.
+    Off,
+    /// Ask the remote this often.
+    Every(DurationSpec),
+}
+
+impl Default for RemoteCheck {
+    fn default() -> Self {
+        Self::Every(dur("2m"))
+    }
+}
+
+impl RemoteCheck {
+    /// The interval; `None` when off.
+    #[must_use]
+    pub fn interval(&self) -> Option<Duration> {
+        match self {
+            Self::Off => None,
+            Self::Every(d) => Some(d.get()),
+        }
+    }
+}
+
+impl Serialize for RemoteCheck {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Off => s.serialize_str("off"),
+            Self::Every(d) => d.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteCheck {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        if raw.trim() == "off" {
+            return Ok(Self::Off);
+        }
+        DurationSpec::parse(&raw)
+            .map(Self::Every)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// `[session]` (R104): what `tollgate check` may do in an agent session.
@@ -1265,5 +1366,40 @@ SQLX_OFFLINE = "true"
         );
         assert_eq!(remote_project_name("git@gitlab.com:a/b"), Some("b"));
         assert_eq!(remote_project_name("/srv/repo.git"), Some("repo"));
+    }
+
+    /// R111, R112: `[push]` defaults, its values, and a host file without
+    /// it, which serializes as before (no `push` key in `spec.json`).
+    #[test]
+    fn push_table_defaults_and_values_r111_r112() {
+        let c = HostConfig::from_toml("").unwrap();
+        assert_eq!(c.push.second_candidate, SecondCandidate::Refuse);
+        assert_eq!(c.push.candidate_hold.get(), Duration::from_secs(600));
+        assert_eq!(
+            c.push.remote_check.interval(),
+            Some(Duration::from_secs(120))
+        );
+        let json = serde_json::to_value(&c).unwrap();
+        assert!(json.get("push").is_none(), "{json}");
+        let c = HostConfig::from_toml(
+            "[push]\nsecond_candidate = \"allow\"\ncandidate_hold = \"3s\"\nremote_check = \"off\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.push.second_candidate, SecondCandidate::Allow);
+        assert_eq!(c.push.candidate_hold.get(), Duration::from_secs(3));
+        assert_eq!(c.push.remote_check, RemoteCheck::Off);
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(json["push"]["remote_check"], "off", "{json}");
+        let back: HostConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back, c);
+        let c = HostConfig::from_toml("[push]\nremote_check = \"1s\"\n").unwrap();
+        assert_eq!(c.push.remote_check.interval(), Some(Duration::from_secs(1)));
+        for bad in [
+            "[push]\nremote_check = \"soon\"\n",
+            "[push]\nsecond_candidate = \"maybe\"\n",
+            "[push]\nother = 1\n",
+        ] {
+            assert!(HostConfig::from_toml(bad).is_err(), "{bad}");
+        }
     }
 }
