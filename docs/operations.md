@@ -80,10 +80,10 @@ An agent works as before. The gates run by themselves.
 | `git commit ...` | Runs `pre-commit` (`fast`). On a deny, the report says what failed. |
 | `tollgate check [--tier full] [--wait \| --detach] [--rerun [--all]]` | Checks the index tree (or `--rev R`, `--tree T`) ahead of a commit or push. In an agent session (`CLAUDECODE` or `CLAUDE_CODE_ENTRYPOINT` set), `--tier full` does not start a job (R104): it answers from a stored record, or attaches to a full job that already runs; `--rerun` starts one only after a stored non-pass. A push of, or a merge into, a full ref starts the full tier. Host `[session] full_check = "allow"` turns this off. |
 | `tollgate run <step> [--rev R \| --tree T] [--rerun] [--wait \| --detach] [-- <args>...]` | Runs one declared step on the index tree (or `--rev R`, `--tree T`) in its own job, or prints its stored pass on the same inputs, with no job (R105). The pass counts as fresh for a later gate job on the same tree. Arguments narrow the step; a narrowed pass answers only the same call. Prints the step's `log:` and `artifacts:` paths (R106). |
-| `tollgate wait <job>` | Waits for a job: exit 0 pass, 1 fail, 3 still running (L17). |
+| `tollgate wait <job> [--timeout D]` | Waits for a job: exit 0 pass, 1 fail, 3 still running (L17). `D` is seconds (`3000`) or has a unit (`50m`) (R113). A job that R112 ended prints why. |
 | `tollgate status [--rev R] [--json]` | Records and running jobs for `HEAD` and the index, the commits on the branch that have no record (L1), and those made without the gate (unverified). |
 | `tollgate report <job\|tree>`, `tollgate log <job> <step> [--tail N]` | The full report and a step log (R92). |
-| `tollgate cancel <job>` | Stops a queued or running job (R89). |
+| `tollgate cancel <job>` | Stops a queued or running job (R89). A cancelled push candidate frees its ref (R111). |
 | `tollgate merge <branch>` | Merges into a full ref with a `full` check before the commit (R99). |
 | `tollgate flaky [--days N]`, `tollgate audit [--since D]`, `tollgate gc [--all]` | Flaky test counts, records for review, cleanup. |
 | `tollgate cost [--since D] [--repo R] [--json]` | Gate time per local day, repo and tier (jobs, passed, step and wall time as `h:mm`, steps run and reused, a total per day) and the 10 branches per repo with the most step time; default the last 7 days; `~` marks a step time estimated from an older log line (R109). |
@@ -157,11 +157,25 @@ These rules stop work that cannot change a result (spec section 4.14). They do n
 - **One stored result per step (R105).** `tollgate run <step>` runs one declared step on the staged tree, in the verify checkout. When the step already passed on the same inputs, it prints `REUSED <step> from <job>` with the log path and starts no job. A builder, a reviewer and a fixer then read the same run. Arguments after `--` narrow the step; a narrowed pass answers only the same call and never a gate job.
 - **Artefacts stay with the job (R106).** A step with `artifacts = ["web/test-results"]` has those paths copied to `<job dir>/artifacts/<step>/` after it ends, also when it fails. The report of a failed step names the dir. The paths must be ignored by git, because a step must not leave untracked files (R42). The limit is `[job] artifacts_max` in the host config (default 512 MiB); `gc` removes artefacts with the step logs. A path that goes through a symlink is not copied, and the search for a glob stops after 20,000 entries: name a dir, not `**/*.png`.
 - **The cost is visible (R109).** `tollgate cost` prints jobs, step time and wall time per local day, repo and tier, and the branches with the most step time.
+- **One commit in the gate for each full-tier ref (R111).** Only one of two commits can land first on `main`. When a push needs a new `full` job and another commit is already in the gate for the same ref of the same remote (queued, running, or passed less than `candidate_hold` ago and not pushed yet), `pre-push` refuses before any job and names that commit, its job, its worktree and its branch. There are two ways on. Wait: `tollgate wait <job>`, and when that push has landed, fetch, merge and push. Or stack: `git merge <that commit>` now and push; the check of the merged commit starts at once, and the push lands by fast-forward after the first one (and alone, when the first one fails). A push that already has a stored pass is always allowed. A newer push from the same worktree and branch (an amended commit) replaces its own earlier commit in the gate and cancels that job. `tollgate cancel <job>` frees the ref, and `tollgate status` lists the commits in the gate. A job whose runner died does not hold a ref. All worktrees and clones of one remote on a machine share the list. A merge into a local full ref (`tollgate merge`) is not in the list before its push.
+- **The remote is checked during the run (R112).** For a job that `pre-push` created, a small watcher process (`tollgate __watch-push`, beside the runner) asks the trusted server for the ref every `remote_check` (default 2 minutes), also while the job is queued. When the ref moved to a commit that the pushed commit does not contain (a push from another machine, or one that had a stored pass), the job ends as cancelled, and `tollgate wait` prints the reason and the `git fetch ... && git merge FETCH_HEAD` command. A failed query ends nothing. A job that `check`, `merge`, `run`, a commit hook or a forced push started, or waits for, is never ended this way.
+
+  ```toml
+  # host config, ~/.config/tollgate/config.toml (all three have these defaults)
+  [push]
+  second_candidate = "refuse"   # "allow" turns R111 off
+  candidate_hold = "10m"        # a passed commit keeps the ref this long before its push
+  remote_check = "2m"           # "off" turns R112 off
+  ```
+- **A new version keeps the stored results (R110).** The fingerprint holds a record epoch, not the version number. `tollgate install` prints `stored results: kept` when the new build reads the results of the installed one. When it does not (a release that changes what a pass means), it says so, lists the jobs that are queued or running, and asks before it goes on: their results would not count.
+- **A bare number is seconds (R113).** `tollgate wait <job> --timeout 3000` waits 3000 seconds; `300s`, `5m` and `1h30m` work as before. Policy and host config files still need the unit.
 
 Three things to know before you install this version or change config for these rules:
 
 - The fingerprint no longer holds the hash of the `tollgate.toml` file, only what a job reads from it (R74). So a comment or an `[[expensive]]` entry voids nothing. The change itself voids the stored results one time, for every repo that has a `tollgate.toml`: each tree runs one time again after the install.
-- The hash of the host config file is part of every result's fingerprint. An edit of the host config (for example `[session]` or `artifacts_max`) makes each tree run one time again.
+- The hash of the host config file is part of every result's fingerprint. An edit of the host config (for example `[session]`, `[push]` or `artifacts_max`) makes each tree run one time again. A file without `[push]` behaves as the defaults and keeps its hash.
+- A host config with a `[push]` table is refused by 0.2.0 and older (unknown table). Add it only on a machine that runs 0.3.0, and remove it before a rollback.
+- Since 0.3.0 a new version number alone voids nothing (R110). Install a build that says `stored results: not used by this build` only when no job runs.
 - An older tollgate binary refuses a `tollgate.toml` that has a table it does not know (`[[expensive]]`, `push.full_refs`, `artifacts`). Install the new binary on every machine before such a policy file reaches `main`.
 
 ## CI
