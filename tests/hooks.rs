@@ -2339,3 +2339,34 @@ fn a_candidate_git_cannot_compare_does_not_make_the_ref_busy_r111() {
     release(&gate, "k");
     release(&gate, "b");
 }
+
+/// R111: a candidate whose runner died (SIGKILL) holds no ref: the next
+/// push of another commit is not `ref-busy`, and the dead job is reaped.
+#[test]
+fn a_candidate_whose_runner_died_does_not_hold_the_ref_r111() {
+    let sb = Sandbox::new();
+    let (repo, _bare, gate) = lane_repo(&sb, "", "");
+    named_commit(&sb, &repo, "a", "main", "a");
+    let ja = job_id(&push_main(&sb, &repo, "a", &[]).out);
+    assert!(running(&sb, &ja));
+    let pid: i32 = std::fs::read_to_string(sb.state().join("jobs").join(&ja).join("runner.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    tollgate::procs::signal(pid, libc::SIGKILL).unwrap();
+    assert!(eventually(10, || !std::path::Path::new(&format!(
+        "/proc/{pid}/cmdline"
+    ))
+    .exists()
+        || std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|s| s.contains(") Z "))));
+    named_commit(&sb, &repo, "b", "main", "b");
+    let r = push_main(&sb, &repo, "b", &[]);
+    assert!(!r.out.contains("(R111)"), "{}", r.out);
+    assert_eq!(sb.job_state(&ja).as_deref(), Some("lost"), "{}", r.out);
+    let jb = job_id(&r.out);
+    assert_ne!(jb, ja);
+    release(&gate, "b");
+    assert_eq!(wait_job(&sb, &repo, &jb).code, Some(0));
+}

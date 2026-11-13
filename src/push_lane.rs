@@ -30,7 +30,7 @@ use crate::fsx;
 use crate::gitx::Oid;
 use crate::ids::JobId;
 use crate::locks::LockFile;
-use crate::sched::{JobState, JobStore};
+use crate::sched::{self, JobState, JobStore};
 
 const VERSION: u32 = 1;
 
@@ -143,6 +143,8 @@ pub fn liveness(
 ) -> Option<Live> {
     let meta = JobStore::new(dirs).read(&c.job).ok()?;
     match meta.state {
+        // A job whose runner died holds no ref; it is reaped here.
+        JobState::Queued | JobState::Running { .. } if !sched::runner_alive(dirs, &meta) => None,
         JobState::Queued => Some(Live::Queued(meta.created)),
         JobState::Running { started, .. } => Some(Live::Running(started)),
         JobState::Finished {
@@ -459,6 +461,13 @@ mod tests {
             state: JobState::Queued,
         };
         let store = JobStore::new(dirs);
+        // A live job's runner holds its key lock (R88): kept for the test.
+        if !state.is_terminal()
+            && let crate::sched::Claim::Owner(claim) =
+                crate::sched::claim_job(dirs, &meta.key, &id).unwrap()
+        {
+            std::mem::forget(claim);
+        }
         store.create(&meta).unwrap();
         if state != JobState::Queued {
             store.transition(&id, &[StateKind::Queued], state).unwrap();

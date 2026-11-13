@@ -179,6 +179,39 @@ pub fn reap_if_lost(dirs: &Dirs, id: &JobId) -> Result<bool, SchedError> {
     Ok(true)
 }
 
+/// How long a queued or running job whose runner does not hold its key
+/// lock is given before it counts as lost: the creator writes its files
+/// one after the other (as `plan::wait` allows).
+pub const RUNNER_GRACE: Duration = Duration::from_millis(200);
+
+/// True when `meta` (queued or running) has a runner that holds its key
+/// lock (R88). A job whose runner is gone after [`RUNNER_GRACE`] is
+/// reaped ([`reap_if_lost`]: marked lost, its leftovers killed) and is not
+/// alive; a job that ended meanwhile is not alive either.
+#[must_use]
+pub fn runner_alive(dirs: &Dirs, meta: &JobMeta) -> bool {
+    let holds = || running_job(dirs, &meta.key).ok().flatten().as_ref() == Some(&meta.id);
+    let end = std::time::Instant::now() + RUNNER_GRACE;
+    loop {
+        if holds() {
+            return true;
+        }
+        if std::time::Instant::now() >= end {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    match reap_if_lost(dirs, &meta.id) {
+        Ok(true) => false,
+        _ => {
+            JobStore::new(dirs)
+                .read(&meta.id)
+                .is_ok_and(|m| !m.state.is_terminal())
+                && holds()
+        }
+    }
+}
+
 /// The lost job's line in the metrics log (item 50). Its runner died
 /// before it wrote one; without it, a cap refusal of the job would stay
 /// open in `tollgate stats`. Its run time is not known: only the time
