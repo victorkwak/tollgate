@@ -592,6 +592,9 @@ path_prepend = []
 allow_ssh_agent = false
 [job.env]
 SQLX_OFFLINE = "true"
+
+[session]
+full_check = "refuse"                    # R104; "allow" lets an agent session start the full tier by hand
 ```
 
 R85. Resource semaphores: `$XDG_STATE_HOME/tollgate/locks/<resource>/slot-<i>`, `File::try_lock` exclusive (`flock(2)`, Linux and macOS; Rust >= 1.89). A step takes its resources in one canonical order (sorted by name), all-or-nothing: if any slot is not free it releases those it holds and waits.
@@ -638,6 +641,7 @@ R99. Agent workflow:
   - Commit: `git commit -m ...` runs `pre-commit` inline (`fast`; often a cache hit after `tollgate check`). The guard raises the Bash timeout (R28).
   - Pre-warm: `tollgate check [--tier fast|full] [--tree T | --rev R] [--wait | --detach] [--rerun]`.
   - Verify step: `tollgate check --tier full --rev HEAD --detach`, later `tollgate wait <job> [--timeout 590s]` (exit 0 pass, 1 fail, 3 running).
+    Note (2026-11-12, R104): an agent session no longer starts this step by hand. `git push` (or `tollgate merge`) starts the full tier; the session reads the result with `tollgate status` and waits with `tollgate wait <job>`.
   - Handoff: `git push origin feat` needs a `full` record of the tip (R20). `tollgate status --rev HEAD --json` goes into the handoff message.
   - Integration merge: `tollgate merge <branch>` = `merge --no-ff --no-commit`, `check --tier full --wait`, `commit`. A plain `git merge` into a full ref denies at the inline budget and continues the job; `tollgate wait` then `git commit` completes it.
   - Sequences on a full ref: `tollgate pick <rev>...` = picks on a temporary branch, `check --tier full --wait`, ff of the full ref (one gated update).
@@ -670,6 +674,9 @@ R101. A step that ran fresh on the same tree is not run again. When a step runs 
 L16's "every step fresh" for full refs now means: every step ran fresh on this tree, tier and fingerprint, in this job or in an earlier one.
 Assumption: a step does not depend on what another step left in the checkout. R42 checks that a step leaves no tracked or untracked change, but ignored output (`target/`, `node_modules`, cache dirs) can stay between steps. A step that needs such output of an earlier step can pass alone and fail when the earlier step is taken from another job: it must make that output itself.
 Reason: a feature branch's full pass that reused one step (L16) does not answer a push of the same tree to `main`. Before R101 that push ran all 20 steps again (32 minutes), although 19 of them had just run fresh on that exact tree with the same fingerprint.
+
+R104. An agent session does not start the full tier by hand. An agent session is a process whose environment has `CLAUDECODE` or `CLAUDE_CODE_ENTRYPOINT` (the test `tollgate install` uses). In a session, `tollgate check --tier full` (also with `--detach`) answers from a stored record as before, and it may attach to a job that already runs for the key and wait for it. It does not create a job. Then it prints on stderr why, that a push or a merge into a full ref starts the full tier, and the `--rerun` command, and exits 2 (refused). `--rerun` may start a job only when the stored record of the key is a non-pass (`fail`, `timeout`, `error`): that is the command a hook's deny gives. `--rerun` with a stored pass or with no record is refused. Tier `fast`, `tollgate merge` and the hooks do not change. The host config switch `[session] full_check = "allow"` turns the rule off (default `"refuse"`). The host config hash is over the file bytes (R74), so a file without `[session]` gives the same fingerprint as before; changing the switch changes the fingerprint.
+Reason: agents ran `tollgate check --tier full` as a "verify" phase, and the push then ran the full tier again. The push or merge starts the full tier and uses its result; a session only reads or waits.
 
 ---
 

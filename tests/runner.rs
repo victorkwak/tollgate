@@ -1868,3 +1868,131 @@ fn reports_record_queue_wait_per_resource_and_for_the_checkout_r85_r87_l20() {
     let checkout = rep["checkout_wait_ms"].as_u64().expect("checkout_wait_ms");
     assert!(checkout < 300, "checkout wait {checkout} ms: {rep}");
 }
+
+/// The R104 refusal, line by line.
+const R104_LINES: [&str; 3] = [
+    "tollgate: check --tier full is not started by hand in an agent session (R104).",
+    "tollgate: a push, or a merge into a full ref, starts the full tier and reuses its result: run git push. Results so far: tollgate status.",
+    "tollgate: after a stored fail: tollgate check --tier full --rev <rev> --rerun (runs only the steps that did not pass).",
+];
+
+const SESSION: &[(&str, &str)] = &[("CLAUDECODE", "1")];
+
+fn refused_r104(r: &support::Run) {
+    assert_eq!(r.code, Some(2), "{}", r.out);
+    for line in R104_LINES {
+        assert!(r.out.contains(line), "{line:?} in {}", r.out);
+    }
+}
+
+/// R104: in an agent session `check --tier full` creates no job (also
+/// `--detach`, and `--rerun` with a stored pass); outside a session it
+/// runs; a stored full pass still answers; `check` (fast) runs.
+#[test]
+fn a_session_does_not_start_the_full_tier_by_hand_r104() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(&sb, "r", PASS_TOML);
+    let full = ["check", "--tier", "full", "--rev", "HEAD", "--wait"];
+    let r = sb.tollgate_with(&repo, &full, SESSION);
+    refused_r104(&r);
+    let detach = ["check", "--tier", "full", "--rev", "HEAD", "--detach"];
+    refused_r104(&sb.tollgate_with(&repo, &detach, SESSION));
+    refused_r104(&sb.tollgate_with(&repo, &full, &[("CLAUDE_CODE_ENTRYPOINT", "cli")]));
+    assert!(sb.jobs().is_empty(), "{:?}", sb.jobs());
+    // `fast` in a session runs.
+    let r = sb.tollgate_with(&repo, &["check", "--rev", "HEAD", "--wait"], SESSION);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(sb.jobs().len(), 1);
+    // Outside a session the full check runs.
+    let r = sb.tollgate(&repo, &full);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(sb.jobs().len(), 2);
+    // Its stored pass answers in a session, with no job.
+    let r = sb.tollgate_with(&repo, &full, SESSION);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(r.out.contains("PASS"), "{}", r.out);
+    // `--rerun` of a stored pass is refused; the record stays.
+    let rerun = [
+        "check", "--tier", "full", "--rev", "HEAD", "--wait", "--rerun",
+    ];
+    refused_r104(&sb.tollgate_with(&repo, &rerun, SESSION));
+    assert_eq!(sb.jobs().len(), 2);
+    assert_eq!(sb.record_count(), 2);
+}
+
+const PASS_TOML: &str =
+    "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n";
+
+/// R104: after a stored full fail, a session may `--rerun` (the command
+/// the hook's deny gives); without `--rerun` it gets the stored fail.
+#[test]
+fn a_session_may_rerun_a_stored_full_fail_r104() {
+    let sb = Sandbox::new();
+    let mark = sb.root().join("mark");
+    host(&sb, &format!("[job.env]\nMARK = \"{}\"\n", mark.display()));
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"once\"\nkind = \"command\"\nrun = 'test -e \"$MARK\" || { touch \"$MARK\"; exit 1; }'\n",
+    );
+    let full = ["check", "--tier", "full", "--rev", "HEAD", "--wait"];
+    let r = sb.tollgate(&repo, &full);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    let r = sb.tollgate_with(&repo, &full, SESSION);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(r.out.contains("stored fail"), "{}", r.out);
+    assert_eq!(sb.jobs().len(), 1);
+    let rerun = [
+        "check", "--tier", "full", "--rev", "HEAD", "--wait", "--rerun",
+    ];
+    let r = sb.tollgate_with(&repo, &rerun, SESSION);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(sb.jobs().len(), 2);
+}
+
+/// R104: a session attaches to a full job that already runs for the key
+/// and waits for it.
+#[test]
+fn a_session_attaches_to_a_running_full_job_r104() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"slow\"\nkind = \"command\"\nrun = \"sleep 2\"\n",
+    );
+    let r = sb.tollgate(
+        &repo,
+        &["check", "--tier", "full", "--rev", "HEAD", "--detach"],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let job = job_id(&r.out);
+    let r = sb.tollgate_with(
+        &repo,
+        &["check", "--tier", "full", "--rev", "HEAD", "--wait"],
+        SESSION,
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        r.out.contains(&format!("attached to running job {job}")),
+        "{}",
+        r.out
+    );
+    assert_eq!(sb.jobs(), vec![job]);
+}
+
+/// R104: host `[session] full_check = "allow"` lets a session start it.
+#[test]
+fn the_host_config_can_allow_full_checks_in_a_session_r104() {
+    let sb = Sandbox::new();
+    host(&sb, "[session]\nfull_check = \"allow\"\n");
+    let repo = repo_with(&sb, "r", PASS_TOML);
+    let r = sb.tollgate_with(
+        &repo,
+        &["check", "--tier", "full", "--rev", "HEAD", "--wait"],
+        SESSION,
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(sb.jobs().len(), 1);
+}

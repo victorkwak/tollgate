@@ -38,6 +38,38 @@ pub struct HostConfig {
     /// Job environment (R52).
     #[serde(default)]
     pub job: JobConfig,
+    /// Agent sessions (R104). Left out of `spec.json` when it is the
+    /// default, so specs and the effective config stay as before.
+    #[serde(default, skip_serializing_if = "SessionConfig::is_default")]
+    pub session: SessionConfig,
+}
+
+/// `[session]` (R104): what `tollgate check` may do in an agent session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConfig {
+    /// `check --tier full` by hand in an agent session.
+    #[serde(default)]
+    pub full_check: FullCheck,
+}
+
+impl SessionConfig {
+    /// True for the default (`full_check = "refuse"`).
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// `[session] full_check` (R104).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FullCheck {
+    /// A session may not create a `full` job by hand (default).
+    #[default]
+    Refuse,
+    /// A session may run `check --tier full`.
+    Allow,
 }
 
 /// `[scope]` (L4).
@@ -973,6 +1005,27 @@ SQLX_OFFLINE = "true"
         assert_eq!(b.inline_for_hook(None, Tier::Fast).as_secs(), 100);
         b.inline = DurationSpec::parse("30s").unwrap();
         assert_eq!(b.inline_for_hook(None, Tier::Fast).as_secs(), 30);
+    }
+
+    /// R104: `[session]` is new. The host hash is over the file bytes, so
+    /// a file without it hashes as before; the parsed config serializes
+    /// without it (old and new `spec.json` agree) and reads back from JSON
+    /// that lacks it (old specs).
+    #[test]
+    fn the_session_table_changes_no_existing_spec_r104() {
+        let old = HostConfig::from_toml("[resources]\ncpu = 5\n").unwrap();
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("session").is_none(), "{json}");
+        let back: HostConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.session.full_check, FullCheck::Refuse);
+        let allow = HostConfig::from_toml("[session]\nfull_check = \"allow\"\n").unwrap();
+        assert_eq!(allow.session.full_check, FullCheck::Allow);
+        assert_eq!(
+            serde_json::to_value(&allow).unwrap()["session"]["full_check"],
+            "allow"
+        );
+        assert!(HostConfig::from_toml("[session]\nfull_check = \"maybe\"\n").is_err());
+        assert!(HostConfig::from_toml("[session]\nother = 1\n").is_err());
     }
 
     #[test]

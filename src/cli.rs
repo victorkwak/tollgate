@@ -17,6 +17,7 @@ use crate::cache::record::{Record, Verdict};
 use crate::cache::store::{Lookup, RecordStore};
 use crate::cache::{Fingerprint, record_key};
 use crate::config::check::REPO_CONFIG_FILE;
+use crate::config::host::FullCheck;
 use crate::config::units::DurationSpec;
 use crate::config::{HostConfig, LoadedHost, RepoConfig, Tier};
 use crate::dirs::Dirs;
@@ -25,7 +26,7 @@ use crate::exit;
 use crate::gitx::{Git, Oid, RepoLayout};
 use crate::ids::JobId;
 use crate::locks::Priority;
-use crate::plan::{self, Base, PlanRequest, Settled, Started, WaitEnd};
+use crate::plan::{self, Base, PlanError, PlanRequest, Settled, Started, WaitEnd};
 use crate::policy::{self, ConfigSource};
 use crate::report::{self, JobReport};
 use crate::runner::env::{BaseInputs, JobEnv};
@@ -292,6 +293,23 @@ pub fn check(ctx: &Ctx, a: &CheckArgs) -> u8 {
         Err(e) => return fail(e),
     };
     plan.spec.carry = !a.all;
+    // R104: in an agent session a full check by hand answers from a
+    // record or attaches to a running job; only `--rerun` of a stored
+    // non-pass (the command a hook's deny gives) may start one. The record
+    // is read before `--rerun` removes it.
+    if a.tier == Tier::Full
+        && repo.host.config.session.full_check == FullCheck::Refuse
+        && crate::install::claude_session(&ctx.env).is_some()
+    {
+        if a.rerun {
+            match RecordStore::new(&repo.dirs).read_usable(&plan.spec.key) {
+                Ok(Some(r)) if r.verdict != Verdict::Pass => {}
+                _ => return refuse_full_in_session(),
+            }
+        } else {
+            plan.may_create = false;
+        }
+    }
     if a.rerun {
         let _ = RecordStore::new(&repo.dirs).remove(&plan.spec.key);
     } else {
@@ -303,6 +321,7 @@ pub fn check(ctx: &Ctx, a: &CheckArgs) -> u8 {
     }
     let started = match plan::start(&repo.dirs, &plan, &ctx.exe, &ctx.env) {
         Ok(s) => s,
+        Err(PlanError::NoNewJob(_)) => return refuse_full_in_session(),
         Err(e) => return fail(e),
     };
     let mut say = |s: &Started| match s {
@@ -351,8 +370,23 @@ pub fn check(ctx: &Ctx, a: &CheckArgs) -> u8 {
             eprintln!("tollgate: {m}");
             exit::FAIL
         }
+        // An attached job ended without answering this check, and this
+        // check may not start its own (R104).
+        Err(PlanError::NoNewJob(_)) => refuse_full_in_session(),
         Err(e) => fail(e),
     }
+}
+
+/// R104: the refusal of `check --tier full` in an agent session. Exit 2,
+/// the code of a refused command or a usage error (R23): not a check
+/// verdict (0, 1) and not "still running" (3).
+fn refuse_full_in_session() -> u8 {
+    eprintln!(
+        "tollgate: check --tier full is not started by hand in an agent session (R104).\n\
+         tollgate: a push, or a merge into a full ref, starts the full tier and reuses its result: run git push. Results so far: tollgate status.\n\
+         tollgate: after a stored fail: tollgate check --tier full --rev <rev> --rerun (runs only the steps that did not pass)."
+    );
+    exit::BLOCK
 }
 
 fn print_lookup(dirs: &Dirs, found: &Lookup) -> u8 {

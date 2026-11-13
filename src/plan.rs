@@ -26,7 +26,7 @@ use crate::config::{CompiledScope, LoadedHost, Platform, Tier, TrustedUrls};
 use crate::dirs::Dirs;
 use crate::env::EnvSnapshot;
 use crate::gitx::{Git, GitError, Oid, RepoLayout};
-use crate::ids::{JobId, ResourceName};
+use crate::ids::{JobId, RecordKey, ResourceName};
 use crate::locks::Priority;
 use crate::policy::{self, PolicyError};
 use crate::remote_refs::{RemoteRefs, TrustedRemote};
@@ -58,6 +58,9 @@ pub enum PlanError {
     /// Job store or files.
     #[error("{0}")]
     Io(String),
+    /// [`Plan::may_create`] is off and no job runs for the key (R104).
+    #[error("no job runs for key {0}, and this check may not start one (R104)")]
+    NoNewJob(RecordKey),
 }
 
 /// The base of a `fast` selection (R55).
@@ -112,6 +115,9 @@ pub struct Plan {
     /// L16: a `full` check of a full ref (or with reuse turned off) accepts
     /// only a `full` pass whose steps all ran fresh.
     pub fresh_only: bool,
+    /// R104: [`start`] may create a job. Off, it only answers from a record
+    /// or attaches to a job that already runs for the key.
+    pub may_create: bool,
 }
 
 /// rustup's toolchain files.
@@ -841,6 +847,7 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
         spec,
         needed,
         fresh_only,
+        may_create: true,
     })
 }
 
@@ -887,6 +894,11 @@ pub fn start(
                     if !matches!(found, Lookup::Miss) {
                         return Ok(Started::Hit(Box::new(found)));
                     }
+                }
+                if !plan.may_create {
+                    // Dropping the claim releases the key.
+                    drop(claim);
+                    return Err(PlanError::NoNewJob(spec.key.clone()));
                 }
                 let spec_json = spec.to_json().map_err(|e| io(&e))?;
                 let meta = JobMeta {
