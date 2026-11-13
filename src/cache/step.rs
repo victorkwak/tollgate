@@ -9,6 +9,10 @@
 //! (`fast` jobs and pushes of non-full refs; never `full` jobs for full refs
 //! or CI) and that a reused `fast` result covers the selection needed now
 //! ([`super::record::Selection::covers`]).
+//!
+//! R101: a second store, namespaced by record key, holds the steps that
+//! ran and passed on that tree, tier and fingerprint. Every job takes them
+//! ([`read_fresh`]), also where L16 reuse does not apply.
 
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -21,7 +25,7 @@ use crate::config::repo::Step;
 use crate::dirs::Dirs;
 use crate::fsx;
 use crate::gitx::TreeEntry;
-use crate::ids::{JobId, StepKey};
+use crate::ids::{JobId, RecordKey, StepKey};
 use crate::steps::Scope;
 
 /// The entries of `tree` that are inputs of `step`, sorted by path bytes.
@@ -96,4 +100,46 @@ pub fn write_stored(dirs: &Dirs, s: &StoredStep) -> io::Result<()> {
     }
     let json = serde_json::to_vec_pretty(s).map_err(io::Error::other)?;
     fsx::write_atomic(&dirs.step_result_file(&s.key), &json)
+}
+
+/// R101: the pass of step `key` that ran (not reused, not carried) in a job
+/// on the tree, tier and fingerprint of `record`. Like [`read_stored`], it
+/// counts only while the report of its job exists, and only when that
+/// report says the same: the job's tree and tier hash to `record` with
+/// `fingerprint`, and the step ran there and passed.
+#[must_use]
+pub fn read_fresh(
+    dirs: &Dirs,
+    record: &RecordKey,
+    fingerprint: &Fingerprint,
+    key: &StepKey,
+) -> Option<StoredStep> {
+    let bytes = fsx::read_optional(&dirs.fresh_step_file(record, key)).ok()??;
+    let s: StoredStep = serde_json::from_slice(&bytes).ok()?;
+    if s.key != *key {
+        return None;
+    }
+    let report = crate::report::JobReport::read(dirs, &s.job).ok()??;
+    let ran_here = report.steps.iter().any(|r| {
+        r.name == s.step
+            && r.status == crate::cache::record::StepStatus::Pass
+            && r.reused_from.is_none()
+            && r.fresh_from.is_none()
+    });
+    (ran_here && super::record_key(&report.tree, report.tier, fingerprint) == *record).then_some(s)
+}
+
+/// Stores a step that ran and passed on the tree of `record` (R101). A
+/// stored pass whose scope already covers this one is kept.
+pub fn write_fresh(
+    dirs: &Dirs,
+    record: &RecordKey,
+    fingerprint: &Fingerprint,
+    s: &StoredStep,
+) -> io::Result<()> {
+    if read_fresh(dirs, record, fingerprint, &s.key).is_some_and(|old| old.scope.covers(&s.scope)) {
+        return Ok(());
+    }
+    let json = serde_json::to_vec_pretty(s).map_err(io::Error::other)?;
+    fsx::write_atomic(&dirs.fresh_step_file(record, &s.key), &json)
 }

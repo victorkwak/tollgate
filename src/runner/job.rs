@@ -146,10 +146,18 @@ pub struct JobSpec {
     pub allow_reuse: bool,
     /// `check --rerun`: no covering record shortcut, no reuse.
     pub rerun: bool,
+    /// R101: take the steps that already ran and passed on this tree,
+    /// tier and fingerprint (`check --rerun --all` turns it off).
+    #[serde(default = "yes")]
+    pub carry: bool,
     /// Queue rank (R89).
     pub priority: Priority,
     /// Creation time.
     pub created: jiff::Timestamp,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl JobSpec {
@@ -987,8 +995,35 @@ impl Runner<'_> {
             };
             let root = steps::step_root(s);
             let map = maps.get(&root).and_then(Option::as_ref);
-            // L16: reuse a stored pass of the same step key.
             let key = step_store::step_key(s, self.spec.tier, &self.spec.fingerprint, entries).ok();
+            // R101: the step already ran and passed on this tree, tier and
+            // fingerprint. That is a fresh result for this tree, so it also
+            // holds where L16 reuse does not (a full ref, `--rerun`).
+            if self.spec.carry
+                && !self.here
+                && let Some(k) = &key
+                && let Some(fresh) =
+                    step_store::read_fresh(self.dirs, &self.spec.key, &self.spec.fingerprint, k)
+                && fresh.job != self.spec.id
+                && fresh.scope.covers(&scope)
+            {
+                let mut rep = StepReport::skipped(&s.name, s.kind, "fresh");
+                rep.status = StepStatus::Pass;
+                rep.message = None;
+                rep.scope = Some(fresh.scope.clone());
+                rep.fresh_from = Some(fresh.job.clone());
+                self.report.steps.push(rep);
+                self.step_results.push(StepResult {
+                    name: s.name.clone(),
+                    status: StepStatus::Pass,
+                    duration_ms: 0,
+                    exit: None,
+                    log: None,
+                    failing: Vec::new(),
+                });
+                continue;
+            }
+            // L16: reuse a stored pass of the same step key.
             if self.spec.allow_reuse
                 && !self.spec.rerun
                 && let Some(k) = &key
@@ -1249,6 +1284,7 @@ impl Runner<'_> {
                 command: Some(inv.display()),
                 scope: Some(scope.clone()),
                 reused_from: None,
+                fresh_from: None,
                 resources: s.resources.iter().map(|r| r.as_str().to_owned()).collect(),
                 queue_ms,
                 message: None,
@@ -1660,6 +1696,9 @@ impl Runner<'_> {
         ) && self.report.cause.is_none()
         {
             for p in std::mem::take(&mut self.pending_steps) {
+                // R101: the same pass, as a result of this tree.
+                let _ =
+                    step_store::write_fresh(self.dirs, &self.spec.key, &self.spec.fingerprint, &p);
                 let _ = step_store::write_stored(self.dirs, &p);
             }
         }
@@ -1737,6 +1776,7 @@ impl Runner<'_> {
             checkout_wait_ms: r.checkout_wait_ms.unwrap_or(0),
             steps: count(r.steps.len()),
             steps_reused: count(r.steps.iter().filter(|s| s.reused_from.is_some()).count()),
+            steps_fresh: count(r.steps.iter().filter(|s| s.fresh_from.is_some()).count()),
             flaky: count(r.flaky.len()),
             quarantined: count(r.quarantined.len()),
         };

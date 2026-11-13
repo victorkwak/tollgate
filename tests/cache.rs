@@ -649,3 +649,116 @@ exclude_inputs = ["docs/**"]
     fp2.insert("rustc", "rustc 1.97.0");
     assert_ne!(keys(&entries(), &fp2)[0], k3[0]);
 }
+
+/// A full job `report.json` (what `read_fresh` parses) whose one step line
+/// is `step`.
+fn write_full_report(dirs: &Dirs, job: &JobId, tree: &Oid, tier: Tier, step: serde_json::Value) {
+    let now = jiff::Timestamp::now();
+    let v = serde_json::json!({
+        "schema": 1,
+        "job_id": job,
+        "tree": tree,
+        "tier": tier,
+        "outcome": "verdict",
+        "verdict": "pass",
+        "origin": {"worktree": "/r", "refname": "refs/heads/feat"},
+        "steps": [step],
+        "record_written": true,
+        "created": now,
+        "finished": now,
+        "host": "test",
+        "tollgate_version": tollgate::VERSION,
+    });
+    tollgate::fsx::write_atomic(&dirs.job_report(job), v.to_string().as_bytes()).unwrap();
+}
+
+/// R101: a same-tree step pass counts only while its job's report backs
+/// it: the report exists, its tree and tier hash to the record key under
+/// the fingerprint, and the step ran there and passed (not reused, not
+/// carried from another job).
+#[test]
+fn a_same_tree_step_pass_needs_a_report_that_ran_it_on_that_tree_r101() {
+    use tollgate::cache::step::{StoredStep, read_fresh, write_fresh};
+    use tollgate::ids::StepKey;
+    use tollgate::steps::Scope;
+
+    let sb = Sandbox::new();
+    let s = store(&sb);
+    let t = tree(1);
+    let record = record_key(&t, Tier::Full, &s.fp);
+    let key = StepKey::from_hash(&blake3::hash(b"tests"));
+    let ran = serde_json::json!({
+        "name": "tests", "kind": "command", "status": "pass", "duration_ms": 5,
+    });
+    // An entry for a new job whose report says `report_step` on
+    // `tree`/`tier`, written straight to the store.
+    let entry = |tree: &Oid, tier: Tier, report_step: serde_json::Value| {
+        let job = JobId::generate(jiff::Timestamp::now());
+        write_full_report(&s.dirs, &job, tree, tier, report_step);
+        let stored = StoredStep {
+            key: key.clone(),
+            step: "tests".into(),
+            job: job.clone(),
+            scope: Scope::All,
+            finished: jiff::Timestamp::now(),
+        };
+        let json = serde_json::to_vec(&stored).unwrap();
+        tollgate::fsx::write_atomic(&s.dirs.fresh_step_file(&record, &key), &json).unwrap();
+        stored
+    };
+    let other = JobId::generate(jiff::Timestamp::now());
+    let mut reused = ran.clone();
+    reused["reused_from"] = serde_json::json!(other);
+    let mut carried = ran.clone();
+    carried["fresh_from"] = serde_json::json!(other);
+    let mut failed = ran.clone();
+    failed["status"] = serde_json::json!("fail");
+    let mut renamed = ran.clone();
+    renamed["name"] = serde_json::json!("lint");
+    for (why, tree, tier, step) in [
+        ("reused there", &t, Tier::Full, reused),
+        ("carried there", &t, Tier::Full, carried),
+        ("failed there", &t, Tier::Full, failed),
+        ("another step ran there", &t, Tier::Full, renamed),
+        ("another tree", &tree(2), Tier::Full, ran.clone()),
+        ("another tier", &t, Tier::Fast, ran.clone()),
+    ] {
+        entry(tree, tier, step);
+        assert_eq!(read_fresh(&s.dirs, &record, &s.fp, &key), None, "{why}");
+    }
+    // A report that backs it.
+    let good = entry(&t, Tier::Full, ran.clone());
+    assert_eq!(
+        read_fresh(&s.dirs, &record, &s.fp, &key),
+        Some(good.clone())
+    );
+    // Another fingerprint: the tree and tier hash to another record key.
+    let mut fp2 = s.fp.clone();
+    fp2.insert("rustc", "rustc 1.97.0");
+    assert_eq!(read_fresh(&s.dirs, &record, &fp2, &key), None);
+    // An entry under another step key.
+    let key2 = StepKey::from_hash(&blake3::hash(b"other"));
+    std::fs::copy(
+        s.dirs.fresh_step_file(&record, &key),
+        s.dirs.fresh_step_file(&record, &key2),
+    )
+    .unwrap();
+    assert_eq!(read_fresh(&s.dirs, &record, &s.fp, &key2), None);
+    // A narrower pass does not replace a covering one.
+    let narrow = StoredStep {
+        job: JobId::generate(jiff::Timestamp::now()),
+        scope: Scope::Files {
+            files: ["a.ts".to_owned()].into(),
+        },
+        ..good.clone()
+    };
+    write_full_report(&s.dirs, &narrow.job, &t, Tier::Full, ran);
+    write_fresh(&s.dirs, &record, &s.fp, &narrow).unwrap();
+    assert_eq!(
+        read_fresh(&s.dirs, &record, &s.fp, &key),
+        Some(good.clone())
+    );
+    // The report gone: the entry no longer counts.
+    std::fs::remove_file(s.dirs.job_report(&good.job)).unwrap();
+    assert_eq!(read_fresh(&s.dirs, &record, &s.fp, &key), None);
+}

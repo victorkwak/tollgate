@@ -222,6 +222,22 @@ impl Dirs {
             .join(format!("{key}.json"))
     }
 
+    /// Root of the same-tree step store (R101).
+    #[must_use]
+    pub fn fresh_steps_dir(&self) -> PathBuf {
+        self.state_dir().join("fresh")
+    }
+
+    /// `fresh/<record key[..2]>/<record key>/<step key>.json`: a step that
+    /// ran and passed on the tree, tier and fingerprint of `record` (R101).
+    #[must_use]
+    pub fn fresh_step_file(&self, record: &RecordKey, step: &StepKey) -> PathBuf {
+        self.fresh_steps_dir()
+            .join(record.shard())
+            .join(record.to_string())
+            .join(format!("{step}.json"))
+    }
+
     /// `metadata/<key>.json`: workspace maps by manifest key, written by
     /// the runner, read by front ends that run no cargo (R51).
     #[must_use]

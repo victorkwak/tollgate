@@ -243,6 +243,9 @@ pub struct StepRow {
     /// L16: the job whose pass it reused.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reused_from: Option<String>,
+    /// R101: the job that ran it on the same tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fresh_from: Option<String>,
 }
 
 /// One job of the bench's state dir.
@@ -305,6 +308,7 @@ impl JobRow {
                         queue_ms: s.queue_ms,
                         resources: s.resources.clone(),
                         reused_from: s.reused_from.as_ref().map(ToString::to_string),
+                        fresh_from: s.fresh_from.as_ref().map(ToString::to_string),
                     })
                     .collect()
             })
@@ -323,7 +327,7 @@ impl JobRow {
             let steps: u64 = r
                 .steps
                 .iter()
-                .filter(|s| s.reused_from.is_none())
+                .filter(|s| s.reused_from.is_none() && s.fresh_from.is_none())
                 .map(|s| s.duration_ms + s.queue_ms.unwrap_or(0))
                 .sum();
             let waits = r.checkout_wait_ms.unwrap_or(0) + steps;
@@ -380,6 +384,8 @@ pub struct Latency {
 pub struct Reuse {
     /// Steps whose stored pass was reused.
     pub steps_reused: usize,
+    /// Steps taken from a job that ran them on the same tree (R101).
+    pub steps_fresh: usize,
     /// Steps that ran.
     pub steps_run: usize,
     /// Steps skipped (selection or docs-only).
@@ -617,6 +623,8 @@ impl BenchReport {
         for s in measured.iter().flat_map(|j| &j.steps) {
             if s.reused_from.is_some() {
                 reuse.steps_reused += 1;
+            } else if s.fresh_from.is_some() {
+                reuse.steps_fresh += 1;
             } else if s.status == StepStatus::Skipped {
                 reuse.steps_skipped += 1;
             } else {
@@ -796,8 +804,11 @@ impl BenchReport {
             }
         }
         out.push(format!(
-            "step reuse: {} reused, {} run, {} skipped",
-            self.reuse.steps_reused, self.reuse.steps_run, self.reuse.steps_skipped
+            "step reuse: {} reused, {} same tree, {} run, {} skipped",
+            self.reuse.steps_reused,
+            self.reuse.steps_fresh,
+            self.reuse.steps_run,
+            self.reuse.steps_skipped
         ));
         out.push(format!(
             "cache hits: {} of {} commits",

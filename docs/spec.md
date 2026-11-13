@@ -53,8 +53,8 @@ Victor: agents as autonomous as practical without giving up safety or quality; 2
 L15. **Sticky verify checkouts.** A fast verify checkout is keyed by origin (the agent worktree path that started the job, from the hook's repo toplevel), not taken from a shared pool: each agent worktree gets its own `fast` checkout with its own target dir, created on first use, so its incremental build stays warm and it never rebuilds another branch's tree. `verify.max_checkouts` (default 12 per repo) with LRU eviction (`cargo clean` is not needed: the whole checkout is removed). Full checkouts: keyed the same way, `verify.max_full_checkouts` default 4, LRU. Concurrency is limited by resource slots (R85), not by checkout count. `verify.slots` (R41) is CUT.
 Reason: a shared checkout that alternates between diverged branches recompiles most of the workspace on each switch (minutes for myapp), which would recreate the 2026-11-04 slowness.
 
-L16. **Step-level reuse by inputs.** A step may declare `inputs` (globs, default `["**"]`) and `exclude_inputs` in policy (from the policy commit, L2). The step's result is stored under a step key = blake3(step definition, fingerprint, sorted list of (path, blob oid, mode) of the tree entries matching its inputs). A job reuses a stored `pass` for a step whose step key matches, and reports it as `REUSED <step> from <job>`. Reuse applies to `fast` jobs and to pushes of non-full refs. `full` jobs for full refs (`tollgate merge`, pushes to `main`) and CI run every step fresh: no reuse there.
-Reason: in myapp an iOS-only or dashboard-only change must not rerun the Rust suite on every commit. A wrong `exclude_inputs` can delay detection only until the merge to a full ref, which always runs everything.
+L16. **Step-level reuse by inputs.** A step may declare `inputs` (globs, default `["**"]`) and `exclude_inputs` in policy (from the policy commit, L2). The step's result is stored under a step key = blake3(step definition, fingerprint, sorted list of (path, blob oid, mode) of the tree entries matching its inputs). A job reuses a stored `pass` for a step whose step key matches, and reports it as `REUSED <step> from <job>`. Reuse applies to `fast` jobs and to pushes of non-full refs. `full` jobs for full refs (`tollgate merge`, pushes to `main`) and CI run every step fresh: no reuse there. A step that already ran fresh on the same tree, tier and fingerprint counts as fresh (R101).
+Reason: in myapp an iOS-only or dashboard-only change must not rerun the Rust suite on every commit. A wrong `exclude_inputs` can delay detection only until the merge to a full ref, where every step runs fresh on that tree (R101).
 
 L17. **Long checks without retry loops.** The guard (R28) sets `TOLLGATE_INLINE_CAP` to the `fast` budget (default 20 min) when the Bash call has `run_in_background: true`, and to 540 s otherwise. The deny message after the inline budget gives one command that waits and then commits: `tollgate wait <job> && git commit <same args>` (tollgate prints the exact command, with the original arguments, from the hook's view of argv where git exposes it, else a placeholder). `tollgate wait` exits 0 on pass, 1 on fail (and prints the report), 3 on still running after its timeout.
 
@@ -648,7 +648,7 @@ R100. `tollgate waive --tree T --tier t --reason S` writes a `pass` record with 
 
 ```
 tollgate install | uninstall | doctor [--repo P] [--injection]       # install, uninstall: TTY only
-tollgate check [--tier fast|full] [--tree T | --rev R] [--wait | --detach] [--rerun]
+tollgate check [--tier fast|full] [--tree T | --rev R] [--wait | --detach] [--rerun [--all]]
 tollgate wait <job> [--timeout D] | cancel <job>
 tollgate status [--rev R] [--json] | report <job|tree> [--json] | log <job> <step> [--tail N]
 tollgate run --tier T --here [--report junit] [--no-host-locks]      # CI mode
@@ -663,6 +663,13 @@ tollgate guard                                                        # PreToolU
 tollgate hook <name> [args]                                           # explicit dispatch
 tollgate waive --tree T --tier t --reason S                           # TTY only (Q6)
 ```
+
+### 4.14 Wasted runs (R101-R109)
+
+R101. A step that ran fresh on the same tree is not run again. When a step runs and passes in a job whose verdict its steps decided (`pass` or `fail`, no cause), the runner stores it under the job's record key: `fresh/<record key[..2]>/<record key>/<step key>.json`. The record key hashes the tree, the tier and the fingerprint. Before L16 reuse, a job looks up each step there. An entry counts only when its step key is the same, its scope covers the scope needed now, and the report of its job still exists, says that tree and tier (hashed with the fingerprint to the same record key), and says that the step ran there and passed (not reused, not taken from another job). The job then does not run the step. Its report line is a `pass` with `fresh_from: <job>`, and the human report prints `FRESH <step> from <job> (same tree)`. The step does not make the job's record `reused`, so a full pass made this way answers a full ref (L16). This applies in every job: `fast` and `full`, full refs, pre-warms and `check --rerun`. `check --rerun` therefore runs only the steps that did not pass on the tree; `check --rerun --all` runs every step. `run --here` keeps no store and runs every step. `tollgate gc` removes these entries by the rule of stored step passes (R48).
+L16's "every step fresh" for full refs now means: every step ran fresh on this tree, tier and fingerprint, in this job or in an earlier one.
+Assumption: a step does not depend on what another step left in the checkout. R42 checks that a step leaves no tracked or untracked change, but ignored output (`target/`, `node_modules`, cache dirs) can stay between steps. A step that needs such output of an earlier step can pass alone and fail when the earlier step is taken from another job: it must make that output itself.
+Reason: a feature branch's full pass that reused one step (L16) does not answer a push of the same tree to `main`. Before R101 that push ran all 20 steps again (32 minutes), although 19 of them had just run fresh on that exact tree with the same fingerprint.
 
 ---
 

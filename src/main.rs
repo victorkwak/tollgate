@@ -63,6 +63,7 @@ fn run() -> u8 {
             wait,
             detach,
             rerun,
+            all,
         } => cli::check(
             &ctx,
             &cli::CheckArgs {
@@ -72,6 +73,7 @@ fn run() -> u8 {
                 wait,
                 detach,
                 rerun,
+                all,
             },
         ),
         Command::Wait { job, timeout } => cli::wait(&ctx, &job, timeout.as_deref()),
@@ -282,8 +284,13 @@ enum Command {
         wait: bool,
         #[arg(long)]
         detach: bool,
+        /// Drop the stored result and run the steps that did not pass
+        /// on this tree (R101).
         #[arg(long)]
         rerun: bool,
+        /// With --rerun: run every step again.
+        #[arg(long, requires = "rerun")]
+        all: bool,
     },
     /// Wait for a job (exit 0 pass, 1 fail, 3 running) (R99).
     Wait {

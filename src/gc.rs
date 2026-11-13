@@ -1,11 +1,12 @@
 //! `tollgate gc [--all]` (R48).
 //!
 //! - records older than 90 days;
-//! - job dirs that no record or stored step pass references, 14 days
-//!   after they ended; bulky files (step logs, `tmp/`) of referenced jobs
+//! - job dirs that no record, stored step pass or same-tree step pass
+//!   references, 14 days after they ended; bulky files (step logs, `tmp/`) of referenced jobs
 //!   after 14 days, keeping `report.json` and the JUnit files as long as
 //!   the record (R82);
-//! - stored step passes (L16) older than 90 days or whose job is gone;
+//! - stored step passes (L16) and same-tree step passes (R101) older than
+//!   90 days or whose job is gone (counted together as step passes);
 //! - verify checkouts whose repo is gone (L15);
 //! - lock tickets, waiter files, queue markers, dedupe locks and gate-run
 //!   markers (item 17) older than 1 day that no live process holds.
@@ -72,6 +73,16 @@ fn remove_unheld(path: &Path) -> bool {
     }
 }
 
+/// A stored step pass (L16) or same-tree step pass (R101) stays while its
+/// job report exists and it is not older than the record age.
+fn step_pass_kept(dirs: &Dirs, s: &StoredStep) -> bool {
+    dirs.job_report(&s.job).is_file()
+        && jiff::Timestamp::now()
+            .duration_since(s.finished)
+            .unsigned_abs()
+            <= Duration::from_secs(RECORD_DAYS * DAY)
+}
+
 /// Runs gc. `env` is used for git calls when removing checkouts.
 #[must_use]
 pub fn gc(dirs: &Dirs, host: &HostConfig, env: &EnvSnapshot, all: bool) -> GcReport {
@@ -116,14 +127,7 @@ pub fn gc(dirs: &Dirs, host: &HostConfig, env: &EnvSnapshot, all: bool) -> GcRep
             let stored: Option<StoredStep> = fs::read(&f)
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok());
-            let keep = !all
-                && stored.as_ref().is_some_and(|s| {
-                    dirs.job_report(&s.job).is_file()
-                        && jiff::Timestamp::now()
-                            .duration_since(s.finished)
-                            .unsigned_abs()
-                            <= Duration::from_secs(RECORD_DAYS * DAY)
-                });
+            let keep = !all && stored.as_ref().is_some_and(|s| step_pass_kept(dirs, s));
             if keep {
                 if let Some(s) = stored {
                     referenced.insert(s.job);
@@ -131,6 +135,28 @@ pub fn gc(dirs: &Dirs, host: &HostConfig, env: &EnvSnapshot, all: bool) -> GcRep
             } else if fs::remove_file(&f).is_ok() {
                 rep.steps += 1;
             }
+        }
+        let _ = fs::remove_dir(&shard);
+    }
+
+    // Same-tree step passes (R101), by the rule of stored step passes:
+    // `fresh/<shard>/<record key>/<step key>.json`.
+    for shard in files(&dirs.fresh_steps_dir()) {
+        for record in files(&shard) {
+            for f in files(&record) {
+                let stored: Option<StoredStep> = fs::read(&f)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok());
+                let keep = !all && stored.as_ref().is_some_and(|s| step_pass_kept(dirs, s));
+                if keep {
+                    if let Some(s) = stored {
+                        referenced.insert(s.job);
+                    }
+                } else if fs::remove_file(&f).is_ok() {
+                    rep.steps += 1;
+                }
+            }
+            let _ = fs::remove_dir(&record);
         }
         let _ = fs::remove_dir(&shard);
     }

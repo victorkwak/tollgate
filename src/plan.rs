@@ -833,6 +833,7 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
         job_env: env_pairs,
         allow_reuse,
         rerun: req.rerun,
+        carry: true,
         priority: req.priority,
         created: now,
     };

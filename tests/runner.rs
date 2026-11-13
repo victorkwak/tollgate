@@ -685,10 +685,20 @@ run = "true"
         second.out
     );
     assert!(!second.out.contains("REUSED all"), "{}", second.out);
-    // --rerun runs everything fresh.
+    let second_job = job_id(&second.out);
+    // --rerun reuses no pass of another tree: `ios` runs. `all` ran on
+    // this tree in the second job and is taken from there (R101).
     let third = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD", "--rerun"]);
     assert_eq!(third.code, Some(0), "{}", third.out);
     assert!(!third.out.contains("REUSED"), "{}", third.out);
+    assert!(
+        third
+            .out
+            .contains(&format!("FRESH all from {second_job} (same tree)")),
+        "{}",
+        third.out
+    );
+    assert!(!third.out.contains("FRESH ios"), "{}", third.out);
     // A docs-only change passes with zero steps (R61).
     sb.commit_file(&repo, "README.md", "docs\n", "docs");
     let docs = sb.tollgate(&repo, &["check", "--wait", "--rev", "HEAD"]);
@@ -915,11 +925,13 @@ fn steps_must_leave_the_checkout_as_read_and_are_not_reused_r42_l16() {
     assert_eq!(second.code, Some(1), "{}", second.out);
     assert!(!second.out.contains("REUSED"), "{}", second.out);
     assert!(second.out.contains("cause checkout"), "{}", second.out);
-    assert!(
-        !sb.state().join("steps").exists()
-            || std::fs::read_dir(sb.state().join("steps")).unwrap().count() == 0,
-        "no stored step pass"
-    );
+    for store in ["steps", "fresh"] {
+        assert!(
+            !sb.state().join(store).exists()
+                || std::fs::read_dir(sb.state().join(store)).unwrap().count() == 0,
+            "no stored step pass in {store}/ (L16, R101)"
+        );
+    }
     sb.git(&repo, &["reset", "-q", "--hard"]);
 
     // An untracked file and an index change count too (R42: `git status
@@ -983,6 +995,118 @@ fn a_full_ref_never_takes_a_full_pass_with_reused_steps_l16() {
     assert!(!r.out.contains("REUSED"), "{}", r.out);
     assert!(!r.out.contains(&reused_job), "{}", r.out);
     assert!(r.out.contains("step t: fail"), "{}", r.out);
+}
+
+/// Lines of the run counter file that equal `name`.
+fn runs(counter: &Path, name: &str) -> usize {
+    std::fs::read_to_string(counter)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| *l == name)
+        .count()
+}
+
+/// R101: a job that needs every step fresh takes the steps that already
+/// ran fresh on the same tree, tier and fingerprint, and runs only the
+/// others. The case: a full pass on a branch reused one step; the same
+/// tree on `main` then ran every step again.
+#[test]
+fn a_fresh_job_runs_only_the_steps_that_were_not_fresh_on_the_tree_r101() {
+    let sb = Sandbox::new();
+    let counter = sb.root().join("count");
+    host(
+        &sb,
+        &format!("[job.env]\nCOUNT = \"{}\"\n", counter.display()),
+    );
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"narrow\"\nkind = \"command\"\nrun = \"echo narrow >> \\\"$COUNT\\\"\"\ninputs = [\"a/**\"]\n[[step]]\nname = \"wide\"\nkind = \"command\"\nrun = \"echo wide >> \\\"$COUNT\\\"\"\n",
+    );
+    sb.commit_file(&repo, "a/x", "1\n", "a");
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(&repo, "a/x", "2\n", "c1");
+    let full = ["check", "--tier", "full", "--rev", "HEAD", "--wait"];
+    let r = sb.tollgate(&repo, &full);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!((runs(&counter, "narrow"), runs(&counter, "wide")), (1, 1));
+    // c2 is outside the inputs of `narrow`: the branch job reuses it and
+    // runs `wide` fresh on the new tree.
+    sb.commit_file(&repo, "b/y", "1\n", "c2");
+    let r = sb.tollgate(&repo, &full);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(r.out.contains("REUSED narrow"), "{}", r.out);
+    let branch_job = job_id(&r.out);
+    assert_eq!((runs(&counter, "narrow"), runs(&counter, "wide")), (1, 2));
+    // The same tree on main: `narrow` was not fresh on it and runs;
+    // `wide` was, and does not run again.
+    sb.git(&repo, &["checkout", "-q", "main"]);
+    sb.git(&repo, &["merge", "-q", "--no-verify", "--ff-only", "feat"]);
+    let r = sb.tollgate(&repo, &full);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        r.out
+            .contains(&format!("FRESH wide from {branch_job} (same tree)")),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("REUSED"), "{}", r.out);
+    assert_eq!((runs(&counter, "narrow"), runs(&counter, "wide")), (2, 2));
+    // That job's record is a fresh full pass: the next check is a hit.
+    let jobs = sb.jobs().len();
+    let r = sb.tollgate(&repo, &full);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(sb.jobs().len(), jobs, "{}", r.out);
+}
+
+/// R101: `check --rerun` runs the steps that did not pass on the tree;
+/// `--rerun --all` runs every step.
+#[test]
+fn rerun_runs_only_the_steps_that_did_not_pass_r101() {
+    let sb = Sandbox::new();
+    let counter = sb.root().join("count");
+    let mark = sb.root().join("mark");
+    host(
+        &sb,
+        &format!(
+            "[job.env]\nCOUNT = \"{}\"\nMARK = \"{}\"\n",
+            counter.display(),
+            mark.display()
+        ),
+    );
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"steady\"\nkind = \"command\"\nrun = \"echo steady >> \\\"$COUNT\\\"\"\n[[step]]\nname = \"once\"\nkind = \"command\"\nrun = \"echo once >> \\\"$COUNT\\\"; test -e \\\"$MARK\\\" || {{ touch \\\"$MARK\\\"; exit 1; }}\"\n"
+            .replace("{{", "{")
+            .replace("}}", "}")
+            .as_str(),
+    );
+    sb.commit_file(&repo, "x", "1\n", "x");
+    let full = ["check", "--tier", "full", "--rev", "HEAD", "--wait"];
+    let r = sb.tollgate(&repo, &full);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    assert!(r.out.contains("step once: fail"), "{}", r.out);
+    let failed_job = job_id(&r.out);
+    let rerun = [
+        "check", "--tier", "full", "--rev", "HEAD", "--wait", "--rerun",
+    ];
+    let r = sb.tollgate(&repo, &rerun);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        r.out
+            .contains(&format!("FRESH steady from {failed_job} (same tree)")),
+        "{}",
+        r.out
+    );
+    assert_eq!((runs(&counter, "steady"), runs(&counter, "once")), (1, 2));
+    let all = [
+        "check", "--tier", "full", "--rev", "HEAD", "--wait", "--rerun", "--all",
+    ];
+    let r = sb.tollgate(&repo, &all);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(!r.out.contains("FRESH"), "{}", r.out);
+    assert_eq!((runs(&counter, "steady"), runs(&counter, "once")), (2, 3));
 }
 
 #[test]

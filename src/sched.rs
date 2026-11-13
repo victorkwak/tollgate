@@ -205,6 +205,7 @@ fn lost_metrics(dirs: &Dirs, meta: &JobMeta) {
         checkout_wait_ms: 0,
         steps: 0,
         steps_reused: 0,
+        steps_fresh: 0,
         flaky: 0,
         quarantined: 0,
     };

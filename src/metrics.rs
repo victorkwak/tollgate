@@ -260,6 +260,10 @@ pub struct JobEvent {
     pub steps: u32,
     /// Steps reused from a stored pass (L16).
     pub steps_reused: u32,
+    /// Steps taken from a job that ran them on the same tree (R101); they
+    /// did not run either.
+    #[serde(default)]
+    pub steps_fresh: u32,
     /// Tests that passed on retry.
     pub flaky: u32,
     /// Quarantined failures.
@@ -595,6 +599,8 @@ pub struct RepoTier {
     pub steps: u32,
     /// Steps reused (L16).
     pub steps_reused: u32,
+    /// Steps taken from a job on the same tree (R101).
+    pub steps_fresh: u32,
     /// Flaky tests (passed on retry).
     pub flaky: u32,
     /// Jobs with a flaky test.
@@ -801,6 +807,7 @@ pub fn stats(events: &[Event], since: Option<jiff::Timestamp>) -> Stats {
                 }
                 a.row.steps += j.steps;
                 a.row.steps_reused += j.steps_reused;
+                a.row.steps_fresh += j.steps_fresh;
                 a.row.flaky += j.flaky;
                 a.row.jobs_flaky += u32::from(j.flaky > 0);
                 a.row.quarantined += j.quarantined;
@@ -939,7 +946,8 @@ pub fn render(s: &Stats) -> Vec<String> {
                 r.jobs.to_string(),
                 pair(r.wall_ms, fmt_ms),
                 pair(r.queue_ms, fmt_ms),
-                rate(r.steps_reused, r.steps),
+                // Steps that did not run: L16 reuse and R101 same tree.
+                rate(r.steps_reused + r.steps_fresh, r.steps),
                 r.flaky.to_string(),
             ]);
         }
@@ -1330,6 +1338,7 @@ mod tests {
             checkout_wait_ms: 0,
             steps: 1,
             steps_reused: 0,
+            steps_fresh: 0,
             flaky: 0,
             quarantined: 0,
         })

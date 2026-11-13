@@ -74,6 +74,10 @@ pub struct StepReport {
     /// L16: the job whose pass was reused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reused_from: Option<JobId>,
+    /// R101: the job in which this step ran and passed on the same tree,
+    /// tier and fingerprint; it did not run again here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_from: Option<JobId>,
     /// Host resources the step took (R85), in config order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<String>,
@@ -112,6 +116,7 @@ impl StepReport {
             command: None,
             scope: None,
             reused_from: None,
+            fresh_from: None,
             resources: Vec::new(),
             queue_ms: None,
             message: Some(why.to_owned()),
@@ -297,6 +302,9 @@ pub fn render(r: &JobReport, header: &str) -> Vec<String> {
     for s in &r.steps {
         if let Some(job) = &s.reused_from {
             head.push(format!("REUSED {} from {job}", s.name));
+        }
+        if let Some(job) = &s.fresh_from {
+            head.push(format!("FRESH {} from {job} (same tree)", s.name));
         }
     }
     for f in &r.flaky {

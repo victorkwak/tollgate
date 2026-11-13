@@ -103,8 +103,11 @@ pub struct CheckArgs {
     pub wait: bool,
     /// `--detach`: start and return.
     pub detach: bool,
-    /// `--rerun`: drop the record and run again (R34).
+    /// `--rerun`: drop the record and run the steps that did not pass on
+    /// this tree (R34, R101).
     pub rerun: bool,
+    /// `--rerun --all`: run every step again.
+    pub all: bool,
 }
 
 /// The tree, policy tip, base and ref of a check.
@@ -266,7 +269,7 @@ pub fn check(ctx: &Ctx, a: &CheckArgs) -> u8 {
         Ok(t) => t,
         Err(e) => return fail(e),
     };
-    let plan = match plan::plan(&PlanRequest {
+    let mut plan = match plan::plan(&PlanRequest {
         env: &ctx.env,
         dirs: &repo.dirs,
         host: &repo.host,
@@ -288,6 +291,7 @@ pub fn check(ctx: &Ctx, a: &CheckArgs) -> u8 {
         Ok(p) => p,
         Err(e) => return fail(e),
     };
+    plan.spec.carry = !a.all;
     if a.rerun {
         let _ = RecordStore::new(&repo.dirs).remove(&plan.spec.key);
     } else {
@@ -924,6 +928,8 @@ pub fn run_here(ctx: &Ctx, a: HereArgs) -> u8 {
             .collect(),
         allow_reuse: false,
         rerun: true,
+        // R101: `run --here` keeps no store; every step runs.
+        carry: false,
         priority: Priority::Hook,
         created: now,
     };

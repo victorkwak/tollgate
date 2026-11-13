@@ -29,6 +29,24 @@ fn head(sb: &Sandbox, repo: &Path) -> String {
     sb.git(repo, &["rev-parse", "HEAD"])
 }
 
+/// Job ids in creation order (job ids sort by second only).
+fn jobs_in_order(sb: &Sandbox) -> Vec<String> {
+    let created = |j: &String| {
+        let spec: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(sb.state().join("jobs").join(j).join("spec.json")).unwrap(),
+        )
+        .unwrap();
+        spec["created"]
+            .as_str()
+            .unwrap()
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+    };
+    let mut jobs = sb.jobs();
+    jobs.sort_by_key(created);
+    jobs
+}
+
 /// Tiers of the jobs in creation order (job ids sort by second only).
 fn tiers_of_jobs(sb: &Sandbox) -> Vec<String> {
     let mut specs: Vec<serde_json::Value> = sb
@@ -382,6 +400,56 @@ fn push_tiers_tags_and_deletions_t13_r20_r22() {
     assert_eq!(r.code, Some(0), "{}", r.out);
     assert_eq!(sb.jobs().len(), jobs + 1);
     assert_eq!(tiers_of_jobs(&sb).last().map(String::as_str), Some("full"));
+}
+
+/// R101 through real pushes: a feature branch's full pass reused one step
+/// (L16), so it does not answer a push of the same tree to `main`. That
+/// push's job runs only the step that was not fresh on the tree; the other
+/// step ran on that tree in the branch job and is taken from there.
+#[test]
+fn a_push_to_main_runs_only_the_steps_not_fresh_on_the_tree_r101_l16() {
+    let sb = Sandbox::new();
+    let counter = sb.root().join("count");
+    let toml = "version = 1\n[[step]]\nname = \"narrow\"\nkind = \"command\"\nrun = \"echo narrow >> \\\"$COUNT\\\"\"\ninputs = [\"a/**\"]\n[[step]]\nname = \"wide\"\nkind = \"command\"\nrun = \"echo wide >> \\\"$COUNT\\\"\"\n";
+    let (repo, _bare) = trusted_repo(&sb, toml);
+    sb.scoped_host(&format!(
+        "trusted_paths = [\"{}\"]\n[job.env]\nCOUNT = \"{}\"",
+        sb.root().join("remotes/trusted.git").display(),
+        counter.display()
+    ));
+    let runs = |name: &str| {
+        std::fs::read_to_string(&counter)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| *l == name)
+            .count()
+    };
+    sb.git(&repo, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_file(&repo, "a/x", "1\n", "c1");
+    let r = sb.hooked(&repo, &["push", "-q", "origin", "feat"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!((runs("narrow"), runs("wide")), (1, 1), "{}", r.out);
+    // c2 is outside the inputs of `narrow`: the branch's full job reuses
+    // it (L16) and runs `wide` on the new tree.
+    sb.commit_file(&repo, "b/y", "1\n", "c2");
+    let r = sb.hooked(&repo, &["push", "-q", "origin", "feat"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!((runs("narrow"), runs("wide")), (1, 2), "{}", r.out);
+    let branch_job = jobs_in_order(&sb).last().cloned().unwrap();
+    let rep = sb.report(&branch_job);
+    assert!(rep["steps"][0]["reused_from"].is_string(), "{rep}");
+    // The same tree to main: only `narrow` runs.
+    let r = sb.hooked(&repo, &["push", "-q", "origin", "feat:main"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(tiers_of_jobs(&sb), ["full", "full", "full"]);
+    assert_eq!((runs("narrow"), runs("wide")), (2, 2), "{}", r.out);
+    let main_job = jobs_in_order(&sb).last().cloned().unwrap();
+    let rep = sb.report(&main_job);
+    assert_eq!(rep["verdict"], "pass", "{rep}");
+    assert_eq!(rep["steps"][0]["name"], "narrow", "{rep}");
+    assert!(rep["steps"][0].get("reused_from").is_none(), "{rep}");
+    assert!(rep["steps"][0].get("fresh_from").is_none(), "{rep}");
+    assert_eq!(rep["steps"][1]["fresh_from"], branch_job.as_str(), "{rep}");
 }
 
 /// Item 33 (R4): once a repo had a trusted remote, losing it (removed, or
