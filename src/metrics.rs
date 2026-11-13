@@ -272,6 +272,11 @@ pub struct JobEvent {
     /// did not run either.
     #[serde(default)]
     pub steps_fresh: u32,
+    /// Steps whose command ran in this job: not skipped by selection, not
+    /// reused, not taken from the same tree (R109). `None` in lines from
+    /// before this field; `tollgate cost` then estimates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps_ran: Option<u32>,
     /// Tests that passed on retry.
     pub flaky: u32,
     /// Quarantined failures.
@@ -1432,6 +1437,7 @@ mod tests {
             steps: 1,
             steps_reused: 0,
             steps_fresh: 0,
+            steps_ran: None,
             flaky: 0,
             quarantined: 0,
             step_ms: None,

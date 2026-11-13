@@ -693,6 +693,15 @@ fn exact_selection(
 
 /// Plans a job for `req` (R74, L2, R56).
 pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
+    let (policy, remotes, entries) = resolve_policy(req)?;
+    plan_with(req, &policy, &remotes, &entries)
+}
+
+/// The policy that applies to `req` (L2), with the remote refs and the
+/// tree entries it was resolved from. `req.tier` plays no part.
+fn resolve_policy(
+    req: &PlanRequest<'_>,
+) -> Result<(policy::Policy, RemoteRefs, Vec<crate::gitx::TreeEntry>), PlanError> {
     let host = &req.host.config;
     let scope = CompiledScope::new(&host.scope, req.dirs).map_err(PlanError::Config)?;
     let remotes = remote_refs(
@@ -711,6 +720,58 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
         &remotes,
         Some(&req.refname),
     )?;
+    Ok((policy, remotes, entries))
+}
+
+/// R105: plans a job for one step of the policy that applies to `req`.
+/// The tier is the step's: `full` when it runs in `full`, else `fast`
+/// (`req.tier` is ignored), so only that tier's steps must be ready (an
+/// `env_file` of a step of the other tier is not read).
+pub fn plan_step(
+    req: &PlanRequest<'_>,
+    step: &str,
+) -> Result<(Plan, crate::config::repo::Step), PlanError> {
+    let (policy, remotes, entries) = resolve_policy(req)?;
+    let steps = &policy.config.steps;
+    let Some(found) = steps.iter().find(|s| s.name == step).cloned() else {
+        let names: Vec<&str> = steps.iter().map(|s| s.name.as_str()).collect();
+        return Err(PlanError::Config(format!(
+            "no step {step:?} in the policy; steps: {}",
+            names.join(", ")
+        )));
+    };
+    let tier = if found.runs_in(Tier::Full) {
+        Tier::Full
+    } else {
+        Tier::Fast
+    };
+    let req = PlanRequest {
+        env: req.env,
+        dirs: req.dirs,
+        host: req.host,
+        layout: req.layout,
+        git: req.git,
+        tree: req.tree.clone(),
+        tier,
+        tip: req.tip.clone(),
+        base: req.base.clone(),
+        refname: req.refname.clone(),
+        allow_reuse: req.allow_reuse,
+        priority: req.priority,
+        rerun: req.rerun,
+    };
+    Ok((plan_with(&req, &policy, &remotes, &entries)?, found))
+}
+
+/// [`plan`] on a resolved policy.
+#[allow(clippy::too_many_lines)]
+fn plan_with(
+    req: &PlanRequest<'_>,
+    policy: &policy::Policy,
+    remotes: &RemoteRefs,
+    entries: &[crate::gitx::TreeEntry],
+) -> Result<Plan, PlanError> {
+    let host = &req.host.config;
     let config = &policy.config;
     let rules = config.ref_rules().map_err(PlanError::Config)?;
     // L16: no reuse for full jobs of full refs, or on --rerun; their
@@ -748,11 +809,11 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
         .worktree
         .clone()
         .unwrap_or_else(|| req.layout.common_dir.clone());
-    let detected = select::detect::roots_from_tree(&entries);
+    let detected = select::detect::roots_from_tree(entries);
     let mut rust_roots = steps::rust_roots(config, req.tier, Platform::current());
     rust_roots.extend(detected.rust.iter().cloned());
     let neutral = probe_dir(req.dirs, req.git, &[], &[])?;
-    let rust_dirs = rust_probe_dirs(req.dirs, req.git, &entries, &rust_roots)?;
+    let rust_dirs = rust_probe_dirs(req.dirs, req.git, entries, &rust_roots)?;
     let mut tools = ToolCache::load(&req.dirs.toolcache_file());
     let mut fp = fingerprint::compute(
         &FingerprintInputs {
@@ -791,8 +852,8 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
                     Some("the base is the empty tree (R56)".to_owned()),
                     Needed::Exact(Selection::All),
                 )
-            } else if base_trusted(req.git, &store, b, &fp, &remotes)? {
-                let needed = exact_selection(req, config, &entries, &b.tree, &fp)
+            } else if base_trusted(req.git, &store, b, &fp, remotes)? {
+                let needed = exact_selection(req, config, entries, &b.tree, &fp)
                     .map_or_else(|| Needed::SameBase(b.tree.clone()), Needed::Exact);
                 (true, None, needed)
             } else {
@@ -833,7 +894,7 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
         base_tree: req.base.as_ref().map(|b| b.tree.clone()),
         select,
         select_note: note,
-        policy: PolicySpec::from_policy(&policy),
+        policy: PolicySpec::from_policy(policy),
         host: host.clone(),
         budgets,
         job_env: env_pairs,
@@ -952,8 +1013,9 @@ pub enum Settled {
 }
 
 /// True when job `id` checks exactly what `plan` needs: same key (tree,
-/// tier, fingerprint), same selection base and selection switch, and no
-/// step reuse when `plan` needs every step fresh (L16).
+/// tier, fingerprint), same selection base and selection switch, no step
+/// reuse when `plan` needs every step fresh (L16), and no step taken from
+/// the same tree when `plan` runs every step (R101, `--rerun --all`).
 fn same_check(dirs: &Dirs, id: &JobId, plan: &Plan) -> bool {
     let Ok(other) = JobSpec::read(dirs, id) else {
         return false;
@@ -965,6 +1027,9 @@ fn same_check(dirs: &Dirs, id: &JobId, plan: &Plan) -> bool {
         && other.base_tree == mine.base_tree
         && other.select == mine.select
         && (!plan.fresh_only || !other.allow_reuse)
+        // R101: `check --rerun --all` runs every step; a job that took
+        // steps from the same tree does not answer it.
+        && (mine.carry || !other.carry)
 }
 
 /// Follows `started` to an answer for `plan` (R15, R32, R79, R88).
@@ -1004,9 +1069,13 @@ pub fn settle(
                     WaitEnd::Done(r) if same => return Ok(Settled::Report(r)),
                     WaitEnd::Done(_) => {}
                 }
-                match lookup(dirs, plan)? {
-                    Lookup::Miss => {}
-                    found => return Ok(Settled::Record(Box::new(found))),
+                // `--rerun` wants its own run: the attached job's record
+                // does not answer it either (as in `start`).
+                if !plan.spec.rerun {
+                    match lookup(dirs, plan)? {
+                        Lookup::Miss => {}
+                        found => return Ok(Settled::Record(Box::new(found))),
+                    }
                 }
                 // The queue budget (R33) counts from now, not from when
                 // this plan attached.

@@ -410,3 +410,120 @@ fn artifact_paths_are_validated_r106() {
     assert_ne!(r.code, Some(0), "{}", r.out);
     assert!(r.out.contains("artifacts"), "{}", r.out);
 }
+
+/// R105, R89: queued step runs of one step with other arguments, or with
+/// none, are other origins: none supersedes another, all run to an end.
+#[test]
+fn queued_step_runs_with_other_arguments_all_run_r105_r89() {
+    let sb = Sandbox::new();
+    let counter = host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"s\"\nkind = \"command\"\nrun = '''sh -c 'test \"$1\" != block || sleep 2; echo \"s:$*\" >> \"$COUNT\"' s'''\n",
+    );
+    let detach = |args: &[&str]| {
+        let mut all = vec!["run", "s", "--rev", "HEAD", "--detach"];
+        if !args.is_empty() {
+            all.push("--");
+            all.extend_from_slice(args);
+        }
+        let r = sb.tollgate(&repo, &all);
+        assert_eq!(r.code, Some(0), "{}", r.out);
+        job_id(&r.out)
+    };
+    // The first holds the verify checkout; the others queue behind it.
+    let jobs = [
+        detach(&["block"]),
+        detach(&["a"]),
+        detach(&["b"]),
+        detach(&[]),
+    ];
+    for j in &jobs {
+        let w = sb.tollgate(&repo, &["wait", j, "--timeout", "30s"]);
+        assert_eq!(w.code, Some(0), "{j}: {}", w.out);
+    }
+    for line in ["s:block", "s:a", "s:b", "s:"] {
+        assert_eq!(runs(&counter, line), 1, "{line}");
+    }
+}
+
+/// R106: an artefact path through a tracked symlinked dir that points out
+/// of the checkout copies nothing, and the step message says why.
+#[test]
+fn artifact_paths_through_a_symlinked_dir_copy_nothing_r106() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let outside = sb.root().join("outside");
+    std::fs::create_dir_all(outside.join("res")).unwrap();
+    std::fs::write(outside.join("res/secret.txt"), "secret\n").unwrap();
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"x\"\nkind = \"command\"\nrun = \"true\"\nartifacts = [\"web/res\", \"web/*/*.txt\"]\n",
+    );
+    std::os::unix::fs::symlink(&outside, repo.join("web")).unwrap();
+    sb.git(&repo, &["add", "web"]);
+    sb.git(&repo, &["commit", "-q", "--no-verify", "-m", "link"]);
+    let r = sb.tollgate(&repo, &["run", "x", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let job = job_id(&r.out);
+    assert!(!artifacts(&sb, &job, "x").exists());
+    let rep = sb.report(&job);
+    let msg = rep["steps"][0]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("goes through the symlink web"), "{rep}");
+    assert!(rep["steps"][0].get("artifacts").is_none(), "{rep}");
+}
+
+/// R105: a stored pass whose log and artefacts gc removed (it keeps the
+/// report longer) names no paths that are gone.
+#[test]
+fn a_hit_names_only_paths_that_still_exist_r105() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"e\"\nkind = \"command\"\nrun = 'mkdir -p out && echo a > out/a.txt'\nartifacts = [\"out\"]\n",
+    );
+    sb.commit_file(&repo, ".gitignore", "out/\n", "ignore");
+    let r = sb.tollgate(&repo, &["run", "e", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let job = job_id(&r.out);
+    assert!(path_line(&r.out, "artifacts").is_some(), "{}", r.out);
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(15 * 86_400);
+    let f = std::fs::File::open(sb.state().join("jobs").join(&job).join("job.json")).unwrap();
+    f.set_modified(old).unwrap();
+    let g = sb.tollgate(&sb.root(), &["gc"]);
+    assert_eq!(g.code, Some(0), "{}", g.out);
+    let r = sb.tollgate(&repo, &["run", "e"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(reused_from(&r.out, "e"), job);
+    assert!(
+        r.out.contains(&format!("log: removed by gc (job {job})")),
+        "{}",
+        r.out
+    );
+    assert!(path_line(&r.out, "artifacts").is_none(), "{}", r.out);
+}
+
+/// R105: the step's tier alone is planned: a full-only step whose
+/// `env_file` is missing does not stop `tollgate run` of a fast-only step.
+#[test]
+fn a_fast_step_runs_while_a_full_only_step_cannot_be_planned_r105() {
+    let sb = Sandbox::new();
+    let counter = host(&sb, "");
+    let missing = sb.root().join("missing.env");
+    let repo = repo_with(
+        &sb,
+        "r",
+        &format!(
+            "version = 1\n{}tiers = [\"fast\"]\n[[step]]\nname = \"deploy check\"\nkind = \"command\"\nrun = \"true\"\ntiers = [\"full\"]\nenv_file = \"{}\"\n",
+            counting("f"),
+            missing.display()
+        ),
+    );
+    let r = sb.tollgate(&repo, &["run", "f", "--wait"]);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(runs(&counter, "f:"), 1);
+}

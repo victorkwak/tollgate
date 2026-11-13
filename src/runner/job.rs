@@ -1543,12 +1543,23 @@ impl Runner<'_> {
                     "step {:?}: {} artefact file(s), {} bytes",
                     s.name, c.files, c.bytes
                 ));
-                (c.over_limit > 0).then(|| {
-                    format!(
+                let mut notes = Vec::new();
+                for r in &c.refused {
+                    notes.push(format!("artifacts: {r}; nothing copied from it (R106)"));
+                }
+                if c.walk_stopped {
+                    notes.push(format!(
+                        "artifacts: the walk stopped after {} entries; narrow the paths (R106)",
+                        super::artifacts::MAX_VISITS
+                    ));
+                }
+                if c.over_limit > 0 {
+                    notes.push(format!(
                         "artifacts: {} file(s) not kept, over the limit of {} bytes (R106)",
                         c.over_limit, limit
-                    )
-                })
+                    ));
+                }
+                (!notes.is_empty()).then(|| notes.join("; "))
             }
             Err(e) => Some(format!("artifacts: copy failed: {e} (R106)")),
         };
@@ -1920,6 +1931,9 @@ impl Runner<'_> {
             steps: count(r.steps.len()),
             steps_reused: count(r.steps.iter().filter(|s| s.reused_from.is_some()).count()),
             steps_fresh: count(r.steps.iter().filter(|s| s.fresh_from.is_some()).count()),
+            // A step whose command ran has a log; skipped, reused and
+            // same-tree steps have none (R109).
+            steps_ran: Some(count(r.steps.iter().filter(|s| s.log.is_some()).count())),
             flaky: count(r.flaky.len()),
             quarantined: count(r.quarantined.len()),
             step_ms: Some(crate::metrics::ran_step_ms(&r.steps)),

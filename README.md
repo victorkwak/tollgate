@@ -22,6 +22,7 @@ tollgate closes these gaps for agent sessions. Your own terminal is not gated.
 - **Policy from the protected branch.** `tollgate.toml` and the tool configs come from the merge-base with the trusted `main`. A branch cannot weaken the checks that judge it. Its policy changes apply after it merges.
 - **Shared slots.** Steps take host-wide slots (`cpu`, `pg`, ...) in a fair queue, so many agents do not overload one machine or one test database.
 - **Short reports.** A deny prints the failing step, the failing tests or new diagnostics, one command to rerun, and `tollgate log <job> <step>` for the full log.
+- **No wasted runs.** A push that git would reject is refused before any check. A branch push runs only the `fast` tier. A step that already passed on the same tree is not run again. An agent session cannot start the `full` tier by hand, and the guard refuses the commands that a repo declares expensive (a whole browser suite, a workspace-wide test run) and prints the narrow form. `tollgate run <step>` gives every session the one stored result of a step, with its log and artefacts. `tollgate cost` shows the gate time per repo and day. See [Wasted runs](docs/operations.md#wasted-runs).
 - **A Bash guard.** `tollgate guard` is a Claude Code PreToolUse hook. It denies commands that skip or change the hooks (`--no-verify`, `-c core.hooksPath`, ...), denies every Bash call while the gate is not armed, and asks before edits to policy files and settings. It is aimed at a careless agent, not a hostile one (see [Status](#status)).
 - **Languages.** Rust (`cargo fmt`, clippy, nextest, doctests), TypeScript with Bun (biome, `tsc` or `svelte-check`, `bun test`) and Python with uv (ruff, pyright and pytest against a baseline). Without a `tollgate.toml`, tollgate detects the steps.
 
@@ -126,6 +127,13 @@ To remove it, run `tollgate uninstall`. It removes exactly what `install` added.
    run = "./scripts/lint-migrations.sh"
    tiers = ["full"]
    when = ["migrations/**"]
+
+   [[expensive]]                           # the guard refuses the wide form in a session
+   name = "workspace tests"
+   program = "cargo"
+   with = ["nextest", "run"]
+   narrow = ["-p", "--package*", "-E", "--filterset*"]
+   hint = "cargo nextest run -p <crate> -E 'test(<name>)'"
    ```
 
    `tollgate config --check` validates `tollgate.toml` and the host config. The full schema is in section 4.8 of [docs/spec.md](docs/spec.md).
@@ -134,7 +142,7 @@ To remove it, run `tollgate uninstall`. It removes exactly what `install` added.
 
    | Command | Use |
    |---|---|
-   | `tollgate check [--tier full] [--wait \| --detach] [--rerun [--all]]` | Check the index tree (or `--rev R`) before a commit or push. In an agent session, `--tier full` does not start a job (R104): it answers from a record or waits for a running job; a push starts the full tier. |
+   | `tollgate check [--tier full] [--wait \| --detach] [--rerun [--all]]` | Check the index tree (or `--rev R`) before a commit or push. In an agent session, `--tier full` does not start a job (R104): it answers from a record or waits for a running job; a push of, or a merge into, a full ref starts the full tier. |
    | `tollgate run <step> [--rerun] [--wait \| --detach] [-- <args>...]` | Run one declared step, or get its stored pass on the same inputs (R105). Arguments narrow it. Its log and artefacts are printed. |
    | `tollgate wait <job>` | Wait for a job: exit 0 pass, 1 fail, 3 still running. |
    | `tollgate status` | Results and running jobs for `HEAD` and the index, and commits on the branch that have no result. |

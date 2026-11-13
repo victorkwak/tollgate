@@ -79,6 +79,7 @@ pub fn assess(ctx: &Context, command: &str) -> Assessment {
         nest: 0,
         typed: None,
         runtime_args: false,
+        r103_off: false,
     };
     w.script(&script, &mut st);
     Assessment {
@@ -139,6 +140,11 @@ struct State {
     /// The command gets more arguments at run time (`xargs`, `find -exec
     /// ... {}`): for R103 it is narrow.
     runtime_args: bool,
+    /// R103 is off: this code is the text of a script file or package
+    /// script that the repo declares in `[[expensive]]` and that a narrow
+    /// call started. What the repo's own runner runs inside is its
+    /// business; every other rule still applies.
+    r103_off: bool,
 }
 
 /// The stdin and the source text of the simple command that runs.
@@ -693,7 +699,7 @@ impl<'a> Walker<'a> {
             return;
         };
         let base = rules::basename(name);
-        self.expensive(name, false, rest, st, io);
+        let (file_off, script_off) = self.expensive(name, false, rest, st, io);
         if base == "git" {
             return self.git(rest, st);
         }
@@ -715,10 +721,13 @@ impl<'a> Walker<'a> {
             }
             "source" | "." => {
                 if let Some(f) = rest.first() {
-                    if let Some(name) = f.lit() {
-                        self.expensive(name, true, &rest[1..], st, io);
-                    }
+                    let off = f
+                        .lit()
+                        .is_some_and(|name| self.expensive(name, true, &rest[1..], st, io).0);
+                    let was = st.r103_off;
+                    st.r103_off |= off;
                     self.run_file(f, st, false, true, io);
+                    st.r103_off = was;
                 }
                 return;
             }
@@ -748,6 +757,11 @@ impl<'a> Walker<'a> {
             return self.wrapper(w, rest, st, io);
         }
         if let Some(r) = runners::runner(base, rest) {
+            if script_off && matches!(r, Runner::Script(..)) {
+                let mut sub = st.clone();
+                sub.r103_off = true;
+                return self.runner(r, rest, &sub, io);
+            }
             return self.runner(r, rest, st, io);
         }
         if let Some(targets) = cmds::write_targets(base, rest) {
@@ -758,7 +772,13 @@ impl<'a> Walker<'a> {
             return;
         }
         if name.contains('/') {
-            self.run_file(first, st, true, false, io);
+            if file_off {
+                let mut sub = st.clone();
+                sub.r103_off = true;
+                self.run_file(first, &mut sub, true, false, io);
+            } else {
+                self.run_file(first, st, true, false, io);
+            }
         }
         if !cmds::takes_text(base) {
             self.probe(rest, st, io, 5);
@@ -882,10 +902,11 @@ impl<'a> Walker<'a> {
         }
         match rest.get(i) {
             Some(f) if !stdin => {
-                if let Some(name) = f.lit() {
-                    self.expensive(name, true, &rest[i + 1..], st, io);
-                }
-                self.run_file(f, &mut st.clone(), false, false, io);
+                let mut sub = st.clone();
+                sub.r103_off |= f
+                    .lit()
+                    .is_some_and(|name| self.expensive(name, true, &rest[i + 1..], st, io).0);
+                self.run_file(f, &mut sub, false, false, io);
             }
             _ => self.stdin_code(st, io),
         }
@@ -1369,19 +1390,37 @@ impl<'a> Walker<'a> {
 
     /// R103: the `[[expensive]]` rule for `word args...` in the repo of
     /// the command's cwd. `file`: a shell reads `word` as a script file.
-    fn expensive(&mut self, word: &str, file: bool, args: &[Arg], st: &State, io: Io<'_>) {
-        if self.probing || st.runtime_args {
-            return;
+    ///
+    /// Returns whether R103 is off in what this call starts, because the
+    /// repo declares it and the call is allowed: (the `program` of a rule
+    /// matches, for a script file; its `program` and `with` match, for a
+    /// package script).
+    fn expensive(
+        &mut self,
+        word: &str,
+        file: bool,
+        args: &[Arg],
+        st: &State,
+        io: Io<'_>,
+    ) -> (bool, bool) {
+        if self.probing || st.r103_off {
+            return (st.r103_off, st.r103_off);
         }
         // A cwd the walker cannot follow: the repo is not known.
         let Some(cwd) = st.cwd.as_deref() else {
-            return;
+            return (false, false);
         };
         let Some(rules) = self.expensive_rules(cwd) else {
-            return;
+            return (false, false);
         };
         let typed = st.typed.as_deref().unwrap_or(io.raw);
-        self.add(rules.check(word, file, args, cwd, typed));
+        let check = rules.check(word, file, args, cwd, typed);
+        // Words added at run time make the call narrow.
+        if st.runtime_args || check.ruling == Ruling::Allow {
+            return (check.program, check.program_with);
+        }
+        self.add(check.ruling);
+        (false, false)
     }
 
     /// The R103 rules of the repo that holds `cwd`: the nearest dir with a

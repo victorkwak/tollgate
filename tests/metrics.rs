@@ -246,6 +246,8 @@ fn hook_outcomes_and_job_times_reach_stats() {
     assert_eq!(jobs[0]["job"], job.as_str());
     assert_eq!(jobs[0]["verdict"], "pass");
     assert_eq!(jobs[0]["by"], "hook");
+    // R109: the job's own count of steps whose command ran.
+    assert_eq!(jobs[0]["steps_ran"], 1, "{:?}", jobs[0]);
     assert!(
         jobs[0]["wall_ms"].as_u64().unwrap() >= 2000,
         "{:?}",

@@ -78,7 +78,7 @@ An agent works as before. The gates run by themselves.
 | Command | Use |
 |---|---|
 | `git commit ...` | Runs `pre-commit` (`fast`). On a deny, the report says what failed. |
-| `tollgate check [--tier full] [--wait \| --detach] [--rerun [--all]]` | Checks the index tree (or `--rev R`, `--tree T`) ahead of a commit or push. In an agent session (`CLAUDECODE` or `CLAUDE_CODE_ENTRYPOINT` set), `--tier full` does not start a job (R104): it answers from a stored record, or attaches to a full job that already runs; `--rerun` starts one only after a stored non-pass. A push or a merge into a full ref starts the full tier. Host `[session] full_check = "allow"` turns this off. |
+| `tollgate check [--tier full] [--wait \| --detach] [--rerun [--all]]` | Checks the index tree (or `--rev R`, `--tree T`) ahead of a commit or push. In an agent session (`CLAUDECODE` or `CLAUDE_CODE_ENTRYPOINT` set), `--tier full` does not start a job (R104): it answers from a stored record, or attaches to a full job that already runs; `--rerun` starts one only after a stored non-pass. A push of, or a merge into, a full ref starts the full tier. Host `[session] full_check = "allow"` turns this off. |
 | `tollgate run <step> [--rev R \| --tree T] [--rerun] [--wait \| --detach] [-- <args>...]` | Runs one declared step on the index tree (or `--rev R`, `--tree T`) in its own job, or prints its stored pass on the same inputs, with no job (R105). The pass counts as fresh for a later gate job on the same tree. Arguments narrow the step; a narrowed pass answers only the same call. Prints the step's `log:` and `artifacts:` paths (R106). |
 | `tollgate wait <job>` | Waits for a job: exit 0 pass, 1 fail, 3 still running (L17). |
 | `tollgate status [--rev R] [--json]` | Records and running jobs for `HEAD` and the index, the commits on the branch that have no record (L1), and those made without the gate (unverified). |
@@ -125,11 +125,44 @@ The guard line gives the calls, allows (and how many got the R28 rewrite), asks 
 | Id | Means | A high count means |
 |---|---|---|
 | `unclassified` | Ask: a part of a command the guard cannot read names git, tollgate, `.claude` or `.githooks` (six cases, R26) | Agents build git commands at run time (`eval "$x"`, `sh -c "$cmd"`, `$tool commit`). Give them the literal form. Many distinct commands that are harmless: a guard case to look at |
+| `expensive-wide` | Deny: the wide form of a command that the repo's `tollgate.toml` declares in `[[expensive]]` (R103) | Agents try to run a whole suite by hand. Many distinct commands that are narrow in fact: add the missing form to the entry's `narrow` list |
 | `not-armed` | Deny of every Bash call: the R24 self-check failed (hooks dir missing, a hook that is not a link to the guard binary, the session `env` injection missing or changed) | The gate is broken, not the agent. Run `tollgate doctor`, then `tollgate install` from your own terminal |
 | `malformed-input` | Deny: the hook input was not the JSON the guard expects | A Claude Code change of the hook input format. Check the Claude Code version |
 | `cap-prefix` | Deny: a command that already starts with `export TOLLGATE_INLINE_CAP=` (R28 note) | Agents copy the rewritten command back. Harmless, but tell them to drop the prefix |
 
 A deny rule with many denies over many distinct commands is a candidate false deny: read the commands it hit (the log holds hashes, so compare with the session transcript) and, when they are harmless, add them to the allow corpus with the fix.
+
+## Wasted runs
+
+These rules stop work that cannot change a result (spec section 4.14). They do not depend on what an agent was told: the hooks, the guard and the CLI apply them.
+
+- **A push that cannot land starts no check (R102).** When the remote branch has a commit that the push does not contain, `pre-push` refuses at once and prints `git fetch <remote> <branch> && git merge FETCH_HEAD`. A forced push is not refused.
+- **A branch push runs the relevant tests (R107, R108).** A push needs `full` only for a full ref (`tiers.full_refs`) or a branch that matches `push.full_refs`. Every other branch needs `fast`, and a new branch is compared with the commit it was cut from on the trusted `main`. The full tier runs when the work goes to `main`: at the merge and at the push.
+- **A step runs one time for a tree (R101).** A job takes each step that already ran and passed on the same tree, tier and fingerprint, and reports it as `FRESH <step> from <job> (same tree)`. This also holds for a push to `main`, which does not use reuse by inputs. `tollgate check --rerun` runs only the steps that did not pass; `--rerun --all` runs every step. A step must not need the output that another step left in the checkout.
+- **A session does not start the full tier by hand (R104).** In a Claude Code session, `tollgate check --tier full` answers from a record or waits for a job that runs, but it does not create a job. `--rerun` after a stored fail is allowed.
+- **Expensive commands are declared (R103).** The guard refuses the wide form in a session and prints the narrow form. Gate jobs and your own terminal are not affected.
+
+  ```toml
+  [[expensive]]
+  name = "browser suite"                    # label in the refusal and in stats
+  program = "scripts/e2e*.sh"               # no "/": the command name; with "/": a file of the repo
+  with = []                                 # words that must all be in the arguments
+  narrow = ["*.spec.ts", "-g", "--grep*"]   # one argument that matches makes the call narrow
+  cwd = "web"                               # optional: only in this dir or below
+  hint = "scripts/e2e.sh <suite> <file>.spec.ts"
+  step = "e2e main"                         # optional: the gate step that runs the wide form
+  ```
+
+  An argument made at run time (`"$spec"`) counts as narrow. A narrow call of a script that an entry declares is allowed whatever the script's text holds; a script that no entry declares is read, and a wide call in it is refused. The table is not part of the fingerprint, so a change to it keeps every stored result (R74). The guard reads the file in the working tree, and an edit of `tollgate.toml` asks a person (R26).
+- **One stored result per step (R105).** `tollgate run <step>` runs one declared step on the staged tree, in the verify checkout. When the step already passed on the same inputs, it prints `REUSED <step> from <job>` with the log path and starts no job. A builder, a reviewer and a fixer then read the same run. Arguments after `--` narrow the step; a narrowed pass answers only the same call and never a gate job.
+- **Artefacts stay with the job (R106).** A step with `artifacts = ["web/test-results"]` has those paths copied to `<job dir>/artifacts/<step>/` after it ends, also when it fails. The report of a failed step names the dir. The paths must be ignored by git, because a step must not leave untracked files (R42). The limit is `[job] artifacts_max` in the host config (default 512 MiB); `gc` removes artefacts with the step logs. A path that goes through a symlink is not copied, and the search for a glob stops after 20,000 entries: name a dir, not `**/*.png`.
+- **The cost is visible (R109).** `tollgate cost` prints jobs, step time and wall time per local day, repo and tier, and the branches with the most step time.
+
+Three things to know before you install this version or change config for these rules:
+
+- The fingerprint no longer holds the hash of the `tollgate.toml` file, only what a job reads from it (R74). So a comment or an `[[expensive]]` entry voids nothing. The change itself voids the stored results one time, for every repo that has a `tollgate.toml`: each tree runs one time again after the install.
+- The hash of the host config file is part of every result's fingerprint. An edit of the host config (for example `[session]` or `artifacts_max`) makes each tree run one time again.
+- An older tollgate binary refuses a `tollgate.toml` that has a table it does not know (`[[expensive]]`, `push.full_refs`, `artifacts`). Install the new binary on every machine before such a policy file reaches `main`.
 
 ## CI
 

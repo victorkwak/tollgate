@@ -314,6 +314,7 @@ const ASK: &[&str] = &[
 /// that only name the program. They run in that repo's root.
 const EXPENSIVE_ALLOW: &[&str] = &[
     "./scripts/e2e.sh main web/login.spec.ts",
+    "scripts/e2e.sh main a.spec.ts",
     "bash scripts/e2e.sh main web/a.spec.ts web/b.spec.ts",
     "./scripts/e2e.sh main -g login 2>&1 | tail -30",
     "timeout 900 ./scripts/e2e.sh main --grep=@smoke",
@@ -430,7 +431,9 @@ fn setup() -> (Armed, PathBuf, PathBuf, PathBuf) {
     std::fs::write(app.join("tollgate.toml"), EXPENSIVE_TOML).unwrap();
     support::write_exe(
         &app.join("scripts/e2e.sh"),
-        "#!/bin/bash\nset -euo pipefail\ncd web\nbunx playwright test \"$@\"\n",
+        // The repo's own runner: a wide call in a branch that a narrow
+        // call does not take (R103).
+        "#!/bin/bash\nset -euo pipefail\nif [ -z \"${2:-}\" ]; then\n  cd web && bunx playwright test\nelse\n  cd web && bunx playwright test \"$2\"\nfi\n",
     );
     std::fs::create_dir_all(app.join("web")).unwrap();
     std::fs::write(

@@ -304,16 +304,16 @@ pub fn check(ctx: &Ctx, a: &CheckArgs) -> u8 {
     plan.spec.carry = !a.all;
     // R104: in an agent session a full check by hand answers from a
     // record or attaches to a running job; only `--rerun` of a stored
-    // non-pass (the command a hook's deny gives) may start one. The record
-    // is read before `--rerun` removes it.
+    // non-pass of the tree, under any key (the command a hook's deny
+    // gives), may start one. The records are read before `--rerun`
+    // removes this check's own.
     if a.tier == Tier::Full
         && repo.host.config.session.full_check == FullCheck::Refuse
         && crate::install::claude_session(&ctx.env).is_some()
     {
         if a.rerun {
-            match RecordStore::new(&repo.dirs).read_usable(&plan.spec.key) {
-                Ok(Some(r)) if r.verdict != Verdict::Pass => {}
-                _ => return refuse_full_in_session(a.rev.as_deref()),
+            if !stored_full_non_pass(&repo.dirs, &plan.spec.tree) {
+                return refuse_full_in_session(a.rev.as_deref());
             }
         } else {
             plan.may_create = false;
@@ -436,10 +436,17 @@ fn step_paths(dirs: &Dirs, job: &JobId, step: &str) {
         return;
     };
     let dir = std::path::absolute(dirs.job_dir(job)).unwrap_or_else(|_| dirs.job_dir(job));
+    // gc removes logs and artefacts before the report (R48, R82): name
+    // only what is still there.
     if let Some(l) = &s.log {
-        println!("log: {}", dir.join(l).display());
+        let log = dir.join(l);
+        if log.is_file() {
+            println!("log: {}", log.display());
+        } else {
+            println!("log: removed by gc (job {job})");
+        }
     }
-    if let Some(a) = &s.artifacts {
+    if let Some(a) = s.artifacts.as_ref().filter(|a| Path::new(a).is_dir()) {
         println!("artifacts: {a}");
     }
 }
@@ -463,15 +470,18 @@ pub fn run_step(ctx: &Ctx, a: &StepArgs) -> u8 {
             "tollgate: note: the working tree has changes that are not staged; the staged tree (the index) is what runs"
         );
     }
-    let plan_at = |tier: Tier| {
-        plan::plan(&PlanRequest {
+    // The step and its tier come from the policy that applies (L2):
+    // `full` when the step runs in `full`, else `fast`; one plan for that
+    // tier only.
+    let (mut plan, step) = match plan::plan_step(
+        &PlanRequest {
             env: &ctx.env,
             dirs: &repo.dirs,
             host: &repo.host,
             layout: &repo.layout,
             git: &repo.git,
             tree: t.tree.clone(),
-            tier,
+            tier: Tier::Fast,
             tip: t.tip.clone(),
             base: None,
             refname: t.refname.clone(),
@@ -482,22 +492,11 @@ pub fn run_step(ctx: &Ctx, a: &StepArgs) -> u8 {
                 Priority::Hook
             },
             rerun: true,
-        })
-    };
-    // The step and its tier come from the policy that applies (L2): `full`
-    // when the step runs in `full`, else `fast`.
-    let mut plan = match plan_at(Tier::Full) {
+        },
+        &a.step,
+    ) {
         Ok(p) => p,
         Err(e) => return fail(e),
-    };
-    let steps = &plan.spec.policy.config.steps;
-    let Some(step) = steps.iter().find(|s| s.name == a.step).cloned() else {
-        let names: Vec<&str> = steps.iter().map(|s| s.name.as_str()).collect();
-        return fail(format!(
-            "no step {:?} in the policy; steps: {}",
-            a.step,
-            names.join(", ")
-        ));
     };
     if !step.runs_on(crate::config::Platform::current()) {
         return fail(format!(
@@ -510,12 +509,6 @@ pub fn run_step(ctx: &Ctx, a: &StepArgs) -> u8 {
             "step kind {} takes no arguments",
             kind_name(step.kind)
         ));
-    }
-    if !step.runs_in(Tier::Full) {
-        plan = match plan_at(Tier::Fast) {
-            Ok(p) => p,
-            Err(e) => return fail(e),
-        };
     }
     let entries = match repo.git.ls_tree(&t.tree) {
         Ok(e) => e,
@@ -558,7 +551,14 @@ pub fn run_step(ctx: &Ctx, a: &StepArgs) -> u8 {
     spec.allow_reuse = false;
     spec.carry = false;
     spec.rerun = true;
-    spec.origin.refname = format!("{} (tollgate run {})", spec.origin.refname, step.name);
+    // The run key in the ref: runs with other arguments (or none) are
+    // other origins and never supersede each other (R89).
+    spec.origin.refname = format!(
+        "{} (tollgate run {} {})",
+        spec.origin.refname,
+        step.name,
+        &run_key.as_str()[..8]
+    );
     spec.step_run = Some(StepRun {
         step: step.name.clone(),
         args: a.args.clone(),
@@ -619,6 +619,25 @@ pub fn run_step(ctx: &Ctx, a: &StepArgs) -> u8 {
             exit::FAIL
         }
     }
+}
+
+/// R104: true when any usable stored `full` record of `tree` is a
+/// non-pass. A hook may have stored its fail under another key than this
+/// check's (another ref can give another policy and fingerprint); its deny
+/// gives `check --rerun`, which must then be allowed. Scans the record
+/// store, on this refusal path only.
+fn stored_full_non_pass(dirs: &Dirs, tree: &Oid) -> bool {
+    let store = RecordStore::new(dirs);
+    store.list().unwrap_or_default().iter().any(|r| {
+        r.tree == *tree
+            && r.tier == Tier::Full
+            && r.verdict != Verdict::Pass
+            && store
+                .read_usable(&r.key)
+                .ok()
+                .flatten()
+                .is_some_and(|u| u.verdict != Verdict::Pass)
+    })
 }
 
 /// R104: the refusal of `check --tier full` in an agent session. Exit 2,

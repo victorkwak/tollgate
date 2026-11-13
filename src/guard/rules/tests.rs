@@ -1349,3 +1349,96 @@ fn expensive_no_table_no_rule_r103() {
         &["./scripts/e2e.sh"],
     );
 }
+
+/// A script or package script the repo declares is the repo's own
+/// runner: a narrow call to it is not refused for a wide call in its text
+/// (a branch that does not run). Every other rule still applies inside,
+/// and an undeclared wrapper is still read with R103 on.
+#[test]
+fn expensive_declared_runner_called_narrow_is_its_own_business_r103() {
+    let (_tmp, app, other) = expensive_fixture();
+    std::fs::write(
+        app.join("tollgate.toml"),
+        format!(
+            "{EXPENSIVE_TOML}\n[[expensive]]\nname = \"web runner\"\nprogram = \"bun\"\nwith = [\"run\", \"e2e:web\"]\nnarrow = [\"*.spec.ts\"]\nhint = \"bun run e2e:web <file>.spec.ts\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("scripts/e2e.sh"),
+        "#!/bin/bash\nset -e\nif [ -z \"$2\" ]; then\n  cd web && bunx playwright test\nelse\n  cd web && bunx playwright test \"$2\"\nfi\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("scripts/e2e-commit.sh"),
+        "#!/bin/bash\ncd web && bunx playwright test\ngit commit --no-verify -m wip\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("scripts/run-all.sh"),
+        "#!/bin/bash\ncd web && bunx playwright test\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("web/package.json"),
+        r#"{"scripts":{"e2e:web":"playwright test --list && playwright test","e2e":"playwright test"}}"#,
+    )
+    .unwrap();
+    let root = ctx_at(&app, Path::new("/h"));
+    let web = ctx_at(&app.join("web"), Path::new("/h"));
+    all_filled(
+        &root,
+        ALLOWED,
+        &app,
+        &other,
+        &[
+            "scripts/e2e.sh main a.spec.ts",
+            "./scripts/e2e.sh main a.spec.ts",
+            "bash scripts/e2e.sh main a.spec.ts",
+            "sh ./scripts/e2e.sh main -g login",
+            "source scripts/e2e.sh main a.spec.ts",
+            "timeout 900 ./scripts/e2e.sh main a.spec.ts",
+            "ls web/*.spec.ts | xargs ./scripts/e2e.sh main",
+            "cd web && bun run e2e:web a.spec.ts",
+        ],
+    );
+    all_filled(&web, ALLOWED, &app, &other, &["bun run e2e:web a.spec.ts"]);
+    all_filled(
+        &root,
+        WIDE,
+        &app,
+        &other,
+        &[
+            "scripts/e2e.sh main",
+            "bash scripts/e2e.sh main",
+            "./scripts/run-all.sh",
+            "bash scripts/run-all.sh a.spec.ts",
+            // R103 is off only for the file the narrow call starts.
+            "./scripts/e2e.sh main a.spec.ts && ./scripts/run-all.sh",
+            // The sourced script's `cd` in its branches leaves the cwd
+            // unknown: an absolute `cd` names it again.
+            "source scripts/e2e.sh main a.spec.ts; cd {APP}/web && bunx playwright test",
+        ],
+    );
+    all_filled(
+        &web,
+        WIDE,
+        &app,
+        &other,
+        &[
+            "bun run e2e:web",
+            "bun run e2e",
+            "bun run e2e a.spec.ts --list && bunx playwright test",
+        ],
+    );
+    all_filled(
+        &root,
+        ("deny", "no-verify"),
+        &app,
+        &other,
+        &[
+            "./scripts/e2e-commit.sh main a.spec.ts",
+            "bash scripts/e2e-commit.sh main a.spec.ts",
+        ],
+    );
+}

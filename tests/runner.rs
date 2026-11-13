@@ -2003,3 +2003,124 @@ fn the_host_config_can_allow_full_checks_in_a_session_r104() {
     assert_eq!(r.code, Some(0), "{}", r.out);
     assert_eq!(sb.jobs().len(), 1);
 }
+
+/// R74, R103: the fingerprint holds what a job reads from `tollgate.toml`
+/// (its effective config), not the file's blob. A comment or an
+/// `[[expensive]]` entry in the policy file keeps the record key (the next
+/// check of the same tree is a record hit); a changed step `run` and a
+/// changed other policy file (`.config/nextest.toml`) still give a new key.
+#[test]
+fn only_what_jobs_read_from_the_policy_file_is_in_the_key_r74_r103() {
+    let sb = Sandbox::new();
+    host(&sb, "");
+    let policy = "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n";
+    let repo = repo_with(&sb, "r", policy);
+    sb.commit_file(&repo, "x", "1\n", "x");
+    let tree = sb.git(&repo, &["rev-parse", "HEAD^{tree}"]);
+    // `--tree T` at a HEAD whose own policy (no anchor: the tip's) moves.
+    let check = ["check", "--tier", "full", "--tree", &tree, "--wait"];
+    let r = sb.tollgate(&repo, &check);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let hit = |what: &str| {
+        let jobs = sb.jobs().len();
+        let r = sb.tollgate(&repo, &check);
+        assert_eq!(r.code, Some(0), "{what}: {}", r.out);
+        sb.jobs().len() == jobs
+    };
+    sb.commit_file(
+        &repo,
+        "tollgate.toml",
+        &format!("# a comment\n{policy}"),
+        "comment",
+    );
+    assert!(hit("comment"), "a comment keeps the key");
+    sb.commit_file(
+        &repo,
+        "tollgate.toml",
+        &format!(
+            "# a comment\n{policy}[[expensive]]\nname = \"suite\"\nprogram = \"scripts/e2e.sh\"\nhint = \"scripts/e2e.sh <file>\"\n"
+        ),
+        "expensive",
+    );
+    assert!(hit("expensive"), "an [[expensive]] entry keeps the key");
+    sb.commit_file(
+        &repo,
+        "tollgate.toml",
+        &policy.replace("run = \"true\"", "run = \"true \""),
+        "run",
+    );
+    assert!(!hit("run"), "a changed step run gives a new key");
+    sb.commit_file(
+        &repo,
+        ".config/nextest.toml",
+        "[profile.default]\n",
+        "nextest",
+    );
+    assert!(!hit("nextest"), "another policy file gives a new key");
+}
+
+/// R101: `check --rerun --all` that attaches to a running job which may
+/// take steps from the same tree does not take its report: it waits, then
+/// runs its own job with every step.
+#[test]
+fn rerun_all_does_not_take_an_attached_carrying_job_r101() {
+    let sb = Sandbox::new();
+    let counter = sb.root().join("count");
+    host(
+        &sb,
+        &format!("[job.env]\nCOUNT = \"{}\"\n", counter.display()),
+    );
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"slow\"\nkind = \"command\"\nrun = 'sleep 2; echo slow >> \"$COUNT\"'\n",
+    );
+    let r = sb.tollgate(
+        &repo,
+        &["check", "--tier", "full", "--rev", "HEAD", "--detach"],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    let first = job_id(&r.out);
+    let r = sb.tollgate(
+        &repo,
+        &[
+            "check", "--tier", "full", "--rev", "HEAD", "--wait", "--rerun", "--all",
+        ],
+    );
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert!(
+        r.out.contains(&format!("attached to running job {first}")),
+        "{}",
+        r.out
+    );
+    assert_eq!(sb.jobs().len(), 2, "{}", r.out);
+    assert_eq!(runs(&counter, "slow"), 2, "{}", r.out);
+}
+
+/// R104: a stored full fail of the tree under another key (here another
+/// host config, so another fingerprint) still allows a session's
+/// `--rerun`, which the hook's deny names (with no non-pass at all it is
+/// refused: `a_session_does_not_start_the_full_tier_by_hand_r104`).
+#[test]
+fn a_session_may_rerun_a_full_fail_stored_under_another_key_r104() {
+    let sb = Sandbox::new();
+    let mark = sb.root().join("mark");
+    let host_a = format!("[job.env]\nMARK = \"{}\"\n", mark.display());
+    host(&sb, &host_a);
+    let repo = repo_with(
+        &sb,
+        "r",
+        "version = 1\n[[step]]\nname = \"once\"\nkind = \"command\"\nrun = 'test -e \"$MARK\" || { touch \"$MARK\"; exit 1; }'\n",
+    );
+    let full = ["check", "--tier", "full", "--rev", "HEAD", "--wait"];
+    let r = sb.tollgate(&repo, &full);
+    assert_eq!(r.code, Some(1), "{}", r.out);
+    // Another host config: another key for the same tree, with no record.
+    host(&sb, &format!("# changed\n{host_a}"));
+    let rerun = [
+        "check", "--tier", "full", "--rev", "HEAD", "--wait", "--rerun",
+    ];
+    let r = sb.tollgate_with(&repo, &rerun, SESSION);
+    assert_eq!(r.code, Some(0), "{}", r.out);
+    assert_eq!(sb.jobs().len(), 2);
+}

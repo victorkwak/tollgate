@@ -1412,7 +1412,10 @@ hint = "h"
     }
 
     /// The table only feeds the guard: no job checks differently, so it
-    /// must not change the fingerprint of any record (R65, R74, R103).
+    /// must not change the effective hash (R65, R74, R103). The record key
+    /// also leaves the blob of `tollgate.toml` out of the policy-file hash;
+    /// `tests/runner.rs::only_what_jobs_read_from_the_policy_file_is_in_the_key_r74_r103`
+    /// proves that end to end.
     #[test]
     fn expensive_entries_do_not_change_the_effective_hash_r103() {
         let base = parse(SPEC_EXAMPLE);

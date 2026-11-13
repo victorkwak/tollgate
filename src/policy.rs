@@ -454,11 +454,18 @@ pub struct Policy {
 
 impl Policy {
     /// blake3 of the policy files' (path, blob) list: part of the
-    /// fingerprint, so a policy change voids records (R74).
+    /// fingerprint, so a policy change voids records (R74). `tollgate.toml`
+    /// is left out: what a job reads from it is the effective config,
+    /// whose own hash ([`RepoConfig::effective_hash`]) is in the
+    /// fingerprint, so a comment or an `[[expensive]]` entry (R103) voids
+    /// nothing.
     #[must_use]
     pub fn files_hash(&self) -> String {
         let mut h = blake3::Hasher::new();
         for (p, (mode, oid)) in &self.files {
+            if p == Path::new(CONFIG_FILE) {
+                continue;
+            }
             h.update(p.as_os_str().as_encoded_bytes());
             h.update(b"\0");
             h.update(mode.as_bytes());

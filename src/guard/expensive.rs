@@ -97,19 +97,41 @@ impl Rules {
     /// path under the cwd too. `typed` is the command as the agent typed
     /// it, for the refusal.
     #[must_use]
-    pub fn check(&self, word: &str, file: bool, args: &[Arg], cwd: &Path, typed: &str) -> Ruling {
+    pub fn check(&self, word: &str, file: bool, args: &[Arg], cwd: &Path, typed: &str) -> Check {
+        let mut out = Check {
+            ruling: Ruling::Allow,
+            program: false,
+            program_with: false,
+        };
         for r in &self.rules {
-            if r.wide(&self.root, word, file, args, cwd) {
-                return Ruling::deny(RULE, r.refusal(typed));
+            if !r.program(&self.root, word, file, cwd) {
+                continue;
+            }
+            out.program = true;
+            let with = r.with_holds(args);
+            out.program_with |= with;
+            if with && r.wide(args, cwd) {
+                out.ruling = Ruling::deny(RULE, r.refusal(typed));
+                return out;
             }
         }
-        Ruling::Allow
+        out
     }
 }
 
+/// The result of [`Rules::check`].
+#[derive(Debug)]
+pub struct Check {
+    pub ruling: Ruling,
+    /// `word` is the `program` of a rule.
+    pub program: bool,
+    /// `word` is the `program` of a rule and its `with` words are there.
+    pub program_with: bool,
+}
+
 impl Rule {
-    fn wide(&self, root: &Path, word: &str, file: bool, args: &[Arg], cwd: &Path) -> bool {
-        let program = if self.path {
+    fn program(&self, root: &Path, word: &str, file: bool, cwd: &Path) -> bool {
+        if self.path {
             // PATH lookup never reads the cwd: a bare name is a path only
             // for a shell that reads it as a script file.
             (file || word.contains('/'))
@@ -118,13 +140,19 @@ impl Rule {
                     .is_ok_and(|rel| self.program.is_match(rel))
         } else {
             self.program.is_match(rules::basename(word))
-        };
-        program
-            && self
-                .with
-                .iter()
-                .all(|w| args.iter().any(|a| a.lit() == Some(w.as_str())))
-            && self.cwd.as_ref().is_none_or(|c| cwd.starts_with(c))
+        }
+    }
+
+    fn with_holds(&self, args: &[Arg]) -> bool {
+        self.with
+            .iter()
+            .all(|w| args.iter().any(|a| a.lit() == Some(w.as_str())))
+    }
+
+    /// The program and `with` match: the cwd holds and no argument is
+    /// narrow.
+    fn wide(&self, args: &[Arg], cwd: &Path) -> bool {
+        self.cwd.as_ref().is_none_or(|c| cwd.starts_with(c))
             && !args.iter().any(|a| a.dynamic || self.narrow.is_match(&a.s))
     }
 

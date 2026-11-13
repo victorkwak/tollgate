@@ -174,9 +174,12 @@ pub fn cost(
             passed: u32::from(j.verdict == "pass"),
             step_ms,
             wall_ms: j.wall_ms,
-            // Not run: reused by inputs (L16) or taken from a job on the
-            // same tree (R101).
-            steps_run: j.steps.saturating_sub(j.steps_reused + j.steps_fresh),
+            // The job's own count (R109); for older lines, every step
+            // that was not reused by inputs (L16) or taken from a job on
+            // the same tree (R101), which also counts skipped steps.
+            steps_run: j
+                .steps_ran
+                .unwrap_or_else(|| j.steps.saturating_sub(j.steps_reused + j.steps_fresh)),
             steps_reused: j.steps_reused + j.steps_fresh,
             estimated,
         };
@@ -366,6 +369,7 @@ mod tests {
             steps: 4,
             steps_reused: 1,
             steps_fresh: 0,
+            steps_ran: None,
             flaky: 0,
             quarantined: 0,
             step_ms,
@@ -431,6 +435,8 @@ mod tests {
         );
         if let Event::Job(j) = &mut step {
             j.by = "step".into();
+            // A newer line: its own count of steps that ran.
+            j.steps_ran = Some(1);
         }
         let events = [
             job(
@@ -506,7 +512,9 @@ mod tests {
             ),
             (5, 4, 3_700_001, 3_000_000)
         );
-        assert_eq!((d.total.steps_run, d.total.steps_reused), (15, 5));
+        // Four older lines estimate 4 - 1 = 3 each; the step job's line
+        // says 1.
+        assert_eq!((d.total.steps_run, d.total.steps_reused), (13, 5));
         assert!(!d.total.estimated);
         // --repo
         let c = cost(&events, None, &TimeZone::UTC, Some("b"), &none);
