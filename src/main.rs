@@ -123,6 +123,7 @@ fn run() -> u8 {
         Command::Stats { since, json } => cli::stats(&ctx, since.as_deref(), json),
         Command::Cost { since, repo, json } => cli::cost(&ctx, &since, repo.as_deref(), json),
         Command::RunJob { job, lock_fd } => cli::run_job(&ctx, &job, lock_fd),
+        Command::WatchPush { job } => cli::watch_push(&ctx, &job),
         Command::Merge { branch } => tollgate::merge::merge(&ctx, &branch),
         Command::Remotes {
             action: RemotesAction::Forget { repo },
@@ -450,6 +451,9 @@ enum Command {
         #[arg(long)]
         lock_fd: Option<i32>,
     },
+    /// Internal: the remote check of a push job (R112).
+    #[command(name = "__watch-push", hide = true)]
+    WatchPush { job: String },
     /// Internal: a Python baseline step in a job (R94).
     #[command(name = "__step", hide = true)]
     Step {

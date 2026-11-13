@@ -342,23 +342,8 @@ pub fn run_job(dirs: &Dirs, id: &JobId, runner_env: &EnvSnapshot) -> u8 {
         eprintln!("tollgate runner: cannot become subreaper: {e}");
     }
     let job_dir = dirs.job_dir(id);
-    // R112: a push job asks the remote during its run.
-    let watch = match spec.host.push.remote_check.interval() {
-        Some(every) if spec.for_push => Some(super::remote_watch::start(
-            super::remote_watch::WatchInput {
-                dirs: dirs.clone(),
-                job: id.clone(),
-                common_dir: spec.common_dir.clone(),
-                env: runner_env.clone(),
-                path_prepend: spec.host.job.path_prepend.clone(),
-                every,
-            },
-        )),
-        _ => None,
-    };
     let mut r = Runner::new(dirs, spec, job_dir, runner_env, false, true);
     let end = r.run();
-    drop(watch);
     r.finish(end);
     0
 }

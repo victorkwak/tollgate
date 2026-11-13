@@ -24,6 +24,9 @@ use crate::ids::JobId;
 /// The hidden runner subcommand.
 pub const RUNNER_SUBCOMMAND: &str = "__run-job";
 
+/// The hidden subcommand of the remote check of a push job (R112).
+pub const WATCH_SUBCOMMAND: &str = "__watch-push";
+
 /// The fd number the runner finds its dedupe lock on.
 pub const LOCK_FD: i32 = 3;
 
@@ -103,6 +106,47 @@ pub fn spawn(
     // For `status` and test cleanup; the job state carries the pid once
     // the job runs.
     let _ = std::fs::write(job_dir.join("runner.pid"), child.id().to_string());
+    Ok(child.id())
+}
+
+/// Starts the remote check of push job `id` (R112): `tollgate
+/// __watch-push <id>`, in its own session like the runner, stdio to
+/// `jobs/<id>/watch.log`, the runner's environment, and no inherited fd.
+/// It is a sibling of the runner, never its descendant: the runner's step
+/// ends treat every descendant as part of the step (R35). Writes
+/// `jobs/<id>/watch.pid`; returns the pid.
+pub fn spawn_watch(exe: &Path, dirs: &Dirs, id: &JobId, env: &EnvSnapshot) -> io::Result<u32> {
+    let job_dir = dirs.job_dir(id);
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(job_dir.join("watch.log"))?;
+    let err = log.try_clone()?;
+    let mut cmd = Command::new(exe);
+    cmd.arg0("tollgate")
+        .args([WATCH_SUBCOMMAND, id.as_str()])
+        .env_clear()
+        .current_dir(&job_dir)
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(err);
+    for key in RUNNER_ENV {
+        if let Some(v) = env.get(key) {
+            cmd.env(key, v);
+        }
+    }
+    // SAFETY: the closure runs in the forked child before exec and only
+    // calls setsid, which is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn()?;
+    let _ = std::fs::write(job_dir.join("watch.pid"), child.id().to_string());
     Ok(child.id())
 }
 
