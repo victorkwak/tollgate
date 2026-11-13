@@ -101,15 +101,19 @@ impl Rules {
         let mut out = Check {
             ruling: Ruling::Allow,
             program: false,
-            program_with: false,
+            with_words: Vec::new(),
         };
         for r in &self.rules {
             if !r.program(&self.root, word, file, cwd) {
                 continue;
             }
-            out.program = true;
             let with = r.with_holds(args);
-            out.program_with |= with;
+            // A declared runner: a rule on a repo path (never a bare
+            // program name) that applies to this call in full.
+            out.program |= r.path && with && r.cwd_holds(cwd);
+            if with {
+                out.with_words.extend(r.with.iter().cloned());
+            }
             if with && r.wide(args, cwd) {
                 out.ruling = Ruling::deny(RULE, r.refusal(typed));
                 return out;
@@ -123,10 +127,12 @@ impl Rules {
 #[derive(Debug)]
 pub struct Check {
     pub ruling: Ruling,
-    /// `word` is the `program` of a rule.
+    /// `word` is a script file that a rule declares by its repo path,
+    /// and that rule applies to this call (its `with` words and `cwd`).
     pub program: bool,
-    /// `word` is the `program` of a rule and its `with` words are there.
-    pub program_with: bool,
+    /// The `with` words of the rules whose `program` is `word` and whose
+    /// `with` words are all there: the package scripts those rules name.
+    pub with_words: Vec<String>,
 }
 
 impl Rule {
@@ -152,8 +158,11 @@ impl Rule {
     /// The program and `with` match: the cwd holds and no argument is
     /// narrow.
     fn wide(&self, args: &[Arg], cwd: &Path) -> bool {
+        self.cwd_holds(cwd) && !args.iter().any(|a| a.dynamic || self.narrow.is_match(&a.s))
+    }
+
+    fn cwd_holds(&self, cwd: &Path) -> bool {
         self.cwd.as_ref().is_none_or(|c| cwd.starts_with(c))
-            && !args.iter().any(|a| a.dynamic || self.narrow.is_match(&a.s))
     }
 
     fn refusal(&self, typed: &str) -> String {

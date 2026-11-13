@@ -1381,7 +1381,13 @@ fn expensive_declared_runner_called_narrow_is_its_own_business_r103() {
     .unwrap();
     std::fs::write(
         app.join("web/package.json"),
-        r#"{"scripts":{"e2e:web":"playwright test --list && playwright test","e2e":"playwright test"}}"#,
+        r#"{"scripts":{"e2e:web":"playwright test --list && playwright test","e2e":"playwright test","all":"playwright test; true"}}"#,
+    )
+    .unwrap();
+    // A file whose name is a declared bare program, with a wide call in it.
+    std::fs::write(
+        app.join("web/playwright"),
+        "#!/bin/bash\n../scripts/e2e.sh main\n",
     )
     .unwrap();
     let root = ctx_at(&app, Path::new("/h"));
@@ -1429,6 +1435,12 @@ fn expensive_declared_runner_called_narrow_is_its_own_business_r103() {
             "bun run e2e:web",
             "bun run e2e",
             "bun run e2e a.spec.ts --list && bunx playwright test",
+            // The words of the "web runner" rule do not switch R103 off
+            // for another script of the same runner.
+            "bun run all e2e:web a.spec.ts",
+            // Nor does a rule on a bare program name for a script file
+            // of that name: only a rule on a repo path declares a runner.
+            "./playwright test a.spec.ts",
         ],
     );
     all_filled(

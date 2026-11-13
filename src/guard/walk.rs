@@ -699,7 +699,7 @@ impl<'a> Walker<'a> {
             return;
         };
         let base = rules::basename(name);
-        let (file_off, script_off) = self.expensive(name, false, rest, st, io);
+        let (file_off, declared_scripts) = self.expensive(name, false, rest, st, io);
         if base == "git" {
             return self.git(rest, st);
         }
@@ -757,7 +757,12 @@ impl<'a> Walker<'a> {
             return self.wrapper(w, rest, st, io);
         }
         if let Some(r) = runners::runner(base, rest) {
-            if script_off && matches!(r, Runner::Script(..)) {
+            // R103 is off inside a package script only when a rule names
+            // that script in its `with` words: the words of a rule must
+            // not switch it off for another script of the same runner.
+            if let Runner::Script(script, _) = &r
+                && declared_scripts.iter().any(|w| w == script)
+            {
                 let mut sub = st.clone();
                 sub.r103_off = true;
                 return self.runner(r, rest, &sub, io);
@@ -1393,8 +1398,8 @@ impl<'a> Walker<'a> {
     ///
     /// Returns whether R103 is off in what this call starts, because the
     /// repo declares it and the call is allowed: (the `program` of a rule
-    /// matches, for a script file; its `program` and `with` match, for a
-    /// package script).
+    /// on a repo path applies to the call, for a script file), and the
+    /// package scripts that the matching rules name in their `with` words.
     fn expensive(
         &mut self,
         word: &str,
@@ -1402,25 +1407,25 @@ impl<'a> Walker<'a> {
         args: &[Arg],
         st: &State,
         io: Io<'_>,
-    ) -> (bool, bool) {
+    ) -> (bool, Vec<String>) {
         if self.probing || st.r103_off {
-            return (st.r103_off, st.r103_off);
+            return (st.r103_off, Vec::new());
         }
         // A cwd the walker cannot follow: the repo is not known.
         let Some(cwd) = st.cwd.as_deref() else {
-            return (false, false);
+            return (false, Vec::new());
         };
         let Some(rules) = self.expensive_rules(cwd) else {
-            return (false, false);
+            return (false, Vec::new());
         };
         let typed = st.typed.as_deref().unwrap_or(io.raw);
         let check = rules.check(word, file, args, cwd, typed);
         // Words added at run time make the call narrow.
         if st.runtime_args || check.ruling == Ruling::Allow {
-            return (check.program, check.program_with);
+            return (check.program, check.with_words);
         }
         self.add(check.ruling);
-        (false, false)
+        (false, Vec::new())
     }
 
     /// The R103 rules of the repo that holds `cwd`: the nearest dir with a
