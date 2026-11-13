@@ -5,8 +5,10 @@
 //!   references, 14 days after they ended; bulky files (step logs, `tmp/`) of referenced jobs
 //!   after 14 days, keeping `report.json` and the JUnit files as long as
 //!   the record (R82);
-//! - stored step passes (L16) and same-tree step passes (R101) older than
-//!   90 days or whose job is gone (counted together as step passes);
+//! - stored step passes (L16), same-tree step passes (R101) and narrowed
+//!   step-run passes (R105) older than 90 days or whose job is gone
+//!   (counted together as step passes); step artefacts (R106) go with the
+//!   bulky files of a job;
 //! - verify checkouts whose repo is gone (L15);
 //! - lock tickets, waiter files, queue markers, dedupe locks and gate-run
 //!   markers (item 17) older than 1 day that no live process holds.
@@ -123,6 +125,24 @@ pub fn gc(dirs: &Dirs, host: &HostConfig, env: &EnvSnapshot, all: bool) -> GcRep
 
     // Stored step passes (L16).
     for shard in files(&dirs.step_results_dir()) {
+        for f in files(&shard) {
+            let stored: Option<StoredStep> = fs::read(&f)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok());
+            let keep = !all && stored.as_ref().is_some_and(|s| step_pass_kept(dirs, s));
+            if keep {
+                if let Some(s) = stored {
+                    referenced.insert(s.job);
+                }
+            } else if fs::remove_file(&f).is_ok() {
+                rep.steps += 1;
+            }
+        }
+        let _ = fs::remove_dir(&shard);
+    }
+
+    // Narrowed step-run passes (R105), by the same rule.
+    for shard in files(&dirs.step_runs_dir()) {
         for f in files(&shard) {
             let stored: Option<StoredStep> = fs::read(&f)
                 .ok()

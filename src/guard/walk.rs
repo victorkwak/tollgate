@@ -792,7 +792,7 @@ impl<'a> Walker<'a> {
             ["remotes", "forget", ..] => "remotes forget",
             ["baseline", "record", ..] => "baseline record",
             [sub, ..] => {
-                self.long_timeout |= matches!(*sub, "check" | "wait" | "merge");
+                self.long_timeout |= matches!(*sub, "check" | "wait" | "merge" | "run");
                 return;
             }
             [] => return,

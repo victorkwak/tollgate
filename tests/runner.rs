@@ -1873,7 +1873,7 @@ fn reports_record_queue_wait_per_resource_and_for_the_checkout_r85_r87_l20() {
 const R104_LINES: [&str; 3] = [
     "tollgate: check --tier full is not started by hand in an agent session (R104).",
     "tollgate: a push, or a merge into a full ref, starts the full tier and reuses its result: run git push. Results so far: tollgate status.",
-    "tollgate: after a stored fail: tollgate check --tier full --rev <rev> --rerun (runs only the steps that did not pass).",
+    "tollgate: after a stored fail: tollgate check --tier full --rev HEAD --rerun (runs only the steps that did not pass).",
 ];
 
 const SESSION: &[(&str, &str)] = &[("CLAUDECODE", "1")];
@@ -1899,6 +1899,13 @@ fn a_session_does_not_start_the_full_tier_by_hand_r104() {
     let detach = ["check", "--tier", "full", "--rev", "HEAD", "--detach"];
     refused_r104(&sb.tollgate_with(&repo, &detach, SESSION));
     refused_r104(&sb.tollgate_with(&repo, &full, &[("CLAUDE_CODE_ENTRYPOINT", "cli")]));
+    // Without --rev the hint keeps a placeholder.
+    let r = sb.tollgate_with(&repo, &["check", "--tier", "full", "--wait"], SESSION);
+    assert!(
+        r.out.contains("--tier full --rev <rev> --rerun"),
+        "{}",
+        r.out
+    );
     assert!(sb.jobs().is_empty(), "{:?}", sb.jobs());
     // `fast` in a session runs.
     let r = sb.tollgate_with(&repo, &["check", "--rev", "HEAD", "--wait"], SESSION);

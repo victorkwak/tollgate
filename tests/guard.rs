@@ -164,6 +164,20 @@ fn waiting_commands_get_the_long_timeout_and_the_cap_t17_r28_l17() {
     assert_eq!((code, out.as_str()), (Some(0), ""));
 }
 
+/// R28, R105: `tollgate run <step>` waits like `check`, so it gets the
+/// long timeout.
+#[test]
+fn a_step_run_gets_the_long_timeout_r28_r105() {
+    let a = Armed::new();
+    let (code, out, err) = a.bash("tollgate run e2e --wait");
+    assert_eq!(code, Some(0), "{err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(
+        v["hookSpecificOutput"]["updatedInput"]["timeout"], 600_000,
+        "{v}"
+    );
+}
+
 #[test]
 fn an_unarmed_gate_denies_every_bash_call_and_repairs_links_t5_r24_l8_l18() {
     let a = Armed::new();

@@ -82,18 +82,41 @@ fn run() -> u8 {
         Command::Report { target, json } => cli::report_cmd(&ctx, &target, json),
         Command::Log { job, step, tail } => cli::log(&ctx, &job, &step, tail),
         Command::Run {
+            step,
             tier,
             here: _,
             report,
             no_host_locks,
-        } => cli::run_here(
-            &ctx,
-            cli::HereArgs {
-                tier: tier.tier(),
-                junit: report.is_some(),
-                no_host_locks,
-            },
-        ),
+            rev,
+            tree,
+            rerun,
+            wait,
+            detach,
+            args,
+        } => match (step, tier) {
+            (Some(step), _) => cli::run_step(
+                &ctx,
+                &cli::StepArgs {
+                    step,
+                    rev,
+                    tree,
+                    rerun,
+                    wait,
+                    detach,
+                    args,
+                },
+            ),
+            (None, Some(tier)) => cli::run_here(
+                &ctx,
+                cli::HereArgs {
+                    tier: tier.tier(),
+                    junit: report.is_some(),
+                    no_host_locks,
+                },
+            ),
+            // clap requires a step or --here, and --here requires --tier.
+            (None, None) => tollgate::exit::BLOCK,
+        },
         Command::Gc { all } => cli::gc(&ctx, all),
         Command::Audit { since } => cli::audit(&ctx, since.as_deref()),
         Command::Flaky { days } => cli::flaky(&ctx, days),
@@ -320,16 +343,34 @@ enum Command {
         #[arg(long)]
         tail: Option<usize>,
     },
-    /// CI mode: run the steps in the current directory (R47).
+    /// Run one declared step (R105), or, with --here, the CI mode: every
+    /// step in the current directory (R47).
     Run {
-        #[arg(long, value_enum)]
-        tier: TierArg,
-        #[arg(long, required = true)]
+        /// The step to run (R105).
+        #[arg(required_unless_present = "here", conflicts_with = "here")]
+        step: Option<String>,
+        #[arg(long, value_enum, requires = "here")]
+        tier: Option<TierArg>,
+        #[arg(long, requires = "tier")]
         here: bool,
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, requires = "here")]
         report: Option<ReportFormat>,
-        #[arg(long)]
+        #[arg(long, requires = "here")]
         no_host_locks: bool,
+        #[arg(long, conflicts_with_all = ["tree", "here"])]
+        rev: Option<String>,
+        #[arg(long, conflicts_with = "here")]
+        tree: Option<String>,
+        /// Run the step even when a stored pass answers.
+        #[arg(long, conflicts_with = "here")]
+        rerun: bool,
+        #[arg(long, conflicts_with_all = ["detach", "here"])]
+        wait: bool,
+        #[arg(long, conflicts_with = "here")]
+        detach: bool,
+        /// Arguments that narrow the step, after `--`.
+        #[arg(last = true)]
+        args: Vec<String>,
     },
     /// Merge with a full check before the commit (R99).
     Merge { branch: String },

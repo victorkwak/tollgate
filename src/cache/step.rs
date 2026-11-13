@@ -143,3 +143,40 @@ pub fn write_fresh(
     let json = serde_json::to_vec_pretty(s).map_err(io::Error::other)?;
     fsx::write_atomic(&dirs.fresh_step_file(record, &s.key), &json)
 }
+
+/// R105: the key of `tollgate run <step> -- <args>`: the step key when
+/// there are no arguments, else a key of the step key and the arguments
+/// (never equal to a step key, so a narrowed pass never answers a gate
+/// job).
+#[must_use]
+pub fn run_key(step: &StepKey, args: &[String]) -> StepKey {
+    if args.is_empty() {
+        return step.clone();
+    }
+    let mut h = blake3::Hasher::new();
+    let mut put = |bytes: &[u8]| {
+        h.update(&(bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    };
+    put(b"tollgate step run");
+    put(step.as_str().as_bytes());
+    for a in args {
+        put(a.as_bytes());
+    }
+    StepKey::from_hash(&h.finalize())
+}
+
+/// R105: the pass of a narrowed `tollgate run` under `key`, while the
+/// report of its job exists.
+#[must_use]
+pub fn read_run(dirs: &Dirs, key: &StepKey) -> Option<StoredStep> {
+    let bytes = fsx::read_optional(&dirs.step_run_file(key)).ok()??;
+    let s: StoredStep = serde_json::from_slice(&bytes).ok()?;
+    (s.key == *key && dirs.job_report(&s.job).is_file()).then_some(s)
+}
+
+/// Stores the pass of a narrowed `tollgate run` (R105).
+pub fn write_run(dirs: &Dirs, s: &StoredStep) -> io::Result<()> {
+    let json = serde_json::to_vec_pretty(s).map_err(io::Error::other)?;
+    fsx::write_atomic(&dirs.step_run_file(&s.key), &json)
+}

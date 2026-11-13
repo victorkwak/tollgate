@@ -403,6 +403,22 @@ pub struct JobConfig {
     /// config fails the job (item 35, review note 12).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub host_tool_configs: BTreeMap<String, String>,
+    /// Most bytes of artefacts kept per step (R106); default 512 MiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts_max: Option<SizeSpec>,
+}
+
+/// R106: the default of `[job] artifacts_max`.
+pub const DEFAULT_ARTIFACTS_MAX: u64 = 512 << 20;
+
+impl JobConfig {
+    /// Most bytes of artefacts kept per step (R106).
+    #[must_use]
+    pub fn artifacts_limit(&self) -> u64 {
+        self.artifacts_max
+            .as_ref()
+            .map_or(DEFAULT_ARTIFACTS_MAX, SizeSpec::bytes)
+    }
 }
 
 /// Error when the host config cannot be read or parsed.

@@ -177,6 +177,7 @@ fn step(root: &Path, base: &str, kind: StepKind, resources: &[&str]) -> Step {
         cache_dirs: Vec::new(),
         inputs: vec!["**".into()],
         exclude_inputs: Vec::new(),
+        artifacts: Vec::new(),
     }
 }
 

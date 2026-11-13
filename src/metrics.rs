@@ -243,7 +243,7 @@ pub struct JobEvent {
     pub repo: String,
     /// Tier.
     pub tier: Tier,
-    /// `hook` or `prewarm`.
+    /// `hook`, `prewarm` or `step` (`tollgate run <step>`, R105).
     pub by: String,
     /// `pass`, `fail`, ..., or how it ended ([`LOST`]: its runner died).
     pub verdict: String,
@@ -589,6 +589,8 @@ pub struct RepoTier {
     pub jobs_by_hook: u32,
     /// Pre-warm jobs.
     pub jobs_prewarm: u32,
+    /// `tollgate run <step>` jobs (R105).
+    pub jobs_step: u32,
     /// Jobs whose verdict is not pass.
     pub jobs_not_pass: u32,
     /// Job wall time, ms.
@@ -798,6 +800,7 @@ pub fn stats(events: &[Event], since: Option<jiff::Timestamp>) -> Stats {
                 a.row.jobs += 1;
                 match j.by.as_str() {
                     "hook" => a.row.jobs_by_hook += 1,
+                    "step" => a.row.jobs_step += 1,
                     _ => a.row.jobs_prewarm += 1,
                 }
                 a.row.jobs_not_pass += u32::from(j.verdict != "pass");

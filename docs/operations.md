@@ -79,6 +79,7 @@ An agent works as before. The gates run by themselves.
 |---|---|
 | `git commit ...` | Runs `pre-commit` (`fast`). On a deny, the report says what failed. |
 | `tollgate check [--tier full] [--wait \| --detach] [--rerun [--all]]` | Checks the index tree (or `--rev R`, `--tree T`) ahead of a commit or push. In an agent session (`CLAUDECODE` or `CLAUDE_CODE_ENTRYPOINT` set), `--tier full` does not start a job (R104): it answers from a stored record, or attaches to a full job that already runs; `--rerun` starts one only after a stored non-pass. A push or a merge into a full ref starts the full tier. Host `[session] full_check = "allow"` turns this off. |
+| `tollgate run <step> [--rev R \| --tree T] [--rerun] [--wait \| --detach] [-- <args>...]` | Runs one declared step on the index tree (or `--rev R`, `--tree T`) in its own job, or prints its stored pass on the same inputs, with no job (R105). The pass counts as fresh for a later gate job on the same tree. Arguments narrow the step; a narrowed pass answers only the same call. Prints the step's `log:` and `artifacts:` paths (R106). |
 | `tollgate wait <job>` | Waits for a job: exit 0 pass, 1 fail, 3 still running (L17). |
 | `tollgate status [--rev R] [--json]` | Records and running jobs for `HEAD` and the index, the commits on the branch that have no record (L1), and those made without the gate (unverified). |
 | `tollgate report <job\|tree>`, `tollgate log <job> <step> [--tail N]` | The full report and a step log (R92). |

@@ -325,6 +325,12 @@ pub struct Step {
     /// than written.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude_inputs: Vec<String>,
+    /// Repo-relative paths or globs the runner copies out of the checkout
+    /// after the step ends (R106): test reports, screenshots. Left out of
+    /// the serialized step when empty, so existing step keys and config
+    /// hashes stay the same.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
 }
 
 fn both_tiers() -> Vec<Tier> {
@@ -663,6 +669,11 @@ impl RepoConfig {
             globs(&mut v, &format!("{at}.when"), &s.when);
             globs(&mut v, &format!("{at}.inputs"), &s.inputs);
             globs(&mut v, &format!("{at}.exclude_inputs"), &s.exclude_inputs);
+            // R106: inside the checkout, no `..`.
+            for a in &s.artifacts {
+                rel_path(&mut v, &at, "artifacts", Some(a));
+            }
+            globs(&mut v, &format!("{at}.artifacts"), &s.artifacts);
             if s.inputs.is_empty() {
                 v.error(
                     &at,

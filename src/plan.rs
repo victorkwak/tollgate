@@ -842,6 +842,7 @@ pub fn plan(req: &PlanRequest<'_>) -> Result<Plan, PlanError> {
         carry: true,
         priority: req.priority,
         created: now,
+        step_run: None,
     };
     Ok(Plan {
         spec,

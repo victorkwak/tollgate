@@ -135,6 +135,7 @@ To remove it, run `tollgate uninstall`. It removes exactly what `install` added.
    | Command | Use |
    |---|---|
    | `tollgate check [--tier full] [--wait \| --detach] [--rerun [--all]]` | Check the index tree (or `--rev R`) before a commit or push. In an agent session, `--tier full` does not start a job (R104): it answers from a record or waits for a running job; a push starts the full tier. |
+   | `tollgate run <step> [--rerun] [--wait \| --detach] [-- <args>...]` | Run one declared step, or get its stored pass on the same inputs (R105). Arguments narrow it. Its log and artefacts are printed. |
    | `tollgate wait <job>` | Wait for a job: exit 0 pass, 1 fail, 3 still running. |
    | `tollgate status` | Results and running jobs for `HEAD` and the index, and commits on the branch that have no result. |
    | `tollgate report <job>`, `tollgate log <job> <step>` | The full report and a step log. |

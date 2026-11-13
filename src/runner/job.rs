@@ -154,6 +154,59 @@ pub struct JobSpec {
     pub priority: Priority,
     /// Creation time.
     pub created: jiff::Timestamp,
+    /// R105: a `tollgate run <step>` job. Its `key` is then the claim key
+    /// of the run (R88), not a record key: the job writes no tree record
+    /// and makes no record lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_run: Option<StepRun>,
+}
+
+/// What a `tollgate run <step>` job runs (R105).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepRun {
+    /// The step name.
+    pub step: String,
+    /// Arguments that narrow the step (after `--`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// The record key of the tree, tier and fingerprint: where a pass
+    /// without arguments goes in the same-tree store (R101).
+    pub record_key: RecordKey,
+    /// The key the pass is stored under: the step key, or the run key of
+    /// the arguments ([`step_store::run_key`]).
+    pub run_key: crate::ids::StepKey,
+}
+
+impl StepRun {
+    /// The claim key of the run (R88): derived from the run key, in its
+    /// own domain, so it is never the record key of a tier job.
+    #[must_use]
+    pub fn claim_key(run_key: &crate::ids::StepKey) -> RecordKey {
+        let mut h = blake3::Hasher::new();
+        h.update(b"tollgate step run claim\0");
+        h.update(run_key.as_str().as_bytes());
+        RecordKey::from_hash(&h.finalize())
+    }
+
+    /// True when arguments narrow the step.
+    #[must_use]
+    pub fn narrowed(&self) -> bool {
+        !self.args.is_empty()
+    }
+}
+
+/// The `run` text of a `command` step with `args` appended, each quoted
+/// for `sh` (R105).
+#[must_use]
+pub fn with_args(run: &str, args: &[String]) -> String {
+    let mut out = run.to_owned();
+    for a in args {
+        out.push(' ');
+        out.push('\'');
+        out.push_str(&a.replace('\'', "'\\''"));
+        out.push('\'');
+    }
+    out
 }
 
 fn yes() -> bool {
@@ -618,13 +671,29 @@ impl Runner<'_> {
             Ok(p) => p,
             Err(end) => return end,
         };
-        let (picked, plan) = match fast {
+        let (picked, mut plan) = match fast {
             Some(f) => {
                 self.record_selection = f.selection;
                 (Some(f.picked), f.plan)
             }
             None => (None, steps::plan(config, self.spec.tier, None, platform)),
         };
+        // R105: a step run runs that one step, narrowed by its arguments.
+        if let Some(run) = &self.spec.step_run {
+            plan.retain(|p| p.step.name == run.step);
+            let Some(p) = plan.first_mut() else {
+                return error(
+                    ErrorCause::Config,
+                    format!("step {:?} is not in the policy for this tier", run.step),
+                );
+            };
+            if run.narrowed()
+                && p.step.kind == StepKind::Command
+                && let Some(r) = &p.step.run
+            {
+                p.step.run = Some(with_args(r, &run.args));
+            }
+        }
         if let Some(p) = plan
             .iter()
             .find(|p| matches!(p.decision, Decision::Run(_)) && !steps::is_built(p.step.kind))
@@ -646,6 +715,7 @@ impl Runner<'_> {
             }
         }
         if !self.spec.rerun
+            && self.spec.step_run.is_none()
             && let Some(end) = self.covered()
         {
             return end;
@@ -1177,6 +1247,14 @@ impl Runner<'_> {
                     break;
                 }
             };
+            // R105: the arguments of a narrowed step run (a `command`
+            // step has them in its `run` text already).
+            let mut inv = inv;
+            if let Some(run) = &self.spec.step_run
+                && s.kind != StepKind::Command
+            {
+                inv.args.extend(run.args.iter().map(Into::into));
+            }
             // Resources: canonical order, all or nothing, within the queue
             // budget (R85, R86, R33).
             let sems: Vec<Semaphore> = if self.use_locks {
@@ -1285,6 +1363,7 @@ impl Runner<'_> {
                 scope: Some(scope.clone()),
                 reused_from: None,
                 fresh_from: None,
+                artifacts: None,
                 resources: s.resources.iter().map(|r| r.as_str().to_owned()).collect(),
                 queue_ms,
                 message: None,
@@ -1336,6 +1415,12 @@ impl Runner<'_> {
                         rep.tail = report::tail(&log, report::TAIL_LINES);
                     }
                 }
+            }
+            // R106: artefacts of a step that ran to an end (pass, fail,
+            // timeout), before the next step can change them.
+            if !s.artifacts.is_empty() && matches!(out.end, ExecEnd::Exited(_) | ExecEnd::TimedOut)
+            {
+                self.keep_artifacts(s, workdir, &slug, &mut rep);
             }
             // R42 after every step that ran, so a step that changes the tree
             // is named and its pass is never stored for reuse (L16).
@@ -1436,6 +1521,45 @@ impl Runner<'_> {
         End::Verdict(verdict, None, None)
     }
 
+    /// R106: copies the step's artefacts into `artifacts/<slug>/` of the
+    /// job dir and names that dir in its report line. Over the limit or on
+    /// an error, the step's message says so; the verdict does not change.
+    fn keep_artifacts(
+        &self,
+        s: &crate::config::repo::Step,
+        workdir: &Path,
+        slug: &str,
+        rep: &mut StepReport,
+    ) {
+        let dest = self.job_dir.join("artifacts").join(slug);
+        let limit = self.spec.host.job.artifacts_limit();
+        let note = match super::artifacts::copy(workdir, &s.artifacts, &dest, limit) {
+            Ok(c) => {
+                if c.files > 0 {
+                    let abs = std::path::absolute(&dest).unwrap_or(dest.clone());
+                    rep.artifacts = Some(abs.display().to_string());
+                }
+                self.say(&format!(
+                    "step {:?}: {} artefact file(s), {} bytes",
+                    s.name, c.files, c.bytes
+                ));
+                (c.over_limit > 0).then(|| {
+                    format!(
+                        "artifacts: {} file(s) not kept, over the limit of {} bytes (R106)",
+                        c.over_limit, limit
+                    )
+                })
+            }
+            Err(e) => Some(format!("artifacts: copy failed: {e} (R106)")),
+        };
+        if let Some(n) = note {
+            rep.message = Some(match rep.message.take() {
+                Some(m) => format!("{m}; {n}"),
+                None => n,
+            });
+        }
+    }
+
     /// What is left of the job limit (R33; slot waits do not count), and
     /// at most the step's own timeout.
     fn step_limit(&self, s: &crate::config::repo::Step) -> Duration {
@@ -1516,7 +1640,7 @@ impl Runner<'_> {
             None => None,
         };
         if let Some(sum) = &summary {
-            if *scope == Scope::All {
+            if *scope == Scope::All && !self.spec.step_run.as_ref().is_some_and(StepRun::narrowed) {
                 self.known_tests_full = Some(sum.known.clone());
             }
             self.report.flaky.extend(sum.flaky.iter().cloned());
@@ -1681,8 +1805,10 @@ impl Runner<'_> {
         if let Err(e) = self.report.write(self.dirs) {
             self.say(&format!("cannot write report.json: {e}"));
         }
+        // R105: a step run is not a tier pass: no tree record.
         if let JobState::Finished { verdict } = &state
             && self.report.covered_by.is_none()
+            && self.spec.step_run.is_none()
         {
             self.write_record(*verdict, now);
         }
@@ -1696,10 +1822,26 @@ impl Runner<'_> {
         ) && self.report.cause.is_none()
         {
             for p in std::mem::take(&mut self.pending_steps) {
-                // R101: the same pass, as a result of this tree.
-                let _ =
-                    step_store::write_fresh(self.dirs, &self.spec.key, &self.spec.fingerprint, &p);
-                let _ = step_store::write_stored(self.dirs, &p);
+                match &self.spec.step_run {
+                    // R105: a narrowed pass answers only the same call.
+                    Some(run) if run.narrowed() => {
+                        let _ = step_store::write_run(
+                            self.dirs,
+                            &StoredStep {
+                                key: run.run_key.clone(),
+                                ..p
+                            },
+                        );
+                    }
+                    run => {
+                        // R101: the same pass, as a result of this tree
+                        // (a step run's spec key is its claim key).
+                        let record = run.as_ref().map_or(&self.spec.key, |r| &r.record_key);
+                        let _ =
+                            step_store::write_fresh(self.dirs, record, &self.spec.fingerprint, &p);
+                        let _ = step_store::write_stored(self.dirs, &p);
+                    }
+                }
             }
         }
         self.flaky_log(now);
@@ -1765,9 +1907,10 @@ impl Runner<'_> {
             job: self.spec.id.clone(),
             repo: crate::metrics::repo_name(&self.spec.common_dir),
             tier: self.spec.tier,
-            by: match self.spec.priority {
-                Priority::Hook => "hook".into(),
-                Priority::Prewarm => "prewarm".into(),
+            by: match (&self.spec.step_run, self.spec.priority) {
+                (Some(_), _) => "step".into(),
+                (None, Priority::Hook) => "hook".into(),
+                (None, Priority::Prewarm) => "prewarm".into(),
             },
             verdict: r.verdict_text(),
             wall_ms: crate::metrics::ms_between(r.created, now),

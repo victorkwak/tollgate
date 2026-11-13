@@ -494,6 +494,12 @@ when = ["ios/**"]
 resources = ["cpu"]
 timeout = "10m"
 cache_dirs = ["ios/.build"]
+[[step]]
+name = "web e2e"
+kind = "command"
+run = "bunx playwright test"
+cwd = "web"
+artifacts = ["web/test-results", "web/playwright-report/*.html"]   # R106; ignored paths
 
 [[quarantine]]
 test = "gatehouse-api::sessions test_concurrent_cancel"   # <package>::<binary> <test>, exact
@@ -501,7 +507,7 @@ until = "2026-12-01"
 issue = "Issues/open/myapp-cancel-flake"
 ```
 
-Common step fields: `name`, `kind`, `cwd`, `tiers`, `when`, `resources`, `timeout`, `grace`, `only_on`, `env`, `env_file` (outside the tree, hashed into the key), `cache_dirs`.
+Common step fields: `name`, `kind`, `cwd`, `tiers`, `when`, `resources`, `timeout`, `grace`, `only_on`, `env`, `env_file` (outside the tree, hashed into the key), `cache_dirs`, `inputs`, `exclude_inputs` (L16), `artifacts` (R106).
 Reason: TOML matches Victor's Rust CLIs; built-in kinds give parsing and selection; `command` gives escape room.
 
 R64. Config validation runs per job against `T`'s metadata: unknown `owners` packages (R57b warn + whole workspace), unknown `quarantine` tests (`error`: the entry must match a listed test), `until` more than 30 days after the committer date of the policy commit (R71) -> `error`. `tollgate config --check` runs the same validation locally.
@@ -590,6 +596,7 @@ full = "2h"
 [job]
 path_prepend = []
 allow_ssh_agent = false
+artifacts_max = "512M"                   # R106: step artefacts kept per step
 [job.env]
 SQLX_OFFLINE = "true"
 
@@ -656,6 +663,7 @@ tollgate check [--tier fast|full] [--tree T | --rev R] [--wait | --detach] [--re
 tollgate wait <job> [--timeout D] | cancel <job>
 tollgate status [--rev R] [--json] | report <job|tree> [--json] | log <job> <step> [--tail N]
 tollgate run --tier T --here [--report junit] [--no-host-locks]      # CI mode
+tollgate run <step> [--rev R | --tree T] [--rerun] [--wait | --detach] [-- <args>...]   # one step (R105)
 tollgate merge <branch> | pick <rev>...
 tollgate config --effective | --check | init [--nextest] | ci-snippet --gitlab
 tollgate policy approve <rev> [--reason S]                            # TTY only
@@ -677,6 +685,16 @@ Reason: a feature branch's full pass that reused one step (L16) does not answer 
 
 R104. An agent session does not start the full tier by hand. An agent session is a process whose environment has `CLAUDECODE` or `CLAUDE_CODE_ENTRYPOINT` (the test `tollgate install` uses). In a session, `tollgate check --tier full` (also with `--detach`) answers from a stored record as before, and it may attach to a job that already runs for the key and wait for it. It does not create a job. Then it prints on stderr why, that a push or a merge into a full ref starts the full tier, and the `--rerun` command, and exits 2 (refused). `--rerun` may start a job only when the stored record of the key is a non-pass (`fail`, `timeout`, `error`): that is the command a hook's deny gives. `--rerun` with a stored pass or with no record is refused. Tier `fast`, `tollgate merge` and the hooks do not change. The host config switch `[session] full_check = "allow"` turns the rule off (default `"refuse"`). The host config hash is over the file bytes (R74), so a file without `[session]` gives the same fingerprint as before; changing the switch changes the fingerprint.
 Reason: agents ran `tollgate check --tier full` as a "verify" phase, and the push then ran the full tier again. The push or merge starts the full tier and uses its result; a session only reads or waits.
+
+R105. `tollgate run <step> [--rev R | --tree T] [--rerun] [--wait | --detach] [-- <args>...]` runs one declared step. The CI form `tollgate run --tier T --here` (R47) stays; `<step>` and `--here` exclude each other. The tree is chosen as for `check` (the index tree by default); when the working tree has changes that are not staged, a note line says that the staged tree runs. The step comes from the policy that applies (L2); an unknown name is an error that lists the step names. The tier is `full` when the step runs in `full`, else `fast`; the scope is everything, with no selection.
+Without arguments, and unless `--rerun` is given, it looks up (1) the same-tree entry of the step (R101, under the record key of the tree, tier and fingerprint) and (2) a stored L16 pass of the step key whose scope covers everything. A hit prints `tollgate: REUSED <step> from <job> (passed <time>)`, a `log: <path>` line and, when that job kept artefacts, an `artifacts: <path>` line, and exits 0 with no job.
+A miss starts a job that runs the setup steps and that one step, in the verify checkout, with the resource slots and budgets of a normal job. The job writes `report.json` but no tree record: it is not a tier pass, and it makes no record lookup. Its claim key (R88) is derived from the step's run key, so two sessions that run the same step on the same inputs share one job, and the claim key is never the record key of a tier job. Its origin ref names the step, so it neither supersedes a gate job nor is superseded by one (R89). On a pass it stores the step pass in the L16 store and in the same-tree store under the real record key, so a later gate job on the same tree, also one for a full ref, takes it (`FRESH`).
+Arguments after `--` narrow the step. For `kind = "command"` they are appended, quoted for `sh`, to the `run` text; for `nextest`, `cargo-doctest` and `bun-test` they are appended to the tool's arguments; any other kind is an error, `step kind <k> takes no arguments`. A narrowed run has its own key (the step key and the arguments). Its pass is stored only under that key (`runs/`), is returned to a later identical `tollgate run`, and never enters the L16 or same-tree stores that gate jobs read.
+`tollgate wait`, `report` and `log` work on a step job; the final output is the report plus the `log:` and `artifacts:` lines. The metrics line of the job has `by: "step"`, which `tollgate stats` counts as `jobs_step`. The guard gives `tollgate run` the long timeout, like `check`, `wait` and `merge` (R28). R104 does not apply: this is how a session runs one step.
+Reason: builders, reviewers and fixers each ran the same suite again to see its result or its screenshots. One command that runs a declared step, and returns the stored result when the same step already passed on the same inputs, removes those runs.
+
+R106. A step may declare `artifacts`: repo-relative paths or globs (no root, no `..`; left out of the serialized step when empty, so existing step keys and config hashes do not change). After a step ends with a pass, a fail or a timeout, in every job (gate jobs too), the runner copies the files that match from the checkout into `<job dir>/artifacts/<step slug>/`, keeping their relative paths. A plain path names a file or every file under a dir; a glob names the files it matches and every file under a dir it matches. Symlinks are neither followed nor copied. At most `[job] artifacts_max` bytes (default 512 MiB) are copied per step; over the limit, copying stops and the step's report message says how many files were not kept. The step's report line gets `artifacts` (the absolute dir) when something was copied, and the human report prints one `artifacts: <path>` line for a failed step that has them. `tollgate gc` removes artefacts with the bulky step logs (14 days, R48, R82). R42 requires that a step leave no untracked files, so artefact dirs must be ignored paths (`.gitignore`); `git clean -ffdx` removes them before the next job.
+Reason: a failed end-to-end test is read from its screenshots and traces. Kept with the job, they are there for whoever reads the report, and no one runs the suite again to get them.
 
 ---
 

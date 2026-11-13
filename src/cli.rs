@@ -14,10 +14,12 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::cache::record::{Record, Verdict};
+use crate::cache::step as step_store;
 use crate::cache::store::{Lookup, RecordStore};
 use crate::cache::{Fingerprint, record_key};
 use crate::config::check::REPO_CONFIG_FILE;
 use crate::config::host::FullCheck;
+use crate::config::repo::StepKind;
 use crate::config::units::DurationSpec;
 use crate::config::{HostConfig, LoadedHost, RepoConfig, Tier};
 use crate::dirs::Dirs;
@@ -30,9 +32,10 @@ use crate::plan::{self, Base, PlanError, PlanRequest, Settled, Started, WaitEnd}
 use crate::policy::{self, ConfigSource};
 use crate::report::{self, JobReport};
 use crate::runner::env::{BaseInputs, JobEnv};
-use crate::runner::job::{self, JobSpec, PolicySpec, SPEC_SCHEMA};
+use crate::runner::job::{self, JobSpec, PolicySpec, SPEC_SCHEMA, StepRun};
 use crate::sched::{CancelOutcome, JobState, JobStore, Origin};
 use crate::select::detect;
+use crate::steps::Scope;
 
 /// What every command needs.
 #[derive(Debug, Clone)]
@@ -247,6 +250,12 @@ fn wait_and_print(dirs: &Dirs, id: &JobId, deadline: Option<Instant>) -> u8 {
     match plan::wait(dirs, id, deadline) {
         WaitEnd::Done(r) => {
             print_report(&r);
+            // R105: a step job's log and artefacts.
+            if let Ok(spec) = JobSpec::read(dirs, id)
+                && let Some(run) = &spec.step_run
+            {
+                step_paths(dirs, id, &run.step);
+            }
             report_exit(&r)
         }
         WaitEnd::Running => {
@@ -304,7 +313,7 @@ pub fn check(ctx: &Ctx, a: &CheckArgs) -> u8 {
         if a.rerun {
             match RecordStore::new(&repo.dirs).read_usable(&plan.spec.key) {
                 Ok(Some(r)) if r.verdict != Verdict::Pass => {}
-                _ => return refuse_full_in_session(),
+                _ => return refuse_full_in_session(a.rev.as_deref()),
             }
         } else {
             plan.may_create = false;
@@ -321,7 +330,7 @@ pub fn check(ctx: &Ctx, a: &CheckArgs) -> u8 {
     }
     let started = match plan::start(&repo.dirs, &plan, &ctx.exe, &ctx.env) {
         Ok(s) => s,
-        Err(PlanError::NoNewJob(_)) => return refuse_full_in_session(),
+        Err(PlanError::NoNewJob(_)) => return refuse_full_in_session(a.rev.as_deref()),
         Err(e) => return fail(e),
     };
     let mut say = |s: &Started| match s {
@@ -372,19 +381,255 @@ pub fn check(ctx: &Ctx, a: &CheckArgs) -> u8 {
         }
         // An attached job ended without answering this check, and this
         // check may not start its own (R104).
-        Err(PlanError::NoNewJob(_)) => refuse_full_in_session(),
+        Err(PlanError::NoNewJob(_)) => refuse_full_in_session(a.rev.as_deref()),
         Err(e) => fail(e),
+    }
+}
+
+/// `tollgate run <step>` arguments (R105).
+#[derive(Debug, Clone)]
+pub struct StepArgs {
+    /// The step name.
+    pub step: String,
+    /// `--rev R`.
+    pub rev: Option<String>,
+    /// `--tree T`.
+    pub tree: Option<String>,
+    /// `--rerun`: no stored pass answers.
+    pub rerun: bool,
+    /// `--wait`: until the job ends (bounded by `TOLLGATE_INLINE_CAP`).
+    pub wait: bool,
+    /// `--detach`: start and return.
+    pub detach: bool,
+    /// Arguments after `--` that narrow the step.
+    pub args: Vec<String>,
+}
+
+/// R105: the step kinds that take narrowing arguments, appended to their
+/// command line (`command`: to the `run` text, shell-quoted).
+const NARROWABLE: [StepKind; 4] = [
+    StepKind::Command,
+    StepKind::Nextest,
+    StepKind::CargoDoctest,
+    StepKind::BunTest,
+];
+
+fn kind_name(kind: StepKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// True when the worktree has changes that are not staged.
+fn unstaged(git: &Git) -> bool {
+    git.output(["diff", "--quiet", "--no-ext-diff"])
+        .is_ok_and(|o| o.status.code() == Some(1))
+}
+
+/// The `log:` and `artifacts:` lines of `step` in the report of `job`.
+fn step_paths(dirs: &Dirs, job: &JobId, step: &str) {
+    let Ok(Some(r)) = JobReport::read(dirs, job) else {
+        return;
+    };
+    let Some(s) = r.steps.iter().find(|s| s.name == step) else {
+        return;
+    };
+    let dir = std::path::absolute(dirs.job_dir(job)).unwrap_or_else(|_| dirs.job_dir(job));
+    if let Some(l) = &s.log {
+        println!("log: {}", dir.join(l).display());
+    }
+    if let Some(a) = &s.artifacts {
+        println!("artifacts: {a}");
+    }
+}
+
+/// `tollgate run <step>` (R105): returns a stored pass of the step on the
+/// same inputs, or runs the setup steps and that step in a job of its own
+/// (no tree record). R104 does not apply: this is how a session runs one
+/// step.
+#[allow(clippy::too_many_lines)]
+pub fn run_step(ctx: &Ctx, a: &StepArgs) -> u8 {
+    let repo = match ctx.repo() {
+        Ok(r) => r,
+        Err(e) => return fail(e),
+    };
+    let t = match target(&repo.git, a.tree.as_deref(), a.rev.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return fail(e),
+    };
+    if a.rev.is_none() && a.tree.is_none() && unstaged(&repo.git) {
+        println!(
+            "tollgate: note: the working tree has changes that are not staged; the staged tree (the index) is what runs"
+        );
+    }
+    let plan_at = |tier: Tier| {
+        plan::plan(&PlanRequest {
+            env: &ctx.env,
+            dirs: &repo.dirs,
+            host: &repo.host,
+            layout: &repo.layout,
+            git: &repo.git,
+            tree: t.tree.clone(),
+            tier,
+            tip: t.tip.clone(),
+            base: None,
+            refname: t.refname.clone(),
+            allow_reuse: false,
+            priority: if a.detach {
+                Priority::Prewarm
+            } else {
+                Priority::Hook
+            },
+            rerun: true,
+        })
+    };
+    // The step and its tier come from the policy that applies (L2): `full`
+    // when the step runs in `full`, else `fast`.
+    let mut plan = match plan_at(Tier::Full) {
+        Ok(p) => p,
+        Err(e) => return fail(e),
+    };
+    let steps = &plan.spec.policy.config.steps;
+    let Some(step) = steps.iter().find(|s| s.name == a.step).cloned() else {
+        let names: Vec<&str> = steps.iter().map(|s| s.name.as_str()).collect();
+        return fail(format!(
+            "no step {:?} in the policy; steps: {}",
+            a.step,
+            names.join(", ")
+        ));
+    };
+    if !step.runs_on(crate::config::Platform::current()) {
+        return fail(format!(
+            "step {:?} does not run on this platform",
+            step.name
+        ));
+    }
+    if !a.args.is_empty() && !NARROWABLE.contains(&step.kind) {
+        return fail(format!(
+            "step kind {} takes no arguments",
+            kind_name(step.kind)
+        ));
+    }
+    if !step.runs_in(Tier::Full) {
+        plan = match plan_at(Tier::Fast) {
+            Ok(p) => p,
+            Err(e) => return fail(e),
+        };
+    }
+    let entries = match repo.git.ls_tree(&t.tree) {
+        Ok(e) => e,
+        Err(e) => return fail(e),
+    };
+    let step_key =
+        match step_store::step_key(&step, plan.spec.tier, &plan.spec.fingerprint, &entries) {
+            Ok(k) => k,
+            Err(e) => return fail(e),
+        };
+    let run_key = step_store::run_key(&step_key, &a.args);
+    let record_key = plan.spec.key.clone();
+    if !a.rerun {
+        let all = Scope::All;
+        let found = if a.args.is_empty() {
+            step_store::read_fresh(&repo.dirs, &record_key, &plan.spec.fingerprint, &step_key)
+                .filter(|s| s.scope.covers(&all))
+                .or_else(|| {
+                    step_store::read_stored(&repo.dirs, &step_key).filter(|s| s.scope.covers(&all))
+                })
+        } else {
+            step_store::read_run(&repo.dirs, &run_key)
+        };
+        if let Some(s) = found {
+            println!(
+                "tollgate: REUSED {} from {} (passed {})",
+                step.name, s.job, s.finished
+            );
+            step_paths(&repo.dirs, &s.job, &step.name);
+            return exit::OK;
+        }
+    }
+    // A job of its own: claimed by the run key (R88), no selection, no
+    // reuse, no record lookup (`rerun`), its own origin ref so it neither
+    // supersedes nor is superseded by a gate job (R89).
+    let spec = &mut plan.spec;
+    spec.key = StepRun::claim_key(&run_key);
+    spec.select = false;
+    spec.select_note = Some(format!("tollgate run {} (R105)", step.name));
+    spec.allow_reuse = false;
+    spec.carry = false;
+    spec.rerun = true;
+    spec.origin.refname = format!("{} (tollgate run {})", spec.origin.refname, step.name);
+    spec.step_run = Some(StepRun {
+        step: step.name.clone(),
+        args: a.args.clone(),
+        record_key,
+        run_key,
+    });
+    let started = match plan::start(&repo.dirs, &plan, &ctx.exe, &ctx.env) {
+        Ok(s) => s,
+        Err(e) => return fail(e),
+    };
+    let id = match started {
+        Started::Created(id) => {
+            println!(
+                "tollgate: job {id} started: step {} tier {} tree {}",
+                step.name,
+                plan.spec.tier,
+                plan.spec.tree.short(12)
+            );
+            id
+        }
+        Started::Attached(id) => {
+            println!(
+                "tollgate: attached to running job {id} (step {})",
+                step.name
+            );
+            id
+        }
+        // `rerun` makes no record lookup; nothing to answer from.
+        Started::Hit(found) => return print_lookup(&repo.dirs, &found),
+    };
+    if a.detach {
+        println!("tollgate: wait with: tollgate wait {id}");
+        return exit::OK;
+    }
+    let deadline = if a.wait {
+        inline_cap(&ctx.env).map(|d| Instant::now() + d)
+    } else {
+        Some(
+            Instant::now()
+                + plan
+                    .spec
+                    .budgets
+                    .inline_for_hook(ctx.env.get_str("TOLLGATE_INLINE_CAP"), plan.spec.tier),
+        )
+    };
+    match plan::wait(&repo.dirs, &id, deadline) {
+        WaitEnd::Done(r) => {
+            print_report(&r);
+            step_paths(&repo.dirs, &id, &step.name);
+            report_exit(&r)
+        }
+        WaitEnd::Running => {
+            println!("tollgate: job {id} is still running; wait with: tollgate wait {id}");
+            exit::RUNNING
+        }
+        WaitEnd::Lost(m) => {
+            eprintln!("tollgate: {m}");
+            exit::FAIL
+        }
     }
 }
 
 /// R104: the refusal of `check --tier full` in an agent session. Exit 2,
 /// the code of a refused command or a usage error (R23): not a check
 /// verdict (0, 1) and not "still running" (3).
-fn refuse_full_in_session() -> u8 {
+fn refuse_full_in_session(rev: Option<&str>) -> u8 {
     eprintln!(
         "tollgate: check --tier full is not started by hand in an agent session (R104).\n\
          tollgate: a push, or a merge into a full ref, starts the full tier and reuses its result: run git push. Results so far: tollgate status.\n\
-         tollgate: after a stored fail: tollgate check --tier full --rev <rev> --rerun (runs only the steps that did not pass)."
+         tollgate: after a stored fail: tollgate check --tier full --rev {} --rerun (runs only the steps that did not pass).",
+        rev.unwrap_or("<rev>")
     );
     exit::BLOCK
 }
@@ -966,6 +1211,7 @@ pub fn run_here(ctx: &Ctx, a: HereArgs) -> u8 {
         carry: false,
         priority: Priority::Hook,
         created: now,
+        step_run: None,
     };
     // The repo's own nextest config applies in CI (no policy base).
     let mut spec = spec;

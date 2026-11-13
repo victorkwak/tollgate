@@ -238,6 +238,21 @@ impl Dirs {
             .join(format!("{step}.json"))
     }
 
+    /// Root of the narrowed step-run store (R105).
+    #[must_use]
+    pub fn step_runs_dir(&self) -> PathBuf {
+        self.state_dir().join("runs")
+    }
+
+    /// `runs/<key[..2]>/<key>.json`: the pass of a `tollgate run <step>
+    /// -- <args>` (R105). Gate jobs never read it.
+    #[must_use]
+    pub fn step_run_file(&self, key: &StepKey) -> PathBuf {
+        self.step_runs_dir()
+            .join(key.shard())
+            .join(format!("{key}.json"))
+    }
+
     /// `metadata/<key>.json`: workspace maps by manifest key, written by
     /// the runner, read by front ends that run no cargo (R51).
     #[must_use]
