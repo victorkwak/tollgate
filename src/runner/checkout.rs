@@ -4,8 +4,11 @@
 //! `<verify root>/<repo key>/<tier>/<worktree key>`, created on first use
 //! as a registered, locked git worktree, so its incremental build stays
 //! warm. Above `verify.max_checkouts` (`max_full_checkouts` for `full`)
-//! the least recently used checkout whose lock is free is removed. The
-//! checkout lock (R87) is held for the whole job.
+//! the least recently used checkout whose lock is free is removed. A
+//! checkout whose agent worktree or repo is gone is of no further use:
+//! [`remove_unused`] removes it (`tollgate gc`, R48, and a job below
+//! `verify.min_free`, R44). The checkout lock (R87) is held for the whole
+//! job.
 //!
 //! Before a job (R42): `read-tree -u --reset <T>`, `clean -ffdx` keeping
 //! `target`, `node_modules`, `.venv` and the steps' `cache_dirs`, then no
@@ -206,6 +209,72 @@ pub fn remove(repo_git: &Git, path: &Path, meta: &Path) {
         let _ = repo_git.output(["worktree", "prune"]);
     }
     let _ = fs::remove_file(meta);
+}
+
+/// Whether `origin` is still a worktree of the repo at `common_dir`: its
+/// main worktree (`<origin>/.git` is the common dir) or a linked worktree
+/// registered there. A gone path, or a path that is now a plain dir or
+/// another repo, is not.
+#[must_use]
+pub fn origin_live(origin: &Path, common_dir: &Path) -> bool {
+    let dot = origin.join(".git");
+    if dot.is_dir() {
+        return match (fs::canonicalize(&dot), fs::canonicalize(common_dir)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+    }
+    registered_git_dir(origin, common_dir).is_some()
+}
+
+/// Removes the checkouts under the verify `root` that are of no further
+/// use: their repo is gone, or their agent worktree is gone (L15, R48).
+/// With `all`, every checkout. A checkout whose lock is held (a running
+/// job, R87) is kept. Returns how many were removed.
+pub fn remove_unused(root: &Path, env: &crate::env::EnvSnapshot, all: bool) -> usize {
+    let ls = |dir: &Path| -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .map(|rd| rd.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default()
+    };
+    let mut removed = 0;
+    for repo_dir in ls(root) {
+        for tier_dir in ls(&repo_dir) {
+            for meta_path in ls(&tier_dir) {
+                if meta_path.extension().is_none_or(|e| e != "json") {
+                    continue;
+                }
+                let meta = CheckoutMeta::read(&meta_path);
+                let repo_live = meta.as_ref().is_some_and(|m| m.common_dir.is_dir());
+                let unused = !repo_live
+                    || meta
+                        .as_ref()
+                        .is_some_and(|m| !origin_live(&m.origin, &m.common_dir));
+                if !(unused || all) {
+                    continue;
+                }
+                let lock = meta_path.with_extension("lock");
+                let Ok(Some(held)) = LockFile::try_acquire(&lock) else {
+                    continue;
+                };
+                let checkout = meta_path.with_extension("");
+                match meta.filter(|_| repo_live) {
+                    Some(m) => remove(&Git::scrubbed(env, &m.common_dir), &checkout, &meta_path),
+                    None => {
+                        let _ = fs::remove_dir_all(&checkout);
+                        let _ = fs::remove_file(&meta_path);
+                    }
+                }
+                // Unlink while locked (a runner that opened the old file
+                // finds it gone and opens the new one).
+                let _ = held.remove_locked();
+                removed += 1;
+            }
+            let _ = fs::remove_dir(&tier_dir);
+        }
+        let _ = fs::remove_dir(&repo_dir);
+    }
+    removed
 }
 
 /// L15: removes least recently used checkouts of the tier until fewer than

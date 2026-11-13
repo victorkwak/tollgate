@@ -164,6 +164,98 @@ fn gc_removes_checkouts_of_gone_repos_and_all_state_r48() {
     assert!(sb.jobs().is_empty());
 }
 
+/// The checkout meta files under the sandbox verify root (one per
+/// checkout, L15).
+fn checkout_metas(sb: &Sandbox) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let ls = |p: &Path| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(p)
+            .map(|rd| rd.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default()
+    };
+    for repo in ls(&sb.state().join("verify")) {
+        for tier in ls(&repo) {
+            out.extend(
+                ls(&tier)
+                    .into_iter()
+                    .filter(|p| p.extension().is_some_and(|e| e == "json")),
+            );
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A repo with a passing policy and a linked worktree `w` of it; both have
+/// run a job, so each has its own fast checkout (L15).
+fn repo_and_worktree_with_checkouts(sb: &Sandbox) -> (std::path::PathBuf, std::path::PathBuf) {
+    let repo = sb.repo("r");
+    sb.commit_file(
+        &repo,
+        "tollgate.toml",
+        "version = 1\n[[step]]\nname = \"ok\"\nkind = \"command\"\nrun = \"true\"\n",
+        "policy",
+    );
+    let wt = sb.root().join("w");
+    sb.git(&repo, &["worktree", "add", "-b", "w", wt.to_str().unwrap()]);
+    sb.commit_file(&wt, "f.txt", "w\n", "in w");
+    for dir in [&repo, &wt] {
+        let r = sb.tollgate(dir, &["check", "--wait"]);
+        assert_eq!(r.code, Some(0), "{}", r.out);
+    }
+    assert_eq!(checkout_metas(sb).len(), 2, "one checkout per worktree");
+    (repo, wt)
+}
+
+/// L15, R48: gc removes the checkout of a worktree that is gone, or whose
+/// path is no longer a worktree of the repo, and keeps the checkout of the
+/// worktree that is still there.
+#[test]
+fn gc_removes_checkouts_of_gone_worktrees_l15_r48() {
+    let sb = Sandbox::new();
+    sb.host_config("[verify]\nmin_free = \"1M\"\n");
+    let (repo, wt) = repo_and_worktree_with_checkouts(&sb);
+    let kept = sb.tollgate(&sb.root(), &["gc"]);
+    assert!(kept.out.contains("0 verify checkout(s)"), "{}", kept.out);
+    sb.git(
+        &repo,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    // The same path again, but a plain dir: not a worktree of the repo.
+    std::fs::create_dir_all(&wt).unwrap();
+    let g = sb.tollgate(&sb.root(), &["gc"]);
+    assert_eq!(g.code, Some(0), "{}", g.out);
+    assert!(g.out.contains("1 verify checkout(s)"), "{}", g.out);
+    let left = checkout_metas(&sb);
+    assert_eq!(left.len(), 1, "{left:?}");
+    let origin = tollgate::runner::checkout::CheckoutMeta::read(&left[0])
+        .unwrap()
+        .origin;
+    assert_eq!(support::norm(&origin), support::norm(&repo));
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert_eq!(r.code, Some(0), "the kept checkout still works: {}", r.out);
+}
+
+/// R44: a job below `verify.min_free` first removes the checkouts of gone
+/// worktrees, then defers when that is not enough.
+#[test]
+fn low_disk_removes_checkouts_of_gone_worktrees_before_deferring_r44() {
+    let sb = Sandbox::new();
+    sb.host_config("[verify]\nmin_free = \"1M\"\n");
+    let (repo, wt) = repo_and_worktree_with_checkouts(&sb);
+    sb.git(
+        &repo,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    sb.host_config("[verify]\nmin_free = \"1000T\"\n");
+    sb.commit_file(&repo, "g.txt", "g\n", "new tree");
+    let r = sb.tollgate(&repo, &["check", "--wait"]);
+    assert!(r.out.contains("below verify.min_free"), "{}", r.out);
+    assert!(r.out.contains("removed 1 verify checkout"), "{}", r.out);
+    let left = checkout_metas(&sb);
+    assert_eq!(left.len(), 1, "{left:?}");
+}
+
 /// `fresh/<shard>/<record key>/<step key>.json` files (R101).
 fn fresh_entries(sb: &Sandbox) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();

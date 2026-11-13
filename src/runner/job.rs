@@ -297,6 +297,8 @@ struct Runner<'a> {
     report: JobReport,
     env: JobEnv,
     repo_git: Git,
+    /// The runner's environment, for git in other repos' checkouts (R44).
+    runner_env: EnvSnapshot,
     log: PathBuf,
     started: Option<Instant>,
     run_time: Duration,
@@ -416,6 +418,7 @@ impl<'a> Runner<'a> {
             dirs,
             env: spec.env(),
             repo_git: Git::scrubbed(runner_env, &spec.common_dir),
+            runner_env: runner_env.clone(),
             store: JobStore::new(dirs),
             log: job_dir.join("job.log"),
             job_dir,
@@ -511,17 +514,32 @@ impl Runner<'_> {
             Err(LockWait::Aborted(_)) => return End::Cancelled,
             Err(LockWait::Io(e)) => return error(ErrorCause::Internal, e.to_string()),
         };
-        // R44: defer on low disk.
+        // R44: on low disk, first remove the checkouts of gone worktrees
+        // and repos, then defer when that was not enough.
         let root = self.spec.host.verify.root(self.dirs);
         if let Err(e) = fsx::ensure_dir(&root) {
             return error(ErrorCause::Disk, format!("{}: {e}", root.display()));
         }
-        match checkout::free_bytes(&root) {
-            Ok(free) if free < self.spec.host.verify.min_free.bytes() => {
+        let min_free = self.spec.host.verify.min_free.bytes();
+        let mut freed = 0;
+        let free = match checkout::free_bytes(&root) {
+            Ok(free) if free < min_free => {
+                freed = checkout::remove_unused(&root, &self.runner_env, false);
+                if freed > 0 {
+                    self.say(&format!(
+                        "R44: removed {freed} verify checkout(s) of gone worktrees or repos"
+                    ));
+                }
+                checkout::free_bytes(&root)
+            }
+            other => other,
+        };
+        match free {
+            Ok(free) if free < min_free => {
                 return error(
                     ErrorCause::Disk,
                     format!(
-                        "{} has {} MiB free, below verify.min_free {}",
+                        "{} has {} MiB free, below verify.min_free {} (removed {freed} verify checkout(s) of gone worktrees or repos first)",
                         root.display(),
                         free >> 20,
                         self.spec.host.verify.min_free

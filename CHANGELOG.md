@@ -2,6 +2,12 @@
 
 Versions follow the package version in `Cargo.toml`. A git tag `v<version>` marks each one. `tollgate --version` also prints the commit of the build.
 
+## Unreleased
+
+Fixed:
+
+- Verify checkouts of agent worktrees that are gone no longer stay until the count limit. `tollgate gc` removes them, and a job below `verify.min_free` removes them (and those of gone repos) before it defers. Before, a checkout was removed only when its whole repo was gone or the LRU limit of 12 was passed, so the checkouts of removed worktrees filled the disk and the gate deferred every job while it held them (L15, R44, R48).
+
 ## 0.3.0 (2026-11-13)
 
 More guards against wasted runs (spec section 4.14, R110 to R113). This version voids no stored result.

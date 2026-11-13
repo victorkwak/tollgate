@@ -9,7 +9,7 @@
 //!   step-run passes (R105) older than 90 days or whose job is gone
 //!   (counted together as step passes); step artefacts (R106) go with the
 //!   bulky files of a job;
-//! - verify checkouts whose repo is gone (L15);
+//! - verify checkouts whose repo or agent worktree is gone (L15);
 //! - lock tickets, waiter files, queue markers, dedupe locks and gate-run
 //!   markers (item 17) older than 1 day that no live process holds;
 //! - push-candidate files with no live entry (R111), counted as tickets.
@@ -27,10 +27,9 @@ use crate::cache::store::RecordStore;
 use crate::config::HostConfig;
 use crate::dirs::Dirs;
 use crate::env::EnvSnapshot;
-use crate::gitx::Git;
 use crate::ids::JobId;
 use crate::locks::{self, LockFile};
-use crate::runner::checkout::{self, CheckoutMeta};
+use crate::runner::checkout;
 use crate::sched::JobStore;
 
 const DAY: u64 = 86_400;
@@ -221,42 +220,8 @@ pub fn gc(dirs: &Dirs, host: &HostConfig, env: &EnvSnapshot, all: bool) -> GcRep
         }
     }
 
-    // Verify checkouts (L15): repo gone, or --all.
-    let root = host.verify.root(dirs);
-    for repo_dir in files(&root) {
-        for tier_dir in files(&repo_dir) {
-            for meta_path in files(&tier_dir) {
-                if meta_path.extension().is_none_or(|e| e != "json") {
-                    continue;
-                }
-                let meta = CheckoutMeta::read(&meta_path);
-                let gone = meta.as_ref().is_none_or(|m| !m.common_dir.is_dir());
-                if !(gone || all) {
-                    continue;
-                }
-                let lock = meta_path.with_extension("lock");
-                let Ok(Some(held)) = LockFile::try_acquire(&lock) else {
-                    continue;
-                };
-                let checkout = meta_path.with_extension("");
-                match meta.filter(|m| m.common_dir.is_dir()) {
-                    Some(m) => {
-                        checkout::remove(&Git::scrubbed(env, &m.common_dir), &checkout, &meta_path)
-                    }
-                    None => {
-                        let _ = fs::remove_dir_all(&checkout);
-                        let _ = fs::remove_file(&meta_path);
-                    }
-                }
-                // Unlink while locked (a runner that opened the old file
-                // finds it gone and opens the new one).
-                let _ = held.remove_locked();
-                rep.checkouts += 1;
-            }
-            let _ = fs::remove_dir(&tier_dir);
-        }
-        let _ = fs::remove_dir(&repo_dir);
-    }
+    // Verify checkouts (L15): repo or agent worktree gone, or --all.
+    rep.checkouts = checkout::remove_unused(&host.verify.root(dirs), env, all);
 
     // Tickets, waiters, markers, dedupe locks.
     for res in files(&dirs.locks_dir()) {
