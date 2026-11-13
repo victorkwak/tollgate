@@ -1,6 +1,6 @@
 [package]
 name = "tollgate"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 # std `File::lock`/`try_lock` (R85) need 1.89.
 rust-version = "1.89"
